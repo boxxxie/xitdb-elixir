@@ -52,7 +52,7 @@ defmodule Xitdb.MixProject do
   defp package do
     [
       files:
-        ~w(lib native/nif_entry.c native/xitdb_nif.odin native/xitdb-odin/xitdb .formatter.exs mix.exs README.md CHANGELOG.md usage-rules.md LICENSE),
+        ~w(lib docs native/nif_entry.c native/xitdb_nif.odin native/xitdb-odin/xitdb .formatter.exs mix.exs README.md CHANGELOG.md usage-rules.md LICENSE),
       licenses: ["MIT"],
       links: %{
         "GitHub" => @source_url,
@@ -64,7 +64,29 @@ defmodule Xitdb.MixProject do
   defp docs do
     [
       main: "readme",
-      extras: ["README.md", "usage-rules.md", "CHANGELOG.md"],
+      extras: [
+        "README.md",
+        "usage-rules.md",
+        "docs/access-and-enumerable.md",
+        "docs/collections-and-indexing.md",
+        "docs/time-travel-and-storage.md",
+        "docs/path-and-pull-dsl.md",
+        "docs/transaction-dsl.md",
+        "docs/datalog-dsl.md",
+        "CHANGELOG.md"
+      ],
+      groups_for_extras: [
+        "Core Concepts & Protocols": [
+          "docs/access-and-enumerable.md",
+          "docs/collections-and-indexing.md",
+          "docs/time-travel-and-storage.md"
+        ],
+        "Macro DSLs & Query Languages": [
+          "docs/path-and-pull-dsl.md",
+          "docs/transaction-dsl.md",
+          "docs/datalog-dsl.md"
+        ]
+      ],
       source_ref: "v#{@version}",
       source_url: @source_url
     ]

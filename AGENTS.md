@@ -10,9 +10,14 @@ This document provides the architecture, build/test/benchmark commands, and deve
   - [`lib/xitdb.ex`](lib/xitdb.ex): Top-level `%Xitdb{}` struct, lifecycle (`open/1`, `close/1`, `sync/1`, `info/1`, `compact/2`), snapshots (`db/1`, `as_of/2`), transactions (`transact/3`, `insert_at/4`, `delete_at/3`, `fork/3`), queries (`select/2`, `pull/2`, `diff_moments/3`, `history_of/2`, `query/3`), and `Access` delegation.
   - [`lib/xitdb/cursor.ex`](lib/xitdb/cursor.ex): Lazy 9-byte `Slot` cursor (`%Xitdb.Cursor{}`) implementing `Access`, `Enumerable`, and `Inspect`.
   - [`lib/xitdb/collection.ex`](lib/xitdb/collection.ex): Explicit collection wrappers (`counted_map`, `sorted_map`, `linked_list`, `hash_set`, `counted_set`, `sorted_set`).
+  - [`lib/xitdb/dsl.ex`](lib/xitdb/dsl.ex): Compile-time macro DSL for path selectors (`path/1`), declarative transactions (`tx/2,3`, `tx!/2,3`), Pull patterns (`pull_pattern/1`), and Datalog queries (`datalog/1`, `query/2,3`, `query!/2,3`).
+  - [`lib/xitdb/pull.ex`](lib/xitdb/pull.ex): Structural Pull pattern compiler (`Xitdb.Pull.compile/1`, `Xitdb.Pull.compile!/1`).
   - [`lib/xitdb/tx_compiler.ex`](lib/xitdb/tx_compiler.ex): Compiles nested Elixir maps, collections, and staged `put_in`/`update_in`/`pop_in` cursor edits into coarse-grained NIF transaction operations.
   - [`lib/xitdb/sigils.ex`](lib/xitdb/sigils.ex): Compile-time validated `~x` (selector) and `~q` (Datalog) sigils.
   - [`lib/xitdb/nif.ex`](lib/xitdb/nif.ex): `@on_load` loader for `priv/xitdb_nif.so`.
+- **`docs/`** — Dedicated reference guides:
+  - Core concepts & protocols: [`docs/access-and-enumerable.md`](docs/access-and-enumerable.md), [`docs/collections-and-indexing.md`](docs/collections-and-indexing.md), [`docs/time-travel-and-storage.md`](docs/time-travel-and-storage.md).
+  - Macro DSLs & query languages: [`docs/path-and-pull-dsl.md`](docs/path-and-pull-dsl.md), [`docs/transaction-dsl.md`](docs/transaction-dsl.md), [`docs/datalog-dsl.md`](docs/datalog-dsl.md).
 - **`native/`** — C-ABI Erlang NIF shim & Odin NIF implementation:
   - [`native/nif_entry.c`](native/nif_entry.c): Thin C shim exporting `ERL_NIF_INIT` and wrapping `ErlNifResourceType` / `ErlNifRWLock` callbacks for Odin.
   - [`native/xitdb_nif.odin`](native/xitdb_nif.odin): Odin NIF procedures bridging `ErlNifEnv` terms to `xitdb`.

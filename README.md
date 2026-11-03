@@ -19,8 +19,8 @@ Rather than re-implementing `xitdb`'s wire format in pure Elixir or requiring qu
   Use `cursor["key"]`, `cursor[idx]`, `get_in/2`, `put_in/3`, `update_in/3`, `pop_in/2`, `Enum.count/1` ($O(1)$ on counted maps/sets/lists), `Enum.member?/2` ($O(1)$ HAMT membership), `Enum.slice/2` ($O(\log N)$ index seek), and lazy `Stream.*` pipelines.
 - **Instant Time-Travel & Structural Diffs:**
   Pin historical snapshots in $O(1)$ with `Xitdb.as_of(db, moment)`, diff any two moments in $O(\Delta)$ with `Xitdb.diff_moments/3`, and inspect attribute lineage with `Xitdb.history_of/2`.
-- **Compile-Time Validated Sigils (`~x`, `~q`), Pull & Datalog:**
-  Validate path selectors (`~x|.users["101"].todos[1]|`) and Datalog queries (`~q"find ?name where ..."`) at compile time, project nested subtrees with Datomic-style `Xitdb.pull/2`, and run Datalog queries with B+Tree secondary index pushdown and grouped aggregations.
+- **Compile-Time Validated Sigils (`~x`, `~q`), Macro DSL (`Xitdb.DSL`), Pull & Datalog:**
+  Use standard `Access` for lazy navigation or `use Xitdb.DSL` for compile-time path selectors (`path(users[id].todos[[0]])`), zero-read atomic transaction blocks (`tx db do ... end`), structural Pull patterns (`[:username, todos: 0..2]`), and Ecto-style Datalog queries with `^var` pinning.
 
 ---
 
@@ -73,8 +73,8 @@ snapshot_v0 = Xitdb.as_of(db, 0)
 snapshot_v0["users"]["alice"]["age"] # => 30
 db["users"]["alice"]["age"]          # => 31
 
-# 6. Datomic Pull projections & Datalog queries
-Xitdb.pull!(alice, "{name, age, roles[0..1]}")
+# 6. Datomic Pull projections & Datalog queries (supports both strings and structured DSLs)
+Xitdb.pull!(alice, [:name, :age, roles: 0..1])
 # => %{"name" => "Alice Liddell", "age" => 31, "roles" => ["admin"]}
 
 Xitdb.query!(db, ~q"""
@@ -86,6 +86,57 @@ where
 """)
 # => %{vars: ["?id", "?age"], rows: [["alice", 31]]}
 ```
+
+---
+
+## Macro DSLs (`use Xitdb.DSL`)
+
+For operations where Elixir's `Access` protocol has friction—such as auto-vivifying deep paths without intermediate NIF reads, native list `append`/`insert`/`slice`, $O(1)$ subtree `fork`, typed collection selectors (`#counted`, `$sorted`, `[[linked]]`), and Datalog queries with pinned runtime variables (`^var`)—`Xitdb` provides a compile-time macro DSL:
+
+```elixir
+use Xitdb.DSL
+
+# 1. Atomic transaction block (0 intermediate NIF reads, native collection ops)
+{:ok, db} =
+  tx db, doc: "promote alice" do
+    put users[id].role, "admin"
+    append users[id].roles, "staff"
+    insert audit_log[[1]], "promoted"
+    fork users[id], backups[id]
+    update users[id].age, &((&1 || 0) + 1)
+  end
+
+# 2. Path selector macro with runtime interpolation & collection tags
+role = Xitdb.select!(db, path(users[id].roles[0]))
+
+# 3. Declarative Datalog query macro with ^var pinning
+prefix = "al"
+min_age = 21
+
+{:ok, %{rows: [["alice", 32]]}} =
+  query db do
+    find {id, age}
+
+    where [
+      sorted("username->id")[uname] == id,
+      starts_with(uname, ^prefix),
+      users[id].age == age,
+      age >= ^min_age
+    ]
+  end
+```
+
+### Documentation & Guides
+
+#### Core Concepts & Protocols
+- **[Lazy Cursors, `Access` & `Enumerable` (`docs/access-and-enumerable.md`)](docs/access-and-enumerable.md)** — 9-byte `Slot` cursors, bracket navigation (`db["users"]["alice"]`), `get_in`/`put_in`/`update_in`/`pop_in`, `Xitdb.at/1`, `Enumerable` fast paths (`Enum.count/1`, `Enum.member?/2`, `Enum.slice/2`), and chunked `Stream` pagination.
+- **[Collections & Secondary Indexing (`docs/collections-and-indexing.md`)](docs/collections-and-indexing.md)** — Choosing between `hash_map`, `counted_map`, `sorted_map`, `array_list`, `linked_list`, and sets, plus secondary B+Tree indexing (`index_on`).
+- **[Time-Travel, Diffs, History & Storage (`docs/time-travel-and-storage.md`)](docs/time-travel-and-storage.md)** — $O(1)$ snapshots (`as_of/2`), structural moment diffs (`diff_moments/3`), attribute lineage (`history_of/2`), storage backends (`:memory`, `:file`, `:buffered_file`), and online compaction (`compact/2`).
+
+#### Macro DSLs & Query Languages
+- **[Path Selector & Structural Pull DSL (`docs/path-and-pull-dsl.md`)](docs/path-and-pull-dsl.md)** — `path/1`, typed collection modifiers (`counted`, `sorted`, `[[idx]]`), set member probes, wildcard scans (`*`), and structural `Xitdb.pull/2` patterns.
+- **[Declarative Transaction Block DSL (`docs/transaction-dsl.md`)](docs/transaction-dsl.md)** — `tx/2,3`, `put` (including 1-arity set member additions), `update/2,3`, `rm`, `append`, `insert`, `slice`, `fork`, `index_on`, `meta`, `instant`, `savepoint`, and `abort`.
+- **[Declarative Datalog Query DSL (`docs/datalog-dsl.md`)](docs/datalog-dsl.md)** — `datalog/1` and `query/2,3`, `^var` pinning, entity generators (`u <- users`), set membership, transitive graph reachability (`reach/3,4`), cross-moment queries (`at_moment/2`), and aggregations.
 
 ---
 

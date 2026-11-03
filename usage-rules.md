@@ -1,49 +1,224 @@
 # Xitdb Elixir Client Usage Rules
 
-This file defines the canonical usage patterns, performance invariants, and anti-patterns for the `Xitdb` Elixir client library.
+`Xitdb` is an idiomatic Elixir client and Odin NIF wrapper for `xitdb`—an embeddable, immutable, append-only database with persistent structural sharing (`Hash_Map`, `Counted_Hash_Map`, `Sorted_Map`, `Array_List`, `Linked_Array_List`, and sets).
 
 ---
 
-## 1. Lazy `%Xitdb.Cursor{}` Navigation vs. Eager Materialization
+## 1. Core Architecture & Lazy `%Xitdb.Cursor{}` Navigation
 
-- **Default to Lazy `Access` Navigation (`db["users"]["alice"]["name"]`)**:
-  - Indexing a `%Xitdb{}` handle or `%Xitdb.Cursor{}` with `cursor["key"]`, `cursor[index]`, or `get_in/2` resolves a single 9-byte `Slot` (`tag` + `value`) per step.
-  - Intermediate containers (`Hash_Map`, `Counted_Hash_Map`, `Sorted_Map`, `Array_List`, `Linked_Array_List`, sets) return a new lazy `%Xitdb.Cursor{}` in $O(1)$ heap space. Leaf scalars (`String`, `Integer`, `Float`, `Boolean`, `{:tagged, tag, bin}`) decode directly into native Elixir terms.
-- **Use `Xitdb.at/1` Instead of `Access.at/1` on Lazy List Cursors**:
-  - Elixir's built-in `Access.at/1` guards `is_list(data)` and raises on structs. When navigating `Array_List` or `Linked_Array_List` cursors with `get_in/2` or `put_in/3`, either pass integer keys directly in the path list (`get_in(root, ["users", "alice", "roles", 1])`) or use `Xitdb.at(1)`.
-- **Call `Xitdb.materialize/1` or `Xitdb.pull/2` Only at the Leaf Subtree**:
-  - Never call `Xitdb.materialize(db)` on the entire database root in hot paths. Navigate to the target entity first (`user = db["users"][id]`) and then call `Xitdb.materialize(user)` or `Xitdb.pull!(user, "{name, age, roles[0..5]}")`.
-
----
-
-## 2. `Enumerable` Protocol Fast Paths
-
-`%Xitdb.Cursor{}` implements `Enumerable` with native data-structure fast paths:
-- **`Enum.count(cursor)`**:
-  - Executes in **$O(1)$** on `:counted_hash_map`, `:counted_hash_set`, `:array_list`, `:linked_array_list`, `:sorted_map`, and `:sorted_set`.
-  - When you need fast cardinality checks on maps or sets, wrap them at transaction time with `Xitdb.counted_map/1` or `Xitdb.counted_set/1`.
-- **`Enum.member?(cursor, elem)`**:
-  - Executes in **$O(1)$ / $O(\log_{16} N)$** on sets (`:hash_set`, `:counted_hash_set`, `:sorted_set`) and maps (`{key, value}` pairs) via direct HAMT/B+Tree slot lookup—never call `Enum.to_list(cursor)` before checking membership.
-- **`Enum.slice(cursor, range)`**:
-  - Executes in **$O(\log N + K)$** on `:array_list`, `:linked_array_list`, `:sorted_map`, and `:sorted_set` by seeking directly to the start index in the underlying Radix Trie or B+Tree.
+1. **Default to Lazy `Access` Navigation (`db["users"]["alice"]["name"]`)**:
+   - Reading from `Xitdb` (`Xitdb.db(db)`, `Xitdb.as_of(db, moment)`, or `db["users"]`) returns a lazy `%Xitdb.Cursor{}` holding only the NIF database reference and 9-byte `Slot` coordinates (`tag`, `tag_id`, `value`).
+   - Cursors are **pure, immutable Elixir values**. Pass them freely across BEAM processes (`Task.async_stream/3`, GenServers, ETS, Phoenix LiveView assigns) without locks or copying underlying subtrees.
+   - Navigating to a scalar (`string`, `integer`, `float`, `boolean`, or `{:tagged, tag, bytes}`) unwraps and returns the native Elixir value directly; navigating to a nested container returns another `%Xitdb.Cursor{}` in $O(1)$ heap space.
+2. **Use `Xitdb.at/1` Instead of `Access.at/1` on Lazy List Cursors**:
+   - Elixir's built-in `Access.at/1` guards `is_list(data)` and raises on structs. When navigating `Array_List` or `Linked_Array_List` cursors with `get_in/2` or `put_in/3`, either pass integer keys directly in the path list (`get_in(root, ["users", "alice", "roles", 1])`) or use `Xitdb.at(1)`.
+3. **Never Eagerly Materialize Large Subtrees Unless Needed**:
+   - Never call `Xitdb.materialize(db)` on the entire database root in hot paths. Prefer lazy navigation (`cursor["key"]`, `cursor[0]`), `Xitdb.pull/2` projections, `Enum.count/1`, `Enum.member?/2`, `Enum.slice/2`, or `Stream` pipelines, or navigate to the leaf entity first (`user = db["users"][id]`) before calling `Xitdb.materialize(user)`.
 
 ---
 
-## 3. Coarse-Grained Transactions (`Xitdb.transact/3`)
+## 2. Database Lifecycle
 
-- **Batch Mutations into a Single `Xitdb.transact/3` Call**:
-  - `xitdb` is an append-only copy-on-write store where each `Xitdb.transact/3` call commits a new top-level moment.
-  - Prefer passing either a nested map (`Xitdb.transact(db, %{"users" => ...})`) or a cursor pipeline (`Xitdb.transact(db, fn root -> root |> put_in(...) |> update_in(...) end)`) so all mutations execute in a single NIF call and a single atomic moment commit.
-- **Explicit Collection Wrappers**:
-  - Plain Elixir maps (`%{}`) default to `:hash_map`, plain lists (`[]`) default to `:array_list`, and `%MapSet{}` defaults to `:counted_hash_set`.
-  - Use `Xitdb.counted_map/1`, `Xitdb.sorted_map/1`, `Xitdb.linked_list/1`, `Xitdb.hash_set/1`, `Xitdb.counted_set/1`, and `Xitdb.sorted_set/1` when you need B+Tree ordering, $O(1)$ map counts, or $O(\log N)$ mid-list insertions (`Xitdb.insert_at/4`, `Xitdb.delete_at/3`).
+```elixir
+# In-memory database
+{:ok, db} = Xitdb.open(backend: :memory)
+
+# File-backed database (:buffered_file is recommended for disk workloads)
+{:ok, db} = Xitdb.open(backend: :buffered_file, path: "/path/to/data.xit", hash: :sha1)
+
+# Synchronize buffered writes and close
+:ok = Xitdb.sync(db)
+:ok = Xitdb.close(db)
+
+# Compact historical moments into a new file keeping only the latest moment
+{:ok, compacted_db} = Xitdb.compact(db, path: "/path/to/data.compacted.xit")
+```
 
 ---
 
-## 4. Concurrency & Time-Travel Snapshots
+## 3. Choosing Collection Types (`Xitdb.Collection`)
 
-- **`%Xitdb.Cursor{}` Is Process-Safe**:
-  - You can freely pass `%Xitdb.Cursor{}` structs across `Task.async/1`, GenServers, and Phoenix LiveView processes.
-- **Pin Snapshots with `Xitdb.as_of/2`**:
-  - `Xitdb.db(db)` resolves the latest moment (`-1`) at the time it is called.
-  - Once you have a `%Xitdb.Cursor{}` (via `Xitdb.db(db)` or `Xitdb.as_of(db, moment)`), its `Slot` is immutable and isolated from any future `Xitdb.transact/3` commits.
+By default, plain Elixir maps (`%{}`) are stored as `:hash_map` (`Tag.Hash_Map`), plain lists (`[]`) as `:array_list` (`Tag.Array_List`), and `%MapSet{}` as `:counted_hash_set`. Use wrapper constructors on `Xitdb` when you need $O(1)$ counts, lexicographical B+Tree ordering, or $O(\log N)$ list insertions/removals:
+
+| Constructor | Selector Sigil | Backing Structure | Best For |
+| :--- | :--- | :--- | :--- |
+| `Xitdb.hash_map(map)` | `.key` | 16-way HAMT | General key-value maps |
+| `Xitdb.counted_map(map)` | `#key` | 16-way HAMT + count header | Maps needing $O(1)$ `Enum.count/1` |
+| `Xitdb.sorted_map(map)` | `$key` | Lexicographical B+Tree | Ordered iteration, range slices, secondary indexes |
+| `Xitdb.array_list(list)` | `[i]` | 16-way Radix Trie | Append-heavy lists and random index reads |
+| `Xitdb.linked_list(list)` | `[[i]]` | Count-augmented B-Tree | Queues/lists needing $O(\log N)$ `insert`, `rm`, and `slice` |
+| `Xitdb.hash_set(enum)` | `%member` | 16-way HAMT set | Uncounted string membership sets |
+| `Xitdb.counted_set(enum)` | `#%member` | 16-way HAMT set + count | Sets needing $O(1)$ `Enum.count/1` and `Enum.member?/2` |
+| `Xitdb.sorted_set(enum)` | `^member` | Lexicographical B+Tree set | Ordered unique tags/badges |
+
+---
+
+## 4. Writing Data & Transactions
+
+### 1. Declarative Macro DSL (`Xitdb.DSL.tx` / `Xitdb.tx`) — Preferred for Targeted Mutations
+
+Use `use Xitdb.DSL` (or `require Xitdb` and `Xitdb.tx/2,3`) to compile deep path writes and native collection operations into a single atomic NIF batch with **zero intermediate NIF reads** and automatic creation of missing intermediate maps:
+
+```elixir
+use Xitdb.DSL
+
+{:ok, db} =
+  tx db, doc: "promote alice", instant: 1_712_000_000_000 do
+    meta "author", "system"
+    put users[id].role, "admin"
+    put users[id].flags.set_member("staff")
+    put users[new_id].profile.city, "Tokyo"
+    append users[id].audit_log, "promoted"
+    insert users[id].todos[[0]], "urgent-task"
+    slice users[id].todos, 0..9
+    fork users[id], backups[id]
+    rm users[id].temp_token
+    update users[id].login_count, 0, &(&1 + 1)
+    savepoint()
+  end
+```
+
+- **Important Elixir syntax rule**: Never start a path expression with a bare leading dot (`.users[id]`). Start with the bare root identifier (`users[id]`), `root.users[id]`, `_.users[id]`, or `:users[id]`.
+- For set member additions inside `tx`, use 1-arity `put path.set_member(val)` (or `counted_set_member`/`sorted_set_member`).
+- For read-modify-write updates with a fallback when the path does not yet exist, use 3-arity `update path, default, fun`.
+- To roll back from inside a `tx` block, call `abort :reason`.
+
+### 2. Top-Level Map Transactions (`Xitdb.transact/3`)
+
+When seeding or replacing whole subtrees from an Elixir map:
+
+```elixir
+{:ok, db} =
+  Xitdb.transact(
+    db,
+    %{
+      "users" => %{"alice" => %{"role" => "admin"}},
+      "queue" => Xitdb.linked_list(["job-1", "job-2"])
+    },
+    doc: "initial seed",
+    index_rules: [{:index_on, "users", "username", "username->id"}]
+  )
+```
+
+### 3. Cursor `Access` Transactions (`put_in` / `update_in` / `pop_in`)
+
+When mutating existing paths via a root `%Xitdb.Cursor{}` callback:
+
+```elixir
+{:ok, db} =
+  Xitdb.transact(db, fn root ->
+    {_, root} = pop_in(root["users"]["alice"]["temp_token"])
+
+    root
+    |> put_in(["users", "alice", "role"], "staff")
+    |> update_in(["users", "alice", "logins"], &(&1 + 1))
+    |> Xitdb.insert_at(["queue"], 1, "job-1.5")
+  end)
+```
+
+---
+
+## 5. Reading, Selecting & Pulling Data
+
+### Lazy `Access` & `Enumerable` Fast Paths
+
+`%Xitdb.Cursor{}` implements `Enumerable` with native data-structure fast paths (`Enum.count/1` in $O(1)$, `Enum.member?/2` in $O(1)$ / $O(\log_{16} N)$, `Enum.slice/2` in $O(\log N + K)$):
+
+```elixir
+root = Xitdb.db(db)
+
+# O(1) / O(log N) lazy navigation
+name = root["users"]["alice"]["name"]
+last_role = root["users"]["alice"]["roles"][-1]
+
+# Native collection pushdowns via Enumerable
+count = Enum.count(root["counted_users"])
+has_perm? = Enum.member?(root["permissions"], "deploy")
+page = Enum.slice(root["linked_queue"], 10..19)
+top_two = root["leaderboard"] |> Stream.take(2) |> Enum.to_list()
+```
+
+### Path Selectors (`path/1` and `~x`)
+
+```elixir
+use Xitdb.DSL
+
+# Dynamic path with collection-type modifiers (# for counted, $ for sorted, [[i]] for linked list)
+selector = path(org.counted(:departments)[dept_id].sorted(:directory)[user_id].todos[[0]])
+todo = Xitdb.select!(db, selector)
+
+# Static compile-time validated sigil
+todo = Xitdb.select!(db, ~x|.users["101"].todos[1]|)
+```
+
+### Datomic-Style Pull Projections (`Xitdb.pull/2`)
+
+Prefer `Xitdb.pull/2` with a structural list pattern over `Xitdb.materialize/1` when you only need a subset of fields or a bounded list slice:
+
+```elixir
+{:ok, user_card} =
+  Xitdb.pull(root["users"]["101"], [
+    :username,
+    :age,
+    todos: 0..2,
+    profile: [:city]
+  ])
+```
+
+---
+
+## 6. Time-Travel, Diffs & History
+
+```elixir
+# Pin a zero-cost immutable snapshot to historical moment 0
+v0 = Xitdb.as_of(db, 0)
+old_val = v0["config"]["version"]
+
+# Compute structural diff between two moments (skips identical 9-byte Slots in O(1))
+{:ok, changes} = Xitdb.diff_moments(db, 0, 2)
+
+# Inspect the historical lineage of a specific path across all moments
+{:ok, lineage} = Xitdb.history_of(db, path(config.version))
+```
+
+---
+
+## 7. Datalog Queries (`Xitdb.DSL.query` & `~q`)
+
+Use the `query/2,3` or `datalog/1` macro when binding runtime Elixir variables with `^`, or `~q` for static query strings:
+
+```elixir
+use Xitdb.DSL
+
+prefix = "da"
+min_salary = 115
+
+{:ok, %{vars: vars, rows: rows}} =
+  query db do
+    find {name, salary}
+
+    where [
+      sorted("username->id")[name] == id,
+      starts_with(name, ^prefix),
+      users[id].salary == salary,
+      salary >= ^min_salary,
+      not users[id].flags.set_member("suspended"),
+      reach(id, :manager_id, mgr, users)
+    ]
+  end
+```
+
+- **Transitive Graph Reachability**: Use `reach(from, :edge_field, to)` or `reach(from, :edge_field, to, collection)` in `where` for cycle-safe recursive graph traversal.
+- **Cross-Moment Joins**: Wrap any path expression in `at_moment(moment_or_var, path)` (e.g. `at_moment(0, users[id].salary) == old_salary` or `at_moment(m, users[id].role) == role`) to join across historical moments within a single query.
+- **Path Existence & Absence**: Use bare paths (`users[id].mfa_secret`) or negated bare paths (`not users[id].deleted_at`) to filter by key presence without binding a variable.
+
+---
+
+## 8. Reference Guides (`docs/`)
+
+- [`docs/access-and-enumerable.md`](docs/access-and-enumerable.md) — Lazy 9-byte `Slot` cursors, `Access`, `Enumerable` fast paths, and `Stream` pagination.
+- [`docs/collections-and-indexing.md`](docs/collections-and-indexing.md) — Persistent data structure selection (`hash_map`, `counted_map`, `sorted_map`, `array_list`, `linked_list`, sets) and secondary B+Tree indexing (`index_on`).
+- [`docs/time-travel-and-storage.md`](docs/time-travel-and-storage.md) — Snapshots (`as_of/2`), structural diffs (`diff_moments/3`), attribute history (`history_of/2`), storage backends, and compaction.
+- [`docs/path-and-pull-dsl.md`](docs/path-and-pull-dsl.md) — `path/1`, `~x`, typed collection modifiers, wildcard scans, and structural `Xitdb.pull/2` projections.
+- [`docs/transaction-dsl.md`](docs/transaction-dsl.md) — Declarative `tx/2,3` blocks, collection operations, metadata (`doc`, `instant`, `meta`), savepoints, and rollback.
+- [`docs/datalog-dsl.md`](docs/datalog-dsl.md) — Declarative `query/2,3` and `datalog/1` blocks, `^var` pinning, `reach`, `at_moment`, predicates, and aggregations.
