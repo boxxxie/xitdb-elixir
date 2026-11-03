@@ -11,7 +11,56 @@ defmodule Xitdb do
 
   @behaviour Access
 
-  alias Xitdb.{Collection, Cursor, Error, NIF, TxCompiler}
+  alias Xitdb.{Collection, Cursor, Error, NIF, Pull, TxCompiler}
+
+  defmacro path(expr) do
+    quote do
+      require Xitdb.DSL
+      Xitdb.DSL.path(unquote(expr))
+    end
+  end
+
+  defmacro tx(db, block) do
+    quote do
+      require Xitdb.DSL
+      Xitdb.DSL.tx(unquote(db), unquote(block))
+    end
+  end
+
+  defmacro tx(db, opts, block) do
+    quote do
+      require Xitdb.DSL
+      Xitdb.DSL.tx(unquote(db), unquote(opts), unquote(block))
+    end
+  end
+
+  defmacro tx!(db, block) do
+    quote do
+      require Xitdb.DSL
+      Xitdb.DSL.tx!(unquote(db), unquote(block))
+    end
+  end
+
+  defmacro tx!(db, opts, block) do
+    quote do
+      require Xitdb.DSL
+      Xitdb.DSL.tx!(unquote(db), unquote(opts), unquote(block))
+    end
+  end
+
+  defmacro datalog(block) do
+    quote do
+      require Xitdb.DSL
+      Xitdb.DSL.datalog(unquote(block))
+    end
+  end
+
+  defmacro pull_pattern(pattern) do
+    quote do
+      require Xitdb.DSL
+      Xitdb.DSL.pull_pattern(unquote(pattern))
+    end
+  end
 
   @open_schema NimbleOptions.new!(
                  backend: [
@@ -266,32 +315,48 @@ defmodule Xitdb do
     base_moment = Keyword.get(opts, :base_moment, -1)
     doc = Keyword.get(opts, :doc, "")
 
-    case NIF.nif_transact(db_ref, base_moment, ops, doc) do
+    opt_ops =
+      case Keyword.get(opts, :instant) do
+        inst when is_integer(inst) -> [{:instant, inst}]
+        _ -> []
+      end ++
+        case Keyword.get(opts, :meta) do
+          meta when is_map(meta) or is_list(meta) ->
+            Enum.map(meta, fn {k, v} -> {:meta, to_string(k), v} end)
+
+          _ ->
+            []
+        end
+
+    case NIF.nif_transact(db_ref, base_moment, opt_ops ++ ops, doc) do
       {:ok, _} -> {:ok, db}
       {:error, reason} -> {:error, %Error{reason: reason}}
     end
   end
 
   @doc """
-  Stages an $O(\\log N)$ insertion into a `Linked_Array_List` at `path_keys` and `index`
+  Stages an $O(\\log N)$ insertion into a `Linked_Array_List` at `path_or_selector` and `index`
   on a root `%Xitdb.Cursor{}` inside `Xitdb.transact/2`.
+
+  `path_or_selector` can be a selector string (`path(users[id].queue)`) or a list of keys /
+  typed `{kind, key}` steps (`[{:counted, "users"}, "alice", "queue"]`).
   """
-  @spec insert_at(Cursor.t(), [String.t() | atom()], integer(), term()) :: Cursor.t()
-  def insert_at(%Cursor{} = root, path_keys, index, value)
-      when is_list(path_keys) and is_integer(index) do
-    selector = Enum.map_join(path_keys, "", &TxCompiler.format_step(:hash_map, &1))
+  @spec insert_at(Cursor.t(), String.t() | [term()], integer(), term()) :: Cursor.t()
+  def insert_at(%Cursor{} = root, path_or_selector, index, value)
+      when (is_list(path_or_selector) or is_binary(path_or_selector)) and is_integer(index) do
+    selector = TxCompiler.format_path_steps(path_or_selector)
     %{root | staged_ops: root.staged_ops ++ [{:insert, selector, index, value}]}
   end
 
   @doc """
-  Stages an $O(\\log N)$ removal from a `Linked_Array_List` at `path_keys` and `index`
+  Stages an $O(\\log N)$ removal from a `Linked_Array_List` at `path_or_selector` and `index`
   on a root `%Xitdb.Cursor{}` inside `Xitdb.transact/2`.
   """
-  @spec delete_at(Cursor.t(), [String.t() | atom()], integer()) :: Cursor.t()
-  def delete_at(%Cursor{} = root, path_keys, index)
-      when is_list(path_keys) and is_integer(index) do
+  @spec delete_at(Cursor.t(), String.t() | [term()], integer()) :: Cursor.t()
+  def delete_at(%Cursor{} = root, path_or_selector, index)
+      when (is_list(path_or_selector) or is_binary(path_or_selector)) and is_integer(index) do
     selector =
-      Enum.map_join(path_keys, "", &TxCompiler.format_step(:hash_map, &1)) <>
+      TxCompiler.format_path_steps(path_or_selector) <>
         TxCompiler.format_step(:linked_array_list, index)
 
     %{root | staged_ops: root.staged_ops ++ [{:rm, selector}]}
@@ -361,16 +426,17 @@ defmodule Xitdb do
   end
 
   @doc """
-  Executes a Datomic-style Pull projection (`"{username, age, todos[0..2], profile{city}}"`)
-  against a `%Xitdb.Cursor{}` or `%Xitdb{}` handle.
+  Executes a Datomic-style Pull projection against a `%Xitdb.Cursor{}` or `%Xitdb{}` handle.
+
+  Accepts either a raw Pull pattern string (`"{username, age, todos[0..2], profile{city}}"`)
+  or a structural Elixir list (`[:username, :age, todos: 0..2, profile: [:city]]`).
   """
-  @spec pull(t() | Cursor.t(), String.t()) :: {:ok, term()} | {:error, Error.t()}
-  def pull(%__MODULE__{} = db, pattern) when is_binary(pattern) do
+  @spec pull(t() | Cursor.t(), Pull.pattern()) :: {:ok, term()} | {:error, Error.t()}
+  def pull(%__MODULE__{} = db, pattern) do
     pull(as_of(db, -1), pattern)
   end
 
-  def pull(%Cursor{} = cursor, pattern)
-      when is_binary(pattern) do
+  def pull(%Cursor{} = cursor, pattern) when is_binary(pattern) do
     %Cursor{db_ref: db_ref, tag_id: tag_id, value: val} = Cursor.ensure_resolved(cursor)
 
     case NIF.nif_pull(db_ref, tag_id, val, pattern) do
@@ -379,8 +445,14 @@ defmodule Xitdb do
     end
   end
 
+  def pull(%Cursor{} = cursor, pattern) when is_list(pattern) do
+    with {:ok, compiled} <- Pull.compile(pattern) do
+      pull(cursor, compiled)
+    end
+  end
+
   @doc "Same as `pull/2`, but raises `Xitdb.Error` on failure."
-  @spec pull!(t() | Cursor.t(), String.t()) :: term()
+  @spec pull!(t() | Cursor.t(), Pull.pattern()) :: term()
   def pull!(target, pattern) do
     case pull(target, pattern) do
       {:ok, val} -> val

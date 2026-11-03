@@ -80,6 +80,8 @@ ATOM_FORK:             ERL_NIF_TERM
 ATOM_INDEX_ON:         ERL_NIF_TERM
 ATOM_INIT_COL:         ERL_NIF_TERM
 ATOM_RESET_COL:        ERL_NIF_TERM
+ATOM_META:             ERL_NIF_TERM
+ATOM_SAVEPOINT:        ERL_NIF_TERM
 ATOM_MOMENT_COUNT:     ERL_NIF_TERM
 ATOM_FILE_SIZE:        ERL_NIF_TERM
 ATOM_MOMENT_INDEX:     ERL_NIF_TERM
@@ -121,6 +123,8 @@ odin_nif_init_atoms :: proc "c" (env: ErlNifEnv) {
 	ATOM_INDEX_ON     = make_atom(env, "index_on")
 	ATOM_INIT_COL     = make_atom(env, "init_col")
 	ATOM_RESET_COL    = make_atom(env, "reset_col")
+	ATOM_META         = make_atom(env, "meta")
+	ATOM_SAVEPOINT    = make_atom(env, "savepoint")
 	ATOM_MOMENT_COUNT = make_atom(env, "moment_count")
 	ATOM_FILE_SIZE    = make_atom(env, "file_size")
 	ATOM_MOMENT_INDEX = make_atom(env, "moment_index")
@@ -1399,6 +1403,7 @@ odin_nif_transact :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TER
 			if err := xitdb.tx_fork(&tx, from_str, to_str); err != nil {
 				return make_xitdb_err(env, err)
 			}
+			xitdb.tx_savepoint(&tx)
 
 		case ATOM_INDEX_ON:
 			src_map, ok_1 := get_string_from_binary(env, elems[1])
@@ -1408,6 +1413,27 @@ odin_nif_transact :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TER
 				return make_err(env, "invalid_index_on_op")
 			}
 			xitdb.tx_index_on(&tx, src_map, field_key, idx_map)
+
+		case ATOM_INSTANT:
+			inst_val: i64 = 0
+			if nif_get_int64(env, elems[1], &inst_val) == 0 {
+				return make_err(env, "invalid_instant_op")
+			}
+			xitdb.tx_instant(&tx, inst_val)
+
+		case ATOM_META:
+			if arity < 3 {
+				return make_err(env, "invalid_meta_op")
+			}
+			key_str, ok_k := get_string_from_binary(env, elems[1])
+			val, ok_v := decode_writeable_value(env, elems[2])
+			if !ok_k || !ok_v {
+				return make_err(env, "invalid_meta_op")
+			}
+			xitdb.tx_meta(&tx, key_str, val)
+
+		case ATOM_SAVEPOINT:
+			xitdb.tx_savepoint(&tx)
 
 		case ATOM_INIT_COL, ATOM_RESET_COL:
 			path_str, ok_p := get_string_from_binary(env, elems[1])

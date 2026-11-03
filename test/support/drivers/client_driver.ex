@@ -116,6 +116,21 @@ defmodule Xitdb.TestDrivers.ClientDriver do
     end
   end
 
+  def execute_dsl_tx(ctx, fun) when is_function(fun, 1) do
+    {:ok, db} = fun.(ctx.db)
+    %{ctx | db: db}
+  end
+
+  def attempt_failing_dsl_tx(ctx, fun) when is_function(fun, 1) do
+    case fun.(ctx.db) do
+      {:error, err} ->
+        %{ctx | last_error: err}
+
+      {:ok, _} ->
+        flunk("Expected DSL transaction to fail and roll back, but it succeeded")
+    end
+  end
+
   def select_path(ctx, result_key, selector) do
     val = Xitdb.select!(ctx.db, selector)
     %{ctx | results: Map.put(ctx.results, result_key, val)}
@@ -330,7 +345,8 @@ defmodule Xitdb.TestDrivers.ClientDriver do
 
     simplified =
       Enum.map(history, fn h ->
-        %{moment: h.moment_index, value: h.value, doc: h.doc}
+        base = %{moment: h.moment_index, value: h.value, doc: h.doc}
+        if Map.get(h, :instant, 0) != 0, do: Map.put(base, :instant, h.instant), else: base
       end)
 
     assert simplified == expected_entries

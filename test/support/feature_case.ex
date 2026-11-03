@@ -13,6 +13,7 @@ defmodule Xitdb.FeatureCase do
       import Xitdb.FeatureCase, only: [scenario: 2]
       import Xitdb.TestDSL.ClientDSL
       import Xitdb.Sigils
+      use Xitdb.DSL
     end
   end
 

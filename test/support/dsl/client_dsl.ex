@@ -59,6 +59,14 @@ defmodule Xitdb.TestDSL.ClientDSL do
     ClientDriver.attempt_failing_transact(ctx, fun)
   end
 
+  def executing_dsl_transaction(ctx, fun) when is_function(fun, 1) do
+    ClientDriver.execute_dsl_tx(ctx, fun)
+  end
+
+  def attempting_failing_dsl_transaction(ctx, fun) when is_function(fun, 1) do
+    ClientDriver.attempt_failing_dsl_tx(ctx, fun)
+  end
+
   def selecting_path(ctx, result_key, selector) do
     ClientDriver.select_path(ctx, result_key, selector)
   end
