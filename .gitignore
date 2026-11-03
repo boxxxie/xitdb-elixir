@@ -1,0 +1,17 @@
+/_build/
+/cover/
+/deps/
+/doc/
+/.fetch
+erl_crash.dump
+*.ez
+*.beam
+*.o
+*.so
+*.dylib
+*.dll
+/priv/xitdb_nif.*
+/native/*.o
+/benchmarks/bench_client_bin
+/tmp/
+/.tmp/

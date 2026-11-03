@@ -1,0 +1,8 @@
+{
+  "track_id": "dsl_transactions_datalog_20261103",
+  "type": "feature",
+  "status": "new",
+  "created_at": "2026-11-03T14:00:00Z",
+  "updated_at": "2026-11-03T14:00:00Z",
+  "description": "Ergonomic Transactions (put_in/update_in), Time-Travel (as_of, diff_moments, history_of), Pull, Datalog & Compile-Time Sigils (~x, ~q)"
+}

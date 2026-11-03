@@ -1,0 +1,11 @@
+{
+	"$schema": "https://raw.githubusercontent.com/DanielGavin/ols/master/misc/ols.schema.json",
+	"collections": [
+		{ "name": "xitdb", "path": "native/xitdb-odin/xitdb" }
+	],
+	"enable_format": true,
+	"enable_hover": true,
+	"enable_snippets": true,
+	"enable_checker_only_saved": true,
+	"checker_args": "-vet -strict-style -disallow-do"
+}

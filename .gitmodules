@@ -1,0 +1,3 @@
+[submodule "native/xitdb-odin"]
+	path = native/xitdb-odin
+	url = git@github.com:boxxxie/odin-xitdb.git
