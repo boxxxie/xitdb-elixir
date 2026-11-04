@@ -85,6 +85,11 @@ defmodule Xitdb.Features.QueriesAndDatalogSpec do
             """
           )
 
+    @upon querying_datalog(
+            :comma_separated_single_line,
+            ~q|find ?name, ?salary where $username->id[?name] = ?id, .users[?id].salary = ?salary, ?salary > 125, not .users[?id].flags%"suspended"|
+          )
+
     @then datalog_rows_are(:prefix_active_da, [
             ["dan", 120],
             ["daria", 140]
@@ -93,6 +98,11 @@ defmodule Xitdb.Features.QueriesAndDatalogSpec do
     @then datalog_rows_are(:dept_rollup, [
             ["eng", 2, 260],
             ["design", 1, 130]
+          ])
+
+    @then datalog_rows_are(:comma_separated_single_line, [
+            ["alice", 130],
+            ["daria", 140]
           ])
   end
 
