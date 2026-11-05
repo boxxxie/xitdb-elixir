@@ -135,8 +135,9 @@ min_age = 21
 
 #### Macro DSLs & Query Languages
 - **[Path Selector & Structural Pull DSL (`docs/path-and-pull-dsl.md`)](docs/path-and-pull-dsl.md)** — `path/1`, typed collection modifiers (`counted`, `sorted`, `[[idx]]`), set member probes, wildcard scans (`*`), and structural `Xitdb.pull/2` patterns.
-- **[Declarative Transaction Block DSL (`docs/transaction-dsl.md`)](docs/transaction-dsl.md)** — `tx/2,3`, `put` (including 1-arity set member additions), `update/2,3`, `rm`, `append`, `insert`, `slice`, `fork`, `index_on`, `meta`, `instant`, `savepoint`, and `abort`.
+- **[Declarative Transaction Block DSL (`docs/transaction-dsl.md`)](docs/transaction-dsl.md)** — `tx/2,3`, `tx_for/3,4`, `put` (including 1-arity set member additions), `update/2,3`, `rm`, `append`, `insert`, `slice`, `fork`, `index_on`, `meta`, `instant`, `savepoint`, and `abort`.
 - **[Declarative Datalog Query DSL (`docs/datalog-dsl.md`)](docs/datalog-dsl.md)** — `datalog/1` and `query/2,3`, `^var` pinning, entity generators (`u <- users`), set membership, transitive graph reachability (`reach/3,4`), cross-moment queries (`at_moment/2`), and aggregations.
+- **[Ash & Spark Integration (`docs/ash-and-spark.md`)](docs/ash-and-spark.md)** — `Xitdb.Ash.Resource` Spark DSL extension (`xitdb do ... end`), compile-time `VerifySyncProjection` verifier and `WireChanges` transformer, `Xitdb.Ash.Info` introspection, and `tx_for` / `tx_for!` automatic secondary index transactions.
 
 ---
 

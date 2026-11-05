@@ -119,11 +119,20 @@ Clones the subtree at `from_path` to `to_path` in **$O(1)$ zero-copy time** by c
 fork users[id], backups[id]
 ```
 
-### `index_on source_map, field_key, index_map`
+### `index_on source_map, field_key, index_map` (and `tx_for` / `tx_for!`)
 Registers a secondary `Sorted_Map` B+Tree index rule for the transaction, automatically indexing `source_map[record_id][field_key] -> record_id` into `index_map` and evicting stale entries when indexed fields are updated or removed.
 
 ```elixir
 index_on :users, :username, "username->id"
+```
+
+When using [`Xitdb.Ash.Resource`](ash-and-spark.md) (or schema modules defining `__xitdb_indexes__/0`), prefer `tx_for/3,4` and `tx_for!/3,4` over manual `index_on` declarations—`tx_for` automatically injects all `index_on` rules configured on the given resource(s) at compile time:
+
+```elixir
+{:ok, db} =
+  tx_for db, [Organization, OrganizationProfile], doc: "upsert indexed org" do
+    put organizations[id].domain, "northleafcapital.com"
+  end
 ```
 
 ### `init_col path, kind` / `reset_col path, kind`

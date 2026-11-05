@@ -75,6 +75,7 @@ defmodule Xitdb.MixProject do
         "docs/path-and-pull-dsl.md",
         "docs/transaction-dsl.md",
         "docs/datalog-dsl.md",
+        "docs/ash-and-spark.md",
         "CHANGELOG.md"
       ],
       groups_for_extras: [
@@ -86,7 +87,8 @@ defmodule Xitdb.MixProject do
         "Macro DSLs & Query Languages": [
           "docs/path-and-pull-dsl.md",
           "docs/transaction-dsl.md",
-          "docs/datalog-dsl.md"
+          "docs/datalog-dsl.md",
+          "docs/ash-and-spark.md"
         ]
       ],
       source_ref: "v#{@version}",

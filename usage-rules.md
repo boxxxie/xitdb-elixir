@@ -258,5 +258,6 @@ end
 - [`docs/collections-and-indexing.md`](docs/collections-and-indexing.md) — Persistent data structure selection (`hash_map`, `counted_map`, `sorted_map`, `array_list`, `linked_list`, sets) and secondary B+Tree indexing (`index_on`).
 - [`docs/time-travel-and-storage.md`](docs/time-travel-and-storage.md) — Snapshots (`as_of/2`), structural diffs (`diff_moments/3`), attribute history (`history_of/2`), storage backends, and compaction.
 - [`docs/path-and-pull-dsl.md`](docs/path-and-pull-dsl.md) — `path/1`, `~x`, typed collection modifiers, wildcard scans, and structural `Xitdb.pull/2` projections.
-- [`docs/transaction-dsl.md`](docs/transaction-dsl.md) — Declarative `tx/2,3` blocks, collection operations, metadata (`doc`, `instant`, `meta`), savepoints, and rollback.
+- [`docs/transaction-dsl.md`](docs/transaction-dsl.md) — Declarative `tx/2,3` and `tx_for/3,4` blocks, collection operations, metadata (`doc`, `instant`, `meta`), savepoints, and rollback.
 - [`docs/datalog-dsl.md`](docs/datalog-dsl.md) — Declarative `query/2,3` and `datalog/1` blocks, `^var` pinning, `reach`, `at_moment`, predicates, and aggregations.
+- [`docs/ash-and-spark.md`](docs/ash-and-spark.md) — `Xitdb.Ash.Resource` Spark DSL extension, `Xitdb.Ash.Info` introspection, `VerifySyncProjection` verifier, and `tx_for` / `tx_for!`.
