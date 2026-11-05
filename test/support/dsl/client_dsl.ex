@@ -95,6 +95,26 @@ defmodule Xitdb.TestDSL.ClientDSL do
     ClientDriver.reopen_file_database(ctx, label)
   end
 
+  def inspecting_ash_resource_info(ctx, result_key, resource_or_resources, opts \\ []) do
+    ClientDriver.inspect_ash_resource_info(ctx, result_key, resource_or_resources, opts)
+  end
+
+  def creating_ash_record(ctx, record_key, resource, action, params) do
+    ClientDriver.create_ash_record(ctx, record_key, resource, action, params)
+  end
+
+  def updating_ash_record(ctx, record_key, action, params) do
+    ClientDriver.update_ash_record(ctx, record_key, action, params)
+  end
+
+  def verifying_ash_sync_projection(ctx, result_key, resource, option_overrides \\ []) do
+    ClientDriver.verify_ash_sync_projection(ctx, result_key, resource, option_overrides)
+  end
+
+  def evaluating_quoted_ast(ctx, result_key, quoted_ast) do
+    ClientDriver.evaluate_quoted_ast(ctx, result_key, quoted_ast)
+  end
+
   # ============================================================================
   # @then steps
   # ============================================================================
@@ -165,5 +185,25 @@ defmodule Xitdb.TestDSL.ClientDSL do
 
   def compacted_database_Shrinks_and_preserves(ctx, path_keys, expected_value) do
     ClientDriver.assert_compacted_valid(ctx, path_keys, expected_value)
+  end
+
+  def ash_action_includes_change(ctx, resource, action_name, expected_change_tuple) do
+    ClientDriver.assert_ash_action_has_change(ctx, resource, action_name, expected_change_tuple)
+  end
+
+  def ash_record_attribute_equals(ctx, record_key, attribute, expected_value) do
+    ClientDriver.assert_ash_record_attribute(ctx, record_key, attribute, expected_value)
+  end
+
+  def ash_verifier_succeeded(ctx, result_key) do
+    ClientDriver.assert_ash_verifier_ok(ctx, result_key)
+  end
+
+  def ash_verifier_failed_with(ctx, result_key, expected_opts) do
+    ClientDriver.assert_ash_verifier_error(ctx, result_key, expected_opts)
+  end
+
+  def compile_error_raised_with(ctx, result_key, expected_snippets) do
+    ClientDriver.assert_compile_error(ctx, result_key, expected_snippets)
   end
 end

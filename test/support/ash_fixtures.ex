@@ -96,6 +96,55 @@ defmodule Xitdb.TestSupport.AshFixtures do
 
     resources do
       resource(TestOrg)
+      resource(Xitdb.TestSupport.AshFixtures.TestOrgProfile)
+    end
+  end
+
+  defmodule TestOrgProfile do
+    @moduledoc false
+    use Ash.Resource,
+      domain: Xitdb.TestSupport.AshFixtures.TestDomain,
+      data_layer: Ash.DataLayer.Ets,
+      extensions: [Xitdb.Ash.Resource]
+
+    ets do
+      private?(true)
+    end
+
+    xitdb do
+      collection :organizations
+      companion_resource Xitdb.TestSupport.AshFixtures.TestOrg
+      lock_change TestLockChange
+
+      editable_fields [:website, :industry]
+      passthru_fields [:linkedin_url]
+      computed_xitdb_fields [:normalized_name]
+
+      indexes(website: "website->org_id")
+    end
+
+    attributes do
+      uuid_primary_key(:id)
+      attribute(:website, :string, public?: true)
+      attribute(:industry, :string, public?: true)
+      attribute(:linkedin_url, :string, public?: true)
+      attribute(:locked_fields, {:array, :string}, default: [], public?: true)
+      attribute(:status, :atom, default: :active, public?: true)
+    end
+
+    actions do
+      defaults([:read, create: :*])
+
+      update :mdm_sync_update do
+        require_atomic?(false)
+        accept([:website, :industry, :linkedin_url, :status])
+      end
+
+      update :lock_field do
+        require_atomic?(false)
+        argument(:field, :string, allow_nil?: false)
+        change({TestLockChange, op: :custom_lock})
+      end
     end
   end
 
@@ -103,5 +152,10 @@ defmodule Xitdb.TestSupport.AshFixtures do
     @moduledoc false
     def __xitdb_collection__, do: :items
     def __xitdb_indexes__, do: [sku: "sku->item_id"]
+  end
+
+  defmodule ExplicitTripleIndexedSchema do
+    @moduledoc false
+    def __xitdb_indexes__, do: [{:events, :external_id, "ext_id->event_id"}]
   end
 end

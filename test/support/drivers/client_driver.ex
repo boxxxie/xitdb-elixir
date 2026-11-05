@@ -176,6 +176,95 @@ defmodule Xitdb.TestDrivers.ClientDriver do
     }
   end
 
+  def inspect_ash_resource_info(ctx, result_key, resource_or_resources, opts) do
+    alias Xitdb.Ash.Info, as: XitdbInfo
+
+    base = %{
+      editable_field_strings: XitdbInfo.editable_field_strings(resource_or_resources),
+      pull_fields: XitdbInfo.pull_fields(resource_or_resources),
+      pull_pattern: XitdbInfo.pull_pattern_for(resource_or_resources)
+    }
+
+    info =
+      if is_atom(resource_or_resources) do
+        store_queries = Keyword.get(opts, :store_queries, [])
+
+        resolved_stores =
+          Map.new(store_queries, fn {label, query_ctx} ->
+            {label, XitdbInfo.resolve_store(resource_or_resources, query_ctx)}
+          end)
+
+        Map.merge(base, %{
+          collection: XitdbInfo.xitdb_collection!(resource_or_resources),
+          merge_redirect_collection:
+            case XitdbInfo.xitdb_merge_redirect_collection(resource_or_resources) do
+              {:ok, val} -> val
+              _ -> nil
+            end,
+          locked_ids_set:
+            case XitdbInfo.xitdb_locked_ids_set(resource_or_resources) do
+              {:ok, val} -> val
+              _ -> nil
+            end,
+          companion_resource:
+            case XitdbInfo.xitdb_companion_resource(resource_or_resources) do
+              {:ok, val} -> val
+              _ -> nil
+            end,
+          resolved_stores: resolved_stores
+        })
+      else
+        base
+      end
+
+    %{ctx | results: Map.put(ctx.results, result_key, info)}
+  end
+
+  def create_ash_record(ctx, record_key, resource, action, params) do
+    record =
+      resource
+      |> Ash.Changeset.for_create(action, params)
+      |> Ash.create!()
+
+    %{ctx | results: Map.put(ctx.results, record_key, record)}
+  end
+
+  def update_ash_record(ctx, record_key, action, params) do
+    record = Map.fetch!(ctx.results, record_key)
+
+    updated =
+      record
+      |> Ash.Changeset.for_update(action, params)
+      |> Ash.update!()
+
+    %{ctx | results: Map.put(ctx.results, record_key, updated)}
+  end
+
+  def verify_ash_sync_projection(ctx, result_key, resource, option_overrides) do
+    alias Spark.Dsl.Transformer
+    alias Xitdb.Ash.Verifiers.VerifySyncProjection
+
+    dsl_state =
+      Enum.reduce(option_overrides, resource.spark_dsl_config(), fn {opt_key, opt_val}, acc ->
+        Transformer.set_option(acc, [:xitdb], opt_key, opt_val)
+      end)
+
+    outcome = VerifySyncProjection.verify(dsl_state)
+    %{ctx | results: Map.put(ctx.results, result_key, outcome)}
+  end
+
+  def evaluate_quoted_ast(ctx, result_key, quoted_ast) do
+    outcome =
+      try do
+        {val, _binding} = Code.eval_quoted(quoted_ast)
+        {:ok, val}
+      rescue
+        e in CompileError -> {:error, e}
+      end
+
+    %{ctx | results: Map.put(ctx.results, result_key, outcome)}
+  end
+
   # ============================================================================
   # Assertions
   # ============================================================================
@@ -373,6 +462,57 @@ defmodule Xitdb.TestDrivers.ClientDriver do
     root = Xitdb.db(ctx.compacted_db)
     actual = resolve_path(root, path_keys) |> materialize_if_cursor()
     assert actual == expected_value
+    ctx
+  end
+
+  def assert_ash_action_has_change(ctx, resource, action_name, expected_change_tuple) do
+    action = Ash.Resource.Info.action(resource, action_name)
+    assert not is_nil(action), "Expected action #{inspect(action_name)} on #{inspect(resource)}"
+
+    matching =
+      Enum.filter(action.changes, fn
+        %{change: ^expected_change_tuple} -> true
+        _ -> false
+      end)
+
+    assert length(matching) == 1
+    ctx
+  end
+
+  def assert_ash_record_attribute(ctx, record_key, attribute, expected_value) do
+    record = Map.fetch!(ctx.results, record_key)
+    assert Map.fetch!(record, attribute) == expected_value
+    ctx
+  end
+
+  def assert_ash_verifier_ok(ctx, result_key) do
+    assert Map.fetch!(ctx.results, result_key) == :ok
+    ctx
+  end
+
+  def assert_ash_verifier_error(ctx, result_key, expected_opts) do
+    alias Spark.Error.DslError
+
+    assert {:error, %DslError{path: path, message: msg}} = Map.fetch!(ctx.results, result_key)
+
+    if expected_path = Keyword.get(expected_opts, :path) do
+      assert path == expected_path
+    end
+
+    for snippet <- List.wrap(Keyword.get(expected_opts, :message_includes, [])) do
+      assert msg =~ snippet
+    end
+
+    ctx
+  end
+
+  def assert_compile_error(ctx, result_key, expected_snippets) do
+    assert {:error, %CompileError{description: desc}} = Map.fetch!(ctx.results, result_key)
+
+    for snippet <- List.wrap(expected_snippets) do
+      assert desc =~ snippet
+    end
+
     ctx
   end
 
