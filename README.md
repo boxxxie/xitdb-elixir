@@ -21,6 +21,8 @@ Rather than re-implementing `xitdb`'s wire format in pure Elixir or requiring qu
   Pin historical snapshots in $O(1)$ with `Xitdb.as_of(db, moment)`, diff any two moments in $O(\Delta)$ with `Xitdb.diff_moments/3`, and inspect attribute lineage with `Xitdb.history_of/2`.
 - **Compile-Time Validated Sigils (`~x`, `~q`), Macro DSL (`Xitdb.DSL`), Pull & Datalog:**
   Use standard `Access` for lazy navigation or `use Xitdb.DSL` for compile-time path selectors (`path(users[id].todos[[0]])`), zero-read atomic transaction blocks (`tx db do ... end`), structural Pull patterns (`[:username, todos: 0..2]`), and Ecto-style Datalog queries with `^var` pinning.
+- **Ash & Spark DSL Extension (`Xitdb.Ash.Resource`):**
+  Declare a `xitdb do ... end` block directly on any `Ash.Resource` to configure collections, survivorship/lock fields, field aliases, and secondary B+Tree indexes with compile-time sync verification (`VerifySyncProjection`), automatic change wiring (`WireChanges`), $O(1)$ precompiled Pull patterns (`Xitdb.Ash.Info`), and resource-aware transactions (`tx_for` / `tx_for!`).
 
 ---
 
@@ -126,7 +128,69 @@ min_age = 21
   end
 ```
 
-### Documentation & Guides
+---
+
+## Ash & Spark DSL (`Xitdb.Ash.Resource`)
+
+When pairing `Xitdb` with [`Ash`](https://hexdocs.pm/ash) (e.g., as an immutable Master Data Management engine, audit graph, or secondary projection store), add `Xitdb.Ash.Resource` to `extensions:` on your `Ash.Resource` to declare collections, survivorship/lock fields, and secondary B+Tree indexes in a compile-time verified `xitdb do ... end` block:
+
+```elixir
+defmodule MyApp.Accounts.Organization do
+  use Ash.Resource,
+    domain: MyApp.Accounts,
+    data_layer: Ash.DataLayer.Postgres,
+    extensions: [Xitdb.Ash.Resource]
+
+  xitdb do
+    store MyApp.MDM.Store
+    collection :organizations
+    merge_redirect_collection :org_merged_into
+    locked_ids_set :locked_org_ids
+
+    editable_fields [:name, :domain]
+    passthru_fields [:creatio_id, :parent_organization_id]
+    computed_xitdb_fields [:normalized_name]
+    field_aliases parent_organization_id: :parent_org_id
+
+    indexes(
+      domain: "domain->org_id",
+      normalized_name: "norm_name->org_id"
+    )
+  end
+
+  attributes do
+    uuid_primary_key :id
+    attribute :name, :string, allow_nil?: false, public?: true
+    attribute :domain, :string, public?: true
+    attribute :creatio_id, :string, public?: true
+    attribute :parent_organization_id, :uuid, public?: true
+  end
+end
+```
+
+Use `tx_for` / `tx_for!` to automatically prepend the resource's configured `index_on` rules at compile time, and `Xitdb.Ash.Info` for $O(1)$ precompiled Pull projections:
+
+```elixir
+use Xitdb.DSL
+alias MyApp.Accounts.Organization
+
+db =
+  tx_for! db, Organization, doc: "upsert organization 101" do
+    put organizations["101"].id, "101"
+    put organizations["101"].name, "Northleaf Capital"
+    put organizations["101"].domain, "northleafcapital.com"
+    put organizations["101"].normalized_name, "northleaf capital"
+  end
+
+db["domain->org_id"]["northleafcapital.com"] # => "101"
+
+pattern = Xitdb.Ash.Info.pull_pattern_for(Organization)
+Xitdb.pull!(db["organizations"]["101"], pattern)
+```
+
+---
+
+## Documentation & Guides
 
 #### Core Concepts & Protocols
 - **[Lazy Cursors, `Access` & `Enumerable` (`docs/access-and-enumerable.md`)](docs/access-and-enumerable.md)** — 9-byte `Slot` cursors, bracket navigation (`db["users"]["alice"]`), `get_in`/`put_in`/`update_in`/`pop_in`, `Xitdb.at/1`, `Enumerable` fast paths (`Enum.count/1`, `Enum.member?/2`, `Enum.slice/2`), and chunked `Stream` pagination.
@@ -148,7 +212,8 @@ min_age = 21
 │ Elixir Client Layer (lib/xitdb*.ex)                                        │
 │  • %Xitdb{} handle + %Xitdb.Cursor{db_ref, tag, tag_id, value, moment}     │
 │  • Access, Enumerable, Inspect protocols                                   │
-│  • Xitdb.TxCompiler + Xitdb.Sigils (~x, ~q)                                │
+│  • Xitdb.DSL + Xitdb.Pull + Xitdb.TxCompiler + Xitdb.Sigils (~x, ~q)       │
+│  • Xitdb.Ash.Resource (Spark DSL, VerifySyncProjection, WireChanges, Info) │
 ├────────────────────────────────────────────────────────────────────────────┤
 │ C-ABI Erlang NIF Boundary (native/nif_entry.c + native/xitdb_nif.odin)     │
 │  • ErlNifResourceType + ErlNifRWLock thread safety                         │
