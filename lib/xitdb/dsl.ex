@@ -243,25 +243,42 @@ defmodule Xitdb.DSL do
           {field, idx_name} when not is_nil(col) -> {col, field, idx_name}
         end)
 
-      Code.ensure_loaded?(Xitdb.Ash.Info) ->
-        col = apply(Xitdb.Ash.Info, :xitdb_collection!, [mod])
-        idxs = apply(Xitdb.Ash.Info, :xitdb_indexes!, [mod])
-        for {field, idx_name} <- idxs, do: {col, field, idx_name}
+      Code.ensure_loaded?(Xitdb.Ash.Info) and Code.ensure_loaded?(mod) and
+          function_exported?(mod, :spark_dsl_config, 0) ->
+        case Spark.Dsl.Extension.get_persisted(mod, :xitdb_normalized_indexes, nil) do
+          persisted when is_list(persisted) ->
+            persisted
+
+          nil ->
+            case apply(Xitdb.Ash.Info, :xitdb_collection, [mod]) do
+              {:ok, col} when not is_nil(col) ->
+                idxs = apply(Xitdb.Ash.Info, :xitdb_indexes!, [mod])
+                for {field, idx_name} <- idxs, do: {col, field, idx_name}
+
+              _ ->
+                raise_invalid_tx_for_schema!(mod)
+            end
+        end
 
       true ->
-        raise CompileError,
-          description:
-            "Module #{inspect(mod)} does not declare Xitdb indexes (use `Xitdb.Ash.Resource` or define `__xitdb_collection__/0` and `__xitdb_indexes__/0`)."
+        raise_invalid_tx_for_schema!(mod)
     end
+  end
+
+  defp raise_invalid_tx_for_schema!(mod) do
+    raise CompileError,
+      description:
+        "Module #{inspect(mod)} does not declare Xitdb indexes (use `Xitdb.Ash.Resource` or define `__xitdb_collection__/0` and `__xitdb_indexes__/0`)."
   end
 
   defp compile_tx_block(db_ast, opts_ast, block_ast) do
     tx_ref_var = Macro.unique_var(:tx_ref, __MODULE__)
+    track_staged? = block_has_tx_update?(block_ast)
     rewritten_block = rewrite_tx_ast(block_ast, tx_ref_var)
 
     quote do
       unquote(tx_ref_var) =
-        Xitdb.DSL.__init_tx_state__(unquote(db_ast), unquote(opts_ast))
+        Xitdb.DSL.__init_tx_state__(unquote(db_ast), unquote(opts_ast), unquote(track_staged?))
 
       try do
         _ = unquote(rewritten_block)
@@ -279,6 +296,27 @@ defmodule Xitdb.DSL do
         Xitdb.DSL.__cleanup_tx_state__(unquote(tx_ref_var))
       end
     end
+  end
+
+  defp block_has_tx_update?(ast) do
+    {_ast, found?} =
+      Macro.prewalk(ast, false, fn
+        {op, meta, _args}, acc
+        when op in [:tx, :tx!, :tx_for, :tx_for!] and is_list(meta) ->
+          {nil, acc}
+
+        {{:., _, [_mod, op]}, _, _}, acc
+        when op in [:tx, :tx!, :tx_for, :tx_for!] ->
+          {nil, acc}
+
+        {:update, _meta, args} = node, _acc when length(args) in [2, 3] ->
+          {node, true}
+
+        node, acc ->
+          {node, acc}
+      end)
+
+    found?
   end
 
   defp rewrite_tx_ast({op, meta, _args} = node, _tx_ref_var)
@@ -1235,7 +1273,7 @@ defmodule Xitdb.DSL do
   # ============================================================================
 
   @doc false
-  def __init_tx_state__(db, opts) do
+  def __init_tx_state__(db, opts, track_staged? \\ false) do
     tx_ref = make_ref()
 
     state = %{
@@ -1243,7 +1281,7 @@ defmodule Xitdb.DSL do
       opts: opts,
       index_ops: [],
       ops: [],
-      staged: %{}
+      staged: if(track_staged?, do: %{}, else: nil)
     }
 
     Process.put(tx_ref, state)
@@ -1266,23 +1304,48 @@ defmodule Xitdb.DSL do
   @doc false
   def __tx_put__(tx_ref, selector, value) when is_binary(selector) do
     state = Process.get(tx_ref)
-    compiled_ops = TxCompiler.compile_node(selector, value, true)
 
-    staged =
-      Enum.reduce(compiled_ops, Map.put(state.staged, selector, {:val, value}), fn
-        {:put, path, v}, acc -> Map.put(acc, path, {:val, v})
-        {:rm, path}, acc -> Map.put(acc, path, :deleted)
-        _, acc -> acc
-      end)
+    if is_nil(value) do
+      __tx_rm__(tx_ref, selector)
+      nil
+    else
+      if not is_map(value) and not is_list(value) do
+        op = {:put, selector, value}
 
-    new_state = %{
-      state
-      | ops: :lists.reverse(compiled_ops) ++ state.ops,
-        staged: staged
-    }
+        staged =
+          case state.staged do
+            nil -> nil
+            staged_map -> Map.put(staged_map, selector, {:val, value})
+          end
 
-    Process.put(tx_ref, new_state)
-    value
+        Process.put(tx_ref, %{state | ops: [op | state.ops], staged: staged})
+        value
+      else
+        compiled_ops = TxCompiler.compile_node(selector, value, true)
+
+        staged =
+          case state.staged do
+            nil ->
+              nil
+
+            staged_map ->
+              Enum.reduce(compiled_ops, Map.put(staged_map, selector, {:val, value}), fn
+                {:put, path, v}, acc -> Map.put(acc, path, {:val, v})
+                {:rm, path}, acc -> Map.put(acc, path, :deleted)
+                _, acc -> acc
+              end)
+          end
+
+        new_state = %{
+          state
+          | ops: :lists.reverse(compiled_ops) ++ state.ops,
+            staged: staged
+        }
+
+        Process.put(tx_ref, new_state)
+        value
+      end
+    end
   end
 
   @doc false
@@ -1290,10 +1353,16 @@ defmodule Xitdb.DSL do
     state = Process.get(tx_ref)
     op = {:put, selector, ""}
 
+    staged =
+      case state.staged do
+        nil -> nil
+        staged_map -> Map.put(staged_map, selector, {:val, true})
+      end
+
     new_state = %{
       state
       | ops: [op | state.ops],
-        staged: Map.put(state.staged, selector, {:val, true})
+        staged: staged
     }
 
     Process.put(tx_ref, new_state)
@@ -1323,18 +1392,26 @@ defmodule Xitdb.DSL do
     state = Process.get(tx_ref)
 
     staged =
-      state.staged
-      |> Map.new(fn {k, v} ->
-        if k == selector or String.starts_with?(k, selector <> ".") or
-             String.starts_with?(k, selector <> "[") or
-             String.starts_with?(k, selector <> "#") or
-             String.starts_with?(k, selector <> "$") do
-          {k, :deleted}
-        else
-          {k, v}
-        end
-      end)
-      |> Map.put(selector, :deleted)
+      case state.staged do
+        nil ->
+          nil
+
+        staged_map when map_size(staged_map) == 0 ->
+          %{selector => :deleted}
+
+        staged_map ->
+          sel_len = byte_size(selector)
+
+          staged_map
+          |> Map.new(fn {k, v} ->
+            if k == selector or deleted_child_path?(k, selector, sel_len) do
+              {k, :deleted}
+            else
+              {k, v}
+            end
+          end)
+          |> Map.put(selector, :deleted)
+      end
 
     new_state = %{
       state
@@ -1345,6 +1422,19 @@ defmodule Xitdb.DSL do
     Process.put(tx_ref, new_state)
     :ok
   end
+
+  defp deleted_child_path?(k, selector, sel_len) when byte_size(k) > sel_len do
+    case k do
+      <<^selector::binary-size(sel_len), sep, _rest::binary>>
+      when sep in [?., ?[, ?#, ?$] ->
+        true
+
+      _ ->
+        false
+    end
+  end
+
+  defp deleted_child_path?(_k, _selector, _sel_len), do: false
 
   @doc false
   def __tx_append__(tx_ref, selector, value) when is_binary(selector) do
