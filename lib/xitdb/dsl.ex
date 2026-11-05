@@ -166,6 +166,95 @@ defmodule Xitdb.DSL do
     end
   end
 
+  @doc """
+  Wraps `tx/2` and `tx/3`, automatically injecting all `index_on` declarations
+  configured on one or more `Xitdb.Ash.Resource` modules (or modules exporting
+  `__xitdb_indexes__/0` and optional `__xitdb_collection__/0`).
+  """
+  defmacro tx_for(db, schemas, do: block) do
+    compile_tx_for_block(db, schemas, [], block, __CALLER__)
+  end
+
+  defmacro tx_for(db, schemas, opts, do: block) do
+    compile_tx_for_block(db, schemas, opts, block, __CALLER__)
+  end
+
+  @doc """
+  Same as `tx_for/3` and `tx_for/4`, but returns the updated `%Xitdb{}` handle directly
+  or raises `Xitdb.Error` on failure.
+  """
+  defmacro tx_for!(db, schemas, do: block) do
+    quote do
+      case unquote(compile_tx_for_block(db, schemas, [], block, __CALLER__)) do
+        {:ok, updated_db} -> updated_db
+        {:error, err} -> raise err
+      end
+    end
+  end
+
+  defmacro tx_for!(db, schemas, opts, do: block) do
+    quote do
+      case unquote(compile_tx_for_block(db, schemas, opts, block, __CALLER__)) do
+        {:ok, updated_db} -> updated_db
+        {:error, err} -> raise err
+      end
+    end
+  end
+
+  defp compile_tx_for_block(db_ast, schemas_ast, opts_ast, block_ast, caller) do
+    schema_list =
+      case schemas_ast do
+        list when is_list(list) -> list
+        single -> [single]
+      end
+
+    index_calls =
+      for schema_node <- schema_list,
+          {col, field, idx_name} <- extract_schema_indexes!(schema_node, caller),
+          uniq: true do
+        {:index_on, [], [col, field, idx_name]}
+      end
+
+    combined_block =
+      {:__block__, [], index_calls ++ [block_ast]}
+
+    compile_tx_block(db_ast, opts_ast, combined_block)
+  end
+
+  defp extract_schema_indexes!(schema_ast, caller) do
+    mod = Macro.expand(schema_ast, caller)
+
+    cond do
+      not is_atom(mod) ->
+        raise CompileError,
+          description:
+            "tx_for expects a compile-time module or list of modules, got: #{Macro.to_string(schema_ast)}"
+
+      Code.ensure_loaded?(mod) and function_exported?(mod, :__xitdb_indexes__, 0) ->
+        col =
+          if function_exported?(mod, :__xitdb_collection__, 0) do
+            mod.__xitdb_collection__()
+          else
+            nil
+          end
+
+        Enum.map(mod.__xitdb_indexes__(), fn
+          {c, field, idx_name} -> {c, field, idx_name}
+          {field, idx_name} when not is_nil(col) -> {col, field, idx_name}
+        end)
+
+      Code.ensure_loaded?(Xitdb.Ash.Info) ->
+        col = apply(Xitdb.Ash.Info, :xitdb_collection!, [mod])
+        idxs = apply(Xitdb.Ash.Info, :xitdb_indexes!, [mod])
+        for {field, idx_name} <- idxs, do: {col, field, idx_name}
+
+      true ->
+        raise CompileError,
+          description:
+            "Module #{inspect(mod)} does not declare Xitdb indexes (use `Xitdb.Ash.Resource` or define `__xitdb_collection__/0` and `__xitdb_indexes__/0`)."
+    end
+  end
+
   defp compile_tx_block(db_ast, opts_ast, block_ast) do
     tx_ref_var = Macro.unique_var(:tx_ref, __MODULE__)
     rewritten_block = rewrite_tx_ast(block_ast, tx_ref_var)
@@ -193,13 +282,13 @@ defmodule Xitdb.DSL do
   end
 
   defp rewrite_tx_ast({op, meta, _args} = node, _tx_ref_var)
-       when op in [:tx, :tx!] and is_list(meta) do
+       when op in [:tx, :tx!, :tx_for, :tx_for!] and is_list(meta) do
     # Do not rewrite inside nested `tx` blocks
     node
   end
 
   defp rewrite_tx_ast({{:., _, [_mod, op]}, _, _} = node, _tx_ref_var)
-       when op in [:tx, :tx!] do
+       when op in [:tx, :tx!, :tx_for, :tx_for!] do
     node
   end
 

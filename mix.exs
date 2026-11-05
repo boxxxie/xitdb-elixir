@@ -44,7 +44,9 @@ defmodule Xitdb.MixProject do
     [
       {:nimble_options, "~> 1.1"},
       {:telemetry, "~> 1.3"},
-      {:stream_data, "~> 1.1", only: :test},
+      {:ash, "~> 3.0", optional: true},
+      {:spark, "~> 2.2", optional: true},
+      {:stream_data, "~> 1.1", optional: true},
       {:ex_doc, "~> 0.34", only: :dev, runtime: false}
     ]
   end

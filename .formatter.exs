@@ -1,8 +1,18 @@
 locals_without_parens = [
   scenario: 2,
   # Xitdb.DSL transaction operations
+  tx: 2,
+  tx: 3,
+  tx!: 2,
+  tx!: 3,
+  tx_for: 2,
+  tx_for: 3,
+  tx_for!: 2,
+  tx_for!: 3,
+  put: 1,
   put: 2,
   update: 2,
+  update: 3,
   rm: 1,
   append: 2,
   insert: 2,
@@ -13,6 +23,8 @@ locals_without_parens = [
   index_on: 3,
   init_col: 2,
   reset_col: 2,
+  meta: 2,
+  instant: 1,
   abort: 1,
   # Xitdb.DSL Datalog clauses
   find: 1,
@@ -20,7 +32,23 @@ locals_without_parens = [
   find: 3,
   find: 4,
   from: 1,
-  where: 1
+  where: 1,
+  # Xitdb.Ash.Resource Spark DSL section options
+  store: 1,
+  collection: 1,
+  merge_redirect_collection: 1,
+  locked_ids_set: 1,
+  companion_resource: 1,
+  editable_fields: 1,
+  passthru_fields: 1,
+  computed_xitdb_fields: 1,
+  field_aliases: 1,
+  indexes: 1,
+  sync_update_action: 1,
+  ignored_sync_attributes: 1,
+  lock_action: 1,
+  unlock_action: 1,
+  lock_change: 1
 ]
 
 [

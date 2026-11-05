@@ -214,7 +214,45 @@ min_salary = 115
 
 ---
 
-## 8. Reference Guides (`docs/`)
+## 8. Ash & Spark Integration (`Xitdb.Ash.Resource`, `Xitdb.Ash.Info`, `tx_for`)
+
+When `:ash` and `:spark` are loaded, `Xitdb` provides a declarative Spark DSL extension (`Xitdb.Ash.Resource`), compile-time/runtime introspection (`Xitdb.Ash.Info`), a compile-time projection/index verifier (`Xitdb.Ash.Verifiers.VerifySyncProjection`), and automatic secondary index injection (`tx_for` / `tx_for!`):
+
+```elixir
+defmodule MyApp.Accounts.Organization do
+  use Ash.Resource,
+    domain: MyApp.Accounts,
+    extensions: [Xitdb.Ash.Resource]
+
+  xitdb do
+    store MyApp.MDM.Store
+    collection :organizations
+    merge_redirect_collection :org_merged_into
+    locked_ids_set :locked_org_ids
+    lock_change MyApp.MDM.Changes.ModifyLockedFields
+
+    editable_fields [:name, :domain, :headquarters]
+    passthru_fields [:creatio_id, :parent_organization_id]
+    computed_xitdb_fields [:normalized_name, :activity_count]
+    field_aliases parent_organization_id: :parent_org_id
+
+    indexes(
+      domain: "domain->org_id",
+      normalized_name: "norm_name->org_id",
+      creatio_id: "creatio_id->org_id"
+    )
+  end
+end
+```
+
+- **Prefer `tx_for/3,4` and `tx_for!/3,4` over manual `index_on` repetition**:
+  `tx_for(db, Organization, doc: "...") do ... end` automatically injects all `index_on` declarations configured on `Organization` (or a list of resources/schemas) so secondary B+Tree indexes never drift on write or `rm`.
+- **Use `Xitdb.Ash.Info` for Pull Projections & Field Lists**:
+  Use `Xitdb.Ash.Info.pull_fields(Resource)`, `Xitdb.Ash.Info.pull_pattern_for(Resource)`, `Xitdb.Ash.Info.editable_field_strings(Resource)`, and `Xitdb.Ash.Info.resolve_store(Resource, context_or_opts)` instead of hardcoding field lists across engines and reconcilers.
+
+---
+
+## 9. Reference Guides (`docs/`)
 
 - [`docs/access-and-enumerable.md`](docs/access-and-enumerable.md) — Lazy 9-byte `Slot` cursors, `Access`, `Enumerable` fast paths, and `Stream` pagination.
 - [`docs/collections-and-indexing.md`](docs/collections-and-indexing.md) — Persistent data structure selection (`hash_map`, `counted_map`, `sorted_map`, `array_list`, `linked_list`, sets) and secondary B+Tree indexing (`index_on`).
