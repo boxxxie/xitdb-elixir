@@ -1,7 +1,7 @@
 defmodule Xitdb.MixProject do
   use Mix.Project
 
-  @version "0.1.0"
+  @version "1.0.0"
   @source_url "https://github.com/boxxxie/xitdb-elixir"
 
   def project do
@@ -58,7 +58,7 @@ defmodule Xitdb.MixProject do
       licenses: ["MIT"],
       links: %{
         "GitHub" => @source_url,
-        "Changelog" => "#{@source_url}/blob/main/CHANGELOG.md"
+        "Changelog" => "#{@source_url}/blob/master/CHANGELOG.md"
       }
     ]
   end
@@ -76,7 +76,8 @@ defmodule Xitdb.MixProject do
         "docs/transaction-dsl.md",
         "docs/datalog-dsl.md",
         "docs/ash-and-spark.md",
-        "CHANGELOG.md"
+        "CHANGELOG.md",
+        "LICENSE"
       ],
       groups_for_extras: [
         "Core Concepts & Protocols": [

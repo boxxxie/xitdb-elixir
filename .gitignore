@@ -10,6 +10,7 @@ erl_crash.dump
 *.so
 *.dylib
 *.dll
+*.tar
 /priv/xitdb_nif.*
 /native/*.o
 /benchmarks/bench_client_bin

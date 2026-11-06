@@ -1,6 +1,6 @@
 # Xitdb — Idiomatic Elixir Client for `xitdb`
 
-[![Hex.pm](https://img.shields.io/badge/hex-0.1.0-blue.svg)](https://hex.pm/packages/xitdb)
+[![Hex.pm](https://img.shields.io/badge/hex-1.0.0-blue.svg)](https://hex.pm/packages/xitdb)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 `Xitdb` is an idiomatic Elixir client and Odin NIF wrapper for [`xitdb`](https://github.com/xit-vcs/xitdb) (backed by [`odin-xitdb`](https://github.com/boxxxie/odin-xitdb)), an embeddable, immutable, append-only database with persistent structural sharing.
@@ -23,6 +23,26 @@ Rather than re-implementing `xitdb`'s wire format in pure Elixir or requiring qu
   Use standard `Access` for lazy navigation or `use Xitdb.DSL` for compile-time path selectors (`path(users[id].todos[[0]])`), zero-read atomic transaction blocks (`tx db do ... end`), structural Pull patterns (`[:username, todos: 0..2]`), and Ecto-style Datalog queries with `^var` pinning.
 - **Ash & Spark DSL Extension (`Xitdb.Ash.Resource`):**
   Declare a `xitdb do ... end` block directly on any `Ash.Resource` to configure collections, survivorship/lock fields, field aliases, and secondary B+Tree indexes with compile-time sync verification (`VerifySyncProjection`), automatic change wiring (`WireChanges`), $O(1)$ precompiled Pull patterns (`Xitdb.Ash.Info`), and resource-aware transactions (`tx_for` / `tx_for!`).
+
+---
+
+## Installation
+
+Add `xitdb` to your list of dependencies in `mix.exs`:
+
+```elixir
+def deps do
+  [
+    {:xitdb, "~> 1.0"}
+  ]
+end
+```
+
+### System Requirements
+
+Building `xitdb` compiles a native C-ABI Erlang NIF bridge to the embedded Odin database engine:
+- **Odin Compiler**: `odin` must be installed and available in your `PATH` (see [Odin Getting Started](https://odin-lang.org/docs/install/)).
+- **C Compiler**: A standard C compiler (`cc` or `gcc`) for compiling the Erlang NIF C shim.
 
 ---
 
@@ -240,4 +260,4 @@ mix test --trace
 ./benchmarks/update_readme.sh
 ```
 
-See [`benchmarks/README.md`](benchmarks/README.md) for full statistical latency, throughput, and NIF overhead tables, and [`usage-rules.md`](usage-rules.md) for LLM/coding agent integration rules.
+See [`benchmarks/README.md`](https://github.com/boxxxie/xitdb-elixir/blob/master/benchmarks/README.md) for full statistical latency, throughput, and NIF overhead tables, and [`usage-rules.md`](usage-rules.md) for LLM/coding agent integration rules.

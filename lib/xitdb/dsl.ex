@@ -245,7 +245,7 @@ defmodule Xitdb.DSL do
 
       Code.ensure_loaded?(Xitdb.Ash.Info) and Code.ensure_loaded?(mod) and
           function_exported?(mod, :spark_dsl_config, 0) ->
-        case Spark.Dsl.Extension.get_persisted(mod, :xitdb_normalized_indexes, nil) do
+        case apply(Spark.Dsl.Extension, :get_persisted, [mod, :xitdb_normalized_indexes, nil]) do
           persisted when is_list(persisted) ->
             persisted
 
