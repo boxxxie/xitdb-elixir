@@ -1,6 +1,6 @@
 # Xitdb — Idiomatic Elixir Client for `xitdb`
 
-[![Hex.pm](https://img.shields.io/badge/hex-1.0.0-blue.svg)](https://hex.pm/packages/xitdb)
+[![Hex.pm](https://img.shields.io/badge/hex-1.0.1-blue.svg)](https://hex.pm/packages/xitdb)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 `Xitdb` is an idiomatic Elixir client and Odin NIF wrapper for [`xitdb`](https://github.com/xit-vcs/xitdb) (backed by [`odin-xitdb`](https://github.com/boxxxie/odin-xitdb)), an embeddable, immutable, append-only database with persistent structural sharing.
