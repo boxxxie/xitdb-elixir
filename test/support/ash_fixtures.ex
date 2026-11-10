@@ -97,6 +97,111 @@ defmodule Xitdb.TestSupport.AshFixtures do
     resources do
       resource(TestOrg)
       resource(Xitdb.TestSupport.AshFixtures.TestOrgProfile)
+      resource(Xitdb.TestSupport.AshFixtures.TestPerson)
+      resource(Xitdb.TestSupport.AshFixtures.TestPhone)
+      resource(Xitdb.TestSupport.AshFixtures.TestOrgHeadquarters)
+    end
+  end
+
+  defmodule TestPerson do
+    @moduledoc false
+    use Ash.Resource,
+      domain: Xitdb.TestSupport.AshFixtures.TestDomain,
+      data_layer: Ash.DataLayer.Ets,
+      extensions: [Xitdb.Ash.Resource]
+
+    ets do
+      private?(true)
+    end
+
+    xitdb do
+      collection :people
+      editable_fields [:email]
+    end
+
+    attributes do
+      uuid_primary_key(:id)
+      attribute(:email, :string, public?: true)
+    end
+
+    actions do
+      defaults([:read, create: :*])
+    end
+  end
+
+  defmodule TestPhone do
+    @moduledoc false
+    use Ash.Resource,
+      domain: Xitdb.TestSupport.AshFixtures.TestDomain,
+      data_layer: Ash.DataLayer.Ets,
+      extensions: [Xitdb.Ash.Resource]
+
+    ets do
+      private?(true)
+    end
+
+    xitdb do
+      nested_in(Xitdb.TestSupport.AshFixtures.TestPerson,
+        as: :phones,
+        parent_key: :person_id,
+        key: :e164
+      )
+
+      nested_in(Xitdb.TestSupport.AshFixtures.TestOrg,
+        as: :phones,
+        parent_key: :organization_id,
+        key: :e164
+      )
+
+      editable_fields [:number_type, :is_primary]
+      passthru_fields [:e164, :person_id, :organization_id]
+    end
+
+    attributes do
+      uuid_primary_key(:id)
+      attribute(:e164, :string, allow_nil?: false, public?: true)
+      attribute(:number_type, :string, public?: true)
+      attribute(:is_primary, :boolean, default: false, public?: true)
+      attribute(:person_id, :uuid, public?: true)
+      attribute(:organization_id, :uuid, public?: true)
+    end
+
+    actions do
+      defaults([:read, create: :*])
+    end
+  end
+
+  defmodule TestOrgHeadquarters do
+    @moduledoc false
+    use Ash.Resource,
+      domain: Xitdb.TestSupport.AshFixtures.TestDomain,
+      data_layer: Ash.DataLayer.Ets,
+      extensions: [Xitdb.Ash.Resource]
+
+    ets do
+      private?(true)
+    end
+
+    xitdb do
+      nested_in(Xitdb.TestSupport.AshFixtures.TestOrg,
+        as: :headquarters_address,
+        parent_key: :organization_id,
+        cardinality: :one
+      )
+
+      editable_fields [:city, :country]
+      passthru_fields [:organization_id]
+    end
+
+    attributes do
+      uuid_primary_key(:id)
+      attribute(:city, :string, public?: true)
+      attribute(:country, :string, public?: true)
+      attribute(:organization_id, :uuid, public?: true)
+    end
+
+    actions do
+      defaults([:read, create: :*])
     end
   end
 

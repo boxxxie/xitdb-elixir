@@ -10,8 +10,194 @@ defmodule Xitdb.Features.AshSparkSpec do
     PlainIndexedSchema,
     TestLockChange,
     TestOrg,
-    TestOrgProfile
+    TestOrgHeadquarters,
+    TestOrgProfile,
+    TestPerson,
+    TestPhone
   }
+
+  scenario "nested_in resources resolve one Xitdb path per parent and expose their mappings" do
+    @upon inspecting_nested_resource_info(:phone_info, TestPhone,
+            records: [
+              person_phone: %{person_id: "p-7", e164: "+14165550199"},
+              org_phone: %{"organization_id" => "101", "e164" => "+14168422000"},
+              shared_phone: %{person_id: "p-7", organization_id: "101", e164: "+14160000000"},
+              keyless_phone: %{person_id: "p-7", e164: nil},
+              orphan_phone: %{e164: "+14161111111"}
+            ],
+            nested_under: [
+              {TestOrg, [TestPhone, TestOrgHeadquarters, TestOrgProfile]},
+              {TestPerson, [TestPhone, TestOrgHeadquarters]}
+            ]
+          )
+    @upon inspecting_nested_resource_info(:hq_info, TestOrgHeadquarters,
+            records: [hq: %{organization_id: "101", city: "Toronto"}]
+          )
+    @upon inspecting_nested_resource_info(:org_info, TestOrg,
+            records: [org: %{id: "101"}, unsaved_org: %{name: "No Id"}]
+          )
+
+    @then resolved_value_is(:phone_info, %{
+            nested?: true,
+            collection: nil,
+            indexes: [],
+            mappings: [
+              %{
+                parent: TestPerson,
+                as: :phones,
+                parent_key: :person_id,
+                key: :e164,
+                cardinality: :many
+              },
+              %{
+                parent: TestOrg,
+                as: :phones,
+                parent_key: :organization_id,
+                key: :e164,
+                cardinality: :many
+              }
+            ],
+            entity_paths: %{
+              person_phone: [["people", "p-7", "phones", "+14165550199"]],
+              org_phone: [["organizations", "101", "phones", "+14168422000"]],
+              shared_phone: [
+                ["people", "p-7", "phones", "+14160000000"],
+                ["organizations", "101", "phones", "+14160000000"]
+              ],
+              keyless_phone: [],
+              orphan_phone: []
+            },
+            nested_under: %{
+              TestOrg => [{TestPhone, :phones}, {TestOrgHeadquarters, :headquarters_address}],
+              TestPerson => [{TestPhone, :phones}]
+            }
+          })
+
+    @then resolved_value_is(:hq_info, %{
+            nested?: true,
+            collection: nil,
+            indexes: [],
+            mappings: [
+              %{
+                parent: TestOrg,
+                as: :headquarters_address,
+                parent_key: :organization_id,
+                key: nil,
+                cardinality: :one
+              }
+            ],
+            entity_paths: %{hq: [["organizations", "101", "headquarters_address"]]},
+            nested_under: %{}
+          })
+
+    @then resolved_value_is(:org_info, %{
+            nested?: false,
+            collection: :organizations,
+            indexes: [
+              {:organizations, :domain, "domain->org_id"},
+              {:organizations, :normalized_name, "norm_name->org_id"},
+              {:organizations, :creatio_id, "creatio_id->org_id"}
+            ],
+            mappings: [],
+            entity_paths: %{org: [["organizations", "101"]], unsaved_org: []},
+            nested_under: %{}
+          })
+  end
+
+  scenario "VerifySyncProjection rejects resources with no storage location, both locations, keyless many-mappings, unknown keys, or nested indexes" do
+    @upon verifying_ash_sync_projection(:valid_nested, TestPhone)
+    @upon verifying_ash_sync_projection(:valid_one, TestOrgHeadquarters)
+    @upon verifying_ash_sync_projection(:no_location, TestOrg, collection: nil)
+    @upon verifying_ash_sync_projection(:both_locations, TestPhone, collection: :phones)
+    @upon verifying_ash_sync_projection(:nested_indexes, TestPhone,
+            indexes: [e164: "e164->phone_id"]
+          )
+    @upon verifying_ash_sync_projection(:keyless_many, TestPhone,
+            nested_in: [
+              %Xitdb.Ash.NestedIn{parent: TestOrg, as: :phones, parent_key: :organization_id}
+            ]
+          )
+    @upon verifying_ash_sync_projection(:unknown_parent_key, TestPhone,
+            nested_in: [
+              %Xitdb.Ash.NestedIn{
+                parent: TestOrg,
+                as: :phones,
+                parent_key: :org_ref,
+                key: :e164
+              }
+            ]
+          )
+    @upon verifying_ash_sync_projection(:unknown_entry_key, TestPhone,
+            nested_in: [
+              %Xitdb.Ash.NestedIn{
+                parent: TestOrg,
+                as: :phones,
+                parent_key: :organization_id,
+                key: :digits
+              }
+            ]
+          )
+
+    @then ash_verifier_succeeded(:valid_nested)
+    @then ash_verifier_succeeded(:valid_one)
+
+    @then ash_verifier_failed_with(:no_location,
+            path: [:xitdb],
+            message_includes: [
+              "must declare either a top-level `collection` or at least one `nested_in`"
+            ]
+          )
+
+    @then ash_verifier_failed_with(:both_locations,
+            path: [:xitdb],
+            message_includes: ["declares both `collection` and `nested_in`"]
+          )
+
+    @then ash_verifier_failed_with(:nested_indexes,
+            path: [:xitdb, :indexes],
+            message_includes: ["only supported on top-level collections"]
+          )
+
+    @then ash_verifier_failed_with(:keyless_many,
+            path: [:xitdb, :nested_in],
+            message_includes: ["cardinality: :many", "must declare a `key`"]
+          )
+
+    @then ash_verifier_failed_with(:unknown_parent_key,
+            path: [:xitdb, :nested_in],
+            message_includes: [":org_ref", "does not exist as an attribute"]
+          )
+
+    @then ash_verifier_failed_with(:unknown_entry_key,
+            path: [:xitdb, :nested_in],
+            message_includes: [":digits", "does not exist as an attribute"]
+          )
+  end
+
+  scenario "tx_for accepts nested_in resources alongside their parents and writes entries under the parent entity" do
+    @given memory_database()
+
+    @upon executing_dsl_transaction(fn db ->
+            updated_db =
+              tx_for! db, [TestOrg, TestPhone, TestOrgHeadquarters], doc: "nested writes" do
+                init_col organizations, :hash_map
+                put organizations["101"].id, "101"
+                put organizations["101"].domain, "northleafcapital.com"
+                put organizations["101"].phones["+14168422000"].e164, "+14168422000"
+                put organizations["101"].phones["+14168422000"].number_type, "work"
+                put organizations["101"].headquarters_address.city, "Toronto"
+              end
+
+            {:ok, updated_db}
+          end)
+
+    @then access_path_equals(
+            ["organizations", "101", "phones", "+14168422000", "number_type"],
+            "work"
+          )
+    @then access_path_equals(["organizations", "101", "headquarters_address", "city"], "Toronto")
+    @then access_path_equals(["domain->org_id", "northleafcapital.com"], "101")
+  end
 
   scenario "Xitdb.Ash.Info introspects single and companion resources, field aliases, Pull patterns, and store precedence" do
     @upon inspecting_ash_resource_info(

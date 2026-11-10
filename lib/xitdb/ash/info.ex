@@ -127,6 +127,126 @@ if Code.ensure_loaded?(Spark.InfoGenerator) and Code.ensure_loaded?(Ash.Resource
     end
 
     @doc """
+    Returns the `nested_in` declarations (`Xitdb.Ash.NestedIn` structs) of a resource,
+    or `[]` for resources stored in their own top-level collection.
+    """
+    @spec nested_mappings(Ash.Resource.t() | Spark.Dsl.t()) :: [Xitdb.Ash.NestedIn.t()]
+    def nested_mappings(resource) when is_atom(resource) do
+      if function_exported?(resource, :__xitdb_nested_in__, 0) do
+        resource.__xitdb_nested_in__()
+      else
+        compute_nested_mappings(resource)
+      end
+    end
+
+    def nested_mappings(dsl_state), do: compute_nested_mappings(dsl_state)
+
+    @doc false
+    def compute_nested_mappings(resource_or_dsl) do
+      resource_or_dsl
+      |> Extension.get_entities([:xitdb])
+      |> Enum.filter(&match?(%Xitdb.Ash.NestedIn{}, &1))
+      |> Enum.map(&%{&1 | __identifier__: nil, __spark_metadata__: nil})
+    end
+
+    @doc "Returns `true` when the resource is stored inside a parent entity."
+    @spec nested?(Ash.Resource.t() | Spark.Dsl.t()) :: boolean()
+    def nested?(resource), do: nested_mappings(resource) != []
+
+    @doc """
+    Filters `resources` down to those nested in `parent`, returning
+    `{resource, %Xitdb.Ash.NestedIn{}}` pairs.
+
+    Parents cannot discover their children at compile time without creating dependency
+    cycles, so callers pass the candidate list explicitly.
+    """
+    @spec nested_under([Ash.Resource.t()], Ash.Resource.t()) ::
+            [{Ash.Resource.t(), Xitdb.Ash.NestedIn.t()}]
+    def nested_under(resources, parent) when is_list(resources) and is_atom(parent) do
+      for resource <- resources,
+          %Xitdb.Ash.NestedIn{parent: ^parent} = mapping <- nested_mappings(resource) do
+        {resource, mapping}
+      end
+    end
+
+    @doc """
+    Returns every Xitdb path (a list of string keys from the root) where `record` is stored.
+
+    - Top-level resources return `[[collection, id]]` when `record` has an `:id`.
+    - Nested resources return one path per `nested_in` declaration whose `parent_key`
+      (and `key`, for `cardinality: :many`) is present on `record`. A phone owned by a
+      user returns `[["people", "42", "phones", "+14165550199"]]`.
+
+    `record` may be a struct or a map with atom or string keys.
+    """
+    @spec entity_paths(Ash.Resource.t(), map()) :: [[String.t()]]
+    def entity_paths(resource, record) when is_atom(resource) and is_map(record) do
+      case nested_mappings(resource) do
+        [] ->
+          with {:ok, collection} when not is_nil(collection) <- xitdb_collection(resource),
+               id when not is_nil(id) and id != "" <- fetch_record_value(record, :id) do
+            [[to_string(collection), to_string(id)]]
+          else
+            _ -> []
+          end
+
+        mappings ->
+          Enum.flat_map(mappings, &nested_entity_path(&1, record))
+      end
+    end
+
+    defp nested_entity_path(%Xitdb.Ash.NestedIn{} = mapping, record) do
+      parent_collection =
+        case xitdb_collection(mapping.parent) do
+          {:ok, collection} -> collection
+          _ -> nil
+        end
+
+      parent_id = fetch_record_value(record, mapping.parent_key)
+
+      cond do
+        is_nil(parent_collection) ->
+          raise ArgumentError,
+                "#{inspect(mapping.parent)} has no top-level `collection`; `nested_in` parents must be top-level resources."
+
+        blank?(parent_id) ->
+          []
+
+        mapping.cardinality == :one ->
+          [[to_string(parent_collection), to_string(parent_id), to_string(mapping.as)]]
+
+        true ->
+          case fetch_record_value(record, mapping.key) do
+            entry_key when is_nil(entry_key) or entry_key == "" ->
+              []
+
+            entry_key ->
+              [
+                [
+                  to_string(parent_collection),
+                  to_string(parent_id),
+                  to_string(mapping.as),
+                  to_string(entry_key)
+                ]
+              ]
+          end
+      end
+    end
+
+    defp fetch_record_value(_record, nil), do: nil
+
+    defp fetch_record_value(record, key) when is_atom(key) do
+      case Map.get(record, key) do
+        nil -> Map.get(record, Atom.to_string(key))
+        val -> val
+      end
+    end
+
+    defp blank?(nil), do: true
+    defp blank?(""), do: true
+    defp blank?(_), do: false
+
+    @doc """
     Resolves the target Xitdb store server from `context[:xitdb_store]`, keyword `opts[:store]`,
     the resource's `xitdb.store` option, or `Application.get_env(:xitdb, :default_store)`.
     """

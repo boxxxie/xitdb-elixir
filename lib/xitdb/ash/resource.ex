@@ -29,6 +29,23 @@ if Code.ensure_loaded?(Spark.Dsl.Extension) and Code.ensure_loaded?(Ash.Resource
             )
           end
         end
+
+    ## Nested sub-collections
+
+    A resource that has no top-level collection of its own can be stored inside a
+    parent entity with `nested_in` (see `Xitdb.Ash.NestedIn`):
+
+        defmodule MyApp.Accounts.PhoneNumber do
+          use Ash.Resource, extensions: [Xitdb.Ash.Resource]
+
+          xitdb do
+            nested_in MyApp.Accounts.User, as: :phones, parent_key: :user_id, key: :e164
+            editable_fields [:number_type, :is_primary]
+            passthru_fields [:e164, :user_id]
+          end
+        end
+
+    Use `Xitdb.Ash.Info.entity_paths/2` to resolve where a record is stored.
     """
 
     @default_ignored_sync_attributes [
@@ -39,9 +56,52 @@ if Code.ensure_loaded?(Spark.Dsl.Extension) and Code.ensure_loaded?(Ash.Resource
       :status
     ]
 
+    @nested_in %Spark.Dsl.Entity{
+      name: :nested_in,
+      describe: """
+      Stores this resource inside a parent entity (`<parent collection>[parent_id].<as>[key]`)
+      instead of a top-level collection. Repeat the entity to allow several parents.
+      """,
+      examples: [
+        "nested_in MyApp.Accounts.User, as: :phones, parent_key: :user_id, key: :e164",
+        "nested_in MyApp.Events.Event, as: :conference, parent_key: :event_id, cardinality: :one"
+      ],
+      target: Xitdb.Ash.NestedIn,
+      args: [:parent],
+      identifier: {:auto, :unique_integer},
+      schema: [
+        parent: [
+          type: :atom,
+          required: true,
+          doc: "Parent `Xitdb.Ash.Resource`, which must declare a top-level `collection`."
+        ],
+        as: [
+          type: :atom,
+          required: true,
+          doc: "Slot name under the parent entity (e.g. `:phones`, `:sessions`)."
+        ],
+        parent_key: [
+          type: :atom,
+          required: true,
+          doc: "Attribute on this resource that holds the parent entity id."
+        ],
+        key: [
+          type: :atom,
+          doc:
+            "Attribute whose value is the entry key inside the sub-collection. Required for `cardinality: :many`."
+        ],
+        cardinality: [
+          type: {:in, [:one, :many]},
+          default: :many,
+          doc: "`:many` stores a map of entries; `:one` stores a single map at the slot."
+        ]
+      ]
+    }
+
     @xitdb_section %Spark.Dsl.Section{
       name: :xitdb,
       describe: "Configures Xitdb MDM projection, survivorship locks, and secondary indexes.",
+      entities: [@nested_in],
       schema: [
         store: [
           type: :atom,
@@ -50,8 +110,8 @@ if Code.ensure_loaded?(Spark.Dsl.Extension) and Code.ensure_loaded?(Ash.Resource
         ],
         collection: [
           type: :atom,
-          required: true,
-          doc: "Primary Xitdb hash_map collection (`:organizations`, `:people`, `:events`)."
+          doc:
+            "Primary Xitdb hash_map collection (`:organizations`, `:people`, `:events`). Required unless the resource declares `nested_in`."
         ],
         merge_redirect_collection: [
           type: :atom,

@@ -7,6 +7,9 @@ if Code.ensure_loaded?(Spark.Dsl.Verifier) and Code.ensure_loaded?(Ash.Resource)
        or `xitdb.passthru_fields` (preventing silent field drops during Xitdb ingestion).
     2. Every declared `editable_fields` / `passthru_fields` entry exists on the resource.
     3. Every `indexes` key maps to a known projected or computed field.
+    4. The resource declares either a top-level `collection` or at least one `nested_in`,
+       every `nested_in` `parent_key` / `key` is an attribute, `cardinality: :many`
+       declarations name a `key`, and nested resources declare no secondary `indexes`.
     """
     use Spark.Dsl.Verifier
 
@@ -27,7 +30,8 @@ if Code.ensure_loaded?(Spark.Dsl.Verifier) and Code.ensure_loaded?(Ash.Resource)
 
       projected_set = MapSet.new(editable ++ passthru)
 
-      with :ok <- verify_attributes_exist(dsl_state, module, projected_set),
+      with :ok <- verify_storage_location(dsl_state, module, computed),
+           :ok <- verify_attributes_exist(dsl_state, module, projected_set),
            :ok <-
              verify_sync_action_covered(
                dsl_state,
@@ -38,6 +42,83 @@ if Code.ensure_loaded?(Spark.Dsl.Verifier) and Code.ensure_loaded?(Ash.Resource)
              ) do
         verify_indexes_covered(dsl_state, module, projected_set, computed, aliases)
       end
+    end
+
+    defp verify_storage_location(dsl_state, module, computed) do
+      collection =
+        case XitdbInfo.xitdb_collection(dsl_state) do
+          {:ok, col} -> col
+          _ -> nil
+        end
+
+      mappings = XitdbInfo.compute_nested_mappings(dsl_state)
+
+      cond do
+        is_nil(collection) and mappings == [] ->
+          dsl_error(
+            module,
+            [:xitdb],
+            "#{inspect(module)} must declare either a top-level `collection` or at least one `nested_in`."
+          )
+
+        not is_nil(collection) and mappings != [] ->
+          dsl_error(
+            module,
+            [:xitdb],
+            "#{inspect(module)} declares both `collection` and `nested_in`; choose one storage location."
+          )
+
+        mappings != [] and XitdbInfo.xitdb_indexes!(dsl_state) != [] ->
+          dsl_error(
+            module,
+            [:xitdb, :indexes],
+            "Secondary `indexes` are only supported on top-level collections, not on `nested_in` resources."
+          )
+
+        true ->
+          Enum.reduce_while(mappings, :ok, fn mapping, :ok ->
+            case verify_nested_mapping(dsl_state, module, mapping, computed) do
+              :ok -> {:cont, :ok}
+              error -> {:halt, error}
+            end
+          end)
+      end
+    end
+
+    defp verify_nested_mapping(dsl_state, module, mapping, computed) do
+      cond do
+        mapping.cardinality == :many and is_nil(mapping.key) ->
+          dsl_error(
+            module,
+            [:xitdb, :nested_in],
+            "`nested_in #{inspect(mapping.parent)}, as: #{inspect(mapping.as)}` uses `cardinality: :many` and must declare a `key`."
+          )
+
+        not valid_mapping_key?(dsl_state, mapping.parent_key, computed) ->
+          dsl_error(
+            module,
+            [:xitdb, :nested_in],
+            "`parent_key` #{inspect(mapping.parent_key)} does not exist as an attribute or computed_xitdb_field on #{inspect(module)}."
+          )
+
+        not is_nil(mapping.key) and not valid_mapping_key?(dsl_state, mapping.key, computed) ->
+          dsl_error(
+            module,
+            [:xitdb, :nested_in],
+            "`key` #{inspect(mapping.key)} does not exist as an attribute or computed_xitdb_field on #{inspect(module)}."
+          )
+
+        true ->
+          :ok
+      end
+    end
+
+    defp valid_mapping_key?(dsl_state, key, computed) do
+      not is_nil(ResourceInfo.attribute(dsl_state, key)) or key in computed
+    end
+
+    defp dsl_error(module, path, message) do
+      {:error, DslError.exception(module: module, path: path, message: message)}
     end
 
     defp verify_attributes_exist(dsl_state, module, projected_set) do

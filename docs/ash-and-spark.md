@@ -79,7 +79,7 @@ end
 
 | Option | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `collection` | `atom()` | *(required)* | Primary `Xitdb` collection storing entities (`:organizations`, `:people`, `:events`). |
+| `collection` | `atom()` | *(required unless `nested_in` is declared)* | Primary `Xitdb` collection storing entities (`:organizations`, `:people`, `:events`). |
 | `store` | `atom()` | `nil` | Default `Xitdb` Store GenServer name (overridable via `context[:xitdb_store]`, `opts[:store]`, or `config :xitdb, :default_store`). |
 | `merge_redirect_collection` | `atom()` | `nil` | Sorted map storing `loser_id -> winner_id` merge redirects (`:org_merged_into`). |
 | `locked_ids_set` | `atom()` | `nil` | Counted hash set tracking entity IDs with user-locked fields (`:locked_org_ids`). |
@@ -95,6 +95,56 @@ end
 | `unlock_action` | `atom()` | `:unlock_field` | Ash update action that unlocks a single field. |
 | `lock_change` | `atom()` | `nil` | `Ash.Resource.Change` module wired into `lock_action` and `unlock_action` (defaults to `config :xitdb, :default_lock_change`). |
 
+### Nested Sub-Collections (`nested_in`)
+
+Some resources belong inside a parent entity rather than in a top-level collection: a person's
+phone numbers, an organization's domains, an event's sessions. Declare them with `nested_in`
+instead of `collection`. A resource may be nested in several parents:
+
+```elixir
+defmodule MyApp.Accounts.PhoneNumber do
+  use Ash.Resource, extensions: [Xitdb.Ash.Resource]
+
+  xitdb do
+    nested_in MyApp.Accounts.User, as: :phones, parent_key: :user_id, key: :e164
+    nested_in MyApp.Accounts.Organization, as: :phones, parent_key: :organization_id, key: :e164
+
+    editable_fields [:number_type, :is_primary]
+    passthru_fields [:e164, :user_id, :organization_id]
+  end
+end
+
+defmodule MyApp.Events.Conference do
+  use Ash.Resource, extensions: [Xitdb.Ash.Resource]
+
+  xitdb do
+    # A single map stored at events[event_id].conference
+    nested_in MyApp.Events.Event, as: :conference, parent_key: :event_id, cardinality: :one
+    editable_fields [:title, :edition_year]
+    passthru_fields [:event_id]
+  end
+end
+```
+
+| `nested_in` option | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `parent` *(argument)* | `module()` | *(required)* | Parent `Xitdb.Ash.Resource`. It must declare a top-level `collection`; nesting is one level deep. |
+| `as` | `atom()` | *(required)* | Slot name under the parent entity (`:phones`, `:sessions`). |
+| `parent_key` | `atom()` | *(required)* | Attribute on this resource holding the parent entity id. |
+| `key` | `atom()` | `nil` | Attribute whose value is the entry key inside the sub-collection. Required for `cardinality: :many`. |
+| `cardinality` | `:one \| :many` | `:many` | `:many` stores a map of entries; `:one` stores a single map at the slot. |
+
+Nested resources cannot declare secondary `indexes`. Use `Xitdb.Ash.Info.entity_paths/2` to
+resolve where a record lives:
+
+```elixir
+XitdbInfo.entity_paths(PhoneNumber, %{user_id: 42, e164: "+14165550199"})
+# => [["people", "42", "phones", "+14165550199"]]
+
+XitdbInfo.nested_under([PhoneNumber, Conference], MyApp.Accounts.User)
+# => [{PhoneNumber, %Xitdb.Ash.NestedIn{as: :phones, ...}}]
+```
+
 ---
 
 ## 2. Compile-Time Transformer & Verifier Guarantees
@@ -105,10 +155,11 @@ At compile time, `WireChanges`:
 - Precomputes and compiles literal module callbacks (`__xitdb_editable_field_strings__/0`, `__xitdb_pull_fields__/0`, `__xitdb_pull_pattern__/0`, `__xitdb_collection__/0`, `__xitdb_indexes__/0`, `__xitdb_store__/0`, `__xitdb_lock_change__/0`, plus pre-merged companion pair lookups) directly onto the resource module so runtime `Xitdb.Ash.Info` lookups run in **$O(1)$ (~30 ns)** with zero heap allocations.
 
 ### 2. `Xitdb.Ash.Verifiers.VerifySyncProjection`
-At compile time, `VerifySyncProjection` verifies three invariants and raises a `Spark.Error.DslError` if any fails:
+At compile time, `VerifySyncProjection` verifies four invariants and raises a `Spark.Error.DslError` if any fails:
 1. **Attribute existence**: Every field listed in `editable_fields` or `passthru_fields` must exist as an attribute on the `Ash.Resource`.
 2. **No silent sync drops**: Every attribute accepted by `sync_update_action` (that is not in `ignored_sync_attributes`) must be declared in either `editable_fields` or `passthru_fields`.
 3. **Index coverage**: Every key in `indexes` must match a projected slot name (`editable_fields` or `passthru_fields` after applying `field_aliases`) or an entry in `computed_xitdb_fields`.
+4. **Storage location**: The resource declares exactly one of `collection` or `nested_in`. Every `nested_in` `parent_key` and `key` must be an attribute, `cardinality: :many` declarations must name a `key`, and nested resources cannot declare `indexes`.
 
 ---
 

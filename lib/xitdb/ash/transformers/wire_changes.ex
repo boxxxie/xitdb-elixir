@@ -39,6 +39,7 @@ if Code.ensure_loaded?(Spark.Dsl.Transformer) and Code.ensure_loaded?(Ash.Resour
 
     defp define_direct_info_functions(dsl_state) do
       collection = Transformer.get_persisted(dsl_state, :xitdb_collection)
+      nested_in = Transformer.get_persisted(dsl_state, :xitdb_nested_in, [])
       editable_strings = Transformer.get_persisted(dsl_state, :xitdb_editable_field_strings)
       pull_fields = Transformer.get_persisted(dsl_state, :xitdb_pull_fields)
       pull_pattern = Transformer.get_persisted(dsl_state, :xitdb_pull_pattern)
@@ -108,6 +109,7 @@ if Code.ensure_loaded?(Spark.Dsl.Transformer) and Code.ensure_loaded?(Ash.Resour
         dsl_state,
         [
           collection: collection,
+          nested_in: nested_in,
           editable_strings: editable_strings,
           pull_fields: pull_fields,
           pull_pattern: pull_pattern,
@@ -118,6 +120,9 @@ if Code.ensure_loaded?(Spark.Dsl.Transformer) and Code.ensure_loaded?(Ash.Resour
         quote do
           @doc false
           def __xitdb_collection__, do: unquote(Macro.escape(collection))
+
+          @doc false
+          def __xitdb_nested_in__, do: unquote(Macro.escape(nested_in))
 
           @doc false
           def __xitdb_indexes__, do: unquote(Macro.escape(normalized_indexes))
@@ -143,7 +148,13 @@ if Code.ensure_loaded?(Spark.Dsl.Transformer) and Code.ensure_loaded?(Ash.Resour
     end
 
     defp persist_xitdb_metadata(dsl_state) do
-      collection = XitdbInfo.xitdb_collection!(dsl_state)
+      collection =
+        case XitdbInfo.xitdb_collection(dsl_state) do
+          {:ok, col} -> col
+          _ -> nil
+        end
+
+      nested_in = XitdbInfo.compute_nested_mappings(dsl_state)
       editable_strings = XitdbInfo.compute_editable_field_strings(dsl_state)
       pull_fields = XitdbInfo.compute_pull_fields(dsl_state)
       pull_pattern = Xitdb.Pull.compile!(pull_fields)
@@ -161,12 +172,17 @@ if Code.ensure_loaded?(Spark.Dsl.Transformer) and Code.ensure_loaded?(Ash.Resour
         end
 
       normalized_indexes =
-        for {field, idx_name} <- XitdbInfo.xitdb_indexes!(dsl_state) do
-          {collection, field, idx_name}
+        if is_nil(collection) do
+          []
+        else
+          for {field, idx_name} <- XitdbInfo.xitdb_indexes!(dsl_state) do
+            {collection, field, idx_name}
+          end
         end
 
       dsl_state
       |> Transformer.persist(:xitdb_collection, collection)
+      |> Transformer.persist(:xitdb_nested_in, nested_in)
       |> Transformer.persist(:xitdb_editable_field_strings, editable_strings)
       |> Transformer.persist(:xitdb_pull_fields, pull_fields)
       |> Transformer.persist(:xitdb_pull_pattern, pull_pattern)

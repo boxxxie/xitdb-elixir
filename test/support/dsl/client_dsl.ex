@@ -111,6 +111,10 @@ defmodule Xitdb.TestDSL.ClientDSL do
     ClientDriver.verify_ash_sync_projection(ctx, result_key, resource, option_overrides)
   end
 
+  def inspecting_nested_resource_info(ctx, result_key, resource, opts \\ []) do
+    ClientDriver.inspect_nested_resource_info(ctx, result_key, resource, opts)
+  end
+
   def evaluating_quoted_ast(ctx, result_key, quoted_ast) do
     ClientDriver.evaluate_quoted_ast(ctx, result_key, quoted_ast)
   end

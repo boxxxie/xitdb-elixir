@@ -245,12 +245,46 @@ defmodule Xitdb.TestDrivers.ClientDriver do
     alias Xitdb.Ash.Verifiers.VerifySyncProjection
 
     dsl_state =
-      Enum.reduce(option_overrides, resource.spark_dsl_config(), fn {opt_key, opt_val}, acc ->
-        Transformer.set_option(acc, [:xitdb], opt_key, opt_val)
+      Enum.reduce(option_overrides, resource.spark_dsl_config(), fn
+        {:nested_in, mappings}, acc ->
+          acc
+          |> Transformer.remove_entity([:xitdb], &match?(%Xitdb.Ash.NestedIn{}, &1))
+          |> then(fn state ->
+            Enum.reduce(mappings, state, &Transformer.add_entity(&2, [:xitdb], &1))
+          end)
+
+        {opt_key, opt_val}, acc ->
+          Transformer.set_option(acc, [:xitdb], opt_key, opt_val)
       end)
 
     outcome = VerifySyncProjection.verify(dsl_state)
     %{ctx | results: Map.put(ctx.results, result_key, outcome)}
+  end
+
+  def inspect_nested_resource_info(ctx, result_key, resource, opts) do
+    alias Xitdb.Ash.Info, as: XitdbInfo
+
+    info = %{
+      nested?: XitdbInfo.nested?(resource),
+      collection: resource.__xitdb_collection__(),
+      indexes: resource.__xitdb_indexes__(),
+      mappings:
+        Enum.map(
+          XitdbInfo.nested_mappings(resource),
+          &Map.take(&1, [:parent, :as, :parent_key, :key, :cardinality])
+        ),
+      entity_paths:
+        Map.new(Keyword.get(opts, :records, []), fn {label, record} ->
+          {label, XitdbInfo.entity_paths(resource, record)}
+        end),
+      nested_under:
+        Map.new(Keyword.get(opts, :nested_under, []), fn {parent, candidates} ->
+          {parent,
+           Enum.map(XitdbInfo.nested_under(candidates, parent), fn {res, m} -> {res, m.as} end)}
+        end)
+    }
+
+    %{ctx | results: Map.put(ctx.results, result_key, info)}
   end
 
   def evaluate_quoted_ast(ctx, result_key, quoted_ast) do
