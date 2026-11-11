@@ -50,12 +50,12 @@
 
 ---
 
-## Phase 4: Single-Writer Store, Savepoints & Transaction Engine
+## Phase 4: Single-Writer Store, Savepoints & Atomic Snapshot Engine
 
-- [ ] Task: Implement `lib/xitdb/ash/store.ex`
+- [ ] Task: Implement `lib/xitdb/ash/store.ex` and `lib/xitdb/ash/store/snapshot.ex`
     - [ ] Implement `use Xitdb.Ash.Store` macro with GenServer writer
-    - [ ] Publish immutable snapshots to `:persistent_term` on write commit
-    - [ ] Implement 3-tier read resolution (Process Dict -> TestSandbox ETS -> `:persistent_term`)
+    - [ ] Implement `Xitdb.Ash.Store.Snapshot` using `:persistent_term` for static `{base_db, atomics}` handle and `:atomics` for per-commit 5ns moment updates (zero global GC scans)
+    - [ ] Implement 3-tier read resolution (Process Dict -> TestSandbox ETS -> `Snapshot.current_db/1`)
     - [ ] Implement nested transaction savepoint stack and rollback via throw `{:xitdb_ash_rollback, store, reason}`
 
 ---

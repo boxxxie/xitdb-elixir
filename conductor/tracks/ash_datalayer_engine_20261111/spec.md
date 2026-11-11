@@ -85,13 +85,15 @@ Index maintenance for `:sorted_map` and `:hash_map` slots:
 - Index differential update: Extract old keys, compute additions/removals, apply atomically.
 - **Ash 3 Upsert Identity Struct Handling:** `find_upsert_existing_id/5` must accept `%Ash.Resource.Identity{}` struct, atom name, or fallback key match list to correctly resolve existing record IDs during upsert.
 
-### 3.5 `store.ex` (`Xitdb.Ash.Store`)
-Store management and snapshot transactions:
+### 3.5 `store.ex` (`Xitdb.Ash.Store` & `Xitdb.Ash.Store.Snapshot`)
+Store management, atomic snapshot publication, and transactions:
 - `use Xitdb.Ash.Store, otp_app: :app` macro generating GenServer writer and snapshot publisher.
+- **Lock-Free Atomic Snapshot Publishing (`:persistent_term` + `:atomics`):**
+  Avoid calling `:persistent_term.put/2` on every commit (which causes VM-wide global GC scans). Instead, store `{base_db, atomics_ref}` in `:persistent_term` once at boot. After each commit, the single writer executes `:atomics.put(atomics_ref, 1, moment)` (~5ns atomic store, zero heap allocation). Readers load `{base_db, atomics}` from `:persistent_term` and call `Xitdb.as_of(base_db, :atomics.get(atomics_ref, 1))` (~10ns), guaranteeing atomic consistency between BM25 search and entity hydration.
 - 3-tier read-handle resolution:
   1. Process dictionary (`:xitdb_ash_tx_handle`) during active transactions.
   2. ETS table (`Xitdb.Ash.TestSandbox`) during active ExUnit tests.
-  3. `:persistent_term.get({store, :current_db})` for lock-free application reads.
+  3. `Xitdb.Ash.Store.Snapshot.current_db(store)` for lock-free application reads.
 - Transaction savepoint stack supporting nested `transaction/3` and `rollback/2` via throw `{:xitdb_ash_rollback, store, reason}`.
 
 ### 3.6 `query.ex` (`Xitdb.Ash.Query`)
