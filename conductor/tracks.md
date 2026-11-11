@@ -21,3 +21,8 @@ This file tracks all major development tracks for the `xitdb` Elixir client (`el
 
 - [x] **Track 4: Ergonomic Transactions (`put_in`/`update_in`), Time-Travel (`as_of`, `diff_moments`, `history_of`), Pull, Datalog & Compile-Time Sigils (`~x`, `~q`)**
   *Link: [./tracks/dsl_transactions_datalog_20261103/](./tracks/dsl_transactions_datalog_20261103/)*
+
+---
+
+- [ ] **Track 5: `Xitdb.Ash.DataLayer` Engine (Ash 3 DataLayer, Store GenServer, Test Sandbox & Verification Suite)**
+  *Link: [./tracks/ash_datalayer_engine_20261111/](./tracks/ash_datalayer_engine_20261111/)*
