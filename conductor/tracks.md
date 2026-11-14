@@ -123,7 +123,7 @@ Each track has its own specification and implementation plan in [`./tracks/`](./
 
 ## Wave 5 — Deferred Synthetic ATDD Suite, Guides & Hex Release
 
-- [ ] **Track 15 [Wave 5 — Extended Verification]: Ash DataLayer Phase 1 Verification Suite (Pattern D/E Properties & Synthetic 4-Layer `WorkspaceDsl` ATDD Workflows)**
+- [x] **Track 15 [Wave 5 — Extended Verification]: Ash DataLayer Phase 1 Verification Suite (Pattern D/E Properties & Synthetic 4-Layer `WorkspaceDsl` ATDD Workflows)**
   *Link: [./tracks/ash_phase1_verification_suite_20261111/](./tracks/ash_phase1_verification_suite_20261111/)*
 
 ---
