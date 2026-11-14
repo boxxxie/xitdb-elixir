@@ -28,11 +28,18 @@ Because `xitdb` is an **immutable, append-only database** where every transactio
 :ok = Xitdb.close(disk_db)
 ```
 
+### Choosing a Backend & Hash Algorithm
+
+- **`:memory`** — Backed by an in-memory buffer with zero filesystem I/O; ideal for `async: true` ExUnit tests, ephemeral caches, and scratchpad projections.
+- **`:buffered_file`** — Buffers node writes in user space before flushing to the OS file descriptor on commit or `Xitdb.sync/1`; recommended for production workloads because multi-node HAMT/B+Tree commits avoid per-slot `write` syscalls.
+- **`:file`** — Issues unbuffered OS file reads/writes directly against the file descriptor; useful for small CLI utilities or constrained memory environments with infrequent writes.
+- **`:sha1` vs. `:sha256`** — Controls the cryptographic digest used for HAMT key hashing (`:sha1` by default for slightly faster hashing and compact digests; `:sha256` when collision-resistance policies require SHA-2). Once a database file is created, always reopen it with the same `:hash` setting.
+
 ---
 
 ## 2. Instant Time-Travel Snapshots (`Xitdb.as_of/2`)
 
-Pinning a snapshot to any historical moment index (`0..moment_count - 1`, or negative offsets from the latest commit like `-1`, `-2`) is an **$O(1)$ operation** that returns a `%Xitdb.Cursor{}` bound to that moment:
+Pinning a snapshot to any historical moment index (`0..moment_count - 1`, or negative offsets from the latest commit like `-1`, `-2`) is an **`O(1)` operation** that returns a `%Xitdb.Cursor{}` bound to that moment:
 
 ```elixir
 use Xitdb.DSL
@@ -79,7 +86,7 @@ db["config"]["version"] # => "1.0.1"
 
 ### Zero-Copy Subtree Cloning (`fork`)
 
-Inside a transaction, `fork from_path, to_path` (or `Xitdb.fork/3`) clones any subtree—even a collection with millions of entries—in **$O(1)$ time and 9 bytes** by copying its `Slot` pointer and freezing the transaction watermark (`savepoint`) so subsequent edits to either path trigger copy-on-write isolation:
+Inside a transaction, `fork from_path, to_path` (or `Xitdb.fork/3`) clones any subtree—even a collection with millions of entries—in **`O(1)` time and 9 bytes** by copying its `Slot` pointer and freezing the transaction watermark (`savepoint`) so subsequent edits to either path trigger copy-on-write isolation:
 
 ```elixir
 {:ok, db} =
@@ -93,7 +100,7 @@ Inside a transaction, `fork from_path, to_path` (or `Xitdb.fork/3`) clones any s
 
 ## 4. Structural Diffs (`Xitdb.diff_moments/3`)
 
-Because unchanged subtrees share identical 9-byte `Slot` pointers (`tag` + byte `offset`) across moments, `Xitdb.diff_moments(db, moment_a, moment_b)` skips identical subtrees in **$O(1)$ time** without traversing their children, computing the exact delta in $O(\Delta \text{ changed paths})$:
+Because unchanged subtrees share identical 9-byte `Slot` pointers (`tag` + byte `offset`) across moments, `Xitdb.diff_moments(db, moment_a, moment_b)` skips identical subtrees in **`O(1)` time** without traversing their children, computing the exact delta in `O(delta changed paths)`:
 
 ```elixir
 {:ok, changes} = Xitdb.diff_moments(db, 0, 1)

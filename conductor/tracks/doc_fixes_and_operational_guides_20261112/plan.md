@@ -14,58 +14,58 @@
 
 ## Phase 1: Path & Selector Documentation Updates (`docs/path-and-pull-dsl.md`)
 
-- [ ] Task: Correct `path(sorted("email->id")[email])` Example
-    - [ ] Update output from `"$[\"email->id\"].[\"alice.liddell@acme.io\"]"` to `".email->id$[\"alice.liddell@acme.io\"]"`
-    - [ ] Verify alignment with `Xitdb.DSL.PathCompiler` step formatting rules
+- [x] Task: Correct `path(sorted("email->id")[email])` Example
+    - [x] Update output from `"$[\"email->id\"].[\"alice.liddell@acme.io\"]"` to `".email->id$[\"alice.liddell@acme.io\"]"`
+    - [x] Verify alignment with `Xitdb.DSL.PathCompiler` step formatting rules
 
-- [ ] Task: Add Root Snapshot Cursor Clarification for `Xitdb.select/2`
-    - [ ] Add explicit note explaining that `Xitdb.select/2` and `select!/2` require `%Xitdb{}` or a root cursor (`Xitdb.db/1`, `Xitdb.as_of/2`)
-    - [ ] Clarify that child sub-cursors (`db["users"]`) should use `Access` syntax or `Xitdb.pull/2`
+- [x] Task: Add Root Snapshot Cursor Clarification for `Xitdb.select/2`
+    - [x] Add explicit note explaining that `Xitdb.select/2` and `select!/2` require `%Xitdb{}` or a root cursor (`Xitdb.db/1`, `Xitdb.as_of/2`)
+    - [x] Clarify that child sub-cursors (`db["users"]`) should use `Access` syntax or `Xitdb.pull/2`
 
 ---
 
 ## Phase 2: Storage Engine & Hash Algorithm Selection (`docs/time-travel-and-storage.md`)
 
-- [ ] Task: Document Backend Trade-offs
-    - [ ] Add `### Choosing a Backend & Hash Algorithm` section under Section 1
-    - [ ] Detail use cases for `:memory` (ephemeral/tests), `:buffered_file` (production batching), and `:file` (unbuffered POSIX I/O)
+- [x] Task: Document Backend Trade-offs
+    - [x] Add `### Choosing a Backend & Hash Algorithm` section under Section 1
+    - [x] Detail use cases for `:memory` (ephemeral/tests), `:buffered_file` (production batching), and `:file` (unbuffered POSIX I/O)
 
-- [ ] Task: Document Hash Algorithm Choices
-    - [ ] Contrast `:sha1` (default, fast, compact digests) vs `:sha256` (SHA-2 policy compliance)
-    - [ ] Emphasize persistence invariant: reopening files requires matching `:hash` configuration
-    - [ ] Replace any remaining `$O(...)` LaTeX math blocks in `docs/time-travel-and-storage.md` with inline code spans
+- [x] Task: Document Hash Algorithm Choices
+    - [x] Contrast `:sha1` (default, fast, compact digests) vs `:sha256` (SHA-2 policy compliance)
+    - [x] Emphasize persistence invariant: reopening files requires matching `:hash` configuration
+    - [x] Replace any remaining `$O(...)` LaTeX math blocks in `docs/time-travel-and-storage.md` with inline code spans
 
 ---
 
 ## Phase 3: Concurrency Architecture & Options (`docs/transaction-dsl.md`)
 
-- [ ] Task: Document `:index_rules` in Transaction Options
-    - [ ] Add `:index_rules` specification to Section 4 option definitions
+- [x] Task: Document `:index_rules` in Transaction Options
+    - [x] Add `:index_rules` specification to Section 4 option definitions
 
-- [ ] Task: Document Concurrency Model (Lock-Free Reads & Single-Writer Serialization)
-    - [ ] Add Section 5 explaining Odin `ErlNifRWLock` read scalability across processes
-    - [ ] Explain why read-modify-write transactions must be serialized to avoid TOCTOU races
-    - [ ] Provide copy-pasteable `MyApp.Store` `GenServer` pattern for non-Ash apps (`handle/0` returning `%Xitdb{}`, `db/0` returning `%Xitdb.Cursor{}`, `write/1`, and `terminate/2`), and point Ash apps to `Xitdb.Ash.Store`
+- [x] Task: Document Concurrency Model (Lock-Free Reads & Single-Writer Serialization)
+    - [x] Add Section 5 explaining Odin `ErlNifRWLock` read scalability across processes
+    - [x] Explain why read-modify-write transactions must be serialized to avoid TOCTOU races
+    - [x] Provide copy-pasteable `MyApp.Store` `GenServer` pattern for non-Ash apps (`handle/0` returning `%Xitdb{}`, `db/0` returning `%Xitdb.Cursor{}`, `write/1`, and `terminate/2`), and point Ash apps to `Xitdb.Ash.Store`
 
 ---
 
 ## Phase 4: Unified `Xitdb.Ash` Reference Contracts (`docs/ash-and-spark.md`)
 
-- [ ] Task: Document First-Class `Xitdb.Ash.Store`, `Xitdb.Ash.DataLayer` & `Xitdb.Ash.TestSandbox`
-    - [ ] Add Section 5 (`## 5. Store Supervision (`Xitdb.Ash.Store`), `DataLayer`, `TestSandbox` & `lock_change` Contracts`)
-    - [ ] Show `defmodule MyApp.MDM.Store, do: use Xitdb.Ash.Store`, supervision tree setup, lock-free reads (`MyApp.MDM.Store.current_db()`), serialized MDM `tx_for!` mutations via `Xitdb.Ash.Store.mutate/3`, pure `data_layer: Xitdb.Ash.DataLayer` usage, and `Xitdb.Ash.TestSandbox.checkout/2`
+- [x] Task: Document First-Class `Xitdb.Ash.Store`, `Xitdb.Ash.DataLayer` & `Xitdb.Ash.TestSandbox`
+    - [x] Add Section 5 (`## 5. Store Supervision (`Xitdb.Ash.Store`), `DataLayer`, `TestSandbox` & `lock_change` Contracts`)
+    - [x] Show `defmodule MyApp.MDM.Store, do: use Xitdb.Ash.Store`, supervision tree setup, lock-free reads (`MyApp.MDM.Store.current_db()`), serialized MDM `tx_for!` mutations via `Xitdb.Ash.Store.mutate/3`, pure `data_layer: Xitdb.Ash.DataLayer` usage, and `Xitdb.Ash.TestSandbox.checkout/2`
 
-- [ ] Task: Provide Reference `MyApp.MDM.Changes.ModifyLockedFields` & Atomicity Guidance
-    - [ ] Provide `Ash.Resource.Change` implementation supporting `:lock` and `:unlock` and validating against `Xitdb.Ash.Info.editable_field_strings/1`
-    - [ ] Explicitly note that `lock_action` and `unlock_action` must set `require_atomic? false` because `ModifyLockedFields` reads `Ash.Changeset.get_data(changeset, :locked_fields)` inside `change/3` without an `atomic/3` callback (and `WireChanges` does not toggle `require_atomic?` automatically)
-    - [ ] Replace any remaining `$O(...)` LaTeX math blocks in `docs/ash-and-spark.md` with inline code spans
+- [x] Task: Provide Reference `MyApp.MDM.Changes.ModifyLockedFields` & Atomicity Guidance
+    - [x] Provide `Ash.Resource.Change` implementation supporting `:lock` and `:unlock` and validating against `Xitdb.Ash.Info.editable_field_strings/1`
+    - [x] Explicitly note that `lock_action` and `unlock_action` must set `require_atomic? false` because `ModifyLockedFields` reads `Ash.Changeset.get_data(changeset, :locked_fields)` inside `change/3` without an `atomic/3` callback (and `WireChanges` does not toggle `require_atomic?` automatically)
+    - [x] Replace any remaining `$O(...)` LaTeX math blocks in `docs/ash-and-spark.md` with inline code spans
 
 ---
 
 ## Phase 5: Verification & Format Validation
 
-- [ ] Task: Verify Markdown, Inline-Code Math & Link Integrity Across All 7 `docs/*.md` Guides
-    - [ ] Replace remaining `$O(...)` / `$\le 8$` LaTeX math blocks in `docs/access-and-enumerable.md`, `docs/collections-and-indexing.md`, and `docs/datalog-dsl.md` with inline code spans (`` `O(1)` ``, `` `O(log N)` ``, `` `O(log_16 N)` ``, `` `<= 8` ``)
-    - [ ] Verify that all internal markdown links resolve correctly
-    - [ ] Ensure zero raw LaTeX math blocks (`$...$`) remain in any `docs/*.md` guide
-    - [ ] Run `mix format --check-formatted`
+- [x] Task: Verify Markdown, Inline-Code Math & Link Integrity Across All 7 `docs/*.md` Guides
+    - [x] Replace remaining `$O(...)` / `$\le 8$` LaTeX math blocks in `docs/access-and-enumerable.md`, `docs/collections-and-indexing.md`, and `docs/datalog-dsl.md` with inline code spans (`` `O(1)` ``, `` `O(log N)` ``, `` `O(log_16 N)` ``, `` `<= 8` ``)
+    - [x] Verify that all internal markdown links resolve correctly
+    - [x] Ensure zero raw LaTeX math blocks (`$...$`) remain in any `docs/*.md` guide
+    - [x] Run `mix format --check-formatted`

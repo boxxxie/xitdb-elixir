@@ -52,7 +52,7 @@ path(accounts[email].balance)
 # => ".accounts.[\"alice.liddell@acme.io\"].balance"
 
 path(sorted("email->id")[email])
-# => "$[\"email->id\"].[\"alice.liddell@acme.io\"]"
+# => ".email->id$[\"alice.liddell@acme.io\"]"
 ```
 
 ---
@@ -96,9 +96,10 @@ emp_todo_path = path(^dept_path.sorted(:directory)[emp_id].todos[[0]])
 Compiled selectors work across all `Xitdb` read, history, and mutation APIs:
 
 ```elixir
-# 1. Single-call selection against the latest moment or a historical moment:
+# 1. Single-call root-anchored selection against `%Xitdb{}` or a root snapshot (`Xitdb.db/1`, `Xitdb.as_of/2`):
 todo = Xitdb.select!(db, path(users[id].todos[[0]]))
 v0_role = Xitdb.select!(db, path(at_moment(0, users[id].role)))
+# Note: Selectors always resolve from the moment root; for child cursors (`db["users"]`), use `Access` or `Xitdb.pull/2`.
 
 # 2. Inspecting the temporal lineage of a path across all commits:
 {:ok, lineage} = Xitdb.history_of(db, path(users[id].role))

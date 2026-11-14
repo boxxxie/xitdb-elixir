@@ -128,7 +128,7 @@ Each track has its own specification and implementation plan in [`./tracks/`](./
 
 ---
 
-- [ ] **Track 16 [Wave 5 — Release Readiness]: Documentation Alignment, Operational Guides & Unified `Xitdb.Ash` Reference Contracts**
+- [x] **Track 16 [Wave 5 — Release Readiness]: Documentation Alignment, Operational Guides & Unified `Xitdb.Ash` Reference Contracts**
   *Link: [./tracks/doc_fixes_and_operational_guides_20261112/](./tracks/doc_fixes_and_operational_guides_20261112/)*
 
 ---

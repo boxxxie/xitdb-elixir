@@ -229,3 +229,80 @@ defmodule MyApp.Catalog.ItemSchema do
   def __xitdb_indexes__, do: [sku: "sku->item_id"]
 end
 ```
+
+---
+
+## 5. Store Supervision (`Xitdb.Ash.Store`), `DataLayer`, `TestSandbox` & `lock_change` Contracts
+
+Rather than hand-rolling a bespoke `GenServer`, use `Xitdb.Ash.Store` for both pure `Xitdb.Ash.DataLayer` resources and hybrid `Xitdb.Ash.Resource` MDM projections:
+
+### 1. Defining & Supervising `MyApp.MDM.Store` (`use Xitdb.Ash.Store`)
+
+`Xitdb.Ash.Store` publishes lock-free snapshots via `:persistent_term`, serializes writes with monitored caller-process writer leases, supports nested savepoints (`Store.transact/3`, `Store.rollback/2`), and integrates natively with `Xitdb.Ash.TestSandbox` for `async: true` ExUnit suites:
+
+```elixir
+defmodule MyApp.MDM.Store do
+  use Xitdb.Ash.Store
+end
+
+# In MyApp.Application.start/2:
+children = [
+  {MyApp.MDM.Store,
+   path: "/var/lib/myapp/mdm.xit",
+   domains: [MyApp.Accounts]}
+]
+
+# Lock-free root snapshot cursor (`%Xitdb.Cursor{}` pinned to the latest committed moment):
+root_cursor = MyApp.MDM.Store.root()
+
+# Serialized MDM `tx_for!` batch inside the store's writer lease (re-entrant inside transactions).
+# `mutate/3` passes and expects `{db, moment}` working snapshots:
+{:ok, :synced} =
+  Xitdb.Ash.Store.mutate(MyApp.MDM.Store, fn {db, moment} ->
+    next_db =
+      tx_for! db, [MyApp.Accounts.Organization],
+        base_moment: moment,
+        doc: "sync org 101" do
+        put organizations["101"].id, "101"
+        put organizations["101"].domain, "northleaf.ca"
+      end
+
+    {:ok, {next_db, Xitdb.moment_count(next_db) - 1}, :synced}
+  end)
+```
+
+For resources persisted directly in `.xit` files without Postgres, set `data_layer: Xitdb.Ash.DataLayer` (which automatically includes the `xitdb do ... end` DSL, secondary `index` / `search_field` / `references` entities, and `Store` transaction coordination) and isolate concurrent tests in `test_helper.exs` / `DataCase` via `Xitdb.Ash.TestSandbox.init()` and `Xitdb.Ash.TestSandbox.checkout([MyApp.MDM.Store])`.
+
+### 2. Reference `lock_change` Module (`MyApp.MDM.Changes.ModifyLockedFields`)
+
+`WireChanges` attaches `{lock_change_mod, op: :lock}` to `lock_action` and `{lock_change_mod, op: :unlock}` to `unlock_action`.
+
+> [!IMPORTANT]
+> Because `ModifyLockedFields` inspects `Ash.Changeset.get_data(changeset, :locked_fields)` inside `change/3` without an `atomic/3` callback—and `WireChanges` preserves your action flags as written—both `lock_action` (`:lock_field`) and `unlock_action` (`:unlock_field`) **must** set `require_atomic? false` on the resource (as shown in Section 1).
+
+```elixir
+defmodule MyApp.MDM.Changes.ModifyLockedFields do
+  use Ash.Resource.Change
+  alias Xitdb.Ash.Info, as: XitdbInfo
+
+  @impl true
+  def change(changeset, opts, _context) do
+    field = Ash.Changeset.get_argument(changeset, :field)
+    allowed = XitdbInfo.editable_field_strings(changeset.resource)
+
+    if field in allowed do
+      current = Ash.Changeset.get_data(changeset, :locked_fields) || []
+
+      updated =
+        case Keyword.fetch!(opts, :op) do
+          :lock -> Enum.uniq(current ++ [field])
+          :unlock -> List.delete(current, field)
+        end
+
+      Ash.Changeset.force_change_attribute(changeset, :locked_fields, updated)
+    else
+      Ash.Changeset.add_error(changeset, field: :field, message: "is not an editable Xitdb field")
+    end
+  end
+end
+```

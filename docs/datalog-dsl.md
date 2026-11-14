@@ -2,7 +2,7 @@
 
 `Xitdb` includes a native structural and temporal Datalog engine in Odin that supports:
 - Pattern unification across maps, counted maps, sorted maps, lists, and sets
-- Automatic $O(\log N)$ B+Tree secondary index prefix and range pushdown
+- Automatic `O(log N)` B+Tree secondary index prefix and range pushdown
 - Negated clauses (`not`) and key existence checks
 - Cycle-safe BFS transitive graph traversal (`reach/3,4`)
 - Cross-moment and full-history temporal queries (`at_moment/2`)
@@ -197,8 +197,8 @@ Non-aggregated variables in `find` automatically act as the grouping key. If all
   - `u.tags.sorted_set_member("elixir")` (`^` `Sorted_Set`)
 - **Comparisons:** `==`, `!=`, `>`, `>=`, `<`, `<=` (works between two logic variables like `new_salary > old_salary` or a variable and a literal/pinned value like `salary >= ^min_salary`)
 - **String predicates & B+Tree Pushdown:**
-  - `starts_with(var, "prefix")` — triggers an **$O(\log N)$ B+Tree prefix seek** when `var` is unified against a `Sorted_Map` (`sorted(...)`) or `Sorted_Set`!
-  - `var >= "lower_bound"` / `var > "lower_bound"` — also triggers an **$O(\log N)$ B+Tree lower-bound seek** on `Sorted_Map` / `Sorted_Set` keys!
+  - `starts_with(var, "prefix")` — triggers an **`O(log N)` B+Tree prefix seek** when `var` is unified against a `Sorted_Map` (`sorted(...)`) or `Sorted_Set`!
+  - `var >= "lower_bound"` / `var > "lower_bound"` — also triggers an **`O(log N)` B+Tree lower-bound seek** on `Sorted_Map` / `Sorted_Set` keys!
   - `contains(var, "substring")`
 - **Negation:** `not <clause>` (e.g. `not u.flags.set_member("suspended")`, `not u.deleted_at`, or `not (u.role == "guest")`)
 

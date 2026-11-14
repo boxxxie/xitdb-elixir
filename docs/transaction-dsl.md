@@ -4,7 +4,7 @@ While `Xitdb.transact/3` supports standard Elixir [`Access` mutations](access-an
 
 1. **Intermediate NIF reads:** `put_in(root["users"][id]["profile"]["city"], "NYC")` invokes `Access.get_and_update/3` at every step, crossing the NIF boundary on each hop.
 2. **Missing intermediate paths:** If `root["users"][id]` does not exist yet, `Access.get_and_update/3` passes `nil` to the next step and raises unless intermediate maps are initialized first.
-3. **No syntax for native list/tree/metadata operations:** `Access` cannot express `xitdb`'s native $O(\log N)$ list `append`, `insert`, `slice`, $O(1)$ zero-copy subtree `fork`, secondary index registration (`index_on`), or commit metadata (`meta`, `instant`, `savepoint`).
+3. **No syntax for native list/tree/metadata operations:** `Access` cannot express `xitdb`'s native `O(log N)` list `append`, `insert`, `slice`, `O(1)` zero-copy subtree `fork`, secondary index registration (`index_on`), or commit metadata (`meta`, `instant`, `savepoint`).
 
 `Xitdb.DSL.tx/2,3` and `Xitdb.DSL.tx!/2,3` solve all three problems by compiling path expressions directly into a single atomic NIF transaction batch.
 
@@ -95,7 +95,7 @@ append users[id].audit_log, "logged_in"
 ```
 
 ### `insert list_path[[idx]], value` (or `insert list_path, idx, value`)
-Inserts `value` at `idx` in a `Linked_Array_List` in $O(\log N)$ time, shifting subsequent elements right without copying them.
+Inserts `value` at `idx` in a `Linked_Array_List` in `O(log N)` time, shifting subsequent elements right without copying them.
 
 ```elixir
 insert users[id].todos[[0]], "urgent-task"
@@ -104,7 +104,7 @@ insert users[id].todos, 0, "urgent-task"
 ```
 
 ### `slice list_path, first..last` (or `slice list_path, offset, size`)
-Slices a `Linked_Array_List` (arbitrary `offset` and `size` in $O(\log N)$) or truncates an `Array_List` to `size`.
+Slices a `Linked_Array_List` (arbitrary `offset` and `size` in `O(log N)`) or truncates an `Array_List` to `size`.
 
 ```elixir
 slice users[id].todos, 0..9
@@ -113,7 +113,7 @@ slice users[id].todos, 0, 10
 ```
 
 ### `fork from_path, to_path`
-Clones the subtree at `from_path` to `to_path` in **$O(1)$ zero-copy time** by copying its 9-byte `Slot` pointer and freezing the transaction watermark so subsequent mutations in the same `tx` block trigger copy-on-write on either branch.
+Clones the subtree at `from_path` to `to_path` in **`O(1)` zero-copy time** by copying its 9-byte `Slot` pointer and freezing the transaction watermark so subsequent mutations in the same `tx` block trigger copy-on-write on either branch.
 
 ```elixir
 fork users[id], backups[id]
@@ -221,3 +221,49 @@ Both `tx/3` and `tx!/3` (as well as `Xitdb.transact/3`) accept keyword options:
 - `:instant` (`integer()`) — Epoch timestamp in milliseconds stored in `__tx.tx_instant` (inspected by `Xitdb.history_of/2`).
 - `:meta` (`map() | keyword()`) — Custom key-value metadata stored in `__tx.<key>`.
 - `:base_moment` (`integer()`, default `-1`) — Historical moment index to branch from.
+- `:index_rules` (`[{:index_on, source_map, field, index_map}]`, default `[]`) — Secondary B+Tree index rules applied during map or callback transactions.
+
+---
+
+## 5. Concurrency Model: Lock-Free Reads & Single-Writer Serialization
+
+- **Concurrent readers never block each other:** `%Xitdb{}` and `%Xitdb.Cursor{}` handles synchronize NIF slot access with an internal `ErlNifRWLock` and read immutable historical moments, so any number of BEAM processes can query or traverse cursors concurrently.
+- **Serialize read-modify-write transactions through one writer:** While `nif_transact` atomically commits each batch under a write lock, Elixir-side read-modify-write steps (`update` inside `tx` and `Xitdb.transact/3` 1-arity callbacks) read the current moment *before* entering `nif_transact`. If two BEAM processes run read-modify-write transactions concurrently against the same `%Xitdb{}` reference, both can read moment `N` and overwrite each other's updates (TOCTOU).
+
+If you are using Ash, supervise `Xitdb.Ash.Store` (see [`docs/ash-and-spark.md`](ash-and-spark.md)). For standalone non-Ash applications, own writes in a single `GenServer` and publish the `%Xitdb{}` handle in `:persistent_term` so readers bypass the `GenServer` mailbox completely:
+
+```elixir
+defmodule MyApp.Store do
+  use GenServer
+
+  def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+
+  # Zero-bottleneck concurrent reads (never touches GenServer mailbox)
+  def handle, do: :persistent_term.get({__MODULE__, :db})
+  def db, do: Xitdb.db(handle())
+
+  # Serialized atomic writes
+  def write(fun) when is_function(fun, 1) do
+    GenServer.call(__MODULE__, {:write, fun}, :infinity)
+  end
+
+  @impl true
+  def init(opts) do
+    Process.flag(:trap_exit, true)
+    {:ok, db} = Xitdb.open(opts)
+    :persistent_term.put({__MODULE__, :db}, db)
+    {:ok, db}
+  end
+
+  @impl true
+  def handle_call({:write, fun}, _from, db) do
+    {:reply, fun.(db), db}
+  end
+
+  @impl true
+  def terminate(_reason, db) do
+    :persistent_term.erase({__MODULE__, :db})
+    Xitdb.close(db)
+  end
+end
+```

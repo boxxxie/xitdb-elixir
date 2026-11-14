@@ -3,9 +3,9 @@
 By default, when you pass standard Elixir data structures to `Xitdb.transact/3` or `put` inside `Xitdb.DSL.tx`:
 - Plain Elixir maps (`%{}`) are stored as `:hash_map` (16-way HAMT).
 - Plain Elixir lists (`[]`) are stored as `:array_list` (16-way Radix Trie).
-- `%MapSet{}` values are stored as `:counted_hash_set` (16-way HAMT set with $O(1)$ count).
+- `%MapSet{}` values are stored as `:counted_hash_set` (16-way HAMT set with `O(1)` count).
 
-When your workload requires **$O(1)$ map cardinality**, **lexicographical B+Tree key ordering and range scans**, or **$O(\log N)$ middle-of-list insertions and removals**, wrap your data in `Xitdb`'s explicit collection constructors (`Xitdb.counted_map/1`, `Xitdb.sorted_map/1`, `Xitdb.linked_list/1`, etc.) or initialize them with `init_col` in `tx`.
+When your workload requires **`O(1)` map cardinality**, **lexicographical B+Tree key ordering and range scans**, or **`O(log N)` middle-of-list insertions and removals**, wrap your data in `Xitdb`'s explicit collection constructors (`Xitdb.counted_map/1`, `Xitdb.sorted_map/1`, `Xitdb.linked_list/1`, etc.) or initialize them with `init_col` in `tx`.
 
 ---
 
@@ -15,14 +15,14 @@ When your workload requires **$O(1)$ map cardinality**, **lexicographical B+Tree
 
 | Collection Kind | Constructor | Selector Sigil | Backing Structure | `get` / `member?` | `put` / `append` | `insert` / `rm` / `slice` | `Enum.count/1` |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| `:hash_map` | `Xitdb.hash_map(map)` *(or `%{}`)* | `.key` | 16-way HAMT | $O(\log_{16} N)$ | $O(\log_{16} N)$ | `rm`: $O(\log_{16} N)$ | $O(N)$ scan |
-| `:counted_hash_map` | `Xitdb.counted_map(map)` | `#key` | 16-way HAMT + count slot | $O(\log_{16} N)$ | $O(\log_{16} N)$ | `rm`: $O(\log_{16} N)$ | **$O(1)$** |
-| `:sorted_map` | `Xitdb.sorted_map(map)` | `$key` | Count-augmented B+Tree | $O(\log N)$ | $O(\log N)$ | `rm` & `slice`: **$O(\log N)$** | **$O(1)$** |
-| `:array_list` | `Xitdb.array_list(list)` *(or `[]`)* | `[idx]` | 16-way Radix Trie | $O(\log_{16} N)$ | $O(\log_{16} N)$ | Tail `slice` only; no middle `insert`/`rm` | **$O(1)$** |
-| `:linked_array_list` | `Xitdb.linked_list(list)` | `[[idx]]` | Count-augmented B-Tree | $O(\log N)$ | $O(\log N)$ | Arbitrary `insert`, `rm`, `slice`: **$O(\log N)$** | **$O(1)$** |
-| `:hash_set` | `Xitdb.hash_set(enum)` | `%member` | 16-way HAMT set | $O(\log_{16} N)$ | $O(\log_{16} N)$ | `rm`: $O(\log_{16} N)$ | $O(N)$ scan |
-| `:counted_hash_set` | `Xitdb.counted_set(enum)` *(or `MapSet`)* | `#%member` | 16-way HAMT set + count | $O(\log_{16} N)$ | $O(\log_{16} N)$ | `rm`: $O(\log_{16} N)$ | **$O(1)$** |
-| `:sorted_set` | `Xitdb.sorted_set(enum)` | `^member` | Count-augmented B+Tree set | $O(\log N)$ | $O(\log N)$ | `rm` & `slice`: **$O(\log N)$** | **$O(1)$** |
+| `:hash_map` | `Xitdb.hash_map(map)` *(or `%{}`)* | `.key` | 16-way HAMT | `O(log_16 N)` | `O(log_16 N)` | `rm`: `O(log_16 N)` | `O(N)` scan |
+| `:counted_hash_map` | `Xitdb.counted_map(map)` | `#key` | 16-way HAMT + count slot | `O(log_16 N)` | `O(log_16 N)` | `rm`: `O(log_16 N)` | **`O(1)`** |
+| `:sorted_map` | `Xitdb.sorted_map(map)` | `$key` | Count-augmented B+Tree | `O(log N)` | `O(log N)` | `rm` & `slice`: **`O(log N)`** | **`O(1)`** |
+| `:array_list` | `Xitdb.array_list(list)` *(or `[]`)* | `[idx]` | 16-way Radix Trie | `O(log_16 N)` | `O(log_16 N)` | Tail `slice` only; no middle `insert`/`rm` | **`O(1)`** |
+| `:linked_array_list` | `Xitdb.linked_list(list)` | `[[idx]]` | Count-augmented B-Tree | `O(log N)` | `O(log N)` | Arbitrary `insert`, `rm`, `slice`: **`O(log N)`** | **`O(1)`** |
+| `:hash_set` | `Xitdb.hash_set(enum)` | `%member` | 16-way HAMT set | `O(log_16 N)` | `O(log_16 N)` | `rm`: `O(log_16 N)` | `O(N)` scan |
+| `:counted_hash_set` | `Xitdb.counted_set(enum)` *(or `MapSet`)* | `#%member` | 16-way HAMT set + count | `O(log_16 N)` | `O(log_16 N)` | `rm`: `O(log_16 N)` | **`O(1)`** |
+| `:sorted_set` | `Xitdb.sorted_set(enum)` | `^member` | Count-augmented B+Tree set | `O(log N)` | `O(log N)` | `rm` & `slice`: **`O(log N)`** | **`O(1)`** |
 
 ---
 
@@ -30,15 +30,15 @@ When your workload requires **$O(1)$ map cardinality**, **lexicographical B+Tree
 
 ### Maps: `hash_map` vs. `counted_map` vs. `sorted_map`
 - **Use `%{}` / `Xitdb.hash_map/1`** for entity attributes (`%{"username" => "alice", "age" => 30}`) and general key-value lookups where you don't need `Enum.count/1` or sorted key iteration.
-- **Use `Xitdb.counted_map/1`** for entity tables (`"departments"`, `"tenants"`) when you frequently call `Enum.count(db["tenants"])` and want $O(1)$ cardinality without B+Tree key sorting overhead.
+- **Use `Xitdb.counted_map/1`** for entity tables (`"departments"`, `"tenants"`) when you frequently call `Enum.count(db["tenants"])` and want `O(1)` cardinality without B+Tree key sorting overhead.
 - **Use `Xitdb.sorted_map/1`** for lexicographically ordered directories, time-series keys (`"2026-11-03T22:00:00Z"`), leaderboards, and secondary indexes where you need ordered iteration, `Enum.slice/2` pagination by rank, or Datalog `starts_with` / `>=` B+Tree range pushdowns.
 
 ### Lists: `array_list` vs. `linked_list`
 - **Use `[]` / `Xitdb.array_list/1`** for append-only logs, fixed-order arrays, or random index reads (`roles[0]`). `Array_List` supports fast tail `append` and tail truncation (`slice list, 0, new_size`), but does **not** allow middle-of-list insertions or element deletion.
-- **Use `Xitdb.linked_list/1`** for task queues, ordered feeds, or editable lists where items are inserted at index `0` (`insert todos[[0]], "urgent"`), removed by index (`rm todos[[2]]`), or sliced at arbitrary offsets (`slice todos, 10..19`) in **$O(\log N)$** time without re-indexing subsequent elements.
+- **Use `Xitdb.linked_list/1`** for task queues, ordered feeds, or editable lists where items are inserted at index `0` (`insert todos[[0]], "urgent"`), removed by index (`rm todos[[2]]`), or sliced at arbitrary offsets (`slice todos, 10..19`) in **`O(log N)`** time without re-indexing subsequent elements.
 
 ### Sets: `hash_set` vs. `counted_set` vs. `sorted_set`
-- **Use `Xitdb.counted_set/1` (or `MapSet.new/1`)** for user roles, permissions, or feature flags when you need $O(1)$ `Enum.count/1` and $O(1)$ `Enum.member?/2`.
+- **Use `Xitdb.counted_set/1` (or `MapSet.new/1`)** for user roles, permissions, or feature flags when you need `O(1)` `Enum.count/1` and `O(1)` `Enum.member?/2`.
 - **Use `Xitdb.sorted_set/1`** when set members should always iterate and slice in deterministic alphabetical order (e.g., tags or badges).
 
 ```elixir
@@ -96,7 +96,7 @@ Xitdb.select!(db, path(sorted("email->id")["daria@acme.io"])) # => "u102"
 
 | Elixir Value | `xitdb` Storage Representation | Round-Trip Value |
 | :--- | :--- | :--- |
-| `"hello"` | `Tag.Short_Bytes` ($\le 8$ bytes inline in `Slot`) or `Tag.Bytes` | `"hello"` |
+| `"hello"` | `Tag.Short_Bytes` (`<= 8` bytes inline in `Slot`) or `Tag.Bytes` | `"hello"` |
 | `42` (non-negative `integer()`) | `Tag.Uint` (`u64`) | `42` |
 | `-42` (negative `integer()`) | `Tag.Int` (`i64`) | `-42` |
 | `3.14` (`float()`) | `Tag.Float` (`f64`) | `3.14` |

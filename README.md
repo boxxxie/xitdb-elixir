@@ -16,13 +16,13 @@ Rather than re-implementing `xitdb`'s wire format in pure Elixir or requiring qu
 - **Pure-Value Process Safety:**
   Because `%Xitdb.Cursor{}` holds only the NIF resource reference (`db_ref`) and a 9-byte `Slot` coordinate (`tag`, `tag_id`, `value`, `moment`), cursors are **pure immutable Elixir values**. Pass them across `Task.async/1`, GenServers, ETS tables, or Phoenix LiveView assigns with zero mutexes or pointer lifetimes.
 - **Standard Elixir `Access` & `Enumerable`:**
-  Use `cursor["key"]`, `cursor[idx]`, `get_in/2`, `put_in/3`, `update_in/3`, `pop_in/2`, `Enum.count/1` ($O(1)$ on counted maps/sets/lists), `Enum.member?/2` ($O(1)$ HAMT membership), `Enum.slice/2` ($O(\log N)$ index seek), and lazy `Stream.*` pipelines.
+  Use `cursor["key"]`, `cursor[idx]`, `get_in/2`, `put_in/3`, `update_in/3`, `pop_in/2`, `Enum.count/1` (`O(1)` on counted maps/sets/lists), `Enum.member?/2` (`O(1)` HAMT membership), `Enum.slice/2` (`O(log N)` index seek), and lazy `Stream.*` pipelines.
 - **Instant Time-Travel & Structural Diffs:**
-  Pin historical snapshots in $O(1)$ with `Xitdb.as_of(db, moment)`, diff any two moments in $O(\Delta)$ with `Xitdb.diff_moments/3`, and inspect attribute lineage with `Xitdb.history_of/2`.
+  Pin historical snapshots in `O(1)` with `Xitdb.as_of(db, moment)`, diff any two moments in `O(delta)` with `Xitdb.diff_moments/3`, and inspect attribute lineage with `Xitdb.history_of/2`.
 - **Compile-Time Validated Sigils (`~x`, `~q`), Macro DSL (`Xitdb.DSL`), Pull & Datalog:**
   Use standard `Access` for lazy navigation or `use Xitdb.DSL` for compile-time path selectors (`path(users[id].todos[[0]])`), zero-read atomic transaction blocks (`tx db do ... end`), structural Pull patterns (`[:username, todos: 0..2]`), and Ecto-style Datalog queries with `^var` pinning.
 - **Ash & Spark DSL Extension (`Xitdb.Ash.Resource`):**
-  Declare a `xitdb do ... end` block directly on any `Ash.Resource` to configure collections, survivorship/lock fields, field aliases, and secondary B+Tree indexes with compile-time sync verification (`VerifySyncProjection`), automatic change wiring (`WireChanges`), $O(1)$ precompiled Pull patterns (`Xitdb.Ash.Info`), and resource-aware transactions (`tx_for` / `tx_for!`).
+  Declare a `xitdb do ... end` block directly on any `Ash.Resource` to configure collections, survivorship/lock fields, field aliases, and secondary B+Tree indexes with compile-time sync verification (`VerifySyncProjection`), automatic change wiring (`WireChanges`), `O(1)` precompiled Pull patterns (`Xitdb.Ash.Info`), and resource-aware transactions (`tx_for` / `tx_for!`).
 
 ---
 
@@ -113,7 +113,7 @@ where
 
 ## Macro DSLs (`use Xitdb.DSL`)
 
-For operations where Elixir's `Access` protocol has friction—such as auto-vivifying deep paths without intermediate NIF reads, native list `append`/`insert`/`slice`, $O(1)$ subtree `fork`, typed collection selectors (`#counted`, `$sorted`, `[[linked]]`), and Datalog queries with pinned runtime variables (`^var`)—`Xitdb` provides a compile-time macro DSL:
+For operations where Elixir's `Access` protocol has friction—such as auto-vivifying deep paths without intermediate NIF reads, native list `append`/`insert`/`slice`, `O(1)` subtree `fork`, typed collection selectors (`#counted`, `$sorted`, `[[linked]]`), and Datalog queries with pinned runtime variables (`^var`)—`Xitdb` provides a compile-time macro DSL:
 
 ```elixir
 use Xitdb.DSL
@@ -188,7 +188,7 @@ defmodule MyApp.Accounts.Organization do
 end
 ```
 
-Use `tx_for` / `tx_for!` to automatically prepend the resource's configured `index_on` rules at compile time, and `Xitdb.Ash.Info` for $O(1)$ precompiled Pull projections:
+Use `tx_for` / `tx_for!` to automatically prepend the resource's configured `index_on` rules at compile time, and `Xitdb.Ash.Info` for `O(1)` precompiled Pull projections:
 
 ```elixir
 use Xitdb.DSL
@@ -215,7 +215,7 @@ Xitdb.pull!(db["organizations"]["101"], pattern)
 #### Core Concepts & Protocols
 - **[Lazy Cursors, `Access` & `Enumerable` (`docs/access-and-enumerable.md`)](docs/access-and-enumerable.md)** — 9-byte `Slot` cursors, bracket navigation (`db["users"]["alice"]`), `get_in`/`put_in`/`update_in`/`pop_in`, `Xitdb.at/1`, `Enumerable` fast paths (`Enum.count/1`, `Enum.member?/2`, `Enum.slice/2`), and chunked `Stream` pagination.
 - **[Collections & Secondary Indexing (`docs/collections-and-indexing.md`)](docs/collections-and-indexing.md)** — Choosing between `hash_map`, `counted_map`, `sorted_map`, `array_list`, `linked_list`, and sets, plus secondary B+Tree indexing (`index_on`).
-- **[Time-Travel, Diffs, History & Storage (`docs/time-travel-and-storage.md`)](docs/time-travel-and-storage.md)** — $O(1)$ snapshots (`as_of/2`), structural moment diffs (`diff_moments/3`), attribute lineage (`history_of/2`), storage backends (`:memory`, `:file`, `:buffered_file`), and online compaction (`compact/2`).
+- **[Time-Travel, Diffs, History & Storage (`docs/time-travel-and-storage.md`)](docs/time-travel-and-storage.md)** — `O(1)` snapshots (`as_of/2`), structural moment diffs (`diff_moments/3`), attribute lineage (`history_of/2`), storage backends (`:memory`, `:file`, `:buffered_file`), and online compaction (`compact/2`).
 
 #### Macro DSLs & Query Languages
 - **[Path Selector & Structural Pull DSL (`docs/path-and-pull-dsl.md`)](docs/path-and-pull-dsl.md)** — `path/1`, typed collection modifiers (`counted`, `sorted`, `[[idx]]`), set member probes, wildcard scans (`*`), and structural `Xitdb.pull/2` patterns.

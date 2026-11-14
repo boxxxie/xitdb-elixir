@@ -10,7 +10,7 @@ Each `%Xitdb.Cursor{}` wraps only the NIF database resource reference (`db_ref`)
 
 When you read from a `%Xitdb{}` handle (`Xitdb.db(db)`, `Xitdb.as_of(db, moment)`, or `db["users"]`):
 
-1. **Containers return `%Xitdb.Cursor{}` in $O(1)$ heap space:**
+1. **Containers return `%Xitdb.Cursor{}` in `O(1)` heap space:**
    If the target slot is a collection (`:hash_map`, `:counted_hash_map`, `:sorted_map`, `:array_list`, `:linked_array_list`, `:hash_set`, `:counted_hash_set`, `:sorted_set`), `Xitdb` returns a lightweight `%Xitdb.Cursor{}` struct pointing to that collection's byte offset.
 2. **Leaf scalars unwrap automatically:**
    If the target slot is a scalar (`String.t()`, `integer()`, `float()`, `boolean()`, or `{:tagged, tag, payload}`), `Xitdb` immediately decodes and returns the native Elixir value.
@@ -124,14 +124,14 @@ To abort and roll back from inside a `Xitdb.transact/3` callback, return `{:abor
 
 ## 4. `Enumerable` Fast-Path Pushdowns & `Stream` Pagination
 
-`%Xitdb.Cursor{}` implements `Enumerable` with native data-structure pushdowns so common `Enum` operations execute in $O(1)$ or $O(\log N)$ inside Odin rather than linearly scanning elements in Elixir:
+`%Xitdb.Cursor{}` implements `Enumerable` with native data-structure pushdowns so common `Enum` operations execute in `O(1)` or `O(log N)` inside Odin rather than linearly scanning elements in Elixir:
 
 | `Enum` / `Stream` Operation | Backing NIF Pushdown | Complexity | Supported Collection Kinds |
 | :--- | :--- | :--- | :--- |
-| `Enum.count(cursor)` | `nif_slot_count` | **$O(1)$** | `Counted_Hash_Map`, `Counted_Hash_Set`, `Sorted_Map`, `Sorted_Set`, `Array_List`, `Linked_Array_List` *(falls back to $O(N)$ reducer on uncounted `Hash_Map` / `Hash_Set`)* |
-| `Enum.member?(set_cur, "val")` | `nif_slot_contains` | **$O(1)$ / $O(\log N)$** | `Hash_Set`, `Counted_Hash_Set` ($O(\log_{16} N)$ HAMT), `Sorted_Set` ($O(\log N)$ B+Tree) |
-| `Enum.member?(map_cur, {k, v})` | `Cursor.fetch` + equality | **$O(1)$ / $O(\log N)$** | `Hash_Map`, `Counted_Hash_Map`, `Sorted_Map` |
-| `Enum.slice(cursor, first..last)`<br>`Enum.at(cursor, idx)` | `nif_slot_slice` | **$O(\log N + K)$** | `Array_List`, `Linked_Array_List`, `Sorted_Map` (yields `{k, v}` tuples in key order), `Sorted_Set` (yields members in key order) |
+| `Enum.count(cursor)` | `nif_slot_count` | **`O(1)`** | `Counted_Hash_Map`, `Counted_Hash_Set`, `Sorted_Map`, `Sorted_Set`, `Array_List`, `Linked_Array_List` *(falls back to `O(N)` reducer on uncounted `Hash_Map` / `Hash_Set`)* |
+| `Enum.member?(set_cur, "val")` | `nif_slot_contains` | **`O(1)` / `O(log N)`** | `Hash_Set`, `Counted_Hash_Set` (`O(log_16 N)` HAMT), `Sorted_Set` (`O(log N)` B+Tree) |
+| `Enum.member?(map_cur, {k, v})` | `Cursor.fetch` + equality | **`O(1)` / `O(log N)`** | `Hash_Map`, `Counted_Hash_Map`, `Sorted_Map` |
+| `Enum.slice(cursor, first..last)`<br>`Enum.at(cursor, idx)` | `nif_slot_slice` | **`O(log N + K)`** | `Array_List`, `Linked_Array_List`, `Sorted_Map` (yields `{k, v}` tuples in key order), `Sorted_Set` (yields members in key order) |
 | `Stream.take(cursor, k)`<br>`Enum.to_list(cursor)` | `nif_slot_entries` | **Adaptive chunks (`16 -> 64 -> 256`)** | All 8 collection types |
 
 ### Examples
