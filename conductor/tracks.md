@@ -75,7 +75,7 @@ Each track has its own specification and implementation plan in [`./tracks/`](./
 
 ---
 
-- [ ] **Track 14 [Wave 2 — MVP DataLayer Engine]: Ash 3 `Xitdb.Ash.DataLayer` Behaviour, Hybrid `AshPostgres` Boundary Guards & Verification Suite**
+- [x] **Track 14 [Wave 2 — MVP DataLayer Engine]: Ash 3 `Xitdb.Ash.DataLayer` Behaviour, Hybrid `AshPostgres` Boundary Guards & Verification Suite**
   *Link: [./tracks/ash_datalayer_and_verification_suite_20261111/](./tracks/ash_datalayer_and_verification_suite_20261111/)*
   *MVP Scope:* Wire `Xitdb.Ash.DataLayer` to `Store`, `Mutator`, and `Query` (`{db, moment}` snapshots) with telemetry spans; advertise `:async_engine`, `:multitenancy`, `:calculate`, `:changeset_filter`, `:update_query`, `:destroy_query`, `{:atomic, :update}`, `{:atomic, :destroy}`, and `:upsert` while omitting `:composite_primary_key`; scope `{:join, other}`, `{:filter_relationship, rel}`, and `{:aggregate_relationship, rel}` strictly to `Xitdb.Ash.DataLayer`; and validate flat multi-store + hybrid boundary workflows in `data_layer_test.exs`.
 
