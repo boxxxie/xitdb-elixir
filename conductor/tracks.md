@@ -90,7 +90,7 @@ Each track has its own specification and implementation plan in [`./tracks/`](./
 
 ## Wave 3 — Deferred Native Search Pushdown & Physical Document Nesting
 
-- [ ] **Track 9 [Wave 3 — Native Search Optimization]: Native Odin NIF BM25 Pushdown & Direct B+Tree Prefix Seek**
+- [x] **Track 9 [Wave 3 — Native Search Optimization]: Native Odin NIF BM25 Pushdown & Direct B+Tree Prefix Seek**
   *Link: [./tracks/nif_bm25_search_20261111/](./tracks/nif_bm25_search_20261111/)*
   *Deferred Rationale:* Drop-in hot-path acceleration (`odin_nif_bm25_search` and `odin_nif_sorted_map_seek`) behind `Xitdb.Ash.Search` requiring zero Ash resource changes after cutover.
 

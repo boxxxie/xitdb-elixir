@@ -41,6 +41,21 @@ defmodule Xitdb.ClientBench do
     diff_db = seed_fixture_db(diff_db, 200)
     {:ok, diff_db} = Xitdb.transact(diff_db, fn r -> put_in(r["users"]["u42"]["age"], 99) end)
 
+    {:ok, search_db} = Xitdb.open(backend: :memory)
+    search_db = seed_bm25_fixture_db(search_db, 200)
+    search_root = Xitdb.db(search_db)
+
+    bm25_opts = %{
+      match: :all,
+      prefix: true,
+      min_prefix_length: 3,
+      max_prefix_expansions: 64,
+      k1: 1.2,
+      b: 0.75,
+      exact_boost: 1.25,
+      prefix_weight: 1.0
+    }
+
     datalog_prefix_q = """
     find ?name, ?age
     where
@@ -318,6 +333,38 @@ defmodule Xitdb.ClientBench do
          Xitdb.close(d)
          File.rm(tmp_path)
          {elapsed, sz}
+       end},
+      {25, "Search: Sorted_Map B+Tree prefix seek (limit=16)", 100,
+       fn ->
+         for _ <- 1..100 do
+           {:ok, _entries, _next} =
+             Xitdb.NIF.nif_sorted_map_seek(
+               db.db_ref,
+               sorted_cur.tag_id,
+               sorted_cur.value,
+               "u4",
+               16
+             )
+         end
+
+         0
+       end},
+      {26, "Search: BM25 corpus search (N=200, 2-term prefix, limit=10)", 50,
+       fn ->
+         for _ <- 1..50 do
+           {:ok, _hits} =
+             Xitdb.NIF.nif_bm25_search(
+               search_db.db_ref,
+               search_root.tag_id,
+               search_root.value,
+               "articles",
+               ["nord", "cap"],
+               10,
+               bm25_opts
+             )
+         end
+
+         0
        end}
     ]
 
@@ -353,6 +400,7 @@ defmodule Xitdb.ClientBench do
     Xitdb.close(db)
     Xitdb.close(hist_db)
     Xitdb.close(diff_db)
+    Xitdb.close(search_db)
 
     jsonl = Enum.map_join(records, "\n", &encode_json_line/1) <> "\n"
     File.write!("benchmarks/elixir.jsonl", jsonl)
@@ -402,6 +450,46 @@ defmodule Xitdb.ClientBench do
         },
         index_rules: [{:index_on, "users", "username", "username->id"}]
       )
+
+    db
+  end
+
+  defp seed_bm25_fixture_db(db, n) do
+    nord_variants = ["nordic", "north", "nordstrom"]
+    cap_variants = ["capital", "captain", "cap", "capsule"]
+    extra_terms = ["equity", "growth", "market", "credit", "buyout", "zurich", "london", "tokyo"]
+
+    {docs_map, terms_map, total_len} =
+      Enum.reduce(0..(n - 1), {%{}, %{}, 0}, fn i, {docs_acc, terms_acc, len_acc} ->
+        doc_key = Integer.to_string(i + 1)
+        t1 = Enum.at(nord_variants, rem(i, length(nord_variants)))
+        t2 = Enum.at(cap_variants, rem(i, length(cap_variants)))
+        t3 = Enum.at(extra_terms, rem(i, length(extra_terms)))
+        doc_terms = [{t1, 300}, {t2, 200}, {t3, 100}]
+        doc_len = 600
+
+        new_terms =
+          Enum.reduce(doc_terms, terms_acc, fn {term, tf}, t_acc ->
+            postings = Map.get(t_acc, term, %{})
+            Map.put(t_acc, term, Map.put(postings, doc_key, tf))
+          end)
+
+        new_docs = Map.put(docs_acc, doc_key, %{"len" => doc_len})
+        {new_docs, new_terms, len_acc + doc_len}
+      end)
+
+    {:ok, db} =
+      Xitdb.transact(db, %{
+        "idx" => %{
+          "search" => %{
+            "articles" => %{
+              "meta" => %{"doc_count" => n, "total_len" => total_len},
+              "docs" => docs_map,
+              "terms" => Xitdb.sorted_map(terms_map)
+            }
+          }
+        }
+      })
 
     db
   end

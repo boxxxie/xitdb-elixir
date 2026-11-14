@@ -3,8 +3,12 @@ package xitdb_nif
 import "base:runtime"
 import "core:c"
 import "core:fmt"
+import "core:math"
+import "core:mem"
 import "core:os"
+import "core:slice"
 import "core:strings"
+import "core:unicode/utf8"
 import xitdb "xitdb:."
 
 ErlNifEnv :: distinct rawptr
@@ -36,6 +40,7 @@ foreign _ {
 	nif_is_tuple :: proc(env: ErlNifEnv, term: ERL_NIF_TERM) -> c.int ---
 	nif_is_list :: proc(env: ErlNifEnv, term: ERL_NIF_TERM) -> c.int ---
 	nif_is_map :: proc(env: ErlNifEnv, term: ERL_NIF_TERM) -> c.int ---
+	nif_get_map_value :: proc(env: ErlNifEnv, map_term: ERL_NIF_TERM, key: ERL_NIF_TERM, val_out: ^ERL_NIF_TERM) -> c.int ---
 
 	nif_make_atom_len :: proc(env: ErlNifEnv, name: [^]u8, length: c.size_t) -> ERL_NIF_TERM ---
 	nif_make_int64 :: proc(env: ErlNifEnv, val: i64) -> ERL_NIF_TERM ---
@@ -94,9 +99,19 @@ ATOM_NEW_VALUE:        ERL_NIF_TERM
 ATOM_VALUE:            ERL_NIF_TERM
 ATOM_DOC:              ERL_NIF_TERM
 ATOM_INSTANT:          ERL_NIF_TERM
-ATOM_VARS:             ERL_NIF_TERM
-ATOM_ROWS:             ERL_NIF_TERM
-TAG_ATOMS:             [16]ERL_NIF_TERM
+ATOM_VARS:                  ERL_NIF_TERM
+ATOM_ROWS:                  ERL_NIF_TERM
+ATOM_MATCH:                 ERL_NIF_TERM
+ATOM_ALL:                   ERL_NIF_TERM
+ATOM_ANY:                   ERL_NIF_TERM
+ATOM_PREFIX:                ERL_NIF_TERM
+ATOM_MIN_PREFIX_LENGTH:     ERL_NIF_TERM
+ATOM_MAX_PREFIX_EXPANSIONS: ERL_NIF_TERM
+ATOM_K1:                    ERL_NIF_TERM
+ATOM_B:                     ERL_NIF_TERM
+ATOM_EXACT_BOOST:           ERL_NIF_TERM
+ATOM_PREFIX_WEIGHT:         ERL_NIF_TERM
+TAG_ATOMS:                  [16]ERL_NIF_TERM
 
 make_atom :: proc(env: ErlNifEnv, s: string) -> ERL_NIF_TERM {
 	return nif_make_atom_len(env, raw_data(s), c.size_t(len(s)))
@@ -137,8 +152,18 @@ odin_nif_init_atoms :: proc "c" (env: ErlNifEnv) {
 	ATOM_VALUE        = make_atom(env, "value")
 	ATOM_DOC          = make_atom(env, "doc")
 	ATOM_INSTANT      = make_atom(env, "instant")
-	ATOM_VARS         = make_atom(env, "vars")
-	ATOM_ROWS         = make_atom(env, "rows")
+	ATOM_VARS                  = make_atom(env, "vars")
+	ATOM_ROWS                  = make_atom(env, "rows")
+	ATOM_MATCH                 = make_atom(env, "match")
+	ATOM_ALL                   = make_atom(env, "all")
+	ATOM_ANY                   = make_atom(env, "any")
+	ATOM_PREFIX                = make_atom(env, "prefix")
+	ATOM_MIN_PREFIX_LENGTH     = make_atom(env, "min_prefix_length")
+	ATOM_MAX_PREFIX_EXPANSIONS = make_atom(env, "max_prefix_expansions")
+	ATOM_K1                    = make_atom(env, "k1")
+	ATOM_B                     = make_atom(env, "b")
+	ATOM_EXACT_BOOST           = make_atom(env, "exact_boost")
+	ATOM_PREFIX_WEIGHT         = make_atom(env, "prefix_weight")
 
 	for i in 0 ..< 16 {
 		TAG_ATOMS[i] = make_atom(env, tag_to_atom_name(xitdb.Tag(u8(i))))
@@ -1786,4 +1811,775 @@ odin_nif_compact :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM
 	comp_handle.rwlock = nif_rwlock_create("xitdb_rwlock")
 	res_term := nif_make_db_resource(env, raw_res)
 	return make_ok(env, res_term)
+}
+
+// ============================================================================
+// Wave 3: Direct B+Tree Prefix Seek & Native BM25 Pushdown NIFs
+// ============================================================================
+
+BM25_WEIGHT_SCALE :: 100.0
+
+BM25_Match_Mode :: enum u8 {
+	All = 0,
+	Any = 1,
+}
+
+BM25_Opts :: struct {
+	match_mode:            BM25_Match_Mode,
+	prefix_enabled:        bool,
+	min_prefix_length:     int,
+	max_prefix_expansions: int,
+	k1:                    f64,
+	b:                     f64,
+	exact_boost:           f64,
+	prefix_weight:         f64,
+}
+
+BM25_Hit :: struct {
+	doc_key: string,
+	score:   f64,
+}
+
+// Strict total order: primary key descending `score` (f64), secondary key ascending `doc_key` raw UTF-8 bytes.
+bm25_hit_better :: #force_inline proc(a, b: BM25_Hit) -> bool {
+	if a.score != b.score {
+		return a.score > b.score
+	}
+	return a.doc_key < b.doc_key
+}
+
+// Min-heap root predicate: keeps the worst of the current Top-K winners at `heap[0]`.
+bm25_hit_worse :: #force_inline proc(a, b: BM25_Hit) -> bool {
+	return bm25_hit_better(b, a)
+}
+
+bm25_heap_push :: proc(heap: ^[dynamic]BM25_Hit, item: BM25_Hit, k: int) {
+	if len(heap^) < k {
+		append(heap, item)
+		idx := len(heap^) - 1
+		for idx > 0 {
+			parent := (idx - 1) / 2
+			if bm25_hit_worse(heap[idx], heap[parent]) {
+				heap[idx], heap[parent] = heap[parent], heap[idx]
+				idx = parent
+			} else {
+				break
+			}
+		}
+		return
+	}
+
+	if k > 0 && bm25_hit_better(item, heap[0]) {
+		heap[0] = item
+		n := len(heap^)
+		idx := 0
+		for {
+			left := 2*idx + 1
+			right := 2*idx + 2
+			worst := idx
+			if left < n && bm25_hit_worse(heap[left], heap[worst]) {
+				worst = left
+			}
+			if right < n && bm25_hit_worse(heap[right], heap[worst]) {
+				worst = right
+			}
+			if worst == idx {
+				break
+			}
+			heap[idx], heap[worst] = heap[worst], heap[idx]
+			idx = worst
+		}
+	}
+}
+
+// Clones `.Short_Bytes` and `.Bytes` keys onto `arena_alloc` so stack scratch buffers never alias map keys.
+read_arena_string :: proc(cur: xitdb.Read_Cursor, arena_alloc: mem.Allocator) -> (s: string, err: xitdb.Error) {
+	slot_ptr := xitdb.cursor_resolved(cur) or_return
+	if slot_ptr.slot.tag == .Short_Bytes && !slot_ptr.slot.full {
+		sb_buf: [8]u8 = ---
+		b_obj := xitdb.cursor_read_bytes_buf(cur, sb_buf[:]) or_return
+		return strings.clone(string(b_obj.value), arena_alloc), nil
+	}
+	return xitdb.cursor_read_string(cur, 0, arena_alloc)
+}
+
+// Reads non-negative integers stored as either `.Uint` (Elixir `odin_nif_transact`) or `.Int` (raw Odin).
+read_cursor_nonneg_int :: proc(cur: xitdb.Read_Cursor) -> (val: i64, ok: bool, err: xitdb.Error) {
+	slot_ptr := xitdb.cursor_resolved(cur) or_return
+	#partial switch slot_ptr.slot.tag {
+	case .Uint:
+		u := xitdb.cursor_read_uint(cur) or_return
+		return i64(u), true, nil
+	case .Int:
+		i := xitdb.cursor_read_int(cur) or_return
+		if i < 0 {
+			return 0, true, nil
+		}
+		return i, true, nil
+	}
+	return 0, false, nil
+}
+
+read_hash_map_nonneg_int :: proc(hm: xitdb.Read_Hash_Map, key: string) -> (val: i64, err: xitdb.Error) {
+	cur_maybe := xitdb.hash_map_get_cursor(hm, key) or_return
+	cur, has_cur := cur_maybe.?
+	if !has_cur {
+		return 0, nil
+	}
+	v, ok := read_cursor_nonneg_int(cur) or_return
+	if !ok {
+		return 0, nil
+	}
+	return v, nil
+}
+
+// Resolves snapshot root cursor coordinates `(root_tag_id, root_val_int)` from `Xitdb.db/1` or `Xitdb.as_of/2`.
+resolve_snapshot_root_cursor :: proc(
+	db: ^xitdb.Database,
+	root_tag_id: i64,
+	root_val_int: i64,
+) -> (root_cur: xitdb.Read_Cursor, has_data: bool, out_of_range: bool, err: xitdb.Error) {
+	if root_tag_id == -1 {
+		rc := xitdb.database_root_cursor(db).read_cursor
+		slot_ptr := xitdb.cursor_resolved(rc) or_return
+		if slot_ptr.slot.tag == .None || slot_ptr.slot.value == 0 {
+			return {}, false, false, nil
+		}
+		hist := xitdb.read_array_list_init(rc) or_return
+		cnt := xitdb.array_list_count(hist) or_return
+		if cnt == 0 {
+			return {}, false, false, nil
+		}
+		resolved := root_val_int if root_val_int >= 0 else cnt + root_val_int
+		if resolved < 0 || resolved >= cnt {
+			return {}, false, true, nil
+		}
+		slot_maybe := xitdb.array_list_get_slot(hist, resolved) or_return
+		s, found := slot_maybe.?
+		if !found || s.value == 0 || (s.tag == .None && !s.full) {
+			return {}, false, false, nil
+		}
+		return xitdb.Read_Cursor{
+			slot_ptr = xitdb.Slot_Pointer{position = nil, slot = s},
+			db       = db,
+		}, true, false, nil
+	}
+
+	if root_val_int == 0 {
+		return {}, false, false, nil
+	}
+	if root_tag_id < 0 || root_tag_id >= 16 {
+		return {}, false, true, nil
+	}
+	tag := xitdb.Tag(u8(root_tag_id))
+	if tag == .None {
+		return {}, false, false, nil
+	}
+	return xitdb.Read_Cursor{
+		slot_ptr = xitdb.Slot_Pointer{position = nil, slot = xitdb.Slot{tag = tag, value = root_val_int}},
+		db       = db,
+	}, true, false, nil
+}
+
+get_term_float :: proc(env: ErlNifEnv, term: ERL_NIF_TERM) -> (f64, bool) {
+	f: f64 = 0
+	if nif_get_double(env, term, &f) != 0 {
+		return f, true
+	}
+	i: i64 = 0
+	if nif_get_int64(env, term, &i) != 0 {
+		return f64(i), true
+	}
+	return 0, false
+}
+
+parse_bm25_opts :: proc(env: ErlNifEnv, opts_term: ERL_NIF_TERM) -> (opts: BM25_Opts, ok: bool) {
+	opts = BM25_Opts{
+		match_mode            = .All,
+		prefix_enabled        = true,
+		min_prefix_length     = 3,
+		max_prefix_expansions = 64,
+		k1                    = 1.2,
+		b                     = 0.75,
+		exact_boost           = 1.25,
+		prefix_weight         = 1.0,
+	}
+
+	if nif_is_map(env, opts_term) == 0 {
+		return opts, false
+	}
+
+	v: ERL_NIF_TERM
+	if nif_get_map_value(env, opts_term, ATOM_MATCH, &v) != 0 {
+		if v == ATOM_ALL {
+			opts.match_mode = .All
+		} else if v == ATOM_ANY {
+			opts.match_mode = .Any
+		} else {
+			return opts, false
+		}
+	}
+
+	if nif_get_map_value(env, opts_term, ATOM_PREFIX, &v) != 0 {
+		if v == ATOM_TRUE {
+			opts.prefix_enabled = true
+		} else if v == ATOM_FALSE {
+			opts.prefix_enabled = false
+		} else {
+			return opts, false
+		}
+	}
+
+	if nif_get_map_value(env, opts_term, ATOM_MIN_PREFIX_LENGTH, &v) != 0 {
+		iv: i64 = 0
+		if nif_get_int64(env, v, &iv) == 0 || iv < 1 {
+			return opts, false
+		}
+		opts.min_prefix_length = int(iv)
+	}
+
+	if nif_get_map_value(env, opts_term, ATOM_MAX_PREFIX_EXPANSIONS, &v) != 0 {
+		iv: i64 = 0
+		if nif_get_int64(env, v, &iv) == 0 || iv < 1 {
+			return opts, false
+		}
+		opts.max_prefix_expansions = int(iv)
+	}
+
+	if nif_get_map_value(env, opts_term, ATOM_K1, &v) != 0 {
+		fv, fok := get_term_float(env, v)
+		if !fok || fv < 0.0 {
+			return opts, false
+		}
+		opts.k1 = fv
+	}
+
+	if nif_get_map_value(env, opts_term, ATOM_B, &v) != 0 {
+		fv, fok := get_term_float(env, v)
+		if !fok || fv < 0.0 || fv > 1.0 {
+			return opts, false
+		}
+		opts.b = fv
+	}
+
+	if nif_get_map_value(env, opts_term, ATOM_EXACT_BOOST, &v) != 0 {
+		fv, fok := get_term_float(env, v)
+		if !fok || fv < 0.0 {
+			return opts, false
+		}
+		opts.exact_boost = fv
+	}
+
+	if nif_get_map_value(env, opts_term, ATOM_PREFIX_WEIGHT, &v) != 0 {
+		fv, fok := get_term_float(env, v)
+		if !fok || fv < 0.0 {
+			return opts, false
+		}
+		opts.prefix_weight = fv
+	}
+
+	return opts, true
+}
+
+collect_postings_into_map :: proc(
+	postings_cur: xitdb.Read_Cursor,
+	multiplier: f64,
+	dest: ^map[string]f64,
+	arena_alloc: mem.Allocator,
+) -> xitdb.Error {
+	it := xitdb.cursor_iterator(postings_cur) or_return
+	for {
+		next_maybe := xitdb.cursor_iterator_next(&it) or_return
+		elem_cur, has_next := next_maybe.?
+		if !has_next {
+			break
+		}
+		kv := xitdb.cursor_read_kv_pair(elem_cur, arena_alloc) or_return
+		doc_key := read_arena_string(kv.key_cursor, arena_alloc) or_return
+		if doc_key == "__tx" {
+			continue
+		}
+		scaled_tf, ok_tf := read_cursor_nonneg_int(kv.value_cursor) or_return
+		if !ok_tf || scaled_tf <= 0 {
+			continue
+		}
+		tf := (f64(scaled_tf) / BM25_WEIGHT_SCALE) * multiplier
+		if existing, found := dest[doc_key]; found {
+			dest[doc_key] = existing + tf
+		} else {
+			dest[doc_key] = tf
+		}
+	}
+	return nil
+}
+
+// `nif_sorted_map_seek(db_ref, slot_tag_id, slot_val_int, prefix_bin, limit_int)` ->
+// `{:ok, [{term_bin, slot_tuple}, ...], next_cursor_or_nil} | {:error, reason}`
+@(export)
+odin_nif_sorted_map_seek :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {
+	context = runtime.default_context()
+
+	arena: mem.Dynamic_Arena
+	mem.dynamic_arena_init(
+		&arena,
+		block_allocator = runtime.default_allocator(),
+		array_allocator = runtime.default_allocator(),
+	)
+	defer mem.dynamic_arena_destroy(&arena)
+
+	arena_alloc := mem.dynamic_arena_allocator(&arena)
+	context.allocator = arena_alloc
+	context.temp_allocator = arena_alloc
+
+	if argc != 5 {
+		return make_err(env, "badarg")
+	}
+
+	handle, ok := get_handle(env, argv[0])
+	if !ok {
+		return make_err(env, "closed")
+	}
+
+	tag_int: i64 = 0
+	val_int: i64 = 0
+	limit_int: i64 = 0
+	if nif_get_int64(env, argv[1], &tag_int) == 0 ||
+	   nif_get_int64(env, argv[2], &val_int) == 0 ||
+	   nif_get_int64(env, argv[4], &limit_int) == 0 {
+		return make_err(env, "badarg")
+	}
+
+	prefix, ok_p := get_string_from_binary(env, argv[3])
+	if !ok_p {
+		return make_err(env, "badarg")
+	}
+
+	if tag_int < 0 || tag_int >= 16 {
+		return make_err(env, "badarg")
+	}
+	tag := xitdb.Tag(u8(tag_int))
+	if tag != .Sorted_Map && tag != .None {
+		return make_err(env, "unsupported")
+	}
+
+	if val_int == 0 || tag == .None || limit_int <= 0 {
+		empty_list := nif_make_list_from_array(env, nil, 0)
+		return nif_make_tuple3(env, ATOM_OK, empty_list, ATOM_NIL)
+	}
+
+	nif_rwlock_rlock(handle.rwlock)
+	defer nif_rwlock_runlock(handle.rwlock)
+
+	cur := xitdb.Read_Cursor{
+		slot_ptr = xitdb.Slot_Pointer{position = nil, slot = xitdb.Slot{tag = tag, value = val_int}},
+		db       = &handle.db,
+	}
+
+	sm_col, sm_err := xitdb.read_sorted_map_init(cur)
+	if sm_err != nil {
+		return make_xitdb_err(env, sm_err)
+	}
+
+	it, it_err := xitdb.sorted_map_iterator_from_string(sm_col, prefix)
+	if it_err != nil {
+		return make_xitdb_err(env, it_err)
+	}
+
+	cap_hint := int(min(limit_int, 256))
+	items := make([dynamic]ERL_NIF_TERM, 0, cap_hint, arena_alloc)
+	next_cursor_term: ERL_NIF_TERM = ATOM_NIL
+	emitted: i64 = 0
+	sb_buf: [8]u8 = ---
+
+	for {
+		next_maybe, n_err := xitdb.cursor_iterator_next(&it)
+		if n_err != nil {
+			return make_xitdb_err(env, n_err)
+		}
+		elem_cur, has_next := next_maybe.?
+		if !has_next {
+			break
+		}
+
+		kv, kv_err := xitdb.cursor_read_kv_pair(elem_cur, arena_alloc)
+		if kv_err != nil {
+			return make_xitdb_err(env, kv_err)
+		}
+		k_str, k_err := read_key_cursor_string(kv.key_cursor, sb_buf[:])
+		if k_err != nil {
+			return make_xitdb_err(env, k_err)
+		}
+		if !strings.has_prefix(k_str, prefix) {
+			break
+		}
+
+		if emitted == limit_int {
+			next_cursor_term = make_binary(env, k_str)
+			break
+		}
+
+		val_slot, vs_err := xitdb.cursor_slot(kv.value_cursor)
+		if vs_err != nil {
+			return make_xitdb_err(env, vs_err)
+		}
+		val_term, vt_err := slot_to_term(env, &handle.db, val_slot)
+		if vt_err != nil {
+			return make_xitdb_err(env, vt_err)
+		}
+
+		append(&items, nif_make_tuple2(env, make_binary(env, k_str), val_term))
+		emitted += 1
+	}
+
+	list_term: ERL_NIF_TERM
+	if len(items) == 0 {
+		list_term = nif_make_list_from_array(env, nil, 0)
+	} else {
+		list_term = nif_make_list_from_array(env, raw_data(items[:]), c.uint(len(items)))
+	}
+	return nif_make_tuple3(env, ATOM_OK, list_term, next_cursor_term)
+}
+
+// `nif_bm25_search(db_ref, root_tag_id, root_val_int, collection_bin, query_terms, limit_int, opts_map)` ->
+// `{:ok, [{doc_key_bin, score_float}, ...]} | {:error, reason}`
+@(export)
+odin_nif_bm25_search :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {
+	context = runtime.default_context()
+
+	arena: mem.Dynamic_Arena
+	mem.dynamic_arena_init(
+		&arena,
+		block_allocator = runtime.default_allocator(),
+		array_allocator = runtime.default_allocator(),
+	)
+	defer mem.dynamic_arena_destroy(&arena)
+
+	arena_alloc := mem.dynamic_arena_allocator(&arena)
+	context.allocator = arena_alloc
+	context.temp_allocator = arena_alloc
+
+	if argc != 7 {
+		return make_err(env, "badarg")
+	}
+
+	handle, ok := get_handle(env, argv[0])
+	if !ok {
+		return make_err(env, "closed")
+	}
+
+	root_tag_id: i64 = 0
+	root_val_int: i64 = 0
+	limit_int: i64 = 0
+	if nif_get_int64(env, argv[1], &root_tag_id) == 0 ||
+	   nif_get_int64(env, argv[2], &root_val_int) == 0 ||
+	   nif_get_int64(env, argv[5], &limit_int) == 0 {
+		return make_err(env, "badarg")
+	}
+
+	collection, ok_col := get_string_from_binary(env, argv[3])
+	if !ok_col {
+		return make_err(env, "badarg")
+	}
+
+	if nif_is_list(env, argv[4]) == 0 {
+		return make_err(env, "badarg")
+	}
+
+	opts, ok_opts := parse_bm25_opts(env, argv[6])
+	if !ok_opts {
+		return make_err(env, "badarg")
+	}
+
+	query_terms := make([dynamic]string, 0, 8, arena_alloc)
+	seen_query_terms := make(map[string]bool, 8, arena_alloc)
+	head: ERL_NIF_TERM
+	tail := argv[4]
+	for nif_is_empty_list(env, tail) == 0 {
+		if nif_get_list_cell(env, tail, &head, &tail) == 0 {
+			return make_err(env, "badarg")
+		}
+		tok, ok_tok := get_string_from_binary(env, head)
+		if !ok_tok {
+			return make_err(env, "badarg")
+		}
+		if len(tok) == 0 || seen_query_terms[tok] {
+			continue
+		}
+		seen_query_terms[tok] = true
+		append(&query_terms, tok)
+	}
+
+	empty_list := nif_make_list_from_array(env, nil, 0)
+	if len(query_terms) == 0 || limit_int <= 0 || len(collection) == 0 {
+		return make_ok(env, empty_list)
+	}
+
+	nif_rwlock_rlock(handle.rwlock)
+	defer nif_rwlock_runlock(handle.rwlock)
+
+	root_cur, has_root, out_of_range, root_err := resolve_snapshot_root_cursor(&handle.db, root_tag_id, root_val_int)
+	if root_err != nil {
+		return make_xitdb_err(env, root_err)
+	}
+	if out_of_range {
+		return make_err(env, "moment_out_of_range")
+	}
+	if !has_root {
+		return make_ok(env, empty_list)
+	}
+
+	// Traverse root["idx"]["search"][collection]
+	root_hm, rhm_err := xitdb.read_hash_map_init(root_cur)
+	if rhm_err != nil {
+		return make_xitdb_err(env, rhm_err)
+	}
+	idx_maybe, idx_err := xitdb.hash_map_get_cursor(root_hm, "idx")
+	if idx_err != nil {
+		return make_xitdb_err(env, idx_err)
+	}
+	idx_cur, has_idx := idx_maybe.?
+	if !has_idx {
+		return make_ok(env, empty_list)
+	}
+
+	idx_hm, ihm_err := xitdb.read_hash_map_init(idx_cur)
+	if ihm_err != nil {
+		return make_xitdb_err(env, ihm_err)
+	}
+	search_maybe, s_err := xitdb.hash_map_get_cursor(idx_hm, "search")
+	if s_err != nil {
+		return make_xitdb_err(env, s_err)
+	}
+	search_cur, has_search := search_maybe.?
+	if !has_search {
+		return make_ok(env, empty_list)
+	}
+
+	search_hm, shm_err := xitdb.read_hash_map_init(search_cur)
+	if shm_err != nil {
+		return make_xitdb_err(env, shm_err)
+	}
+	col_maybe, c_err := xitdb.hash_map_get_cursor(search_hm, collection)
+	if c_err != nil {
+		return make_xitdb_err(env, c_err)
+	}
+	col_cur, has_col := col_maybe.?
+	if !has_col {
+		return make_ok(env, empty_list)
+	}
+
+	col_hm, chm_err := xitdb.read_hash_map_init(col_cur)
+	if chm_err != nil {
+		return make_xitdb_err(env, chm_err)
+	}
+
+	// 1. Read corpus stats from `meta` (`doc_count` & `total_len`)
+	meta_maybe, m_err := xitdb.hash_map_get_cursor(col_hm, "meta")
+	if m_err != nil {
+		return make_xitdb_err(env, m_err)
+	}
+	meta_cur, has_meta := meta_maybe.?
+	if !has_meta {
+		return make_ok(env, empty_list)
+	}
+	meta_hm, mhm_err := xitdb.read_hash_map_init(meta_cur)
+	if mhm_err != nil {
+		return make_xitdb_err(env, mhm_err)
+	}
+
+	doc_count, dc_err := read_hash_map_nonneg_int(meta_hm, "doc_count")
+	if dc_err != nil {
+		return make_xitdb_err(env, dc_err)
+	}
+	total_len, tl_err := read_hash_map_nonneg_int(meta_hm, "total_len")
+	if tl_err != nil {
+		return make_xitdb_err(env, tl_err)
+	}
+
+	if doc_count <= 0 || total_len <= 0 {
+		return make_ok(env, empty_list)
+	}
+
+	docs_maybe, d_err := xitdb.hash_map_get_cursor(col_hm, "docs")
+	if d_err != nil {
+		return make_xitdb_err(env, d_err)
+	}
+	docs_cur, has_docs := docs_maybe.?
+	if !has_docs {
+		return make_ok(env, empty_list)
+	}
+	docs_hm, dhm_err := xitdb.read_hash_map_init(docs_cur)
+	if dhm_err != nil {
+		return make_xitdb_err(env, dhm_err)
+	}
+
+	terms_maybe, t_err := xitdb.hash_map_get_cursor(col_hm, "terms")
+	if t_err != nil {
+		return make_xitdb_err(env, t_err)
+	}
+	terms_cur, has_terms := terms_maybe.?
+	if !has_terms {
+		return make_ok(env, empty_list)
+	}
+	terms_sm, tsm_err := xitdb.read_sorted_map_init(terms_cur)
+	if tsm_err != nil {
+		return make_xitdb_err(env, tsm_err)
+	}
+
+	// 2. Collect virtual-token posting maps (exact + bounded B+Tree prefix expansion)
+	num_tokens := len(query_terms)
+	token_postings := make([]map[string]f64, num_tokens, arena_alloc)
+	idfs := make([]f64, num_tokens, arena_alloc)
+	sb_buf: [8]u8 = ---
+
+	for q_tok, tok_idx in query_terms {
+		merged := make(map[string]f64, 32, arena_alloc)
+		use_prefix := opts.prefix_enabled && utf8.rune_count_in_string(q_tok) >= opts.min_prefix_length
+
+		if use_prefix {
+			it, it_err := xitdb.sorted_map_iterator_from_string(terms_sm, q_tok)
+			if it_err != nil {
+				return make_xitdb_err(env, it_err)
+			}
+			scanned := 0
+			for scanned < opts.max_prefix_expansions {
+				next_maybe, n_err := xitdb.cursor_iterator_next(&it)
+				if n_err != nil {
+					return make_xitdb_err(env, n_err)
+				}
+				elem_cur, has_next := next_maybe.?
+				if !has_next {
+					break
+				}
+				kv, kv_err := xitdb.cursor_read_kv_pair(elem_cur, arena_alloc)
+				if kv_err != nil {
+					return make_xitdb_err(env, kv_err)
+				}
+				matched_term, kt_err := read_key_cursor_string(kv.key_cursor, sb_buf[:])
+				if kt_err != nil {
+					return make_xitdb_err(env, kt_err)
+				}
+				if !strings.has_prefix(matched_term, q_tok) {
+					break
+				}
+				mult := opts.exact_boost if matched_term == q_tok else opts.prefix_weight
+				if cp_err := collect_postings_into_map(kv.value_cursor, mult, &merged, arena_alloc); cp_err != nil {
+					return make_xitdb_err(env, cp_err)
+				}
+				scanned += 1
+			}
+		} else {
+			p_maybe, p_err := xitdb.sorted_map_get_cursor(terms_sm, q_tok)
+			if p_err != nil {
+				return make_xitdb_err(env, p_err)
+			}
+			if p_cur, has_p := p_maybe.?; has_p {
+				if cp_err := collect_postings_into_map(p_cur, opts.exact_boost, &merged, arena_alloc); cp_err != nil {
+					return make_xitdb_err(env, cp_err)
+				}
+			}
+		}
+
+		if opts.match_mode == .All && len(merged) == 0 {
+			return make_ok(env, empty_list)
+		}
+
+		df := f64(len(merged))
+		idfs[tok_idx] = math.ln(1.0 + (f64(doc_count) - df + 0.5) / (df + 0.5))
+		token_postings[tok_idx] = merged
+	}
+
+	// 3. Resolve candidate document keys (`:all` smallest-posting intersection vs `:any` union)
+	candidates := make([dynamic]string, 0, 64, arena_alloc)
+	if opts.match_mode == .All {
+		smallest_idx := 0
+		for i in 1 ..< num_tokens {
+			if len(token_postings[i]) < len(token_postings[smallest_idx]) {
+				smallest_idx = i
+			}
+		}
+		for doc_key in token_postings[smallest_idx] {
+			in_all := true
+			for i in 0 ..< num_tokens {
+				if i == smallest_idx {
+					continue
+				}
+				if doc_key not_in token_postings[i] {
+					in_all = false
+					break
+				}
+			}
+			if in_all {
+				append(&candidates, doc_key)
+			}
+		}
+	} else {
+		seen_docs := make(map[string]bool, 64, arena_alloc)
+		for i in 0 ..< num_tokens {
+			for doc_key in token_postings[i] {
+				if !seen_docs[doc_key] {
+					seen_docs[doc_key] = true
+					append(&candidates, doc_key)
+				}
+			}
+		}
+	}
+
+	if len(candidates) == 0 {
+		return make_ok(env, empty_list)
+	}
+
+	// 4. Score candidates in IEEE-754 f64 & maintain bounded Top-K min-heap
+	avg_dl := max((f64(total_len) / BM25_WEIGHT_SCALE) / f64(doc_count), 1.0e-6)
+	k_limit := int(limit_int)
+	top_heap := make([dynamic]BM25_Hit, 0, min(len(candidates), k_limit), arena_alloc)
+
+	for doc_key in candidates {
+		raw_doc_len: i64 = 0
+		doc_maybe, dm_err := xitdb.hash_map_get_cursor(docs_hm, doc_key)
+		if dm_err != nil {
+			return make_xitdb_err(env, dm_err)
+		}
+		if doc_cur, has_doc := doc_maybe.?; has_doc {
+			doc_entry_hm, de_err := xitdb.read_hash_map_init(doc_cur)
+			if de_err != nil {
+				return make_xitdb_err(env, de_err)
+			}
+			dl_val, dl_err := read_hash_map_nonneg_int(doc_entry_hm, "len")
+			if dl_err != nil {
+				return make_xitdb_err(env, dl_err)
+			}
+			raw_doc_len = dl_val
+		}
+
+		doc_len := f64(raw_doc_len) / BM25_WEIGHT_SCALE
+		norm := opts.k1 * (1.0 - opts.b + opts.b * (doc_len / avg_dl))
+
+		score: f64 = 0.0
+		for i in 0 ..< num_tokens {
+			if tf, ok_tf := token_postings[i][doc_key]; ok_tf && tf > 0.0 {
+				score += idfs[i] * (tf * (opts.k1 + 1.0)) / (tf + norm)
+			}
+		}
+
+		if score > 0.0 {
+			bm25_heap_push(&top_heap, BM25_Hit{doc_key = doc_key, score = score}, k_limit)
+		}
+	}
+
+	if len(top_heap) == 0 {
+		return make_ok(env, empty_list)
+	}
+
+	slice.sort_by(top_heap[:], bm25_hit_better)
+
+	hit_terms := make([]ERL_NIF_TERM, len(top_heap), arena_alloc)
+	for hit, idx in top_heap {
+		hit_terms[idx] = nif_make_tuple2(
+			env,
+			make_binary(env, hit.doc_key),
+			nif_make_double(env, hit.score),
+		)
+	}
+	return make_ok(env, nif_make_list_from_array(env, raw_data(hit_terms), c.uint(len(hit_terms))))
 }

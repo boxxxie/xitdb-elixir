@@ -34,4 +34,18 @@ defmodule Xitdb.NIF do
   def nif_history_of(_db_ref, _selector), do: :erlang.nif_error(:nif_not_loaded)
   def nif_query_datalog(_db_ref, _moment_idx, _query_str), do: :erlang.nif_error(:nif_not_loaded)
   def nif_compact(_db_ref, _target_path), do: :erlang.nif_error(:nif_not_loaded)
+
+  def nif_sorted_map_seek(_db_ref, _slot_tag_id, _slot_val_int, _prefix_bin, _limit_int),
+    do: :erlang.nif_error(:nif_not_loaded)
+
+  def nif_bm25_search(
+        _db_ref,
+        _root_tag_id,
+        _root_val_int,
+        _collection_bin,
+        _query_terms,
+        _limit_int,
+        _opts_map
+      ),
+      do: :erlang.nif_error(:nif_not_loaded)
 end

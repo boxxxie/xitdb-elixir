@@ -64,6 +64,23 @@ if Code.ensure_loaded?(Ash.DataLayer) do
                       type: :any,
                       default: nil,
                       doc: "Explicit `%Xitdb{}` handle; defaults to `Snapshot.current_db/1`."
+                    ],
+                    exact_boost: [
+                      type: :float,
+                      default: @exact_match_boost,
+                      doc:
+                        "Term-frequency multiplier when a matched index term equals the query token."
+                    ],
+                    prefix_weight: [
+                      type: :float,
+                      default: 1.0,
+                      doc: "Term-frequency multiplier for non-exact B+Tree prefix expansions."
+                    ],
+                    backend: [
+                      type: {:in, [:auto, :nif, :elixir]},
+                      default: :auto,
+                      doc:
+                        "Selects native Odin NIF pushdown (`:nif`), cursor-backed Elixir baseline (`:elixir`), or automatic NIF dispatch (`:auto`)."
                     ]
                   )
 
@@ -216,6 +233,64 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     end
 
     defp score_collection(db, collection, tokens, opts, pk_kind) do
+      case resolve_backend(opts[:backend], db) do
+        :nif -> score_collection_nif(db, collection, tokens, opts, pk_kind)
+        :elixir -> score_collection_elixir(db, collection, tokens, opts, pk_kind)
+      end
+    end
+
+    defp resolve_backend(:elixir, _db), do: :elixir
+    defp resolve_backend(:nif, _db), do: :nif
+
+    defp resolve_backend(:auto, db) do
+      case Storage.root_cursor(db) do
+        %Xitdb.Cursor{tx_mode: false} ->
+          if function_exported?(Xitdb.NIF, :nif_bm25_search, 7), do: :nif, else: :elixir
+
+        _ ->
+          :elixir
+      end
+    end
+
+    defp score_collection_nif(db, collection, tokens, opts, pk_kind) do
+      case Storage.root_cursor(db) do
+        %Xitdb.Cursor{tx_mode: false, db_ref: db_ref, tag_id: root_tag_id, value: root_val_int} ->
+          nif_opts = %{
+            match: opts[:match],
+            prefix: opts[:prefix?],
+            min_prefix_length: opts[:min_prefix_length],
+            max_prefix_expansions: opts[:max_prefix_expansions],
+            k1: opts[:k1] * 1.0,
+            b: opts[:b] * 1.0,
+            exact_boost: opts[:exact_boost] * 1.0,
+            prefix_weight: opts[:prefix_weight] * 1.0
+          }
+
+          case Xitdb.NIF.nif_bm25_search(
+                 db_ref,
+                 root_tag_id,
+                 root_val_int,
+                 collection,
+                 tokens,
+                 opts[:limit],
+                 nif_opts
+               ) do
+            {:ok, raw_hits} ->
+              Enum.map(raw_hits, fn {doc_key, score} ->
+                {decode_doc_key(doc_key, pk_kind), score}
+              end)
+
+            {:error, reason} ->
+              raise Xitdb.Error, reason: reason, details: %{collection: collection}
+          end
+
+        _ ->
+          raise ArgumentError,
+                "backend: :nif requires a committed Xitdb handle or snapshot cursor"
+      end
+    end
+
+    defp score_collection_elixir(db, collection, tokens, opts, pk_kind) do
       %{doc_count: doc_count, total_len: total_len} = Storage.read_corpus_stats(db, collection)
 
       if doc_count <= 0 or total_len <= 0 do
@@ -241,18 +316,26 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     # Merges exact hits + bounded B+Tree prefix hits into a single virtual term per query token
     # so morphological variants ("cap", "capital") never double-count IDF on the same token.
     defp collect_token_postings(db, collection, token, opts) do
+      exact_boost = opts[:exact_boost]
+      prefix_weight = opts[:prefix_weight]
       exact_postings = Storage.lookup_term(db, collection, token)
 
       prefix_postings =
         if opts[:prefix?] and String.length(token) >= opts[:min_prefix_length] do
-          Storage.scan_prefix(db, collection, token, opts[:max_prefix_expansions])
+          Storage.scan_prefix(
+            db,
+            collection,
+            token,
+            opts[:max_prefix_expansions],
+            opts[:backend]
+          )
         else
           []
         end
 
       merged =
         Enum.reduce(prefix_postings, %{}, fn {matched_term, postings}, acc ->
-          multiplier = if matched_term == token, do: @exact_match_boost, else: 1.0
+          multiplier = if matched_term == token, do: exact_boost, else: prefix_weight
 
           Enum.reduce(postings, acc, fn {doc_key, scaled_tf}, inner ->
             tf = scaled_tf / @weight_scale * multiplier
@@ -262,7 +345,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
       if prefix_postings == [] do
         Map.new(exact_postings, fn {doc_key, scaled_tf} ->
-          {doc_key, scaled_tf / @weight_scale * @exact_match_boost}
+          {doc_key, scaled_tf / @weight_scale * exact_boost}
         end)
       else
         merged
@@ -322,13 +405,14 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           end)
 
         if score > 0.0 do
-          [{decode_doc_key(doc_key, pk_kind), score} | acc]
+          [{doc_key, score} | acc]
         else
           acc
         end
       end)
-      |> Enum.sort_by(fn {id, score} -> {-score, id} end)
+      |> Enum.sort_by(fn {doc_key, score} -> {-score, doc_key} end)
       |> Enum.take(opts[:limit])
+      |> Enum.map(fn {doc_key, score} -> {decode_doc_key(doc_key, pk_kind), score} end)
     end
 
     # -- Internal Indexing & Diff Calculation --
@@ -518,10 +602,48 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       end
     end
 
-    @spec scan_prefix(term(), String.t(), String.t(), pos_integer()) :: [
+    @spec scan_prefix_cursors(term(), String.t(), String.t(), pos_integer()) ::
+            {[{String.t(), Xitdb.Cursor.t()}], String.t() | nil}
+    def scan_prefix_cursors(db, collection, prefix, limit) do
+      case get_in_search(db, collection, "terms") do
+        %Xitdb.Cursor{db_ref: db_ref, tag_id: tag_id, value: val, moment: moment} ->
+          case Xitdb.NIF.nif_sorted_map_seek(db_ref, tag_id, val, prefix, limit) do
+            {:ok, entries, next_cursor} ->
+              cursors =
+                Enum.map(entries, fn {term, slot_tuple} ->
+                  {term, Xitdb.Cursor.from_nif_tuple(db_ref, slot_tuple, moment)}
+                end)
+
+              {cursors, next_cursor}
+
+            _ ->
+              {[], nil}
+          end
+
+        _ ->
+          {[], nil}
+      end
+    end
+
+    @spec scan_prefix(term(), String.t(), String.t(), pos_integer(), :auto | :nif | :elixir) :: [
             {String.t(), [{String.t(), pos_integer()}]}
           ]
-    def scan_prefix(db, collection, prefix, limit) do
+    def scan_prefix(db, collection, prefix, limit, backend \\ :auto)
+
+    def scan_prefix(db, collection, prefix, limit, :elixir) do
+      scan_prefix_via_slot_entries(db, collection, prefix, limit)
+    end
+
+    def scan_prefix(db, collection, prefix, limit, _backend) do
+      if function_exported?(Xitdb.NIF, :nif_sorted_map_seek, 5) do
+        {cursor_entries, _next} = scan_prefix_cursors(db, collection, prefix, limit)
+        Enum.map(cursor_entries, fn {term, cur} -> {term, Enum.to_list(cur)} end)
+      else
+        scan_prefix_via_slot_entries(db, collection, prefix, limit)
+      end
+    end
+
+    defp scan_prefix_via_slot_entries(db, collection, prefix, limit) do
       case get_in_search(db, collection, "terms") do
         nil ->
           []
@@ -668,10 +790,11 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       end
     end
 
-    defp root_cursor({%Xitdb{} = db, moment}) when is_integer(moment), do: Xitdb.as_of(db, moment)
-    defp root_cursor(%Xitdb.Cursor{} = cursor), do: cursor
-    defp root_cursor(%Xitdb{} = db), do: Xitdb.db(db)
-    defp root_cursor(_), do: nil
+    @doc false
+    def root_cursor({%Xitdb{} = db, moment}) when is_integer(moment), do: Xitdb.as_of(db, moment)
+    def root_cursor(%Xitdb.Cursor{} = cursor), do: cursor
+    def root_cursor(%Xitdb{} = db), do: Xitdb.db(db)
+    def root_cursor(_), do: nil
 
     defp get_in_search(db, collection, slot) do
       with %Xitdb.Cursor{} = root <- root_cursor(db),

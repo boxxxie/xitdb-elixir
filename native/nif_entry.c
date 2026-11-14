@@ -26,6 +26,8 @@ extern ERL_NIF_TERM odin_nif_diff_moments(ErlNifEnv* env, int argc, const ERL_NI
 extern ERL_NIF_TERM odin_nif_history_of(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 extern ERL_NIF_TERM odin_nif_query_datalog(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 extern ERL_NIF_TERM odin_nif_compact(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+extern ERL_NIF_TERM odin_nif_sorted_map_seek(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+extern ERL_NIF_TERM odin_nif_bm25_search(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 
 static void xitdb_resource_dtor(ErlNifEnv* env, void* obj) {
     odin_nif_dtor(env, obj);
@@ -165,6 +167,10 @@ int nif_is_map(ErlNifEnv* env, ERL_NIF_TERM term) {
     return enif_is_map(env, term);
 }
 
+int nif_get_map_value(ErlNifEnv* env, ERL_NIF_TERM map, ERL_NIF_TERM key, ERL_NIF_TERM* val_out) {
+    return enif_get_map_value(env, map, key, val_out);
+}
+
 // Term creation helpers
 ERL_NIF_TERM nif_make_atom_len(ErlNifEnv* env, const char* name, size_t len) {
     return enif_make_atom_len(env, name, len);
@@ -234,7 +240,9 @@ static ErlNifFunc nif_funcs[] = {
     {"nif_diff_moments",     3, odin_nif_diff_moments,     0},
     {"nif_history_of",       2, odin_nif_history_of,       0},
     {"nif_query_datalog",    3, odin_nif_query_datalog,    0},
-    {"nif_compact",          2, odin_nif_compact,          ERL_NIF_DIRTY_JOB_IO_BOUND}
+    {"nif_compact",          2, odin_nif_compact,          ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"nif_sorted_map_seek",  5, odin_nif_sorted_map_seek,  ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_bm25_search",      7, odin_nif_bm25_search,      ERL_NIF_DIRTY_JOB_CPU_BOUND}
 };
 
 ERL_NIF_INIT(Elixir.Xitdb.NIF, nif_funcs, nif_load, NULL, nif_upgrade, NULL)

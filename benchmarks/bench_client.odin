@@ -1,12 +1,15 @@
 package xitdb_client_benchmarks
 
+import "base:runtime"
 import "core:fmt"
 import "core:math"
+import "core:mem"
 import "core:os"
 import "core:slice"
 import "core:strconv"
 import "core:strings"
 import "core:time"
+import "core:unicode/utf8"
 import xitdb "xitdb:."
 
 MAX_RUNS :: 64
@@ -202,6 +205,249 @@ seed_fixture_db :: proc(core: ^xitdb.Core, db: ^xitdb.Database, n: int) {
 	xitdb.tx_report_destroy(&rep, context.temp_allocator)
 }
 
+BENCH_BM25_WEIGHT_SCALE :: 100.0
+
+Bench_BM25_Hit :: struct {
+	doc_key: string,
+	score:   f64,
+}
+
+bench_bm25_hit_better :: #force_inline proc(a, b: Bench_BM25_Hit) -> bool {
+	if a.score != b.score {
+		return a.score > b.score
+	}
+	return a.doc_key < b.doc_key
+}
+
+bench_bm25_hit_worse :: #force_inline proc(a, b: Bench_BM25_Hit) -> bool {
+	return bench_bm25_hit_better(b, a)
+}
+
+bench_bm25_heap_push :: proc(heap: ^[dynamic]Bench_BM25_Hit, item: Bench_BM25_Hit, k: int) {
+	if len(heap^) < k {
+		append(heap, item)
+		idx := len(heap^) - 1
+		for idx > 0 {
+			parent := (idx - 1) / 2
+			if bench_bm25_hit_worse(heap[idx], heap[parent]) {
+				heap[idx], heap[parent] = heap[parent], heap[idx]
+				idx = parent
+			} else {
+				break
+			}
+		}
+		return
+	}
+	if k > 0 && bench_bm25_hit_better(item, heap[0]) {
+		heap[0] = item
+		n := len(heap^)
+		idx := 0
+		for {
+			left := 2*idx + 1
+			right := 2*idx + 2
+			worst := idx
+			if left < n && bench_bm25_hit_worse(heap[left], heap[worst]) {
+				worst = left
+			}
+			if right < n && bench_bm25_hit_worse(heap[right], heap[worst]) {
+				worst = right
+			}
+			if worst == idx {
+				break
+			}
+			heap[idx], heap[worst] = heap[worst], heap[idx]
+			idx = worst
+		}
+	}
+}
+
+bench_read_arena_string :: proc(cur: xitdb.Read_Cursor, alloc: mem.Allocator) -> string {
+	slot_ptr, _ := xitdb.cursor_resolved(cur)
+	if slot_ptr.slot.tag == .Short_Bytes && !slot_ptr.slot.full {
+		sb_buf: [8]u8 = ---
+		b_obj, _ := xitdb.cursor_read_bytes_buf(cur, sb_buf[:])
+		return strings.clone(string(b_obj.value), alloc)
+	}
+	s, _ := xitdb.cursor_read_string(cur, 0, alloc)
+	return s
+}
+
+bench_read_nonneg_int :: proc(hm: xitdb.Read_Hash_Map, key: string) -> i64 {
+	cm, _ := xitdb.hash_map_get_cursor(hm, key)
+	cur, ok := cm.?
+	if !ok {
+		return 0
+	}
+	sp, _ := xitdb.cursor_resolved(cur)
+	if sp.slot.tag == .Uint {
+		u, _ := xitdb.cursor_read_uint(cur)
+		return i64(u)
+	}
+	if sp.slot.tag == .Int {
+		v, _ := xitdb.cursor_read_int(cur)
+		return max(v, 0)
+	}
+	return 0
+}
+
+seed_bm25_fixture_db :: proc(db: ^xitdb.Database, n: int) {
+	nord_variants := [?]string{"nordic", "north", "nordstrom"}
+	cap_variants := [?]string{"capital", "captain", "cap", "capsule"}
+	extra_terms := [?]string{"equity", "growth", "market", "credit", "buyout", "zurich", "london", "tokyo"}
+
+	tx := xitdb.tx_init(db, base_moment = -1, track_changes = false, allocator = context.temp_allocator)
+	defer xitdb.tx_destroy(&tx)
+
+	total_len: u64 = 0
+	for i in 0 ..< n {
+		doc_key := fmt.tprintf("%d", i + 1)
+		t1 := nord_variants[i % len(nord_variants)]
+		t2 := cap_variants[i % len(cap_variants)]
+		t3 := extra_terms[i % len(extra_terms)]
+
+		_ = xitdb.tx_put(&tx, fmt.tprintf(".idx.search.articles.docs.%s.len", doc_key), u64(600))
+		_ = xitdb.tx_put(&tx, fmt.tprintf(".idx.search.articles.terms$%s.%s", t1, doc_key), u64(300))
+		_ = xitdb.tx_put(&tx, fmt.tprintf(".idx.search.articles.terms$%s.%s", t2, doc_key), u64(200))
+		_ = xitdb.tx_put(&tx, fmt.tprintf(".idx.search.articles.terms$%s.%s", t3, doc_key), u64(100))
+		total_len += 600
+	}
+	_ = xitdb.tx_put(&tx, ".idx.search.articles.meta.doc_count", u64(n))
+	_ = xitdb.tx_put(&tx, ".idx.search.articles.meta.total_len", total_len)
+
+	rep, _ := xitdb.tx_commit(&tx)
+	xitdb.tx_report_destroy(&rep, context.temp_allocator)
+}
+
+bench_raw_bm25_search :: proc(root_map: xitdb.Read_Hash_Map, collection: string, query_terms: []string, k_limit: int) -> []Bench_BM25_Hit {
+	arena: mem.Dynamic_Arena
+	mem.dynamic_arena_init(
+		&arena,
+		block_allocator = runtime.default_allocator(),
+		array_allocator = runtime.default_allocator(),
+	)
+	defer mem.dynamic_arena_destroy(&arena)
+	alloc := mem.dynamic_arena_allocator(&arena)
+
+	idx_c, _ := xitdb.hash_map_get_cursor(root_map, "idx")
+	idx_m, _ := xitdb.read_hash_map_init(idx_c.?)
+	search_c, _ := xitdb.hash_map_get_cursor(idx_m, "search")
+	search_m, _ := xitdb.read_hash_map_init(search_c.?)
+	col_c, _ := xitdb.hash_map_get_cursor(search_m, collection)
+	col_m, _ := xitdb.read_hash_map_init(col_c.?)
+
+	meta_c, _ := xitdb.hash_map_get_cursor(col_m, "meta")
+	meta_m, _ := xitdb.read_hash_map_init(meta_c.?)
+	doc_count := bench_read_nonneg_int(meta_m, "doc_count")
+	total_len := bench_read_nonneg_int(meta_m, "total_len")
+
+	docs_c, _ := xitdb.hash_map_get_cursor(col_m, "docs")
+	docs_m, _ := xitdb.read_hash_map_init(docs_c.?)
+	terms_c, _ := xitdb.hash_map_get_cursor(col_m, "terms")
+	terms_sm, _ := xitdb.read_sorted_map_init(terms_c.?)
+
+	num_tokens := len(query_terms)
+	token_postings := make([]map[string]f64, num_tokens, alloc)
+	idfs := make([]f64, num_tokens, alloc)
+	sb_buf: [8]u8 = ---
+
+	for q_tok, tok_idx in query_terms {
+		merged := make(map[string]f64, 32, alloc)
+		if utf8.rune_count_in_string(q_tok) >= 3 {
+			it, _ := xitdb.sorted_map_iterator_from_string(terms_sm, q_tok)
+			scanned := 0
+			for scanned < 64 {
+				nm, _ := xitdb.cursor_iterator_next(&it)
+				elem_c, has_next := nm.?
+				if !has_next {
+					break
+				}
+				kv, _ := xitdb.cursor_read_kv_pair(elem_c, alloc)
+				matched := bench_read_arena_string(kv.key_cursor, alloc)
+				if !strings.has_prefix(matched, q_tok) {
+					break
+				}
+				mult := 1.25 if matched == q_tok else 1.0
+				pit, _ := xitdb.cursor_iterator(kv.value_cursor)
+				for {
+					pnm, _ := xitdb.cursor_iterator_next(&pit)
+					pelem, ph := pnm.?
+					if !ph {
+						break
+					}
+					pkv, _ := xitdb.cursor_read_kv_pair(pelem, alloc)
+					dk := bench_read_arena_string(pkv.key_cursor, alloc)
+					if dk == "__tx" {
+						continue
+					}
+					vsp, _ := xitdb.cursor_resolved(pkv.value_cursor)
+					raw_tf: i64 = 0
+					if vsp.slot.tag == .Uint {
+						u, _ := xitdb.cursor_read_uint(pkv.value_cursor)
+						raw_tf = i64(u)
+					} else if vsp.slot.tag == .Int {
+						iv, _ := xitdb.cursor_read_int(pkv.value_cursor)
+						raw_tf = iv
+					}
+					if raw_tf > 0 {
+						tf := (f64(raw_tf) / BENCH_BM25_WEIGHT_SCALE) * mult
+						merged[dk] = merged[dk] + tf
+					}
+				}
+				scanned += 1
+			}
+		} else {
+			_ = sb_buf
+		}
+		df := f64(len(merged))
+		idfs[tok_idx] = math.ln(1.0 + (f64(doc_count) - df + 0.5) / (df + 0.5))
+		token_postings[tok_idx] = merged
+	}
+
+	candidates := make([dynamic]string, 0, 64, alloc)
+	smallest_idx := 0
+	for i in 1 ..< num_tokens {
+		if len(token_postings[i]) < len(token_postings[smallest_idx]) {
+			smallest_idx = i
+		}
+	}
+	for dk in token_postings[smallest_idx] {
+		in_all := true
+		for i in 0 ..< num_tokens {
+			if i != smallest_idx && dk not_in token_postings[i] {
+				in_all = false
+				break
+			}
+		}
+		if in_all {
+			append(&candidates, dk)
+		}
+	}
+
+	avg_dl := max((f64(total_len) / BENCH_BM25_WEIGHT_SCALE) / f64(doc_count), 1.0e-6)
+	top_heap := make([dynamic]Bench_BM25_Hit, 0, min(len(candidates), k_limit), alloc)
+	for dk in candidates {
+		dm, _ := xitdb.hash_map_get_cursor(docs_m, dk)
+		raw_len: i64 = 0
+		if dc, hd := dm.?; hd {
+			dem, _ := xitdb.read_hash_map_init(dc)
+			raw_len = bench_read_nonneg_int(dem, "len")
+		}
+		dl := f64(raw_len) / BENCH_BM25_WEIGHT_SCALE
+		norm := 1.2 * (1.0 - 0.75 + 0.75 * (dl / avg_dl))
+		score: f64 = 0.0
+		for i in 0 ..< num_tokens {
+			if tf, ok_tf := token_postings[i][dk]; ok_tf && tf > 0.0 {
+				score += idfs[i] * (tf * 2.2) / (tf + norm)
+			}
+		}
+		if score > 0.0 {
+			bench_bm25_heap_push(&top_heap, Bench_BM25_Hit{doc_key = dk, score = score}, k_limit)
+		}
+	}
+	slice.sort_by(top_heap[:], bench_bm25_hit_better)
+	return top_heap[:]
+}
+
 main :: proc() {
 	g_commit_sha = resolve_git_commit()
 	unix_sec := i64(time.to_unix_nanoseconds(time.now())) / 1_000_000_000
@@ -217,7 +463,7 @@ main :: proc() {
 		}
 	}
 
-	g_records = make([dynamic]Bench_Record, 0, 24)
+	g_records = make([dynamic]Bench_Record, 0, 26)
 
 	// Shared fixture DB for read/query benchmarks (N=500)
 	core := xitdb.core_memory_init()
@@ -713,6 +959,64 @@ main :: proc() {
 		sz, _ := xitdb.core_length(&c)
 		return dur, sz
 	})
+
+	// #25: Search: Sorted_Map B+Tree prefix seek (limit=16)
+	sb_seek: [8]u8 = ---
+	for r in 0 ..< (g_warmup + g_runs) {
+		t0 := time.now()
+		for _ in 0 ..< 100 {
+			it, _ := xitdb.sorted_map_iterator_from_string(sorted_map, "u4")
+			cnt := 0
+			for cnt < 16 {
+				nm, _ := xitdb.cursor_iterator_next(&it)
+				ec, hn := nm.?
+				if !hn {
+					break
+				}
+				kv, _ := xitdb.cursor_read_kv_pair(ec, context.temp_allocator)
+				sp, _ := xitdb.cursor_resolved(kv.key_cursor)
+				ks: string
+				if sp.slot.tag == .Short_Bytes && !sp.slot.full {
+					bo, _ := xitdb.cursor_read_bytes_buf(kv.key_cursor, sb_seek[:])
+					ks = string(bo.value)
+				} else {
+					ks, _ = xitdb.cursor_read_string(kv.key_cursor, 0, context.temp_allocator)
+				}
+				if !strings.has_prefix(ks, "u4") {
+					break
+				}
+				_, _ = xitdb.cursor_slot(kv.value_cursor)
+				cnt += 1
+			}
+		}
+		if r >= g_warmup {
+			samples[r - g_warmup] = f64(time.duration_nanoseconds(time.since(t0))) / 100.0
+		}
+		free_all(context.temp_allocator)
+	}
+	record_samples(25, "Search: Sorted_Map B+Tree prefix seek (limit=16)", 100, samples)
+
+	// #26: Search: BM25 corpus search (N=200, 2-term prefix, limit=10)
+	search_core := xitdb.core_memory_init()
+	defer xitdb.core_destroy(&search_core)
+	search_db, _ := xitdb.database_init(&search_core, xitdb.sha1_hasher())
+	seed_bm25_fixture_db(&search_db, 200)
+	s_rc := xitdb.database_root_cursor(&search_db).read_cursor
+	s_hist, _ := xitdb.read_array_list_init(s_rc)
+	s_m0_cur, _ := xitdb.array_list_get_cursor(s_hist, 0)
+	s_m0_map, _ := xitdb.read_hash_map_init(s_m0_cur.?)
+	bm25_q := [2]string{"nord", "cap"}
+	for r in 0 ..< (g_warmup + g_runs) {
+		t0 := time.now()
+		for _ in 0 ..< 50 {
+			_ = bench_raw_bm25_search(s_m0_map, "articles", bm25_q[:], 10)
+		}
+		if r >= g_warmup {
+			samples[r - g_warmup] = f64(time.duration_nanoseconds(time.since(t0))) / 50.0
+		}
+		free_all(context.temp_allocator)
+	}
+	record_samples(26, "Search: BM25 corpus search (N=200, 2-term prefix, limit=10)", 50, samples)
 
 	emit_jsonl()
 }
