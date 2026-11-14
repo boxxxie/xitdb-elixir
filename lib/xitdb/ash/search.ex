@@ -535,7 +535,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     #   ├── "docs"  (:hash_map -> doc_key => %{"len" => int, "terms" => %{term => weight}})
     #   └── "terms" (:sorted_map -> term => %{doc_key => weight})
 
-    alias Xitdb.TxCompiler
+    alias Xitdb.Selector
 
     @spec read_entity_field(term(), String.t(), String.t(), String.t() | atom()) :: term()
     def read_entity_field(db, collection, doc_key, attr_key) do
@@ -725,8 +725,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     end
 
     def apply_diff(db, collection, doc_key, diff) do
-      col_str = TxCompiler.format_key(collection)
-      doc_str = TxCompiler.format_key(doc_key)
+      col_str = Selector.format_key(collection)
+      doc_str = Selector.format_key(doc_key)
 
       meta_prefix = ".idx.search." <> col_str <> ".meta"
       docs_prefix = ".idx.search." <> col_str <> ".docs"
@@ -751,7 +751,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           %{len: len, terms: doc_terms} ->
             put_terms =
               Enum.map(doc_terms, fn {term, weight} ->
-                {:put, doc_path <> ".terms." <> TxCompiler.format_key(term), weight}
+                {:put, doc_path <> ".terms." <> Selector.format_key(term), weight}
               end)
 
             [
@@ -763,11 +763,11 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       term_ops =
         Enum.flat_map(diff.term_ops, fn
           {:put, term, weight} ->
-            term_str = TxCompiler.format_key(term)
+            term_str = Selector.format_key(term)
             [{:put, terms_prefix <> "$" <> term_str <> "." <> doc_str, weight}]
 
           {:delete, term} ->
-            term_str = TxCompiler.format_key(term)
+            term_str = Selector.format_key(term)
             postings = lookup_term(db, collection, term)
 
             if length(postings) <= 1 do

@@ -10,7 +10,7 @@ defmodule Xitdb.Sigils do
       query = ~q"find ?name where .users[?id].username = ?name"
   """
 
-  @valid_sigil_starts [?., ?#, ?$, ?[, ?%, ?^, ?@]
+  import Xitdb.Selector, only: [is_valid_selector_start: 1]
 
   @doc """
   Validates a `xitdb` path selector at compile time and returns the canonical selector string.
@@ -18,7 +18,7 @@ defmodule Xitdb.Sigils do
   defmacro sigil_x({:<<>>, _meta, [selector]}, _modifiers) when is_binary(selector) do
     trimmed = String.trim(selector)
 
-    if trimmed == "" or :binary.first(trimmed) not in @valid_sigil_starts do
+    if trimmed == "" or not is_valid_selector_start(:binary.first(trimmed)) do
       raise ArgumentError,
             "Invalid ~x selector #{inspect(selector)}: must start with ., #, $, [, %, ^, or @"
     end

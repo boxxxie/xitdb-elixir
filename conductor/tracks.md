@@ -110,7 +110,7 @@ Each track has its own specification and implementation plan in [`./tracks/`](./
 
 ---
 
-- [ ] **Track 6 [Wave 4 — Core Architecture Cleanup]: Split `lib/xitdb/dsl.ex` (`Selector`, `PathCompiler`, `DatalogCompiler`, `TxRuntime`/`TxRewriter`) & Invert Ash/Spark Dependency**
+- [x] **Track 6 [Wave 4 — Core Architecture Cleanup]: Split `lib/xitdb/dsl.ex` (`Selector`, `PathCompiler`, `DatalogCompiler`, `TxRuntime`/`TxRewriter`) & Invert Ash/Spark Dependency**
   *Link: [./tracks/split_dsl_and_invert_ash_dependency_20261111/](./tracks/split_dsl_and_invert_ash_dependency_20261111/)*
 
 ---

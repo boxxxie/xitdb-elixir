@@ -11,7 +11,7 @@ defmodule Xitdb do
 
   @behaviour Access
 
-  alias Xitdb.{Collection, Cursor, Error, NIF, Pull, TxCompiler}
+  alias Xitdb.{Collection, Cursor, Error, NIF, Pull, Selector, TxCompiler}
 
   defmacro path(expr) do
     quote do
@@ -344,7 +344,7 @@ defmodule Xitdb do
   @spec insert_at(Cursor.t(), String.t() | [term()], integer(), term()) :: Cursor.t()
   def insert_at(%Cursor{} = root, path_or_selector, index, value)
       when (is_list(path_or_selector) or is_binary(path_or_selector)) and is_integer(index) do
-    selector = TxCompiler.format_path_steps(path_or_selector)
+    selector = Selector.format_path_steps(path_or_selector)
     %Cursor{root | staged_ops: [{:insert, selector, index, value} | root.staged_ops]}
   end
 
@@ -356,8 +356,8 @@ defmodule Xitdb do
   def delete_at(%Cursor{} = root, path_or_selector, index)
       when (is_list(path_or_selector) or is_binary(path_or_selector)) and is_integer(index) do
     selector =
-      TxCompiler.format_path_steps(path_or_selector) <>
-        TxCompiler.format_step(:linked_array_list, index)
+      Selector.format_path_steps(path_or_selector) <>
+        Selector.format_step(:linked_array_list, index)
 
     %Cursor{root | staged_ops: [{:rm, selector} | root.staged_ops]}
   end

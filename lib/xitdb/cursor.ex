@@ -16,7 +16,7 @@ defmodule Xitdb.Cursor do
 
   @behaviour Access
 
-  alias Xitdb.{NIF, TxCompiler}
+  alias Xitdb.{NIF, Selector, TxCompiler}
 
   @enforce_keys [:db_ref, :tag, :tag_id, :value]
   defstruct [
@@ -256,7 +256,7 @@ defmodule Xitdb.Cursor do
     rev_steps
     |> :lists.reverse()
     |> Enum.map_join("", fn {kind, key_or_idx} ->
-      TxCompiler.format_step(kind, key_or_idx)
+      Selector.format_step(kind, key_or_idx)
     end)
   end
 

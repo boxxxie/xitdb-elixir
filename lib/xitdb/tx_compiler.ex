@@ -1,7 +1,11 @@
 defmodule Xitdb.TxCompiler do
   @moduledoc false
 
-  alias Xitdb.Collection
+  alias Xitdb.{Collection, Selector}
+
+  # Retained for Xitdb.Ash.Indexer.Storage and Xitdb.Ash.Mutator.Sequences
+  defdelegate format_step(kind, key), to: Selector
+  defdelegate format_key(key), to: Selector
 
   @doc """
   Compiles a nested Elixir map or `Xitdb.Collection` into a flat list of
@@ -22,7 +26,7 @@ defmodule Xitdb.TxCompiler do
     acc =
       :maps.fold(
         fn k, v, a ->
-          compile_node_acc(format_step(:hash_map, k), v, false, a)
+          compile_node_acc(Selector.format_step(:hash_map, k), v, false, a)
         end,
         acc,
         map
@@ -30,133 +34,6 @@ defmodule Xitdb.TxCompiler do
 
     :lists.reverse(acc)
   end
-
-  @doc """
-  Formats a single path step according to its parent collection kind.
-  """
-  def format_step(:hash_map, key), do: "." <> format_key(key)
-  def format_step(:counted_hash_map, key), do: "#" <> format_key(key)
-  def format_step(:sorted_map, key), do: "$" <> format_key(key)
-  def format_step(:array_list, idx) when is_integer(idx), do: "[#{idx}]"
-  def format_step(:linked_array_list, idx) when is_integer(idx), do: "[[#{idx}]]"
-  def format_step(:hash_set, member), do: "%" <> format_key(member)
-  def format_step(:counted_hash_set, member), do: "#%" <> format_key(member)
-  def format_step(:sorted_set, member), do: "^" <> format_key(member)
-
-  @doc """
-  Formats a dynamic bracket expression `node[key_or_idx]` based on its runtime type:
-  - Integers format as `:array_list` steps (`"[0]"`).
-  - Single-element integer lists `[idx]` format as `:linked_array_list` steps (`"[[0]]"`).
-  - Typed tuples `{:counted, k}`, `{:sorted, k}`, `{:linked, i}`, etc. format with their collection sigil.
-  - Strings and atoms format as `:hash_map` steps (`".alice"` or `".[\"a.b\"]"`).
-  """
-  def format_bracket_step(idx) when is_integer(idx), do: format_step(:array_list, idx)
-  def format_bracket_step([idx]) when is_integer(idx), do: format_step(:linked_array_list, idx)
-  def format_bracket_step({kind, val}), do: format_typed_step(kind, val)
-
-  def format_bracket_step(key) when is_binary(key) or is_atom(key),
-    do: format_step(:hash_map, key)
-
-  @valid_selector_starts [?., ?#, ?$, ?[, ?%, ?^, ?@]
-
-  @doc """
-  Formats a root-level dynamic value: if it is already a canonical selector string
-  (starting with `.`, `#`, `$`, `[`, `%`, `^`, or `@`), returns it unchanged;
-  otherwise formats it as a path step.
-  """
-  def format_root_or_step(<<first, _rest::binary>> = selector)
-      when first in @valid_selector_starts do
-    selector
-  end
-
-  def format_root_or_step(steps) when is_list(steps), do: format_path_steps(steps)
-  def format_root_or_step({kind, val}), do: format_typed_step(kind, val)
-  def format_root_or_step(key), do: format_step(:hash_map, key)
-
-  @doc """
-  Formats a selector string or a list of path step specifications into a canonical selector.
-  """
-  def format_path_steps(selector) when is_binary(selector), do: selector
-
-  def format_path_steps(steps) when is_list(steps) do
-    Enum.map_join(steps, "", &format_bracket_step/1)
-  end
-
-  def format_typed_step(kind, val) when kind in [:hash_map, :map],
-    do: format_step(:hash_map, val)
-
-  def format_typed_step(kind, val) when kind in [:counted, :counted_map, :counted_hash_map],
-    do: format_step(:counted_hash_map, val)
-
-  def format_typed_step(kind, val) when kind in [:sorted, :sorted_map],
-    do: format_step(:sorted_map, val)
-
-  def format_typed_step(kind, val) when kind in [:array, :array_list],
-    do: format_step(:array_list, val)
-
-  def format_typed_step(kind, val) when kind in [:linked, :linked_list, :linked_array_list],
-    do: format_step(:linked_array_list, val)
-
-  def format_typed_step(kind, val) when kind in [:set, :hash_set, :set_member],
-    do: format_step(:hash_set, val)
-
-  def format_typed_step(kind, val)
-      when kind in [:counted_set, :counted_hash_set, :counted_set_member],
-      do: format_step(:counted_hash_set, val)
-
-  def format_typed_step(kind, val) when kind in [:sorted_set, :sorted_set_member],
-    do: format_step(:sorted_set, val)
-
-  @special_chars [
-    ".",
-    "[",
-    "]",
-    "#",
-    "$",
-    "%",
-    "^",
-    "@",
-    "\"",
-    "'",
-    "\\",
-    " ",
-    "\t",
-    "\n",
-    "\r"
-  ]
-
-  @escapable_chars ["\\", "\"", "\n", "\r", "\t"]
-
-  def format_key(key) when is_binary(key) do
-    if key != <<>> and :binary.match(key, @special_chars) == :nomatch do
-      key
-    else
-      "[" <> encode_quoted(key) <> "]"
-    end
-  end
-
-  def format_key(key) when is_atom(key), do: format_key(Atom.to_string(key))
-  def format_key(key), do: format_key(to_string(key))
-
-  @doc """
-  Wraps `str` in double quotes, escaping backslashes, double quotes, and control
-  whitespace without Elixir interpolation artifacts (`\#{`).
-  """
-  def encode_quoted(str) when is_binary(str) do
-    if :binary.match(str, @escapable_chars) == :nomatch do
-      "\"" <> str <> "\""
-    else
-      IO.iodata_to_binary([?", escape_bytes(str, []), ?"])
-    end
-  end
-
-  defp escape_bytes(<<>>, acc), do: Enum.reverse(acc)
-  defp escape_bytes(<<?\\, rest::binary>>, acc), do: escape_bytes(rest, ["\\\\" | acc])
-  defp escape_bytes(<<?", rest::binary>>, acc), do: escape_bytes(rest, ["\\\"" | acc])
-  defp escape_bytes(<<?\n, rest::binary>>, acc), do: escape_bytes(rest, ["\\n" | acc])
-  defp escape_bytes(<<?\r, rest::binary>>, acc), do: escape_bytes(rest, ["\\r" | acc])
-  defp escape_bytes(<<?\t, rest::binary>>, acc), do: escape_bytes(rest, ["\\t" | acc])
-  defp escape_bytes(<<byte, rest::binary>>, acc), do: escape_bytes(rest, [byte | acc])
 
   def compile_node(prefix, node, reset?) do
     :lists.reverse(compile_node_acc(prefix, node, reset?, []))
@@ -172,20 +49,7 @@ defmodule Xitdb.TxCompiler do
   defp kind_str(:sorted_set), do: "sorted_set"
 
   defp compile_node_acc(prefix, map, reset?, acc) when is_map(map) and not is_struct(map) do
-    if map_size(map) == 0 do
-      op = if reset?, do: {:reset_col, prefix, "hash_map"}, else: {:init_col, prefix, "hash_map"}
-      [op | acc]
-    else
-      acc = if reset?, do: [{:reset_col, prefix, "hash_map"} | acc], else: acc
-
-      :maps.fold(
-        fn k, v, a ->
-          compile_node_acc(prefix <> format_step(:hash_map, k), v, false, a)
-        end,
-        acc,
-        map
-      )
-    end
+    compile_kv_collection(prefix, :hash_map, map, reset?, acc)
   end
 
   defp compile_node_acc(prefix, list, _reset?, acc) when is_list(list) do
@@ -195,37 +59,7 @@ defmodule Xitdb.TxCompiler do
 
   defp compile_node_acc(prefix, %Collection{kind: kind, data: data}, reset?, acc)
        when kind in [:hash_map, :counted_hash_map, :sorted_map] do
-    k_str = kind_str(kind)
-
-    if is_map(data) and not is_struct(data) do
-      if map_size(data) == 0 do
-        op = if reset?, do: {:reset_col, prefix, k_str}, else: {:init_col, prefix, k_str}
-        [op | acc]
-      else
-        acc = if reset?, do: [{:reset_col, prefix, k_str} | acc], else: acc
-
-        :maps.fold(
-          fn k, v, a ->
-            compile_node_acc(prefix <> format_step(kind, k), v, false, a)
-          end,
-          acc,
-          data
-        )
-      end
-    else
-      entries = Enum.to_list(data)
-
-      if entries == [] do
-        op = if reset?, do: {:reset_col, prefix, k_str}, else: {:init_col, prefix, k_str}
-        [op | acc]
-      else
-        acc = if reset?, do: [{:reset_col, prefix, k_str} | acc], else: acc
-
-        Enum.reduce(entries, acc, fn {k, v}, a ->
-          compile_node_acc(prefix <> format_step(kind, k), v, false, a)
-        end)
-      end
-    end
+    compile_kv_collection(prefix, kind, data, reset?, acc)
   end
 
   defp compile_node_acc(prefix, %Collection{kind: kind, data: list}, reset?, acc)
@@ -248,7 +82,7 @@ defmodule Xitdb.TxCompiler do
 
       Enum.reduce(member_list, acc, fn m, a ->
         member_str = to_string(m)
-        [{:put, prefix <> format_step(kind, member_str), member_str} | a]
+        [{:put, prefix <> Selector.format_step(kind, member_str), member_str} | a]
       end)
     end
   end
@@ -270,10 +104,46 @@ defmodule Xitdb.TxCompiler do
     [{:put, prefix, scalar} | acc]
   end
 
+  defp compile_kv_collection(prefix, kind, map, reset?, acc)
+       when is_map(map) and not is_struct(map) do
+    k_str = kind_str(kind)
+
+    if map_size(map) == 0 do
+      op = if reset?, do: {:reset_col, prefix, k_str}, else: {:init_col, prefix, k_str}
+      [op | acc]
+    else
+      acc = if reset?, do: [{:reset_col, prefix, k_str} | acc], else: acc
+
+      :maps.fold(
+        fn k, v, a ->
+          compile_node_acc(prefix <> Selector.format_step(kind, k), v, false, a)
+        end,
+        acc,
+        map
+      )
+    end
+  end
+
+  defp compile_kv_collection(prefix, kind, enumerable, reset?, acc) do
+    k_str = kind_str(kind)
+    entries = Enum.to_list(enumerable)
+
+    if entries == [] do
+      op = if reset?, do: {:reset_col, prefix, k_str}, else: {:init_col, prefix, k_str}
+      [op | acc]
+    else
+      acc = if reset?, do: [{:reset_col, prefix, k_str} | acc], else: acc
+
+      Enum.reduce(entries, acc, fn {k, v}, a ->
+        compile_node_acc(prefix <> Selector.format_step(kind, k), v, false, a)
+      end)
+    end
+  end
+
   defp compile_list_elems([], _prefix, _kind, _idx, acc), do: acc
 
   defp compile_list_elems([elem | rest], prefix, kind, idx, acc) do
-    acc = compile_node_acc(prefix <> format_step(kind, idx), elem, false, acc)
+    acc = compile_node_acc(prefix <> Selector.format_step(kind, idx), elem, false, acc)
     compile_list_elems(rest, prefix, kind, idx + 1, acc)
   end
 end
