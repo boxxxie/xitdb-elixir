@@ -1,0 +1,8 @@
+{
+  "track_id": "ash_dsl_and_verifiers_20261111",
+  "type": "feature",
+  "status": "new",
+  "created_at": "2026-11-11T21:05:00Z",
+  "updated_at": "2026-11-11T21:05:00Z",
+  "description": "Track 12: Spark DSL Extension, BuildIndexPlan Transformer, Compile-Time Verifiers & Info Introspection"
+}

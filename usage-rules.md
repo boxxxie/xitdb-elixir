@@ -214,41 +214,104 @@ min_salary = 115
 
 ---
 
-## 8. Ash & Spark Integration (`Xitdb.Ash.Resource`, `Xitdb.Ash.Info`, `tx_for`)
+## 8. Ash & Spark Integration (`Xitdb.Ash.DataLayer`, `Xitdb.Ash.Resource`, `Xitdb.Ash.Search`)
 
-When `:ash` and `:spark` are loaded, `Xitdb` provides a declarative Spark DSL extension (`Xitdb.Ash.Resource`), compile-time/runtime introspection (`Xitdb.Ash.Info`), a compile-time projection/index verifier (`Xitdb.Ash.Verifiers.VerifySyncProjection`), and automatic secondary index injection (`tx_for` / `tx_for!`):
+`Xitdb.Ash.DataLayer` is a native, lock-free Ash Framework 3.37.2+ storage and BM25 search engine backed by immutable copy-on-write `.xit` files.
+
+### Resource Configuration (`xitdb do ... end`)
+
+Configure persistent Ash resources with `data_layer: Xitdb.Ash.DataLayer` (or `extensions: [Xitdb.Ash.Resource]`):
 
 ```elixir
-defmodule MyApp.Accounts.Organization do
+defmodule MyApp.Accounts.Profile do
   use Ash.Resource,
     domain: MyApp.Accounts,
-    extensions: [Xitdb.Ash.Resource]
+    data_layer: Xitdb.Ash.DataLayer,
+    authorizers: [Ash.Policy.Authorizer]
 
   xitdb do
     store MyApp.MDM.Store
-    collection :organizations
-    merge_redirect_collection :org_merged_into
-    locked_ids_set :locked_org_ids
-    lock_change MyApp.MDM.Changes.ModifyLockedFields
+    collection :profiles
 
-    editable_fields [:name, :domain, :headquarters]
-    passthru_fields [:creatio_id, :parent_organization_id]
-    computed_xitdb_fields [:normalized_name, :activity_count]
-    field_aliases parent_organization_id: :parent_org_id
+    # Explicit composite or single-attribute B+Tree (:sorted_map) secondary indexes
+    # Note: belongs_to foreign keys are indexed automatically when index_relationships? is true
+    index [:status, :inserted_at]
 
-    indexes(
-      domain: "domain->org_id",
-      normalized_name: "norm_name->org_id",
-      creatio_id: "creatio_id->org_id"
-    )
+    # Transactional in-Xitdb BM25 + prefix search fields
+    search_field :full_name, boost: 3.0
+    search_field :headline, boost: 1.5
+
+    search_field :firm_name,
+      boost: 2.0,
+      resolver: fn profile, db ->
+        Xitdb.Ash.Search.lookup_field(db, :organizations, profile.organization_id, "name")
+      end
+
+    # Same-store incoming/outgoing foreign key actions (:nothing | :delete | :nilify | :restrict)
+    references do
+      reference :user, on_delete: :delete
+      reference :organization, on_delete: :nilify
+    end
   end
 end
 ```
 
-- **Prefer `tx_for/3,4` and `tx_for!/3,4` over manual `index_on` repetition**:
-  `tx_for(db, Organization, doc: "...") do ... end` automatically injects all `index_on` declarations configured on `Organization` (or a list of resources/schemas) so secondary B+Tree indexes never drift on write or `rm`.
-- **Use `Xitdb.Ash.Info` for Pull Projections & Field Lists**:
-  Use `Xitdb.Ash.Info.pull_fields(Resource)`, `Xitdb.Ash.Info.pull_pattern_for(Resource)`, `Xitdb.Ash.Info.editable_field_strings(Resource)`, and `Xitdb.Ash.Info.resolve_store(Resource, context_or_opts)` instead of hardcoding field lists across engines and reconcilers.
+For child entities co-located inside a parent entity's subtree for 9-byte `fork` snapshots, declare `nested_in`:
+
+```elixir
+xitdb do
+  store MyApp.MDM.Store
+  collection :agenda_sessions
+  nested_in :events, foreign_key: :event_id, path: :sessions, cardinality: :many
+end
+```
+
+### Strict DO / DON'T Rules
+
+#### 1. Zero SQL Fragments or Codegen Migrations
+- **DON'T** use `fragment(...)` (`Ash.Query.Function.Fragment`) in calculations, policies, validations, or identities. `VerifyNoSqlFragments` rejects SQL fragments at compile time.
+- **DO** write portable `Ash.Expr` expressions (`expr(if(is_nil(location_city), location_name, location_city))`) or `Ash.Resource.Calculation` modules.
+- **DON'T** run `mix ash.codegen` or `mix ash.migrate` for `Xitdb.Ash.DataLayer` resources. Schema, sequences, and B+Tree indexes evolve transactionally without DDL migrations or `priv/resource_snapshots`.
+
+#### 2. Store Boundaries & Cross-Store Relationships
+- **DO** read relationships (`belongs_to`, `has_many`, `many_to_many`, `exists(...)`) freely across distinct `.xit` stores (`MDM.Store` and `AppStore`); Ash resolves cross-store associations via batched `id in ^ids` queries.
+- **DON'T** configure `references` with `on_delete: :delete | :nilify | :restrict` across two different `store` modules. `VerifyCrossStoreReferences` rejects cross-store FK cascades at compile time.
+- **DO** use `Ash.Signals` or `Ash.Changeset.after_action/2` hooks to clean up dependent records living in another `.xit` store.
+
+#### 3. Atomic Mutations, Policies & Validation Modules
+- **DO** keep `update` and `destroy` actions atomic by default (`require_atomic? true`). `Xitdb.Ash.DataLayer` enforces row-level `FilterCheck` write policies (`changeset.filter`), `changeset.atomic_validations`, and `changeset.atomics` race-free inside its single-writer lease.
+- **DO** implement the `atomic/3` callback on custom `Ash.Resource.Change` and `Ash.Resource.Validation` modules instead of opting into `require_atomic? false` unnecessarily.
+- **DON'T** mutate Ash-managed collections via raw `Xitdb` cursor writes outside `Xitdb.Ash.DataLayer` unless also maintaining `meta.sequences`, `idx.<collection>.*`, and `idx.search.<collection>.*`.
+
+#### 4. Oban & External Side Effects
+- **DON'T** enqueue `Oban` jobs or broadcast `Phoenix.PubSub` events inside `before_action` hooks—workers may execute before the Xitdb writer lease commits and bumps the snapshot moment.
+- **DO** enqueue `Oban` jobs inside `Ash.Changeset.after_transaction/2` (only on `{:ok, record}`), passing integer primary keys (`%{"user_id" => record.id}`).
+
+### BM25 + Prefix Search (`Xitdb.Ash.Search`)
+
+Query the transactional `idx.search.<collection>` B+Tree index and preserve BM25 ranking on the resulting `Ash.Query`:
+
+```elixir
+# Inside a Domain action or Preparation:
+ranked_ids = Xitdb.Ash.Search.ids(MyApp.Accounts.Profile, query_text, limit: 50)
+
+Profile
+|> Ash.Query.filter(id in ^ranked_ids)
+|> Xitdb.Ash.Search.sort_by_rank(ranked_ids)
+```
+
+When a referenced parent entity changes a field used in a child's `search_field` `resolver:` (for example, `Organization.name` indexed onto `Profile`), call `Xitdb.Ash.Search.reindex_records/3` in an `after_action` hook on the same store so both updates commit in one moment.
+
+### Concurrent Testing (`Xitdb.Ash.TestSandbox`)
+
+- **DO** check out stores in `DataCase` `setup` via `Xitdb.Ash.TestSandbox.checkout([MyApp.MDM.Store, MyApp.AppStore])` and run tests with `async: true`.
+- **DO** generate unique values via `System.unique_integer([:positive])` for all `identities` in `Ash.Generator` fixtures.
+- **DON'T** check out `Ecto.Adapters.SQL.Sandbox` for domain tests; reserve SQL Sandbox strictly for tests asserting on `oban_jobs` (with `Oban` set to `testing: :manual`).
+
+### Introspection Helpers (`Xitdb.Ash.Info`)
+
+- Use `Xitdb.Ash.Info.pull_fields(Resource)`, `Xitdb.Ash.Info.pull_pattern_for(Resource)`, `Xitdb.Ash.Info.search_fields(Resource)`, `Xitdb.Ash.Info.indexes(Resource)`, and `Xitdb.Ash.Info.resolve_store(Resource, context_or_opts)` instead of hardcoding field lists or index maps.
+- Use `tx_for(db, Resource) do ... end` (`Xitdb.Ash.Tx`) to automatically inject all `index_on` declarations configured on resources so secondary B+Tree indexes never drift on raw transactions.
 
 ---
 

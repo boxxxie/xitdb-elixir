@@ -48,7 +48,15 @@ locals_without_parens = [
   ignored_sync_attributes: 1,
   lock_action: 1,
   unlock_action: 1,
-  lock_change: 1
+  lock_change: 1,
+  nested_in: 1,
+  nested_in: 2,
+  search_field: 1,
+  search_field: 2,
+  index: 1,
+  index: 2,
+  reference: 1,
+  reference: 2
 ]
 
 [

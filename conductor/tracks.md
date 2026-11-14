@@ -24,5 +24,48 @@ This file tracks all major development tracks for the `xitdb` Elixir client (`el
 
 ---
 
-- [ ] **Track 5: `Xitdb.Ash.DataLayer` Engine (Ash 3 DataLayer, Store GenServer, Test Sandbox & Verification Suite)**
+- [ ] **Track 5: `Xitdb.Ash.DataLayer` Umbrella Engine (Ash 3 DataLayer, Store GenServer, Test Sandbox & Verification Suite)**
   *Link: [./tracks/ash_datalayer_engine_20261111/](./tracks/ash_datalayer_engine_20261111/)*
+
+---
+
+- [ ] **Track 6: Native Odin NIF BM25 Pushdown & Direct B+Tree Prefix Seek**
+  *Link: [./tracks/nif_bm25_search_20261111/](./tracks/nif_bm25_search_20261111/)*
+
+---
+
+- [ ] **Track 7: Single-Writer Store GenServer, Monitored Writer Leases, Savepoints & TestSandbox**
+  *Link: [./tracks/ash_store_and_test_sandbox_20261111/](./tracks/ash_store_and_test_sandbox_20261111/)*
+
+---
+
+- [ ] **Track 8: Key Codec & Secondary B+Tree Indexer**
+  *Link: [./tracks/ash_codec_and_indexer_20261111/](./tracks/ash_codec_and_indexer_20261111/)*
+
+---
+
+- [ ] **Track 9: Six-Stage Query Execution Engine**
+  *Link: [./tracks/ash_query_engine_20261111/](./tracks/ash_query_engine_20261111/)*
+
+---
+
+- [ ] **Track 10: Atomic Mutator, Monotonic Sequences & Foreign-Key Cascades**
+  *Link: [./tracks/ash_mutator_and_cascades_20261111/](./tracks/ash_mutator_and_cascades_20261111/)*
+
+---
+
+- [ ] **Track 11: Ash 3 DataLayer Behaviour & Standalone Verification Suite**
+  *Link: [./tracks/ash_datalayer_and_verification_suite_20261111/](./tracks/ash_datalayer_and_verification_suite_20261111/)*
+
+---
+
+- [ ] **Track 12: Spark DSL Extension, BuildIndexPlan Transformer, Compile-Time Verifiers & Info Introspection**
+  *Link: [./tracks/ash_dsl_and_verifiers_20261111/](./tracks/ash_dsl_and_verifiers_20261111/)*
+
+---
+
+- [ ] **Track 13: Query Planner, Atomic Mutator & Ash DataLayer Engine**
+  *Link: [./tracks/ash_query_mutator_datalayer_20261111/](./tracks/ash_query_mutator_datalayer_20261111/)*
+
+
+

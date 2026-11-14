@@ -11,6 +11,93 @@ if Code.ensure_loaded?(Spark.InfoGenerator) and Code.ensure_loaded?(Ash.Resource
     alias Xitdb.Pull
 
     @doc """
+    Returns the list of `search_field` declarations for a resource.
+    """
+    @spec search_fields(Ash.Resource.t() | Spark.Dsl.t()) :: [Xitdb.Ash.SearchField.t()]
+    def search_fields(resource_or_dsl) do
+      resource_or_dsl
+      |> Extension.get_entities([:xitdb])
+      |> Enum.filter(&match?(%Xitdb.Ash.SearchField{}, &1))
+      |> Enum.map(&%{&1 | __identifier__: nil, __spark_metadata__: nil})
+    end
+
+    @doc """
+    Returns the list of explicit `index` declarations for a resource.
+    """
+    @spec indexes(Ash.Resource.t() | Spark.Dsl.t()) :: [Xitdb.Ash.Index.t()]
+    def indexes(resource_or_dsl) do
+      resource_or_dsl
+      |> Extension.get_entities([:xitdb])
+      |> Enum.filter(&match?(%Xitdb.Ash.Index{}, &1))
+      |> Enum.map(&%{&1 | __identifier__: nil, __spark_metadata__: nil})
+    end
+
+    @doc """
+    Returns the list of `reference` declarations for a resource.
+    """
+    @spec references(Ash.Resource.t() | Spark.Dsl.t()) :: [Xitdb.Ash.Reference.t()]
+    def references(resource_or_dsl) do
+      resource_or_dsl
+      |> Extension.get_entities([:xitdb, :references])
+      |> Enum.filter(&match?(%Xitdb.Ash.Reference{}, &1))
+      |> Enum.map(&%{&1 | __identifier__: nil, __spark_metadata__: nil})
+    end
+
+    @doc """
+    Returns the primary Xitdb collection atom for `resource`, raising if undeclared.
+    """
+    @spec collection!(Ash.Resource.t() | Spark.Dsl.t()) :: atom()
+    def collection!(resource_or_dsl) do
+      case xitdb_collection(resource_or_dsl) do
+        {:ok, col} when not is_nil(col) ->
+          col
+
+        _ ->
+          case xitdb_collection!(resource_or_dsl) do
+            col when not is_nil(col) ->
+              col
+
+            _ ->
+              raise ArgumentError,
+                    "Resource #{inspect(resource_or_dsl)} does not declare a collection"
+          end
+      end
+    end
+
+    @doc """
+    Returns the primary Xitdb collection atom for `resource`, or `nil` if undeclared.
+    """
+    @spec collection(Ash.Resource.t() | Spark.Dsl.t()) :: atom() | nil
+    def collection(resource_or_dsl) do
+      case xitdb_collection(resource_or_dsl) do
+        {:ok, col} -> col
+        _ -> nil
+      end
+    end
+
+    @doc """
+    Returns the configured store module for `resource`, raising if undeclared.
+    """
+    @spec store!(Ash.Resource.t() | Spark.Dsl.t()) :: module()
+    def store!(resource_or_dsl) do
+      case resolve_store(resource_or_dsl, []) do
+        store when not is_nil(store) ->
+          store
+
+        nil ->
+          raise ArgumentError, "Resource #{inspect(resource_or_dsl)} does not declare a store"
+      end
+    end
+
+    @doc """
+    Returns the configured store module for `resource`, or `nil` if undeclared.
+    """
+    @spec store(Ash.Resource.t() | Spark.Dsl.t()) :: module() | nil
+    def store(resource_or_dsl) do
+      resolve_store(resource_or_dsl, [])
+    end
+
+    @doc """
     Returns the deduplicated list of editable and computed Xitdb field names as strings
     for one or more `Xitdb.Ash.Resource` modules, applying any configured `field_aliases`.
     """

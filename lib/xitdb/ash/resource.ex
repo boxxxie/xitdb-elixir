@@ -56,6 +56,93 @@ if Code.ensure_loaded?(Spark.Dsl.Extension) and Code.ensure_loaded?(Ash.Resource
       :status
     ]
 
+    @doc false
+    def validate_resolver(fun) when is_function(fun, 2), do: {:ok, fun}
+    def validate_resolver(nil), do: {:ok, nil}
+    def validate_resolver(_), do: {:error, "must be a 2-arity function (record, db) or nil"}
+
+    @search_field %Spark.Dsl.Entity{
+      name: :search_field,
+      describe: "Declares a field to be indexed in the transactional BM25 search index.",
+      examples: [
+        "search_field :full_name, boost: 3.0",
+        "search_field :firm_name, boost: 2.0, resolver: fn profile, db -> ... end"
+      ],
+      target: Xitdb.Ash.SearchField,
+      args: [:field],
+      identifier: :field,
+      schema: [
+        field: [
+          type: :atom,
+          required: true,
+          doc: "The attribute or virtual search field name."
+        ],
+        boost: [
+          type: :float,
+          default: 1.0,
+          doc: "BM25 field weight multiplier."
+        ],
+        resolver: [
+          type: {:custom, __MODULE__, :validate_resolver, []},
+          doc: "Custom 2-arity resolver fn(record, db) -> string or enumerable of strings."
+        ]
+      ]
+    }
+
+    @index %Spark.Dsl.Entity{
+      name: :index,
+      describe: "Declares a single-attribute or composite B+Tree (:sorted_map) secondary index.",
+      examples: [
+        "index :email",
+        "index [:status, :inserted_at]"
+      ],
+      target: Xitdb.Ash.Index,
+      args: [:fields],
+      identifier: :fields,
+      schema: [
+        fields: [
+          type: {:wrap_list, :atom},
+          required: true,
+          doc: "The attribute or list of attributes comprising the secondary index key."
+        ],
+        name: [
+          type: :any,
+          doc: "Optional custom name for the secondary index."
+        ]
+      ]
+    }
+
+    @reference %Spark.Dsl.Entity{
+      name: :reference,
+      describe: "Declares an incoming/outgoing foreign key on_delete action for a relationship.",
+      examples: [
+        "reference :user, on_delete: :delete",
+        "reference :organization, on_delete: :nilify"
+      ],
+      target: Xitdb.Ash.Reference,
+      args: [:relationship],
+      identifier: :relationship,
+      schema: [
+        relationship: [
+          type: :atom,
+          required: true,
+          doc: "Relationship name."
+        ],
+        on_delete: [
+          type: {:in, [:nothing, :delete, :nilify, :restrict]},
+          default: :nothing,
+          doc: "Action taken when referenced target entity is destroyed."
+        ]
+      ]
+    }
+
+    @references_section %Spark.Dsl.Section{
+      name: :references,
+      describe:
+        "Configures incoming/outgoing foreign key actions targeting same-store resources.",
+      entities: [@reference]
+    }
+
     @nested_in %Spark.Dsl.Entity{
       name: :nested_in,
       describe: """
@@ -101,7 +188,8 @@ if Code.ensure_loaded?(Spark.Dsl.Extension) and Code.ensure_loaded?(Ash.Resource
     @xitdb_section %Spark.Dsl.Section{
       name: :xitdb,
       describe: "Configures Xitdb MDM projection, survivorship locks, and secondary indexes.",
-      entities: [@nested_in],
+      entities: [@nested_in, @search_field, @index],
+      sections: [@references_section],
       schema: [
         store: [
           type: :atom,
