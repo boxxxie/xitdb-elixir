@@ -668,17 +668,20 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
     # -- Aggregate & Calculation Engines --
 
-    defp attach_aggregates(_db, records, %__MODULE__{aggregates: []}, _resource),
-      do: {:ok, records}
+    defp attach_aggregates(db, records, %__MODULE__{} = query, resource) do
+      case collect_required_aggregates(query) do
+        [] ->
+          {:ok, records}
 
-    defp attach_aggregates(db, records, %__MODULE__{aggregates: aggregates} = query, resource) do
-      Enum.reduce_while(aggregates, {:ok, records}, fn %Aggregate{} = agg,
-                                                       {:ok, current_records} ->
-        case compute_aggregate_for_records(db, current_records, agg, query, resource) do
-          {:ok, updated_records} -> {:cont, {:ok, updated_records}}
-          {:error, _} = err -> {:halt, err}
-        end
-      end)
+        aggregates ->
+          Enum.reduce_while(aggregates, {:ok, records}, fn %Aggregate{} = agg,
+                                                           {:ok, current_records} ->
+            case compute_aggregate_for_records(db, current_records, agg, query, resource) do
+              {:ok, updated_records} -> {:cont, {:ok, updated_records}}
+              {:error, _} = err -> {:halt, err}
+            end
+          end)
+      end
     end
 
     defp compute_aggregate_for_records(db, records, %Aggregate{} = agg, query, resource) do
@@ -1439,37 +1442,44 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       Map.put(record, :aggregates, aggs)
     end
 
-    defp put_aggregate_result(record, %Aggregate{load: load_key}, value) do
-      Map.put(record, load_key, value)
+    defp put_aggregate_result(record, %Aggregate{load: load_key, name: name}, value) do
+      aggs = record |> Map.get(:aggregates, %{}) |> Map.put(name, value)
+
+      record
+      |> Map.put(load_key, value)
+      |> Map.put(:aggregates, aggs)
     end
 
-    defp attach_calculations(records, %__MODULE__{calculations: []}, _resource),
-      do: {:ok, records}
+    defp attach_calculations(records, %__MODULE__{} = query, resource) do
+      case collect_required_calculations(query) do
+        [] ->
+          {:ok, records}
 
-    defp attach_calculations(records, %__MODULE__{calculations: calcs} = query, resource) do
-      actor = get_in(query.context, [:private, :actor])
+        calcs ->
+          actor = get_in(query.context, [:private, :actor])
 
-      Enum.reduce_while(calcs, {:ok, records}, fn entry, {:ok, current_records} ->
-        {calc, expr} =
-          case entry do
-            {%Calculation{} = c, e} -> {c, e}
-            %Calculation{} = c -> {c, nil}
-          end
+          Enum.reduce_while(calcs, {:ok, records}, fn entry, {:ok, current_records} ->
+            {calc, expr} =
+              case entry do
+                {%Calculation{} = c, e} -> {c, e}
+                %Calculation{} = c -> {c, nil}
+              end
 
-        calc_actor = get_in_calc_context(calc, :actor) || actor
+            calc_actor = get_in_calc_context(calc, :actor) || actor
 
-        case evaluate_calculation_batch(
-               current_records,
-               calc,
-               expr,
-               resource,
-               query,
-               calc_actor
-             ) do
-          {:ok, next_records} -> {:cont, {:ok, next_records}}
-          {:error, _} = err -> {:halt, err}
-        end
-      end)
+            case evaluate_calculation_batch(
+                   current_records,
+                   calc,
+                   expr,
+                   resource,
+                   query,
+                   calc_actor
+                 ) do
+              {:ok, next_records} -> {:cont, {:ok, next_records}}
+              {:error, _} = err -> {:halt, err}
+            end
+          end)
+      end
     end
 
     defp evaluate_calculation_batch(records, %Calculation{} = calc, expr, resource, query, actor) do
@@ -1625,12 +1635,76 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
     defp put_calculation_result(record, %Calculation{load: nil, name: name}, value) do
       calcs = record |> Map.get(:calculations, %{}) |> Map.put(name, value)
+
+      record =
+        if is_atom(name) and Map.has_key?(record, name) do
+          Map.put(record, name, value)
+        else
+          record
+        end
+
       Map.put(record, :calculations, calcs)
     end
 
-    defp put_calculation_result(record, %Calculation{load: load_key}, value) do
-      Map.put(record, load_key, value)
+    defp put_calculation_result(record, %Calculation{load: load_key, name: name}, value) do
+      calcs = record |> Map.get(:calculations, %{}) |> Map.put(name, value)
+
+      record
+      |> Map.put(load_key, value)
+      |> Map.put(:calculations, calcs)
     end
+
+    defp collect_required_aggregates(%__MODULE__{} = query) do
+      ast_sources = [query.filter, query.sort, query.distinct_sort]
+      in_ast = collect_root_derived_nodes(ast_sources, Aggregate, []) |> Enum.reverse()
+      Enum.uniq_by(query.aggregates ++ in_ast, fn %Aggregate{name: n} -> n end)
+    end
+
+    defp collect_required_calculations(%__MODULE__{} = query) do
+      ast_sources = [query.filter, query.sort, query.distinct_sort]
+      in_ast = collect_root_derived_nodes(ast_sources, Calculation, []) |> Enum.reverse()
+
+      (query.calculations ++ in_ast)
+      |> Enum.uniq_by(fn
+        {%Calculation{name: n}, _} -> n
+        %Calculation{name: n} -> n
+      end)
+    end
+
+    defp collect_root_derived_nodes(nil, _mod, acc), do: acc
+
+    defp collect_root_derived_nodes(
+           %Ref{attribute: %mod{} = node, relationship_path: []},
+           mod,
+           acc
+         ) do
+      [node | acc]
+    end
+
+    defp collect_root_derived_nodes(%Ref{}, _mod, acc), do: acc
+    defp collect_root_derived_nodes(%Ash.Query.Exists{}, _mod, acc), do: acc
+
+    defp collect_root_derived_nodes(%mod{} = node, mod, acc) do
+      [node | acc]
+    end
+
+    defp collect_root_derived_nodes(%_{} = struct, mod, acc) do
+      struct
+      |> Map.from_struct()
+      |> Map.delete(:__spark_metadata__)
+      |> Map.values()
+      |> Enum.reduce(acc, &collect_root_derived_nodes(&1, mod, &2))
+    end
+
+    defp collect_root_derived_nodes(list, mod, acc) when is_list(list) do
+      Enum.reduce(list, acc, &collect_root_derived_nodes(&1, mod, &2))
+    end
+
+    defp collect_root_derived_nodes(tuple, mod, acc) when is_tuple(tuple) do
+      tuple |> Tuple.to_list() |> Enum.reduce(acc, &collect_root_derived_nodes(&1, mod, &2))
+    end
+
+    defp collect_root_derived_nodes(_other, _mod, acc), do: acc
 
     # -- Filter AST Inspection & `parent/1` Helpers --
 

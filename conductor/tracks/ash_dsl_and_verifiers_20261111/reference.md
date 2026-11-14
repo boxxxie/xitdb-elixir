@@ -768,7 +768,11 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       pk_fields = Ash.Resource.Info.primary_key(dsl_state)
 
       entities = Transformer.get_entities(dsl_state, [:xitdb])
-      references = strip_entities(Transformer.get_entities(dsl_state, [:xitdb, :references]))
+
+      references =
+        for %Reference{} = r <- Transformer.get_entities(dsl_state, [:xitdb, :references]) do
+          %Reference{r | __identifier__: nil, __spark_metadata__: nil}
+        end
 
       nested_entries =
         for %NestedIn{parent_collection: pc} = n <- entities, not is_nil(pc) do
@@ -811,10 +815,6 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
         {:ok, updated_state}
       end
-    end
-
-    defp strip_entities(list) do
-      Enum.map(list, &%{&1 | __identifier__: nil, __spark_metadata__: nil})
     end
 
     defp validate_store(module, dsl_state) do
@@ -2123,12 +2123,15 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     end
 
     @doc """
-    Returns incoming same-store foreign-key rules targeting `resource`.
+    Returns incoming same-store foreign-key rules targeting `resource`, or `[]` when
+    `store` has not been started (e.g., standalone `Indexer` tests against raw `%Xitdb{}` handles).
     """
     @spec reverse_fks(module(), module()) :: [reverse_fk()]
     def reverse_fks(store, resource) when is_atom(store) and is_atom(resource) do
-      {_base_db, _atomics, reverse_fks} = fetch_slot!(store)
-      Map.get(reverse_fks, resource, [])
+      case :persistent_term.get(pt_key(store), nil) do
+        {_base_db, _atomics, reverse_fks} -> Map.get(reverse_fks, resource, [])
+        nil -> []
+      end
     end
 
     @doc """
@@ -2350,9 +2353,37 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     """
     @spec reindex_records(term(), module(), Enumerable.t(), term()) :: term()
     def reindex_records(db, resource, records, tenant \\ nil) when is_atom(resource) do
-      Enum.reduce(records, db, fn record, acc_db ->
-        index_record(acc_db, resource, record, tenant)
-      end)
+      case Info.search_fields(resource) do
+        [] ->
+          db
+
+        search_fields ->
+          if Code.ensure_loaded?(Xitdb.Ash.Indexer.Storage) and
+               function_exported?(Xitdb.Ash.Indexer.Storage, :compile_search_diff_ops, 5) do
+            pk_attr = resource |> Ash.Resource.Info.primary_key() |> hd()
+            cursor_root = Storage.root_cursor(db)
+
+            {ops_chunks, _batch} =
+              Enum.map_reduce(records, %{}, fn record, batch_acc ->
+                effective_tenant = tenant || Ash.Resource.get_metadata(record, :tenant)
+                collection = resolve_collection_name(resource, effective_tenant)
+                doc_key = record |> Map.fetch!(pk_attr) |> encode_doc_key()
+                new_terms = extract_weighted_terms(record, search_fields, cursor_root)
+
+                Xitdb.Ash.Indexer.Storage.compile_search_diff_ops(
+                  cursor_root,
+                  collection,
+                  doc_key,
+                  new_terms,
+                  batch_acc
+                )
+              end)
+
+            Storage.commit_ops(db, List.flatten(ops_chunks))
+          else
+            Enum.reduce(records, db, &index_record(&2, resource, &1, tenant))
+          end
+      end
     end
 
     @doc """
@@ -2422,8 +2453,6 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     end
 
     defp collect_token_postings(db, collection, token, opts) do
-      exact_postings = Storage.lookup_term(db, collection, token)
-
       prefix_postings =
         if opts[:prefix?] and String.length(token) >= opts[:min_prefix_length] do
           Storage.scan_prefix(db, collection, token, opts[:max_prefix_expansions])
@@ -2442,6 +2471,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         end)
 
       if prefix_postings == [] do
+        exact_postings = Storage.lookup_term(db, collection, token)
+
         Map.new(exact_postings, fn {doc_key, scaled_tf} ->
           {doc_key, scaled_tf / @weight_scale * @exact_match_boost}
         end)
@@ -2839,15 +2870,20 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
         ops = meta_ops ++ doc_ops ++ term_ops
 
-      case db do
-        {%Xitdb{} = raw_db, moment} when is_integer(moment) ->
-          {:ok, new_db} = Xitdb.transact_ops(raw_db, ops, base_moment: moment)
-          {new_db, Xitdb.moment_count(new_db) - 1}
+      commit_ops(db, ops)
+    end
 
-        %Xitdb{} = raw_db ->
-          {:ok, new_db} = Xitdb.transact_ops(raw_db, ops)
-          new_db
-      end
+    @doc false
+    def commit_ops(db, []), do: db
+
+    def commit_ops({%Xitdb{} = raw_db, moment}, ops) when is_integer(moment) do
+      {:ok, new_db} = Xitdb.transact_ops(raw_db, ops, base_moment: moment)
+      {new_db, Xitdb.moment_count(new_db) - 1}
+    end
+
+    def commit_ops(%Xitdb{} = raw_db, ops) do
+      {:ok, new_db} = Xitdb.transact_ops(raw_db, ops)
+      new_db
     end
 
     @doc false

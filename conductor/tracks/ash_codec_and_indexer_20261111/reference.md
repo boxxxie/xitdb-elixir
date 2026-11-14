@@ -353,24 +353,10 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
     defp dump_attribute_or_set(_attr, nil, _as_counted_set?), do: {:ok, nil}
 
-    defp dump_attribute_or_set(
-           %Attribute{type: {:array, inner_type}, constraints: constraints} = attr,
-           values,
-           true
-         )
-         when is_list(values) do
-      item_constraints = Keyword.get(constraints || [], :items, [])
-      elem_attr = %Attribute{attr | type: inner_type, constraints: item_constraints}
-
-      values
-      |> Enum.reduce_while({:ok, []}, fn item, {:ok, acc} ->
-        case dump_attribute(elem_attr, item) do
-          {:ok, dumped_item} -> {:cont, {:ok, [dumped_item | acc]}}
-          {:error, _} = err -> {:halt, err}
-        end
-      end)
-      |> case do
-        {:ok, dumped_rev} -> {:ok, Xitdb.counted_set(Enum.reverse(dumped_rev))}
+    defp dump_attribute_or_set(%Attribute{} = attr, values, true) when is_list(values) do
+      case dump_attribute(attr, values) do
+        {:ok, dumped_list} when is_list(dumped_list) -> {:ok, Xitdb.counted_set(dumped_list)}
+        {:ok, other} -> {:ok, other}
         {:error, _} = err -> err
       end
     end
@@ -441,6 +427,22 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         :uuid when is_binary(value) ->
           {:ok, :binary.copy(value)}
 
+        {:array, inner_type} when is_list(value) ->
+          item_constraints = Keyword.get(constraints || [], :items, [])
+          elem_attr = %Attribute{attr | type: inner_type, constraints: item_constraints}
+
+          value
+          |> Enum.reduce_while({:ok, []}, fn item, {:ok, acc} ->
+            case dump_attribute(elem_attr, item) do
+              {:ok, dumped_item} -> {:cont, {:ok, [dumped_item | acc]}}
+              {:error, _} = err -> {:halt, err}
+            end
+          end)
+          |> case do
+            {:ok, dumped_rev} -> {:ok, Enum.reverse(dumped_rev)}
+            {:error, _} = err -> err
+          end
+
         _complex ->
           Ash.Type.dump_to_embedded(attr.type, value, constraints)
       end
@@ -449,7 +451,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     defp load_attribute(_attr, nil), do: {:ok, nil}
 
     defp load_attribute(%Attribute{} = attr, raw) do
-      {kind, _constraints} = unwrap_type(attr.type, attr.constraints)
+      {kind, constraints} = unwrap_type(attr.type, attr.constraints)
 
       case kind do
         :integer when is_integer(raw) ->
@@ -493,6 +495,27 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
         :uuid when is_binary(raw) ->
           {:ok, :binary.copy(raw)}
+
+        {:array, inner_type} ->
+          item_constraints = Keyword.get(constraints || [], :items, [])
+          elem_attr = %Attribute{attr | type: inner_type, constraints: item_constraints}
+          items = materialize_cursor_term(raw)
+
+          if is_list(items) do
+            items
+            |> Enum.reduce_while({:ok, []}, fn item, {:ok, acc} ->
+              case load_attribute(elem_attr, item) do
+                {:ok, loaded_item} -> {:cont, {:ok, [loaded_item | acc]}}
+                {:error, _} = err -> {:halt, err}
+              end
+            end)
+            |> case do
+              {:ok, loaded_rev} -> {:ok, Enum.reverse(loaded_rev)}
+              {:error, _} = err -> err
+            end
+          else
+            Ash.Type.cast_stored(attr.type, items, attr.constraints)
+          end
 
         _other ->
           materialized = materialize_cursor_term(raw)
