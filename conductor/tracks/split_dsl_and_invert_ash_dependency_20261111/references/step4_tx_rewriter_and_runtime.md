@@ -1758,6 +1758,10 @@ diff --git a/lib/xitdb/dsl.ex b/lib/xitdb/dsl.ex
 -    end
 -  end
 -
++      Xitdb.query!(unquote(target), unquote(q_ast), unquote(runtime_opts))
++    end
++  end
++
    defmacro query!(target, query_str, opts) do
      quote do
        Xitdb.query!(unquote(target), unquote(query_str), unquote(opts))
@@ -2037,9 +2041,8 @@ diff --git a/lib/xitdb/dsl.ex b/lib/xitdb/dsl.ex
 -              nil
 -          end
 -        end
-+      Xitdb.query!(unquote(target), unquote(q_ast), unquote(runtime_opts))
-     end
-   end
+-    end
+-  end
  end
 diff --git a/lib/xitdb/tx_compiler.ex b/lib/xitdb/tx_compiler.ex
 --- a/lib/xitdb/tx_compiler.ex
@@ -2052,13 +2055,13 @@ diff --git a/lib/xitdb/tx_compiler.ex b/lib/xitdb/tx_compiler.ex
 -  defdelegate format_step(kind, key), to: Selector
 +  # Retained for Xitdb.Ash.Indexer.Storage and Xitdb.Ash.Mutator.Sequences
 +  defdelegate format_step(kind, key), to: Selector
- -  defdelegate format_typed_step(kind, val), to: Selector
- -  defdelegate format_bracket_step(val), to: Selector
- -  defdelegate format_root_or_step(val), to: Selector
- -  defdelegate format_path_steps(steps), to: Selector
+-  defdelegate format_typed_step(kind, val), to: Selector
+-  defdelegate format_bracket_step(val), to: Selector
+-  defdelegate format_root_or_step(val), to: Selector
+-  defdelegate format_path_steps(steps), to: Selector
 -  defdelegate format_key(key), to: Selector
 +  defdelegate format_key(key), to: Selector
- -  defdelegate encode_quoted(str), to: Selector
+-  defdelegate encode_quoted(str), to: Selector
 -
    @doc """
    Compiles a nested Elixir map or `Xitdb.Collection` into a flat list of
