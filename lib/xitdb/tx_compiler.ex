@@ -115,23 +115,48 @@ defmodule Xitdb.TxCompiler do
     "$",
     "%",
     "^",
+    "@",
     "\"",
     "'",
+    "\\",
     " ",
     "\t",
-    "\n"
+    "\n",
+    "\r"
   ]
+
+  @escapable_chars ["\\", "\"", "\n", "\r", "\t"]
 
   def format_key(key) when is_binary(key) do
     if key != <<>> and :binary.match(key, @special_chars) == :nomatch do
       key
     else
-      ~s(["#{key}"])
+      "[" <> encode_quoted(key) <> "]"
     end
   end
 
   def format_key(key) when is_atom(key), do: format_key(Atom.to_string(key))
   def format_key(key), do: format_key(to_string(key))
+
+  @doc """
+  Wraps `str` in double quotes, escaping backslashes, double quotes, and control
+  whitespace without Elixir interpolation artifacts (`\#{`).
+  """
+  def encode_quoted(str) when is_binary(str) do
+    if :binary.match(str, @escapable_chars) == :nomatch do
+      "\"" <> str <> "\""
+    else
+      IO.iodata_to_binary([?", escape_bytes(str, []), ?"])
+    end
+  end
+
+  defp escape_bytes(<<>>, acc), do: Enum.reverse(acc)
+  defp escape_bytes(<<?\\, rest::binary>>, acc), do: escape_bytes(rest, ["\\\\" | acc])
+  defp escape_bytes(<<?", rest::binary>>, acc), do: escape_bytes(rest, ["\\\"" | acc])
+  defp escape_bytes(<<?\n, rest::binary>>, acc), do: escape_bytes(rest, ["\\n" | acc])
+  defp escape_bytes(<<?\r, rest::binary>>, acc), do: escape_bytes(rest, ["\\r" | acc])
+  defp escape_bytes(<<?\t, rest::binary>>, acc), do: escape_bytes(rest, ["\\t" | acc])
+  defp escape_bytes(<<byte, rest::binary>>, acc), do: escape_bytes(rest, [byte | acc])
 
   def compile_node(prefix, node, reset?) do
     :lists.reverse(compile_node_acc(prefix, node, reset?, []))

@@ -37,7 +37,7 @@ Each track has its own specification and implementation plan in [`./tracks/`](./
 
 ## Wave 1 — MVP Prerequisites & Hybrid Ash Schema
 
-- [ ] **Track 5A [Wave 1 — MVP Client Fixes]: Selector/Datalog `@` & `\` Escaping, `^sel_len` Pins, `WireChanges` Deadlock Removal & `O(1)` Op Staging**
+- [x] **Track 5A [Wave 1 — MVP Client Fixes]: Selector/Datalog `@` & `\` Escaping, `^sel_len` Pins, `WireChanges` Deadlock Removal & `O(1)` Op Staging**
   *Link: [./tracks/client_fixes_and_dedup_20261111/](./tracks/client_fixes_and_dedup_20261111/)*
   *MVP Scope:* Execute **Phase 1** (byte-level `@`/`\` escaping for email keys + `^sel_len` bitstring pins), **Phase 3** (per-key `:persistent_term` pair cache with zero global GC removing `WireChanges` deadlocks + parallel-safe `tx_for`), **Phase 4A op-staging** (reverse-list `O(1)` op prepending + `MapSet.size/1` opacity compliance + direct `%Xitdb{}` mutation guard), and Wave 1 `mix.exs` test setup (`:stream_data` + `def cli`). Defer Phase 2 (`Pull` ranges) and Phase 4B cursor refactors to **Track 5B**.
 

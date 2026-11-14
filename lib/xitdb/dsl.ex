@@ -224,13 +224,29 @@ defmodule Xitdb.DSL do
   defp extract_schema_indexes!(schema_ast, caller) do
     mod = Macro.expand(schema_ast, caller)
 
-    cond do
-      not is_atom(mod) ->
-        raise CompileError,
-          description:
-            "tx_for expects a compile-time module or list of modules, got: #{Macro.to_string(schema_ast)}"
+    if not is_atom(mod) do
+      raise CompileError,
+        file: caller.file,
+        line: caller.line,
+        description:
+          "tx_for expects a compile-time module or list of modules, got: #{Macro.to_string(schema_ast)}"
+    end
 
-      Code.ensure_loaded?(mod) and function_exported?(mod, :__xitdb_indexes__, 0) ->
+    case Code.ensure_compiled(mod) do
+      {:module, ^mod} ->
+        extract_compiled_module_indexes!(mod, caller)
+
+      {:error, reason} ->
+        raise CompileError,
+          file: caller.file,
+          line: caller.line,
+          description: "tx_for could not load schema module #{inspect(mod)} (#{inspect(reason)})"
+    end
+  end
+
+  defp extract_compiled_module_indexes!(mod, caller) do
+    cond do
+      function_exported?(mod, :__xitdb_indexes__, 0) ->
         col =
           if function_exported?(mod, :__xitdb_collection__, 0) do
             mod.__xitdb_collection__()
@@ -239,12 +255,21 @@ defmodule Xitdb.DSL do
           end
 
         Enum.map(mod.__xitdb_indexes__(), fn
-          {c, field, idx_name} -> {c, field, idx_name}
-          {field, idx_name} when not is_nil(col) -> {col, field, idx_name}
+          {c, field, idx_name} ->
+            {c, field, idx_name}
+
+          {field, idx_name} when not is_nil(col) ->
+            {col, field, idx_name}
+
+          {field, idx_name} ->
+            raise CompileError,
+              file: caller.file,
+              line: caller.line,
+              description:
+                "Module #{inspect(mod)} returned 2-tuple index #{inspect({field, idx_name})} from __xitdb_indexes__/0 without defining __xitdb_collection__/0"
         end)
 
-      Code.ensure_loaded?(Xitdb.Ash.Info) and Code.ensure_loaded?(mod) and
-          function_exported?(mod, :spark_dsl_config, 0) ->
+      Code.ensure_loaded?(Xitdb.Ash.Info) and function_exported?(mod, :spark_dsl_config, 0) ->
         case apply(Spark.Dsl.Extension, :get_persisted, [mod, :xitdb_normalized_indexes, nil]) do
           persisted when is_list(persisted) ->
             persisted
@@ -256,17 +281,19 @@ defmodule Xitdb.DSL do
                 for {field, idx_name} <- idxs, do: {col, field, idx_name}
 
               _ ->
-                raise_invalid_tx_for_schema!(mod)
+                raise_invalid_tx_for_schema!(mod, caller)
             end
         end
 
       true ->
-        raise_invalid_tx_for_schema!(mod)
+        raise_invalid_tx_for_schema!(mod, caller)
     end
   end
 
-  defp raise_invalid_tx_for_schema!(mod) do
+  defp raise_invalid_tx_for_schema!(mod, caller) do
     raise CompileError,
+      file: caller.file,
+      line: caller.line,
       description:
         "Module #{inspect(mod)} does not declare Xitdb indexes (use `Xitdb.Ash.Resource` or define `__xitdb_collection__/0` and `__xitdb_indexes__/0`)."
   end
@@ -1207,6 +1234,10 @@ defmodule Xitdb.DSL do
     {:dynamic, quote(do: Xitdb.DSL.__format_datalog_bracket_pin__(unquote(pinned_expr)))}
   end
 
+  defp compile_datalog_bracket_step([{:^, _, [pinned_expr]}], _find_vars) do
+    {:dynamic, quote(do: Xitdb.DSL.__format_datalog_bracket_pin__([unquote(pinned_expr)]))}
+  end
+
   defp compile_datalog_bracket_step([{var_name, _, ctx}], _find_vars)
        when is_atom(var_name) and is_atom(ctx) do
     {:static, "[[#{format_logic_var(var_name)}]]"}
@@ -1226,7 +1257,12 @@ defmodule Xitdb.DSL do
   end
 
   defp compile_datalog_bracket_step(str, _find_vars) when is_binary(str) do
-    {:static, ~s(["#{str}"])}
+    {:static, "[" <> TxCompiler.encode_quoted(str) <> "]"}
+  end
+
+  defp compile_datalog_bracket_step(atom, _find_vars)
+       when is_atom(atom) and not is_nil(atom) and not is_boolean(atom) do
+    {:static, "[" <> TxCompiler.encode_quoted(Atom.to_string(atom)) <> "]"}
   end
 
   defp compile_datalog_set_step(set_fn, member_arg) do
@@ -1424,14 +1460,11 @@ defmodule Xitdb.DSL do
   end
 
   defp deleted_child_path?(k, selector, sel_len) when byte_size(k) > sel_len do
-    case k do
-      <<^selector::binary-size(sel_len), sep, _rest::binary>>
-      when sep in [?., ?[, ?#, ?$] ->
-        true
-
-      _ ->
-        false
-    end
+    match?(
+      <<^selector::binary-size(^sel_len), sep, _rest::binary>>
+      when sep in [?., ?[, ?#, ?$, ?%, ?^],
+      k
+    )
   end
 
   defp deleted_child_path?(_k, _selector, _sel_len), do: false
@@ -1548,12 +1581,21 @@ defmodule Xitdb.DSL do
   end
 
   @doc false
-  def __format_datalog_literal__(val) when is_binary(val), do: inspect(val)
+  def __format_datalog_literal__(val) when is_binary(val), do: TxCompiler.encode_quoted(val)
   def __format_datalog_literal__(val) when is_integer(val) or is_float(val), do: to_string(val)
-  def __format_datalog_literal__(val) when is_boolean(val), do: to_string(val)
-  def __format_datalog_literal__(val) when is_atom(val), do: inspect(Atom.to_string(val))
+  def __format_datalog_literal__(val) when is_boolean(val), do: Atom.to_string(val)
+
+  def __format_datalog_literal__(val) when is_atom(val) and not is_nil(val),
+    do: TxCompiler.encode_quoted(Atom.to_string(val))
 
   @doc false
   def __format_datalog_bracket_pin__(idx) when is_integer(idx), do: "[#{idx}]"
-  def __format_datalog_bracket_pin__(key), do: ~s(["#{key}"])
+  def __format_datalog_bracket_pin__([idx]) when is_integer(idx), do: "[[#{idx}]]"
+
+  def __format_datalog_bracket_pin__(key) when is_binary(key),
+    do: "[" <> TxCompiler.encode_quoted(key) <> "]"
+
+  def __format_datalog_bracket_pin__(key)
+      when is_atom(key) and not is_nil(key) and not is_boolean(key),
+      do: "[" <> TxCompiler.encode_quoted(Atom.to_string(key)) <> "]"
 end

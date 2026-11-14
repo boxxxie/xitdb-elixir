@@ -280,7 +280,7 @@ defmodule Xitdb do
     try do
       case fun.(root_cursor) do
         %Cursor{staged_ops: ops} ->
-          transact_ops(db, ops, opts)
+          transact_ops(db, :lists.reverse(ops), opts)
 
         {:abort, reason} ->
           {:error, %Error{reason: reason}}
@@ -345,7 +345,7 @@ defmodule Xitdb do
   def insert_at(%Cursor{} = root, path_or_selector, index, value)
       when (is_list(path_or_selector) or is_binary(path_or_selector)) and is_integer(index) do
     selector = TxCompiler.format_path_steps(path_or_selector)
-    %{root | staged_ops: root.staged_ops ++ [{:insert, selector, index, value}]}
+    %Cursor{root | staged_ops: [{:insert, selector, index, value} | root.staged_ops]}
   end
 
   @doc """
@@ -359,7 +359,7 @@ defmodule Xitdb do
       TxCompiler.format_path_steps(path_or_selector) <>
         TxCompiler.format_step(:linked_array_list, index)
 
-    %{root | staged_ops: root.staged_ops ++ [{:rm, selector}]}
+    %Cursor{root | staged_ops: [{:rm, selector} | root.staged_ops]}
   end
 
   @doc """
@@ -367,7 +367,7 @@ defmodule Xitdb do
   """
   @spec fork(Cursor.t(), String.t(), String.t()) :: Cursor.t()
   def fork(%Cursor{} = root, from_selector, to_selector) do
-    %{root | staged_ops: root.staged_ops ++ [{:fork, from_selector, to_selector}]}
+    %Cursor{root | staged_ops: [{:fork, from_selector, to_selector} | root.staged_ops]}
   end
 
   # ============================================================================
@@ -557,13 +557,15 @@ defmodule Xitdb do
   end
 
   @impl Access
-  def get_and_update(%__MODULE__{} = db_handle, key, fun) do
-    Cursor.get_and_update(db(db_handle), key, fun)
+  def get_and_update(%__MODULE__{}, _key, _fun) do
+    raise ArgumentError,
+          "cannot mutate %Xitdb{} directly; wrap put_in/update_in/pop_in inside Xitdb.transact/3 or Xitdb.DSL.tx/3"
   end
 
   @impl Access
-  def pop(%__MODULE__{} = db_handle, key) do
-    Cursor.pop(db(db_handle), key)
+  def pop(%__MODULE__{}, _key) do
+    raise ArgumentError,
+          "cannot mutate %Xitdb{} directly; wrap pop_in inside Xitdb.transact/3 or Xitdb.DSL.tx/3"
   end
 
   def at(index) when is_integer(index) do

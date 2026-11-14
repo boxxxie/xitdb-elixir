@@ -105,10 +105,9 @@ if Code.ensure_loaded?(Spark.InfoGenerator) and Code.ensure_loaded?(Ash.Resource
     def editable_field_strings([resource]), do: editable_field_strings(resource)
 
     def editable_field_strings([a, b]) when is_atom(a) and is_atom(b) do
-      case pair_lookup(a, b, :__xitdb_pair_editable_field_strings__) do
-        nil -> Enum.uniq(editable_field_strings(a) ++ editable_field_strings(b))
-        res -> res
-      end
+      cached_pair(:editable_field_strings, a, b, fn ->
+        Enum.uniq(editable_field_strings(a) ++ editable_field_strings(b))
+      end)
     end
 
     def editable_field_strings(resources) when is_list(resources) do
@@ -118,14 +117,12 @@ if Code.ensure_loaded?(Spark.InfoGenerator) and Code.ensure_loaded?(Ash.Resource
     end
 
     def editable_field_strings(resource) when is_atom(resource) do
-      if function_exported?(resource, :__xitdb_editable_field_strings__, 0) do
-        resource.__xitdb_editable_field_strings__()
-      else
-        case Extension.get_persisted(resource, :xitdb_editable_field_strings, nil) do
-          nil -> compute_editable_field_strings(resource)
-          cached -> cached
-        end
-      end
+      fetch_persisted_or_compute(
+        resource,
+        :__xitdb_editable_field_strings__,
+        :xitdb_editable_field_strings,
+        &compute_editable_field_strings/1
+      )
     end
 
     def editable_field_strings(dsl_state), do: compute_editable_field_strings(dsl_state)
@@ -149,10 +146,9 @@ if Code.ensure_loaded?(Spark.InfoGenerator) and Code.ensure_loaded?(Ash.Resource
     def pull_fields([resource]), do: pull_fields(resource)
 
     def pull_fields([a, b]) when is_atom(a) and is_atom(b) do
-      case pair_lookup(a, b, :__xitdb_pair_pull_fields__) do
-        nil -> Enum.uniq(pull_fields(a) ++ pull_fields(b))
-        res -> res
-      end
+      cached_pair(:pull_fields, a, b, fn ->
+        Enum.uniq(pull_fields(a) ++ pull_fields(b))
+      end)
     end
 
     def pull_fields(resources) when is_list(resources) do
@@ -162,14 +158,12 @@ if Code.ensure_loaded?(Spark.InfoGenerator) and Code.ensure_loaded?(Ash.Resource
     end
 
     def pull_fields(resource) when is_atom(resource) do
-      if function_exported?(resource, :__xitdb_pull_fields__, 0) do
-        resource.__xitdb_pull_fields__()
-      else
-        case Extension.get_persisted(resource, :xitdb_pull_fields, nil) do
-          nil -> compute_pull_fields(resource)
-          cached -> cached
-        end
-      end
+      fetch_persisted_or_compute(
+        resource,
+        :__xitdb_pull_fields__,
+        :xitdb_pull_fields,
+        &compute_pull_fields/1
+      )
     end
 
     def pull_fields(dsl_state), do: compute_pull_fields(dsl_state)
@@ -190,21 +184,18 @@ if Code.ensure_loaded?(Spark.InfoGenerator) and Code.ensure_loaded?(Ash.Resource
     def pull_pattern_for([resource]), do: pull_pattern_for(resource)
 
     def pull_pattern_for([a, b] = pair) when is_atom(a) and is_atom(b) do
-      case pair_lookup(a, b, :__xitdb_pair_pull_pattern__) do
-        nil -> pair |> pull_fields() |> Pull.compile!()
-        res -> res
-      end
+      cached_pair(:pull_pattern, a, b, fn ->
+        pair |> pull_fields() |> Pull.compile!()
+      end)
     end
 
     def pull_pattern_for(resource) when is_atom(resource) do
-      if function_exported?(resource, :__xitdb_pull_pattern__, 0) do
-        resource.__xitdb_pull_pattern__()
-      else
-        case Extension.get_persisted(resource, :xitdb_pull_pattern, nil) do
-          nil -> resource |> pull_fields() |> Pull.compile!()
-          cached -> cached
-        end
-      end
+      fetch_persisted_or_compute(
+        resource,
+        :__xitdb_pull_pattern__,
+        :xitdb_pull_pattern,
+        &(&1 |> pull_fields() |> Pull.compile!())
+      )
     end
 
     def pull_pattern_for(resources) do
@@ -219,21 +210,23 @@ if Code.ensure_loaded?(Spark.InfoGenerator) and Code.ensure_loaded?(Ash.Resource
     """
     @spec nested_mappings(Ash.Resource.t() | Spark.Dsl.t()) :: [Xitdb.Ash.NestedIn.t()]
     def nested_mappings(resource) when is_atom(resource) do
-      if function_exported?(resource, :__xitdb_nested_in__, 0) do
-        resource.__xitdb_nested_in__()
-      else
-        compute_nested_mappings(resource)
-      end
+      fetch_persisted_or_compute(
+        resource,
+        :__xitdb_nested_in__,
+        :xitdb_nested_in,
+        &compute_nested_mappings/1
+      )
     end
 
     def nested_mappings(dsl_state), do: compute_nested_mappings(dsl_state)
 
     @doc false
     def compute_nested_mappings(resource_or_dsl) do
-      resource_or_dsl
-      |> Extension.get_entities([:xitdb])
-      |> Enum.filter(&match?(%Xitdb.Ash.NestedIn{}, &1))
-      |> Enum.map(&%{&1 | __identifier__: nil, __spark_metadata__: nil})
+      for %Xitdb.Ash.NestedIn{parent: parent} = mapping <-
+            Extension.get_entities(resource_or_dsl, [:xitdb]),
+          not is_nil(parent) do
+        %Xitdb.Ash.NestedIn{mapping | __identifier__: nil, __spark_metadata__: nil}
+      end
     end
 
     @doc "Returns `true` when the resource is stored inside a parent entity."
@@ -352,64 +345,89 @@ if Code.ensure_loaded?(Spark.InfoGenerator) and Code.ensure_loaded?(Ash.Resource
     """
     @spec resolve_lock_change(Ash.Resource.t() | Spark.Dsl.t()) :: module() | nil
     def resolve_lock_change(resource) when is_atom(resource) do
-      if function_exported?(resource, :__xitdb_lock_change__, 0) do
-        resource.__xitdb_lock_change__() || Application.get_env(:xitdb, :default_lock_change)
-      else
-        case Extension.get_persisted(resource, :xitdb_lock_change, :__not_persisted__) do
-          :__not_persisted__ -> resolve_lock_change_from_dsl(resource)
-          nil -> Application.get_env(:xitdb, :default_lock_change)
-          mod -> mod
-        end
-      end
+      resolve_option_with_env(
+        resource,
+        :__xitdb_lock_change__,
+        :xitdb_lock_change,
+        &xitdb_lock_change/1,
+        :default_lock_change
+      )
     end
 
-    def resolve_lock_change(dsl_state), do: resolve_lock_change_from_dsl(dsl_state)
-
-    defp resolve_lock_change_from_dsl(resource_or_dsl) do
-      case xitdb_lock_change(resource_or_dsl) do
+    def resolve_lock_change(dsl_state) do
+      case xitdb_lock_change(dsl_state) do
         {:ok, mod} when not is_nil(mod) -> mod
         _ -> Application.get_env(:xitdb, :default_lock_change)
       end
     end
 
     defp default_store(resource) when is_atom(resource) do
-      if function_exported?(resource, :__xitdb_store__, 0) do
-        resource.__xitdb_store__() || Application.get_env(:xitdb, :default_store)
-      else
-        case Extension.get_persisted(resource, :xitdb_store, :__not_persisted__) do
-          :__not_persisted__ -> default_store_from_dsl(resource)
-          nil -> Application.get_env(:xitdb, :default_store)
-          store -> store
-        end
-      end
+      resolve_option_with_env(
+        resource,
+        :__xitdb_store__,
+        :xitdb_store,
+        &xitdb_store/1,
+        :default_store
+      )
     end
 
-    defp default_store(dsl_state), do: default_store_from_dsl(dsl_state)
-
-    defp default_store_from_dsl(resource_or_dsl) do
-      case xitdb_store(resource_or_dsl) do
+    defp default_store(dsl_state) do
+      case xitdb_store(dsl_state) do
         {:ok, store} when not is_nil(store) -> store
         _ -> Application.get_env(:xitdb, :default_store)
       end
     end
 
-    defp pair_lookup(a, b, fun_name) do
-      res_a =
-        if function_exported?(a, fun_name, 2) do
-          apply(a, fun_name, [b, :self_first])
-        else
-          nil
-        end
-
-      if not is_nil(res_a) do
-        res_a
+    defp fetch_persisted_or_compute(resource, callback, persisted_key, compute_fun) do
+      if Code.ensure_loaded?(resource) and function_exported?(resource, callback, 0) do
+        apply(resource, callback, [])
       else
-        if function_exported?(b, fun_name, 2) do
-          apply(b, fun_name, [a, :other_first])
-        else
-          nil
+        case Extension.get_persisted(resource, persisted_key, :__not_persisted__) do
+          :__not_persisted__ -> compute_fun.(resource)
+          cached -> cached
         end
       end
+    end
+
+    defp resolve_option_with_env(resource, callback, persisted_key, dsl_fetcher, env_key) do
+      configured =
+        fetch_persisted_or_compute(resource, callback, persisted_key, fn res ->
+          case dsl_fetcher.(res) do
+            {:ok, val} -> val
+            _ -> nil
+          end
+        end)
+
+      configured || Application.get_env(:xitdb, env_key)
+    end
+
+    defp cached_pair(kind, a, b, compute_fun) do
+      key = {__MODULE__, :pair, kind, a, b}
+
+      case :persistent_term.get(key, :__miss__) do
+        :__miss__ ->
+          val = compute_fun.()
+
+          if Code.ensure_loaded?(a) and function_exported?(a, :__xitdb_pull_fields__, 0) and
+               Code.ensure_loaded?(b) and function_exported?(b, :__xitdb_pull_fields__, 0) do
+            :persistent_term.put(key, val)
+          end
+
+          val
+
+        cached ->
+          cached
+      end
+    end
+
+    @doc false
+    def __purge_pair_cache__(module) when is_atom(module) do
+      for {{__MODULE__, :pair, _kind, a, b} = key, _val} <- :persistent_term.get(),
+          a == module or b == module do
+        :persistent_term.erase(key)
+      end
+
+      :ok
     end
   end
 end

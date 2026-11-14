@@ -17,6 +17,12 @@ if Code.ensure_loaded?(Spark.Dsl.Transformer) and Code.ensure_loaded?(Ash.Resour
 
     @impl true
     def transform(dsl_state) do
+      module = Transformer.get_persisted(dsl_state, :module)
+
+      if is_atom(module) and not is_nil(module) do
+        XitdbInfo.__purge_pair_cache__(module)
+      end
+
       dsl_state =
         dsl_state
         |> persist_xitdb_metadata()
@@ -47,62 +53,11 @@ if Code.ensure_loaded?(Spark.Dsl.Transformer) and Code.ensure_loaded?(Ash.Resour
       lock_change = Transformer.get_persisted(dsl_state, :xitdb_lock_change)
       normalized_indexes = Transformer.get_persisted(dsl_state, :xitdb_normalized_indexes)
 
-      companion_info_quoted =
-        case XitdbInfo.xitdb_companion_resource(dsl_state) do
-          {:ok, companion} when is_atom(companion) and not is_nil(companion) ->
-            case Code.ensure_compiled(companion) do
-              {:module, ^companion} ->
-                if function_exported?(companion, :__xitdb_pull_fields__, 0) do
-                  comp_editable = companion.__xitdb_editable_field_strings__()
-                  comp_pull = companion.__xitdb_pull_fields__()
-
-                  ab_editable = Enum.uniq(editable_strings ++ comp_editable)
-                  ba_editable = Enum.uniq(comp_editable ++ editable_strings)
-
-                  ab_pull = Enum.uniq(pull_fields ++ comp_pull)
-                  ba_pull = Enum.uniq(comp_pull ++ pull_fields)
-
-                  ab_pattern = Xitdb.Pull.compile!(ab_pull)
-                  ba_pattern = Xitdb.Pull.compile!(ba_pull)
-
-                  quote do
-                    @doc false
-                    def __xitdb_pair_editable_field_strings__(unquote(companion), :self_first),
-                      do: unquote(Macro.escape(ab_editable))
-
-                    def __xitdb_pair_editable_field_strings__(unquote(companion), :other_first),
-                      do: unquote(Macro.escape(ba_editable))
-
-                    def __xitdb_pair_editable_field_strings__(_, _), do: nil
-
-                    @doc false
-                    def __xitdb_pair_pull_fields__(unquote(companion), :self_first),
-                      do: unquote(Macro.escape(ab_pull))
-
-                    def __xitdb_pair_pull_fields__(unquote(companion), :other_first),
-                      do: unquote(Macro.escape(ba_pull))
-
-                    def __xitdb_pair_pull_fields__(_, _), do: nil
-
-                    @doc false
-                    def __xitdb_pair_pull_pattern__(unquote(companion), :self_first),
-                      do: unquote(Macro.escape(ab_pattern))
-
-                    def __xitdb_pair_pull_pattern__(unquote(companion), :other_first),
-                      do: unquote(Macro.escape(ba_pattern))
-
-                    def __xitdb_pair_pull_pattern__(_, _), do: nil
-                  end
-                else
-                  nil
-                end
-
-              _ ->
-                nil
-            end
-
-          _ ->
-            nil
+      compile_env_quoted =
+        if is_nil(lock_change) do
+          quote do
+            _ = Application.compile_env(:xitdb, :default_lock_change)
+          end
         end
 
       Transformer.eval(
@@ -118,6 +73,8 @@ if Code.ensure_loaded?(Spark.Dsl.Transformer) and Code.ensure_loaded?(Ash.Resour
           normalized_indexes: normalized_indexes
         ],
         quote do
+          unquote(compile_env_quoted)
+
           @doc false
           def __xitdb_collection__, do: unquote(Macro.escape(collection))
 
@@ -141,8 +98,6 @@ if Code.ensure_loaded?(Spark.Dsl.Transformer) and Code.ensure_loaded?(Ash.Resour
 
           @doc false
           def __xitdb_lock_change__, do: unquote(Macro.escape(lock_change))
-
-          unquote(companion_info_quoted)
         end
       )
     end
@@ -193,11 +148,8 @@ if Code.ensure_loaded?(Spark.Dsl.Transformer) and Code.ensure_loaded?(Ash.Resour
 
     defp maybe_attach_lock_change(dsl_state, action_name, lock_change_mod, op) do
       case Ash.Resource.Info.action(dsl_state, action_name) do
-        nil ->
-          dsl_state
-
-        action ->
-          if lock_change_present?(action.changes, lock_change_mod) do
+        %Ash.Resource.Actions.Update{changes: changes} = action ->
+          if lock_change_present?(changes, lock_change_mod) do
             dsl_state
           else
             {:ok, change} =
@@ -205,7 +157,7 @@ if Code.ensure_loaded?(Spark.Dsl.Transformer) and Code.ensure_loaded?(Ash.Resour
                 change: {lock_change_mod, op: op}
               )
 
-            updated_action = %{action | changes: action.changes ++ [change]}
+            updated_action = %Ash.Resource.Actions.Update{action | changes: changes ++ [change]}
 
             Transformer.replace_entity(
               dsl_state,
@@ -214,6 +166,9 @@ if Code.ensure_loaded?(Spark.Dsl.Transformer) and Code.ensure_loaded?(Ash.Resour
               &(&1.name == action_name and &1.type == :update)
             )
           end
+
+        _ ->
+          dsl_state
       end
     end
 

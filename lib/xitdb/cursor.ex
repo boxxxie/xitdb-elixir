@@ -93,10 +93,13 @@ defmodule Xitdb.Cursor do
 
   @impl Access
   def fetch(
-        %__MODULE__{tx_mode: false, db_ref: db_ref, tag_id: tag_id, value: val, moment: moment},
+        %__MODULE__{tx_mode: false} = raw_cursor,
         key
       )
       when is_integer(key) do
+    %__MODULE__{db_ref: db_ref, tag_id: tag_id, value: val, moment: moment} =
+      ensure_resolved(raw_cursor)
+
     case NIF.nif_slot_get_index(db_ref, tag_id, val, key) do
       {:ok, {:cursor, c_tag, c_tag_id, c_val, c_full}} ->
         {:ok,
@@ -150,7 +153,7 @@ defmodule Xitdb.Cursor do
     cursor = ensure_resolved(cursor)
     child_steps = [{cursor.tag, key} | cursor.path_steps]
 
-    if map_size(cursor.staged_overrides) == 0 and map_size(cursor.deleted_paths.map) == 0 do
+    if map_size(cursor.staged_overrides) == 0 and MapSet.size(cursor.deleted_paths) == 0 do
       case NIF.nif_slot_get_index(cursor.db_ref, cursor.tag_id, cursor.value, key) do
         {:ok, raw} ->
           val = unwrap_nif_value(cursor.db_ref, raw, cursor.moment, child_steps)
@@ -186,7 +189,7 @@ defmodule Xitdb.Cursor do
     key_str = if is_binary(key), do: key, else: Atom.to_string(key)
     child_steps = [{cursor.tag, key_str} | cursor.path_steps]
 
-    if map_size(cursor.staged_overrides) == 0 and map_size(cursor.deleted_paths.map) == 0 do
+    if map_size(cursor.staged_overrides) == 0 and MapSet.size(cursor.deleted_paths) == 0 do
       case NIF.nif_slot_get_key(cursor.db_ref, cursor.tag_id, cursor.value, key_str) do
         {:ok, raw} ->
           val = unwrap_nif_value(cursor.db_ref, raw, cursor.moment, child_steps)
@@ -249,10 +252,10 @@ defmodule Xitdb.Cursor do
         selector = steps_to_selector(child_steps)
         new_ops = TxCompiler.compile_node(selector, new_val, true)
 
-        updated_cursor = %{
+        updated_cursor = %__MODULE__{
           cursor
           | tx_mode: true,
-            staged_ops: cursor.staged_ops ++ new_ops,
+            staged_ops: :lists.reverse(new_ops, cursor.staged_ops),
             staged_overrides: Map.put(cursor.staged_overrides, selector, new_val),
             deleted_paths: MapSet.delete(cursor.deleted_paths, selector)
         }
@@ -276,10 +279,10 @@ defmodule Xitdb.Cursor do
     child_steps = [{cursor.tag, child_key} | cursor.path_steps]
     selector = steps_to_selector(child_steps)
 
-    updated_cursor = %{
+    updated_cursor = %__MODULE__{
       cursor
       | tx_mode: true,
-        staged_ops: cursor.staged_ops ++ [{:rm, selector}],
+        staged_ops: [{:rm, selector} | cursor.staged_ops],
         staged_overrides: Map.delete(cursor.staged_overrides, selector),
         deleted_paths: MapSet.put(cursor.deleted_paths, selector)
     }
