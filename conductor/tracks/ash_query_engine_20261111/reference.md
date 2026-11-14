@@ -1898,10 +1898,20 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     defp filter_uses_derived_or_related?(_scalar), do: false
 
     defp fetch_record_field(record, field) do
-      cond do
-        Map.has_key?(record, field) ->
-          Map.get(record, field)
+      case Map.get(record, field, :__missing__) do
+        %Ash.NotLoaded{} ->
+          fetch_virtual_container_field(record, field)
 
+        :__missing__ ->
+          fetch_virtual_container_field(record, field)
+
+        val ->
+          val
+      end
+    end
+
+    defp fetch_virtual_container_field(record, field) do
+      cond do
         Map.has_key?(Map.get(record, :calculations, %{}), field) ->
           record.calculations[field]
 

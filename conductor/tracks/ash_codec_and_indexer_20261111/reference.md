@@ -1102,13 +1102,18 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           Codec.encode_index_prefix(attrs, prefix_vals)
         end
 
+      min_spec = Map.get(range_spec, :min, :unbounded)
+      max_spec = Map.get(range_spec, :max, :unbounded)
+      has_range_bound? = min_spec != :unbounded or max_spec != :unbounded
+
       {start_key, min_pred} =
         build_lower_bound(
           attrs,
           prefix_vals,
           prefix_bin,
           range_attr,
-          Map.get(range_spec, :min, :unbounded)
+          min_spec,
+          has_range_bound?
         )
 
       max_pred =
@@ -1117,7 +1122,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           prefix_vals,
           prefix_bin,
           range_attr,
-          Map.get(range_spec, :max, :unbounded)
+          max_spec
         )
 
       db_or_cursor
@@ -1126,7 +1131,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         binary_starts_with?(key, prefix_bin) and max_pred.(key)
       end)
       |> Enum.reduce(MapSet.new(), fn {key, ids}, acc ->
-        if not non_null_at_offset?(key, byte_size(prefix_bin)) or not min_pred.(key) do
+        if (has_range_bound? and not non_null_at_offset?(key, byte_size(prefix_bin))) or
+             not min_pred.(key) do
           acc
         else
           Enum.reduce(ids, acc, &MapSet.put(&2, &1))
@@ -1475,9 +1481,13 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
     # -- Range Scan Boundary Helpers (Prefix-Aware for Composite Indexes) --
 
-    defp build_lower_bound(_attrs, _prefix_vals, prefix_bin, _range_attr, :unbounded) do
+    defp build_lower_bound(_attrs, _prefix_vals, prefix_bin, _range_attr, :unbounded, true) do
       start_key = <<prefix_bin::binary, 0x01>>
       {start_key, fn _key -> true end}
+    end
+
+    defp build_lower_bound(_attrs, _prefix_vals, prefix_bin, _range_attr, :unbounded, false) do
+      {prefix_bin, fn _key -> true end}
     end
 
     defp build_lower_bound(
@@ -1485,7 +1495,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
            prefix_vals,
            _prefix_bin,
            %Ash.Resource.Attribute{},
-           {inclusivity, min_val}
+           {inclusivity, min_val},
+           _has_range_bound?
          ) do
       specified_vals = prefix_vals ++ [min_val]
       bound_key = Codec.encode_index_prefix(attrs, specified_vals)
@@ -2186,10 +2197,17 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
           b_next = Map.put(b_init, members_key, MapSet.put(cur_members, doc_id))
 
+          init_set =
+            if MapSet.size(cur_members) == 0 do
+              [{:init_col, set_path, "counted_hash_set"}]
+            else
+              []
+            end
+
           ops_out =
             init_btree ++
+              init_set ++
               [
-                {:init_col, set_path, "counted_hash_set"},
                 {:put, set_path <> TxCompiler.format_step(:counted_hash_set, doc_id), true}
               ]
 

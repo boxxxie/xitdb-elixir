@@ -5,11 +5,12 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     alias Xitdb.Ash.TestSandbox
 
     @type reverse_fk :: %{
-            source_resource: module(),
-            source_collection: atom(),
-            source_attribute: atom(),
-            destination_attribute: atom(),
-            on_delete: :delete | :nilify | :restrict
+            :source_resource => module(),
+            :source_collection => atom(),
+            :source_attribute => atom(),
+            :destination_attribute => atom(),
+            :on_delete => :delete | :nilify | :restrict,
+            optional(:nested?) => boolean()
           }
 
     @type reverse_fk_map :: %{optional(module()) => [reverse_fk()]}

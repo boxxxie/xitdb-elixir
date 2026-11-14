@@ -248,6 +248,10 @@ resolve_snapshot_root_cursor :: proc(
 ) -> (root_cur: xitdb.Read_Cursor, has_data: bool, out_of_range: bool, err: xitdb.Error) {
 	if root_tag_id == -1 {
 		rc := xitdb.database_root_cursor(db).read_cursor
+		slot_ptr := xitdb.cursor_resolved(rc) or_return
+		if slot_ptr.slot.tag == .None || slot_ptr.slot.value == 0 {
+			return {}, false, false, nil
+		}
 		hist := xitdb.read_array_list_init(rc) or_return
 		cnt := xitdb.array_list_count(hist) or_return
 		if cnt == 0 {

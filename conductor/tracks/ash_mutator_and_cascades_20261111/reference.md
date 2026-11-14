@@ -123,13 +123,16 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       store = Info.store!(resource)
       opts = Map.new(options)
       return_records? = Map.get(opts, :return_records?, false)
+      effective_tenant = changeset.tenant || query.tenant || Map.get(opts, :tenant)
+      scoped_query = %Query{query | select: nil, tenant: effective_tenant}
+      scoped_changeset = %Ash.Changeset{changeset | tenant: effective_tenant}
 
       result =
         Store.mutate(store, fn {db, moment} = initial_snapshot ->
           cursor_root = Xitdb.as_of(db, moment)
 
-          with {:ok, candidates} <- Query.execute(cursor_root, %Query{query | select: nil}, resource) do
-            apply_bulk_updates(initial_snapshot, candidates, resource, changeset)
+          with {:ok, candidates} <- Query.execute(cursor_root, scoped_query, resource) do
+            apply_bulk_updates(initial_snapshot, candidates, resource, scoped_changeset)
           end
         end)
 
@@ -181,13 +184,16 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       store = Info.store!(resource)
       opts = Map.new(options)
       return_records? = Map.get(opts, :return_records?, false)
+      effective_tenant = changeset.tenant || query.tenant || Map.get(opts, :tenant)
+      scoped_query = %Query{query | select: nil, tenant: effective_tenant}
+      scoped_changeset = %Ash.Changeset{changeset | tenant: effective_tenant}
 
       result =
         Store.mutate(store, fn {db, moment} = initial_snapshot ->
           cursor_root = Xitdb.as_of(db, moment)
 
-          with {:ok, candidates} <- Query.execute(cursor_root, %Query{query | select: nil}, resource) do
-            apply_bulk_destroys(initial_snapshot, candidates, resource, changeset)
+          with {:ok, candidates} <- Query.execute(cursor_root, scoped_query, resource) do
+            apply_bulk_destroys(initial_snapshot, candidates, resource, scoped_changeset)
           end
         end)
 
