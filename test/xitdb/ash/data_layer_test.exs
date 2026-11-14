@@ -1448,5 +1448,114 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         assert msg =~ "SQL `fragment(...)` is not supported"
       end
     end
+
+    describe "time-travel as_of & xitdb_db queries" do
+      test "reads historical Ash records, aggregates, and BM25 search hits at prior moments" do
+        org =
+          TestDomain.create_org!(
+            %{name: "Helios Alpha", slug: unique_slug("helios-alpha")},
+            authorize?: false
+          )
+
+        event =
+          TestDomain.create_event!(
+            %{title: "Helios Summit", start_time: ~U[2026-10-01 09:00:00Z]},
+            authorize?: false
+          )
+
+        session =
+          TestDomain.create_session!(
+            %{event_id: event.id, title: "Helios Opening", room: "Main"},
+            authorize?: false
+          )
+
+        moment_v1 = TestMdmStore.root().moment
+        assert is_integer(moment_v1)
+
+        # Mutate records + add a second organization after moment_v1
+        updated_org =
+          TestDomain.update_org!(org, %{name: "Helios Beta"}, authorize?: false)
+
+        assert updated_org.name == "Helios Beta"
+
+        _org2 =
+          TestDomain.create_org!(
+            %{name: "Polar Second", slug: unique_slug("polar-second")},
+            authorize?: false
+          )
+
+        _updated_session =
+          TestDomain.update_session!(session, %{title: "Solar Closing"}, authorize?: false)
+
+        # Latest reads reflect v2 state
+        assert length(TestDomain.list_orgs!(authorize?: false)) == 2
+
+        assert Enum.find(TestDomain.list_orgs!(authorize?: false), &(&1.id == org.id)).name ==
+                 "Helios Beta"
+
+        assert Xitdb.Ash.Search.ids(AgendaSession, "helios") == []
+        assert Xitdb.Ash.Search.ids(AgendaSession, "solar") == [session.id]
+
+        # 1. Per-query `context: %{xitdb_moment: moment_v1}` and `context: %{xitdb: %{as_of: moment_v1}}`
+        v1_via_query =
+          Organization
+          |> Ash.Query.set_context(%{xitdb_moment: moment_v1})
+          |> Ash.read!(authorize?: false)
+
+        assert Enum.map(v1_via_query, &{&1.id, &1.name}) == [{org.id, "Helios Alpha"}]
+
+        v1_via_opts =
+          Ash.read!(Organization, context: %{xitdb: %{as_of: moment_v1}}, authorize?: false)
+
+        assert Enum.map(v1_via_opts, &{&1.id, &1.name}) == [{org.id, "Helios Alpha"}]
+
+        v1_via_shared =
+          Ash.read!(Organization,
+            context: %{shared: %{xitdb: %{as_of: moment_v1}}},
+            authorize?: false
+          )
+
+        assert Enum.map(v1_via_shared, &{&1.id, &1.name}) == [{org.id, "Helios Alpha"}]
+
+        # 2. Explicit `context: %{xitdb_db: Store.as_of(moment_v1)}`
+        v1_cursor = TestMdmStore.as_of(moment_v1)
+        v1_via_db = Ash.read!(Organization, context: %{xitdb_db: v1_cursor}, authorize?: false)
+        assert Enum.map(v1_via_db, &{&1.id, &1.name}) == [{org.id, "Helios Alpha"}]
+
+        # 3. Aggregate queries respect `xitdb_moment`
+        assert Ash.count!(Organization, authorize?: false) == 2
+
+        assert Ash.count!(Organization, context: %{xitdb_moment: moment_v1}, authorize?: false) ==
+                 1
+
+        # 4. BM25 search respects `as_of: moment_v1`
+        assert Xitdb.Ash.Search.ids(AgendaSession, "helios", as_of: moment_v1) == [session.id]
+        assert Xitdb.Ash.Search.ids(AgendaSession, "solar", as_of: moment_v1) == []
+
+        # 5. Scoped `Store.with_as_of/2` pins Ash.read, Ash.get, Ash.count, Search, and `$callers`
+        TestMdmStore.with_as_of(moment_v1, fn ->
+          assert Enum.map(TestDomain.list_orgs!(authorize?: false), & &1.name) == [
+                   "Helios Alpha"
+                 ]
+
+          assert TestDomain.get_session!(session.id, authorize?: false).title == "Helios Opening"
+          assert Ash.count!(Organization, authorize?: false) == 1
+          assert Xitdb.Ash.Search.ids(AgendaSession, "helios") == [session.id]
+
+          async_names =
+            1..2
+            |> Task.async_stream(fn _ ->
+              TestDomain.list_orgs!(authorize?: false) |> Enum.map(& &1.name)
+            end)
+            |> Enum.map(fn {:ok, names} -> names end)
+
+          assert async_names == [["Helios Alpha"], ["Helios Alpha"]]
+        end)
+
+        # Outside `with_as_of`, reads return to the latest state
+        assert length(TestDomain.list_orgs!(authorize?: false)) == 2
+        assert TestDomain.get_session!(session.id, authorize?: false).title == "Solar Closing"
+      end
+    end
   end
 end

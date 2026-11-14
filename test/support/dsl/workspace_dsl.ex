@@ -14,6 +14,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         events: %{},
         sessions: %{},
         seats: %{},
+        checkpoints: %{},
         last_result: nil,
         search_hits: [],
         bulk_stats: nil
@@ -26,6 +27,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
               events: map(),
               sessions: map(),
               seats: map(),
+              checkpoints: map(),
               last_result: term(),
               search_hits: list(),
               bulk_stats: map() | nil
@@ -117,7 +119,16 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       %World{ctx | seats: Map.put(ctx.seats, {session.title, member.full_name, seat_no}, seat)}
     end
 
+    def checkpoint(%World{} = ctx, label) do
+      %World{
+        ctx
+        | checkpoints: Map.put(ctx.checkpoints, label, WorkspaceDriver.capture_checkpoint())
+      }
+    end
+
     # -- @upon Steps --
+
+    def recording_checkpoint(%World{} = ctx, label), do: checkpoint(ctx, label)
 
     def updating_profile_headline(%World{} = ctx, target_label, opts) do
       actor = Map.fetch!(ctx.members, Keyword.fetch!(opts, :as))
@@ -209,7 +220,23 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
     def searching_directory(%World{} = ctx, query_text, opts) do
       actor = Map.fetch!(ctx.members, Keyword.fetch!(opts, :as))
-      hits = WorkspaceDriver.search_member_directory(query_text, actor)
+
+      driver_opts =
+        case Keyword.get(opts, :at_checkpoint) do
+          nil ->
+            []
+
+          cp_label ->
+            cp = Map.fetch!(ctx.checkpoints, cp_label)
+
+            if Keyword.get(opts, :mode) == :with_as_of do
+              [checkpoint: cp]
+            else
+              [at_moment: cp.mdm_moment]
+            end
+        end
+
+      hits = WorkspaceDriver.search_member_directory(query_text, actor, driver_opts)
       %World{ctx | search_hits: hits}
     end
 
@@ -240,8 +267,11 @@ if Code.ensure_loaded?(Ash.DataLayer) do
             label -> Map.fetch!(ctx.members, label).id
           end
 
-        profiles =
-          WorkspaceDriver.list_visible_profiles(viewer, messaged_recipient_id: recipient_id)
+        driver_opts =
+          [messaged_recipient_id: recipient_id] ++
+            Xitdb.TestDSL.WorkspaceDSL.checkpoint_opts(ctx, opts)
+
+        profiles = WorkspaceDriver.list_visible_profiles(viewer, driver_opts)
 
         assert Enum.map(profiles, & &1.full_name) == unquote(expected_names)
         ctx
@@ -299,10 +329,12 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         member = Map.fetch!(ctx.members, unquote(member_label))
         opts = unquote(opts)
 
+        driver_opts =
+          [load: [:display_badge, :sent_message_count]] ++
+            Xitdb.TestDSL.WorkspaceDSL.checkpoint_opts(ctx, opts)
+
         [loaded] =
-          WorkspaceDriver.list_visible_profiles(member,
-            load: [:display_badge, :sent_message_count]
-          )
+          WorkspaceDriver.list_visible_profiles(member, driver_opts)
           |> Enum.filter(&(&1.id == member.id))
 
         if badge = opts[:badge], do: assert(loaded.display_badge == badge)
@@ -325,15 +357,29 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       end
     end
 
-    defmacro confirmed_seats_for_session(ctx_ast, session_title, expected_seat_numbers) do
+    defmacro confirmed_seats_for_session(
+               ctx_ast,
+               session_title,
+               expected_seat_numbers,
+               opts \\ []
+             ) do
       quote line: __CALLER__.line do
         %World{} = ctx = unquote(ctx_ast)
         session = Map.fetch!(ctx.sessions, unquote(session_title))
+        driver_opts = Xitdb.TestDSL.WorkspaceDSL.checkpoint_opts(ctx, unquote(opts))
 
-        assert WorkspaceDriver.confirmed_seat_numbers(session.id) ==
+        assert WorkspaceDriver.confirmed_seat_numbers(session.id, driver_opts) ==
                  unquote(expected_seat_numbers)
 
         ctx
+      end
+    end
+
+    @doc false
+    def checkpoint_opts(%World{checkpoints: checkpoints}, opts) do
+      case Keyword.get(opts, :at_checkpoint) do
+        nil -> []
+        cp_label -> [checkpoint: Map.fetch!(checkpoints, cp_label)]
       end
     end
 

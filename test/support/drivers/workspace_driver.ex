@@ -8,12 +8,30 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
     alias Xitdb.TestSupport.{
       AppDomain,
+      AppStore,
       DirectMessage,
       MdmDomain,
       MdmStore,
       MemberProfile,
       TableTalkSeat
     }
+
+    def capture_checkpoint do
+      %{
+        mdm_moment: MdmStore.root().moment,
+        app_moment: AppStore.root().moment
+      }
+    end
+
+    def with_checkpoint(%{mdm_moment: mdm_m, app_moment: app_m}, fun) when is_function(fun, 0) do
+      MdmStore.with_as_of(mdm_m, fn ->
+        if is_integer(app_m) and app_m >= 0 do
+          AppStore.with_as_of(app_m, fun)
+        else
+          fun.()
+        end
+      end)
+    end
 
     def seed_organization(attrs) do
       MdmDomain.register_organization!(attrs)
@@ -28,14 +46,32 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     end
 
     def list_visible_profiles(actor, opts \\ []) do
-      load_fields = Keyword.get(opts, :load, [:display_badge, :sent_message_count])
+      run = fn ->
+        load_fields = Keyword.get(opts, :load, [:display_badge, :sent_message_count])
 
-      MemberProfile
-      |> Ash.Query.for_read(:read, %{}, actor: actor)
-      |> maybe_filter_messaged_recipient(opts[:messaged_recipient_id])
-      |> Ash.Query.load(load_fields)
-      |> Ash.Query.sort(full_name: :asc)
-      |> Ash.read!(domain: MdmDomain)
+        query =
+          MemberProfile
+          |> Ash.Query.for_read(:read, %{}, actor: actor)
+          |> maybe_filter_messaged_recipient(opts[:messaged_recipient_id])
+          |> Ash.Query.load(load_fields)
+          |> Ash.Query.sort(full_name: :asc)
+
+        query =
+          case Keyword.get(opts, :at_moment) do
+            moment when is_integer(moment) ->
+              Ash.Query.set_context(query, %{shared: %{xitdb_moment: moment}})
+
+            nil ->
+              query
+          end
+
+        Ash.read!(query, domain: MdmDomain)
+      end
+
+      case Keyword.get(opts, :checkpoint) do
+        nil -> run.()
+        checkpoint -> with_checkpoint(checkpoint, run)
+      end
     end
 
     def edit_profile(target_profile, attrs, actor) do
@@ -101,12 +137,30 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       MdmDomain.cancel_seat!(seat)
     end
 
-    def confirmed_seat_numbers(session_id) do
-      TableTalkSeat
-      |> Ash.Query.filter(session_id == ^session_id and status == :confirmed)
-      |> Ash.read!(domain: MdmDomain)
-      |> Enum.map(& &1.seat_number)
-      |> Enum.sort()
+    def confirmed_seat_numbers(session_id, opts \\ []) do
+      run = fn ->
+        query =
+          Ash.Query.filter(TableTalkSeat, session_id == ^session_id and status == :confirmed)
+
+        query =
+          case Keyword.get(opts, :at_moment) do
+            moment when is_integer(moment) ->
+              Ash.Query.set_context(query, %{xitdb_moment: moment})
+
+            nil ->
+              query
+          end
+
+        query
+        |> Ash.read!(domain: MdmDomain)
+        |> Enum.map(& &1.seat_number)
+        |> Enum.sort()
+      end
+
+      case Keyword.get(opts, :checkpoint) do
+        nil -> run.()
+        checkpoint -> with_checkpoint(checkpoint, run)
+      end
     end
 
     def run_outer_tx_with_aborted_nested_savepoint(confirmed_fn, aborted_nested_fn) do
@@ -128,19 +182,45 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     @search_page_size 20
     @search_overfetch 10
 
-    def search_member_directory(query_text, actor) do
-      ranked_ids =
-        Search.ids(MemberProfile, query_text, limit: @search_page_size * @search_overfetch)
+    def search_member_directory(query_text, actor, opts \\ []) do
+      run = fn ->
+        search_opts =
+          [limit: @search_page_size * @search_overfetch]
+          |> then(fn s_opts ->
+            case Keyword.get(opts, :at_moment) do
+              moment when is_integer(moment) -> Keyword.put(s_opts, :as_of, moment)
+              nil -> s_opts
+            end
+          end)
 
-      if ranked_ids == [] do
-        []
-      else
-        MemberProfile
-        |> Ash.Query.for_read(:read, %{}, actor: actor)
-        |> Ash.Query.filter(id in ^ranked_ids)
-        |> Search.sort_by_rank(ranked_ids)
-        |> Ash.Query.limit(@search_page_size)
-        |> Ash.read!(domain: MdmDomain)
+        ranked_ids = Search.ids(MemberProfile, query_text, search_opts)
+
+        if ranked_ids == [] do
+          []
+        else
+          query =
+            MemberProfile
+            |> Ash.Query.for_read(:read, %{}, actor: actor)
+            |> Ash.Query.filter(id in ^ranked_ids)
+            |> Search.sort_by_rank(ranked_ids)
+            |> Ash.Query.limit(@search_page_size)
+
+          query =
+            case Keyword.get(opts, :at_moment) do
+              moment when is_integer(moment) ->
+                Ash.Query.set_context(query, %{shared: %{xitdb: %{as_of: moment}}})
+
+              nil ->
+                query
+            end
+
+          Ash.read!(query, domain: MdmDomain)
+        end
+      end
+
+      case Keyword.get(opts, :checkpoint) do
+        nil -> run.()
+        checkpoint -> with_checkpoint(checkpoint, run)
       end
     end
 

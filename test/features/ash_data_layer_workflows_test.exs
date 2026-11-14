@@ -167,5 +167,70 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       @upon changing_member_email("Jordan Lee", as: "Jordan Lee", to: "j.lee@maplecapital.ca")
       @then member_email_has_domain("Jordan Lee", "maplecapital.ca")
     end
+
+    scenario "time-travel checkpoints preserve historical directory visibility, cross-store counts, seats, and BM25 search" do
+      @given firm("Northleaf Capital",
+               domain: "northleaf.ca",
+               mandate: "Private credit and infrastructure co-investments"
+             )
+      @given member("Claire Tremblay",
+               firm: "Northleaf Capital",
+               headline: "Managing Director, Private Credit",
+               visibility: :public
+             )
+      @given member("Victor Leung",
+               firm: "Northleaf Capital",
+               headline: "Partner, Venture Growth",
+               visibility: :public
+             )
+      @given direct_message(from: "Claire Tremblay", to: "Victor Leung", body: "Initial memo")
+      @given conference_event("Private Credit Summit",
+               organizer: "Northleaf Capital",
+               city: "Toronto",
+               venue: "Shangri-La",
+               sessions: [%{title: "Credit Roundtable", capacity: 12}]
+             )
+      @given confirmed_seat(session: "Credit Roundtable", member: "Claire Tremblay", seat: 1)
+      @given checkpoint(:v1_baseline)
+
+      @upon renaming_firm("Northleaf Capital",
+              name: "Northleaf Global",
+              mandate: "Secondary buyouts and distressed debt"
+            )
+      @upon updating_profile_headline("Claire Tremblay",
+              as: "Claire Tremblay",
+              to: "Head of Distressed Debt"
+            )
+      @upon direct_message(from: "Claire Tremblay", to: "Victor Leung", body: "Follow-up memo")
+      @upon cancelling_and_reassigning_seat(
+              session: "Credit Roundtable",
+              seat: 1,
+              from: "Claire Tremblay",
+              to: "Victor Leung"
+            )
+      @upon confirmed_seat(session: "Credit Roundtable", member: "Victor Leung", seat: 2)
+
+      # Latest state reflects all post-checkpoint mutations
+      @then profile_summary_matches("Claire Tremblay",
+              badge: "Claire Tremblay (Head of Distressed Debt)",
+              sent_messages: 2
+            )
+      @then confirmed_seats_for_session("Credit Roundtable", [1, 2])
+      @upon searching_directory("infrastructure credit", as: "Victor Leung")
+      @then search_results_ordered([])
+
+      # Historical checkpoint `:v1_baseline` preserves original BM25 index, cross-store counts, and seats
+      @then profile_summary_matches("Claire Tremblay",
+              badge: "Claire Tremblay (Managing Director, Private Credit)",
+              sent_messages: 1,
+              at_checkpoint: :v1_baseline
+            )
+      @then confirmed_seats_for_session("Credit Roundtable", [1], at_checkpoint: :v1_baseline)
+      @upon searching_directory("infrastructure credit",
+              as: "Victor Leung",
+              at_checkpoint: :v1_baseline
+            )
+      @then search_results_ordered(["Claire Tremblay", "Victor Leung"])
+    end
   end
 end
