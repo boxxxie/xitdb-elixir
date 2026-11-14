@@ -1,101 +1,227 @@
 if Code.ensure_loaded?(Spark.InfoGenerator) and Code.ensure_loaded?(Ash.Resource) do
   defmodule Xitdb.Ash.Info do
     @moduledoc """
-    Compile-time and runtime introspection helpers for `Xitdb.Ash.Resource`.
+    Compile-time and runtime introspection helpers for `Xitdb.Ash.DataLayer`,
+    `Xitdb.Ash.Dsl`, and `Xitdb.Ash.Resource`.
     """
+
     use Spark.InfoGenerator,
       extension: Xitdb.Ash.Resource,
       sections: [:xitdb]
 
     alias Spark.Dsl.Extension
+    alias Xitdb.Ash.{Index, NestedIn, Reference, SearchField}
     alias Xitdb.Pull
 
+    @type resource_or_dsl :: Ash.Resource.t() | Spark.Dsl.t()
+
+    # ==========================================================================
+    # Shared & DataLayer Persisted Introspection Helpers
+    # ==========================================================================
+
     @doc """
-    Returns the list of `search_field` declarations for a resource.
+    Returns the configured `Xitdb.Ash.Store` module for `resource_or_dsl`, or `nil` if undeclared.
     """
-    @spec search_fields(Ash.Resource.t() | Spark.Dsl.t()) :: [Xitdb.Ash.SearchField.t()]
-    def search_fields(resource_or_dsl) do
-      resource_or_dsl
-      |> Extension.get_entities([:xitdb])
-      |> Enum.filter(&match?(%Xitdb.Ash.SearchField{}, &1))
-      |> Enum.map(&%{&1 | __identifier__: nil, __spark_metadata__: nil})
+    @spec store(resource_or_dsl()) :: module() | nil
+    def store(resource_or_dsl) do
+      resolve_store(resource_or_dsl, [])
     end
 
     @doc """
-    Returns the list of explicit `index` declarations for a resource.
+    Fetches `{:ok, store_mod}` when a `xitdb.store` (or `:default_store`) is configured, or `:error`.
     """
-    @spec indexes(Ash.Resource.t() | Spark.Dsl.t()) :: [Xitdb.Ash.Index.t()]
-    def indexes(resource_or_dsl) do
-      resource_or_dsl
-      |> Extension.get_entities([:xitdb])
-      |> Enum.filter(&match?(%Xitdb.Ash.Index{}, &1))
-      |> Enum.map(&%{&1 | __identifier__: nil, __spark_metadata__: nil})
-    end
-
-    @doc """
-    Returns the list of `reference` declarations for a resource.
-    """
-    @spec references(Ash.Resource.t() | Spark.Dsl.t()) :: [Xitdb.Ash.Reference.t()]
-    def references(resource_or_dsl) do
-      resource_or_dsl
-      |> Extension.get_entities([:xitdb, :references])
-      |> Enum.filter(&match?(%Xitdb.Ash.Reference{}, &1))
-      |> Enum.map(&%{&1 | __identifier__: nil, __spark_metadata__: nil})
-    end
-
-    @doc """
-    Returns the primary Xitdb collection atom for `resource`, raising if undeclared.
-    """
-    @spec collection!(Ash.Resource.t() | Spark.Dsl.t()) :: atom()
-    def collection!(resource_or_dsl) do
-      case xitdb_collection(resource_or_dsl) do
-        {:ok, col} when not is_nil(col) ->
-          col
-
-        _ ->
-          case xitdb_collection!(resource_or_dsl) do
-            col when not is_nil(col) ->
-              col
-
-            _ ->
-              raise ArgumentError,
-                    "Resource #{inspect(resource_or_dsl)} does not declare a collection"
-          end
+    @spec fetch_store(resource_or_dsl()) :: {:ok, module()} | :error
+    def fetch_store(resource_or_dsl) do
+      case store(resource_or_dsl) do
+        store_mod when is_atom(store_mod) and not is_nil(store_mod) -> {:ok, store_mod}
+        _ -> :error
       end
     end
 
     @doc """
-    Returns the primary Xitdb collection atom for `resource`, or `nil` if undeclared.
+    Returns the configured `Xitdb.Ash.Store` module for `resource_or_dsl`, raising `ArgumentError` if undeclared.
     """
-    @spec collection(Ash.Resource.t() | Spark.Dsl.t()) :: atom() | nil
-    def collection(resource_or_dsl) do
-      case xitdb_collection(resource_or_dsl) do
-        {:ok, col} -> col
-        _ -> nil
-      end
-    end
-
-    @doc """
-    Returns the configured store module for `resource`, raising if undeclared.
-    """
-    @spec store!(Ash.Resource.t() | Spark.Dsl.t()) :: module()
+    @spec store!(resource_or_dsl()) :: module()
     def store!(resource_or_dsl) do
-      case resolve_store(resource_or_dsl, []) do
-        store when not is_nil(store) ->
-          store
+      case fetch_store(resource_or_dsl) do
+        {:ok, store_mod} ->
+          store_mod
 
-        nil ->
+        :error ->
           raise ArgumentError, "Resource #{inspect(resource_or_dsl)} does not declare a store"
       end
     end
 
     @doc """
-    Returns the configured store module for `resource`, or `nil` if undeclared.
+    Returns the primary Xitdb collection atom for `resource_or_dsl`, or `nil` if undeclared.
     """
-    @spec store(Ash.Resource.t() | Spark.Dsl.t()) :: module() | nil
-    def store(resource_or_dsl) do
-      resolve_store(resource_or_dsl, [])
+    @spec collection(resource_or_dsl()) :: atom() | nil
+    def collection(resource) when is_atom(resource) do
+      fetch_persisted_or_compute(
+        resource,
+        :__xitdb_collection__,
+        :xitdb_collection,
+        &collection_from_dsl/1
+      )
     end
+
+    def collection(dsl_state), do: collection_from_dsl(dsl_state)
+
+    defp collection_from_dsl(resource_or_dsl) do
+      case Extension.fetch_opt(resource_or_dsl, [:xitdb], :collection) do
+        {:ok, col} when is_atom(col) and not is_nil(col) -> col
+        _ -> nil
+      end
+    end
+
+    @doc """
+    Fetches `{:ok, collection}` when `xitdb.collection` is configured, or `:error`.
+    """
+    @spec fetch_collection(resource_or_dsl()) :: {:ok, atom()} | :error
+    def fetch_collection(resource_or_dsl) do
+      case collection(resource_or_dsl) do
+        col when is_atom(col) and not is_nil(col) -> {:ok, col}
+        _ -> :error
+      end
+    end
+
+    @doc """
+    Returns the primary Xitdb collection atom for `resource_or_dsl`, raising `ArgumentError` if undeclared.
+    """
+    @spec collection!(resource_or_dsl()) :: atom()
+    def collection!(resource_or_dsl) do
+      case fetch_collection(resource_or_dsl) do
+        {:ok, col} ->
+          col
+
+        :error ->
+          raise ArgumentError,
+                "Resource #{inspect(resource_or_dsl)} does not declare a collection"
+      end
+    end
+
+    @doc """
+    Returns steward-editable field atoms declared on `resource_or_dsl`.
+    """
+    @spec editable_fields(resource_or_dsl()) :: [atom()]
+    def editable_fields(resource_or_dsl) do
+      Extension.get_opt(resource_or_dsl, [:xitdb], :editable_fields, [])
+    end
+
+    @doc """
+    Returns passthrough field atoms declared on `resource_or_dsl`.
+    """
+    @spec passthru_fields(resource_or_dsl()) :: [atom()]
+    def passthru_fields(resource_or_dsl) do
+      Extension.get_opt(resource_or_dsl, [:xitdb], :passthru_fields, [])
+    end
+
+    @doc """
+    Returns attributes configured as `:counted_hash_set` slots on `resource_or_dsl`.
+    """
+    @spec counted_set_fields(resource_or_dsl()) :: [atom()]
+    def counted_set_fields(resource_or_dsl) do
+      Extension.get_opt(resource_or_dsl, [:xitdb], :counted_set_fields, [])
+    end
+
+    @doc """
+    Returns whether `belongs_to` foreign keys are indexed automatically on `resource_or_dsl`.
+    """
+    @spec index_relationships?(resource_or_dsl()) :: boolean()
+    def index_relationships?(resource_or_dsl) do
+      Extension.get_opt(resource_or_dsl, [:xitdb], :index_relationships?, true)
+    end
+
+    @doc """
+    Returns the `%Xitdb.Ash.NestedIn{}` subtree plan if `resource_or_dsl` uses DataLayer
+    co-located nesting (`:xitdb_nesting_plan`), or `nil`.
+
+    Note: Uses `:xitdb_nesting_plan` so it never collides with `Xitdb.Ash.Resource`'s
+    `:xitdb_nested_in` list (`nested_mappings/1`).
+    """
+    @spec nested_in(resource_or_dsl()) :: NestedIn.t() | nil
+    def nested_in(resource_or_dsl) do
+      case Extension.get_persisted(resource_or_dsl, :xitdb_nesting_plan, :__not_persisted__) do
+        :__not_persisted__ ->
+          resource_or_dsl
+          |> Extension.get_entities([:xitdb])
+          |> Enum.find(fn
+            %NestedIn{parent_collection: pc} when not is_nil(pc) -> true
+            _ -> false
+          end)
+          |> case do
+            %NestedIn{} = n -> %NestedIn{n | __identifier__: nil, __spark_metadata__: nil}
+            nil -> nil
+          end
+
+        persisted ->
+          persisted
+      end
+    end
+
+    @doc """
+    Returns all explicit and auto-generated `%Xitdb.Ash.Index{}` definitions for `resource_or_dsl`.
+    """
+    @spec indexes(resource_or_dsl()) :: [Index.t()]
+    def indexes(resource_or_dsl) do
+      case Extension.get_persisted(resource_or_dsl, :xitdb_indexes, :__not_persisted__) do
+        :__not_persisted__ ->
+          for %Index{} = idx <- Extension.get_entities(resource_or_dsl, [:xitdb]) do
+            %Index{idx | __identifier__: nil, __spark_metadata__: nil}
+          end
+
+        persisted ->
+          persisted
+      end
+    end
+
+    @doc """
+    Returns secondary indexes whose leading column is `field`, ordered from narrowest
+    (single-column `[field]`) to widest composite index for the Stage 1 query planner.
+    """
+    @spec indexes_for_field(resource_or_dsl(), atom()) :: [Index.t()]
+    def indexes_for_field(resource_or_dsl, field) when is_atom(field) do
+      resource_or_dsl
+      |> indexes()
+      |> Enum.filter(fn %Index{fields: [leading | _]} -> leading == field end)
+      |> Enum.sort_by(fn %Index{fields: fields} -> length(fields) end)
+    end
+
+    @doc """
+    Returns all `%Xitdb.Ash.SearchField{}` definitions for `resource_or_dsl`.
+    """
+    @spec search_fields(resource_or_dsl()) :: [SearchField.t()]
+    def search_fields(resource_or_dsl) do
+      case Extension.get_persisted(resource_or_dsl, :xitdb_search_fields, :__not_persisted__) do
+        :__not_persisted__ ->
+          for %SearchField{} = sf <- Extension.get_entities(resource_or_dsl, [:xitdb]) do
+            %SearchField{sf | __identifier__: nil, __spark_metadata__: nil}
+          end
+
+        persisted ->
+          persisted
+      end
+    end
+
+    @doc """
+    Returns outgoing `%Xitdb.Ash.Reference{}` foreign-key rules declared on `resource_or_dsl`.
+    """
+    @spec references(resource_or_dsl()) :: [Reference.t()]
+    def references(resource_or_dsl) do
+      case Extension.get_persisted(resource_or_dsl, :xitdb_references, :__not_persisted__) do
+        :__not_persisted__ ->
+          for %Reference{} = ref <- Extension.get_entities(resource_or_dsl, [:xitdb, :references]) do
+            %Reference{ref | __identifier__: nil, __spark_metadata__: nil}
+          end
+
+        persisted ->
+          persisted
+      end
+    end
+
+    # ==========================================================================
+    # v1.0.2 MDM Sync-Projection & Companion Pair Helpers (100% Preserved)
+    # ==========================================================================
 
     @doc """
     Returns the deduplicated list of editable and computed Xitdb field names as strings
@@ -129,11 +255,11 @@ if Code.ensure_loaded?(Spark.InfoGenerator) and Code.ensure_loaded?(Ash.Resource
 
     @doc false
     def compute_editable_field_strings(resource_or_dsl) do
-      aliases = xitdb_field_aliases!(resource_or_dsl)
+      aliases = Extension.get_opt(resource_or_dsl, [:xitdb], :field_aliases, [])
+      editable = Extension.get_opt(resource_or_dsl, [:xitdb], :editable_fields, [])
+      computed = Extension.get_opt(resource_or_dsl, [:xitdb], :computed_xitdb_fields, [])
 
-      resource_or_dsl
-      |> xitdb_editable_fields!()
-      |> Enum.concat(xitdb_computed_xitdb_fields!(resource_or_dsl))
+      (editable ++ computed)
       |> Enum.map(fn attr -> to_string(Keyword.get(aliases, attr, attr)) end)
       |> Enum.uniq()
     end
@@ -170,9 +296,11 @@ if Code.ensure_loaded?(Spark.InfoGenerator) and Code.ensure_loaded?(Ash.Resource
 
     @doc false
     def compute_pull_fields(resource_or_dsl) do
-      aliases = xitdb_field_aliases!(resource_or_dsl)
+      aliases = Extension.get_opt(resource_or_dsl, [:xitdb], :field_aliases, [])
+      editable = Extension.get_opt(resource_or_dsl, [:xitdb], :editable_fields, [])
+      passthru = Extension.get_opt(resource_or_dsl, [:xitdb], :passthru_fields, [])
 
-      ([:id] ++ xitdb_editable_fields!(resource_or_dsl) ++ xitdb_passthru_fields!(resource_or_dsl))
+      ([:id] ++ editable ++ passthru)
       |> Enum.map(&Keyword.get(aliases, &1, &1))
       |> Enum.uniq()
     end
@@ -205,10 +333,10 @@ if Code.ensure_loaded?(Spark.InfoGenerator) and Code.ensure_loaded?(Ash.Resource
     end
 
     @doc """
-    Returns the `nested_in` declarations (`Xitdb.Ash.NestedIn` structs) of a resource,
+    Returns the MDM `nested_in` declarations (`Xitdb.Ash.NestedIn` structs) of a resource,
     or `[]` for resources stored in their own top-level collection.
     """
-    @spec nested_mappings(Ash.Resource.t() | Spark.Dsl.t()) :: [Xitdb.Ash.NestedIn.t()]
+    @spec nested_mappings(resource_or_dsl()) :: [NestedIn.t()]
     def nested_mappings(resource) when is_atom(resource) do
       fetch_persisted_or_compute(
         resource,
@@ -222,50 +350,41 @@ if Code.ensure_loaded?(Spark.InfoGenerator) and Code.ensure_loaded?(Ash.Resource
 
     @doc false
     def compute_nested_mappings(resource_or_dsl) do
-      for %Xitdb.Ash.NestedIn{parent: parent} = mapping <-
-            Extension.get_entities(resource_or_dsl, [:xitdb]),
+      for %NestedIn{parent: parent} = mapping <- Extension.get_entities(resource_or_dsl, [:xitdb]),
           not is_nil(parent) do
-        %Xitdb.Ash.NestedIn{mapping | __identifier__: nil, __spark_metadata__: nil}
+        %NestedIn{mapping | __identifier__: nil, __spark_metadata__: nil}
       end
     end
 
     @doc "Returns `true` when the resource is stored inside a parent entity."
-    @spec nested?(Ash.Resource.t() | Spark.Dsl.t()) :: boolean()
-    def nested?(resource), do: nested_mappings(resource) != []
+    @spec nested?(resource_or_dsl()) :: boolean()
+    def nested?(resource_or_dsl) do
+      nested_in(resource_or_dsl) != nil or nested_mappings(resource_or_dsl) != []
+    end
 
     @doc """
     Filters `resources` down to those nested in `parent`, returning
     `{resource, %Xitdb.Ash.NestedIn{}}` pairs.
-
-    Parents cannot discover their children at compile time without creating dependency
-    cycles, so callers pass the candidate list explicitly.
     """
     @spec nested_under([Ash.Resource.t()], Ash.Resource.t()) ::
-            [{Ash.Resource.t(), Xitdb.Ash.NestedIn.t()}]
+            [{Ash.Resource.t(), NestedIn.t()}]
     def nested_under(resources, parent) when is_list(resources) and is_atom(parent) do
       for resource <- resources,
-          %Xitdb.Ash.NestedIn{parent: ^parent} = mapping <- nested_mappings(resource) do
+          %NestedIn{parent: ^parent} = mapping <- nested_mappings(resource) do
         {resource, mapping}
       end
     end
 
     @doc """
     Returns every Xitdb path (a list of string keys from the root) where `record` is stored.
-
-    - Top-level resources return `[[collection, id]]` when `record` has an `:id`.
-    - Nested resources return one path per `nested_in` declaration whose `parent_key`
-      (and `key`, for `cardinality: :many`) is present on `record`. A phone owned by a
-      user returns `[["people", "42", "phones", "+14165550199"]]`.
-
-    `record` may be a struct or a map with atom or string keys.
     """
     @spec entity_paths(Ash.Resource.t(), map()) :: [[String.t()]]
     def entity_paths(resource, record) when is_atom(resource) and is_map(record) do
       case nested_mappings(resource) do
         [] ->
-          with {:ok, collection} when not is_nil(collection) <- xitdb_collection(resource),
+          with {:ok, col} <- fetch_collection(resource),
                id when not is_nil(id) and id != "" <- fetch_record_value(record, :id) do
-            [[to_string(collection), to_string(id)]]
+            [[to_string(col), to_string(id)]]
           else
             _ -> []
           end
@@ -275,13 +394,8 @@ if Code.ensure_loaded?(Spark.InfoGenerator) and Code.ensure_loaded?(Ash.Resource
       end
     end
 
-    defp nested_entity_path(%Xitdb.Ash.NestedIn{} = mapping, record) do
-      parent_collection =
-        case xitdb_collection(mapping.parent) do
-          {:ok, collection} -> collection
-          _ -> nil
-        end
-
+    defp nested_entity_path(%NestedIn{} = mapping, record) do
+      parent_collection = collection(mapping.parent)
       parent_id = fetch_record_value(record, mapping.parent_key)
 
       cond do
@@ -330,7 +444,7 @@ if Code.ensure_loaded?(Spark.InfoGenerator) and Code.ensure_loaded?(Ash.Resource
     Resolves the target Xitdb store server from `context[:xitdb_store]`, keyword `opts[:store]`,
     the resource's `xitdb.store` option, or `Application.get_env(:xitdb, :default_store)`.
     """
-    @spec resolve_store(Ash.Resource.t(), map() | keyword()) :: GenServer.server() | nil
+    @spec resolve_store(resource_or_dsl(), map() | keyword()) :: GenServer.server() | nil
     def resolve_store(_resource, %{xitdb_store: store}) when not is_nil(store), do: store
 
     def resolve_store(resource, opts) when is_list(opts) do
@@ -343,19 +457,19 @@ if Code.ensure_loaded?(Spark.InfoGenerator) and Code.ensure_loaded?(Ash.Resource
     Resolves the `Ash.Resource.Change` module for locking/unlocking fields from the
     resource's `xitdb.lock_change` option or `Application.get_env(:xitdb, :default_lock_change)`.
     """
-    @spec resolve_lock_change(Ash.Resource.t() | Spark.Dsl.t()) :: module() | nil
+    @spec resolve_lock_change(resource_or_dsl()) :: module() | nil
     def resolve_lock_change(resource) when is_atom(resource) do
       resolve_option_with_env(
         resource,
         :__xitdb_lock_change__,
         :xitdb_lock_change,
-        &xitdb_lock_change/1,
+        &Extension.fetch_opt(&1, [:xitdb], :lock_change),
         :default_lock_change
       )
     end
 
     def resolve_lock_change(dsl_state) do
-      case xitdb_lock_change(dsl_state) do
+      case Extension.fetch_opt(dsl_state, [:xitdb], :lock_change) do
         {:ok, mod} when not is_nil(mod) -> mod
         _ -> Application.get_env(:xitdb, :default_lock_change)
       end
@@ -366,13 +480,13 @@ if Code.ensure_loaded?(Spark.InfoGenerator) and Code.ensure_loaded?(Ash.Resource
         resource,
         :__xitdb_store__,
         :xitdb_store,
-        &xitdb_store/1,
+        &Extension.fetch_opt(&1, [:xitdb], :store),
         :default_store
       )
     end
 
     defp default_store(dsl_state) do
-      case xitdb_store(dsl_state) do
+      case Extension.fetch_opt(dsl_state, [:xitdb], :store) do
         {:ok, store} when not is_nil(store) -> store
         _ -> Application.get_env(:xitdb, :default_store)
       end

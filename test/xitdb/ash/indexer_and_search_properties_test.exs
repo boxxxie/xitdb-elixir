@@ -132,7 +132,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
       assert Enum.any?(
                diagnostics,
-               &(&1.message =~ ~r/SQL `fragment\(\.\.\.\)` .* is not supported/)
+               &(&1.message =~ ~r/SQL `fragment\(\.\.\.\)` .*is not supported/)
              )
 
       assert Enum.any?(compiled, fn {m, _} -> m == res_mod end)
@@ -140,7 +140,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       assert {:error, %DslError{message: msg}} =
                Xitdb.Ash.Verifiers.VerifyNoSqlFragments.verify(res_mod.spark_dsl_config())
 
-      assert msg =~ ~r/SQL `fragment\(\.\.\.\)` .* is not supported/
+      assert msg =~ ~r/SQL `fragment\(\.\.\.\)` .*is not supported/
     end
 
     test "VerifyCrossStoreReferences rejects on_delete cascades across distinct .xit stores" do

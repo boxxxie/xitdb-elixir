@@ -1,8 +1,8 @@
 defmodule Xitdb.Ash.Tx do
   @moduledoc """
   Provides `tx_for/3`, `tx_for/4`, `tx_for!/3`, and `tx_for!/4` macros that wrap
-  `Xitdb.DSL.tx` and automatically inject all `index_on` declarations configured on
-  one or more `Xitdb.Ash.Resource` modules.
+  `Xitdb.DSL.tx` and automatically inject all single-field `index_on` declarations
+  configured on one or more `Xitdb.Ash.Resource` or `Xitdb.Ash.DataLayer` modules.
 
   Note: `use Xitdb.DSL` also imports `tx_for` and `tx_for!` directly.
   """

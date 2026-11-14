@@ -43,7 +43,7 @@ Each track has its own specification and implementation plan in [`./tracks/`](./
 
 ---
 
-- [ ] **Track 8 [Wave 1 — Hybrid Ash Schema & Verifiers]: Unified Spark DSL Extension, `BuildIndexPlan` Transformer, Hybrid-Safe Verifiers & Additive `Xitdb.Ash.Info`**
+- [x] **Track 8 [Wave 1 — Hybrid Ash Schema & Verifiers]: Unified Spark DSL Extension, `BuildIndexPlan` Transformer, Hybrid-Safe Verifiers & Additive `Xitdb.Ash.Info`**
   *Link: [./tracks/ash_dsl_and_verifiers_20261111/](./tracks/ash_dsl_and_verifiers_20261111/)*
   *MVP Scope:* Fully decoupled from Track 6 by extending `v1.0.2` `lib/xitdb/ash/info.ex` and `.formatter.exs` additively. Implement `Index`, `SearchField`, `Reference`, and `NestedIn`; reject multi-column PKs and auto-index `belongs_to` FKs in `BuildIndexPlan`; enforce `VerifyNoSqlFragments` (including unhydrated `%Ash.Query.Call{name: :fragment}`, aggregates, preparations, relationship filters, and field policies); and iterate `Info.references/1` directly in `VerifyCrossStoreReferences` to reject unknown/non-`belongs_to` refs, `on_delete: :nilify` on non-nullable FKs, and cross-DB or cross-store cascades.
 

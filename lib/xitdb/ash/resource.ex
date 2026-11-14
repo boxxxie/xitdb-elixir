@@ -94,11 +94,11 @@ if Code.ensure_loaded?(Spark.Dsl.Extension) and Code.ensure_loaded?(Ash.Resource
       describe: "Declares a single-attribute or composite B+Tree (:sorted_map) secondary index.",
       examples: [
         "index :email",
-        "index [:status, :inserted_at]"
+        "index [:status, :inserted_at], name: :idx_status_recent"
       ],
       target: Xitdb.Ash.Index,
       args: [:fields],
-      identifier: :fields,
+      identifier: {:auto, :unique_integer},
       schema: [
         fields: [
           type: {:wrap_list, :atom},
@@ -106,7 +106,7 @@ if Code.ensure_loaded?(Spark.Dsl.Extension) and Code.ensure_loaded?(Ash.Resource
           doc: "The attribute or list of attributes comprising the secondary index key."
         ],
         name: [
-          type: :any,
+          type: {:or, [:atom, :string]},
           doc: "Optional custom name for the secondary index."
         ]
       ]
@@ -232,6 +232,16 @@ if Code.ensure_loaded?(Spark.Dsl.Extension) and Code.ensure_loaded?(Ash.Resource
           default: [],
           doc:
             "Derived Xitdb-only fields maintained by the engine (e.g. `:normalized_name`, `:activity_count`)."
+        ],
+        counted_set_fields: [
+          type: {:list, :atom},
+          default: [],
+          doc: "Attributes backed by `:counted_hash_set` slots."
+        ],
+        index_relationships?: [
+          type: :boolean,
+          default: true,
+          doc: "Automatically creates secondary B+Tree indexes for all `belongs_to` foreign keys."
         ],
         field_aliases: [
           type: :keyword_list,
