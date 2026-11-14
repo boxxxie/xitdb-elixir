@@ -133,5 +133,5 @@ Each track has its own specification and implementation plan in [`./tracks/`](./
 
 ---
 
-- [ ] **Track 17 [Wave 5 — Release Readiness]: Unified Formatter Exports (`.formatter.exs`), Package `usage-rules.md` & Hex Packaging Verification**
+- [x] **Track 17 [Wave 5 — Release Readiness]: Unified Formatter Exports (`.formatter.exs`), Package `usage-rules.md` & Hex Packaging Verification**
   *Link: [./tracks/formatter_exports_and_usage_rules_20261112/](./tracks/formatter_exports_and_usage_rules_20261112/)*

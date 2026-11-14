@@ -9,7 +9,7 @@
 1. **Default to Lazy `Access` Navigation (`db["users"]["alice"]["name"]`)**:
    - Reading from `Xitdb` (`Xitdb.db(db)`, `Xitdb.as_of(db, moment)`, or `db["users"]`) returns a lazy `%Xitdb.Cursor{}` holding only the NIF database reference and 9-byte `Slot` coordinates (`tag`, `tag_id`, `value`).
    - Cursors are **pure, immutable Elixir values**. Pass them freely across BEAM processes (`Task.async_stream/3`, GenServers, ETS, Phoenix LiveView assigns) without locks or copying underlying subtrees.
-   - Navigating to a scalar (`string`, `integer`, `float`, `boolean`, or `{:tagged, tag, bytes}`) unwraps and returns the native Elixir value directly; navigating to a nested container returns another `%Xitdb.Cursor{}` in $O(1)$ heap space.
+   - Navigating to a scalar (`string`, `integer`, `float`, `boolean`, or `{:tagged, tag, bytes}`) unwraps and returns the native Elixir value directly; navigating to a nested container returns another `%Xitdb.Cursor{}` in `O(1)` heap space.
 2. **Use `Xitdb.at/1` Instead of `Access.at/1` on Lazy List Cursors**:
    - Elixir's built-in `Access.at/1` guards `is_list(data)` and raises on structs. When navigating `Array_List` or `Linked_Array_List` cursors with `get_in/2` or `put_in/3`, either pass integer keys directly in the path list (`get_in(root, ["users", "alice", "roles", 1])`) or use `Xitdb.at(1)`.
 3. **Never Eagerly Materialize Large Subtrees Unless Needed**:
@@ -38,17 +38,17 @@
 
 ## 3. Choosing Collection Types (`Xitdb.Collection`)
 
-By default, plain Elixir maps (`%{}`) are stored as `:hash_map` (`Tag.Hash_Map`), plain lists (`[]`) as `:array_list` (`Tag.Array_List`), and `%MapSet{}` as `:counted_hash_set`. Use wrapper constructors on `Xitdb` when you need $O(1)$ counts, lexicographical B+Tree ordering, or $O(\log N)$ list insertions/removals:
+By default, plain Elixir maps (`%{}`) are stored as `:hash_map` (`Tag.Hash_Map`), plain lists (`[]`) as `:array_list` (`Tag.Array_List`), and `%MapSet{}` as `:counted_hash_set`. Use wrapper constructors on `Xitdb` when you need `O(1)` counts, lexicographical B+Tree ordering, or `O(log N)` list insertions/removals:
 
 | Constructor | Selector Sigil | Backing Structure | Best For |
 | :--- | :--- | :--- | :--- |
 | `Xitdb.hash_map(map)` | `.key` | 16-way HAMT | General key-value maps |
-| `Xitdb.counted_map(map)` | `#key` | 16-way HAMT + count header | Maps needing $O(1)$ `Enum.count/1` |
+| `Xitdb.counted_map(map)` | `#key` | 16-way HAMT + count header | Maps needing `O(1)` `Enum.count/1` |
 | `Xitdb.sorted_map(map)` | `$key` | Lexicographical B+Tree | Ordered iteration, range slices, secondary indexes |
 | `Xitdb.array_list(list)` | `[i]` | 16-way Radix Trie | Append-heavy lists and random index reads |
-| `Xitdb.linked_list(list)` | `[[i]]` | Count-augmented B-Tree | Queues/lists needing $O(\log N)$ `insert`, `rm`, and `slice` |
+| `Xitdb.linked_list(list)` | `[[i]]` | Count-augmented B-Tree | Queues/lists needing `O(log N)` `insert`, `rm`, and `slice` |
 | `Xitdb.hash_set(enum)` | `%member` | 16-way HAMT set | Uncounted string membership sets |
-| `Xitdb.counted_set(enum)` | `#%member` | 16-way HAMT set + count | Sets needing $O(1)$ `Enum.count/1` and `Enum.member?/2` |
+| `Xitdb.counted_set(enum)` | `#%member` | 16-way HAMT set + count | Sets needing `O(1)` `Enum.count/1` and `Enum.member?/2` |
 | `Xitdb.sorted_set(enum)` | `^member` | Lexicographical B+Tree set | Ordered unique tags/badges |
 
 ---
@@ -82,6 +82,8 @@ use Xitdb.DSL
 - For set member additions inside `tx`, use 1-arity `put path.set_member(val)` (or `counted_set_member`/`sorted_set_member`).
 - For read-modify-write updates with a fallback when the path does not yet exist, use 3-arity `update path, default, fun`.
 - To roll back from inside a `tx` block, call `abort :reason`.
+- **Never mutate `%Xitdb{}` directly** outside `Xitdb.transact/3` or `tx` (`put_in(db["a"], 1)` raises `ArgumentError`).
+- **Single-writer concurrency**: Concurrent readers are lock-free, while read-modify-write transactions (`update` in `tx` and `Xitdb.transact/3` callbacks) must serialize through `Xitdb.Ash.Store` or a single owner `GenServer`.
 
 ### 2. Top-Level Map Transactions (`Xitdb.transact/3`)
 
@@ -122,7 +124,7 @@ When mutating existing paths via a root `%Xitdb.Cursor{}` callback:
 
 ### Lazy `Access` & `Enumerable` Fast Paths
 
-`%Xitdb.Cursor{}` implements `Enumerable` with native data-structure fast paths (`Enum.count/1` in $O(1)$, `Enum.member?/2` in $O(1)$ / $O(\log_{16} N)$, `Enum.slice/2` in $O(\log N + K)$):
+`%Xitdb.Cursor{}` implements `Enumerable` with native data-structure fast paths (`Enum.count/1` in `O(1)`, `Enum.member?/2` in `O(1)` / `O(log_16 N)`, `Enum.slice/2` in `O(log N + K)`):
 
 ```elixir
 root = Xitdb.db(db)
@@ -150,6 +152,8 @@ todo = Xitdb.select!(db, selector)
 # Static compile-time validated sigil
 todo = Xitdb.select!(db, ~x|.users["101"].todos[1]|)
 ```
+
+- `Xitdb.select/2` only accepts `%Xitdb{}` or a root snapshot cursor (`Xitdb.db/1`, `Xitdb.as_of/2`), never a nested child cursor (`db["users"]`).
 
 ### Datomic-Style Pull Projections (`Xitdb.pull/2`)
 
@@ -256,7 +260,7 @@ defmodule MyApp.Accounts.Profile do
 end
 ```
 
-For child entities co-located inside a parent entity's subtree for 9-byte `fork` snapshots, declare `nested_in`:
+For `Xitdb.Ash.DataLayer` child entities co-located inside a parent entity's subtree for 9-byte `fork` snapshots, declare **both** `collection` (for `meta.sequences` and `idx.<collection>._parent` locators) and `nested_in`:
 
 ```elixir
 xitdb do
@@ -265,6 +269,13 @@ xitdb do
   nested_in :events, foreign_key: :event_id, path: :sessions, cardinality: :many
 end
 ```
+
+### Hybrid MDM Extension Rules (`extensions: [Xitdb.Ash.Resource]`)
+
+When attaching `Xitdb.Ash.Resource` as a secondary MDM sync extension onto an external data layer (such as `Ash.DataLayer.Postgres`):
+- Declare **either** top-level `collection :name` **or** `nested_in ParentResource, as: :slot, parent_key: :fk, key: :entry_key`—never both on an MDM-only `Xitdb.Ash.Resource`, and never declare `indexes` on MDM `nested_in` resources.
+- Every attribute accepted by `sync_update_action` (unless listed in `ignored_sync_attributes`) **must** appear in `editable_fields` or `passthru_fields`, or `VerifySyncProjection` raises a compile-time `Spark.Error.DslError`.
+- Set `require_atomic? false` on `lock_action` and `unlock_action` when your `lock_change` module implements `change/3` via `Ash.Changeset.get_data/2` without an `atomic/3` callback.
 
 ### Strict DO / DON'T Rules
 
