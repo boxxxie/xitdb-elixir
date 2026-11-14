@@ -7,6 +7,15 @@ defmodule Xitdb do
   Elixir's `Access`, `Enumerable`, and `Inspect` protocols—allowing you to navigate
   and query on-disk data structures (`Hash_Map`, `Counted_Hash_Map`, `Sorted_Map`,
   `Array_List`, `Linked_Array_List`, and sets) just like standard Elixir maps and lists.
+
+  ## Guides
+  - [Lazy Cursors, `Access` & `Enumerable`](docs/access-and-enumerable.md)
+  - [Collections, Data Modeling & Secondary Indexes](docs/collections-and-indexing.md)
+  - [Path Selector & Structural Pull DSL](docs/path-and-pull-dsl.md)
+  - [Declarative Transaction Block DSL](docs/transaction-dsl.md)
+  - [Declarative Datalog Query DSL](docs/datalog-dsl.md)
+  - [Time-Travel, Structural Diffs, Lineage & Storage Lifecycle](docs/time-travel-and-storage.md)
+  - [Ash & Spark Integration](docs/ash-and-spark.md)
   """
 
   @behaviour Access
@@ -80,6 +89,58 @@ defmodule Xitdb do
                  ]
                )
 
+  @index_rule_type {:tuple,
+                    [
+                      {:in, [:index_on]},
+                      {:or, [:atom, :string]},
+                      {:or, [:atom, :string]},
+                      {:or, [:atom, :string]}
+                    ]}
+
+  @transact_schema NimbleOptions.new!(
+                     doc: [
+                       type: :string,
+                       default: "",
+                       doc: "Commit message stored in `__tx.doc`."
+                     ],
+                     instant: [
+                       type: :integer,
+                       doc: "Epoch timestamp in milliseconds stored in `__tx.tx_instant`."
+                     ],
+                     meta: [
+                       type: {:or, [:map, :keyword_list]},
+                       doc: "Custom commit metadata stored under `__tx.<key>`."
+                     ],
+                     base_moment: [
+                       type: :integer,
+                       default: -1,
+                       doc: "Historical moment index to branch from (`-1` for latest)."
+                     ],
+                     index_rules: [
+                       type: {:list, @index_rule_type},
+                       default: [],
+                       doc:
+                         "Secondary B+Tree index rules (`[{:index_on, source_map, field, index_map}]`)."
+                     ]
+                   )
+
+  @query_schema NimbleOptions.new!(
+                  moment: [
+                    type: :integer,
+                    doc:
+                      "Historical moment index to query (`-1` for latest; defaults to cursor moment when querying a `%Xitdb.Cursor{}`)."
+                  ]
+                )
+
+  @compact_schema NimbleOptions.new!(
+                    path: [
+                      type: :string,
+                      default: "",
+                      doc:
+                        "Destination file path for compacted database (compacts into `:memory` when empty)."
+                    ]
+                  )
+
   @enforce_keys [:db_ref, :backend]
   defstruct [:db_ref, :backend, :path, hash: :sha1]
 
@@ -123,12 +184,7 @@ defmodule Xitdb do
 
   @doc "Same as `open/1`, but raises `Xitdb.Error` on failure."
   @spec open!(keyword()) :: t()
-  def open!(opts \\ []) do
-    case open(opts) do
-      {:ok, db} -> db
-      {:error, err} -> raise err
-    end
-  end
+  def open!(opts \\ []), do: opts |> open() |> Error.unwrap!()
 
   @doc "Flushes and closes the underlying `xitdb` storage handle."
   @spec close(t()) :: :ok
@@ -139,29 +195,18 @@ defmodule Xitdb do
   @doc "Synchronizes buffered writes to disk."
   @spec sync(t()) :: :ok | {:error, Error.t()}
   def sync(%__MODULE__{db_ref: db_ref}) do
-    case NIF.nif_sync(db_ref) do
-      :ok -> :ok
-      {:error, reason} -> {:error, %Error{reason: reason}}
-    end
+    db_ref |> NIF.nif_sync() |> Error.wrap()
   end
 
   @doc "Returns database metadata (`%{moment_count: integer(), file_size: integer()}`)."
   @spec info(t()) :: {:ok, map()} | {:error, Error.t()}
   def info(%__MODULE__{db_ref: db_ref}) do
-    case NIF.nif_info(db_ref) do
-      {:ok, map} -> {:ok, map}
-      {:error, reason} -> {:error, %Error{reason: reason}}
-    end
+    db_ref |> NIF.nif_info() |> Error.wrap()
   end
 
   @doc "Same as `info/1`, but raises `Xitdb.Error` on failure."
   @spec info!(t()) :: map()
-  def info!(%__MODULE__{} = db) do
-    case info(db) do
-      {:ok, map} -> map
-      {:error, err} -> raise err
-    end
-  end
+  def info!(%__MODULE__{} = db), do: db |> info() |> Error.unwrap!()
 
   @doc "Returns the number of committed historical moments in `db`."
   @spec moment_count(t()) :: non_neg_integer()
@@ -195,14 +240,16 @@ defmodule Xitdb do
       tag: :hash_map,
       tag_id: -1,
       value: moment_index,
-      moment: moment_index
+      moment: moment_index,
+      root: true
     }
   end
 
   def as_of(%__MODULE__{db_ref: db_ref}, moment_index) when is_integer(moment_index) do
     case NIF.nif_moment_slot(db_ref, moment_index) do
       {:ok, tuple} ->
-        Cursor.from_nif_tuple(db_ref, tuple, moment_index)
+        cursor = Cursor.from_nif_tuple(db_ref, tuple, moment_index)
+        %Cursor{cursor | root: true}
 
       {:error, reason} ->
         raise Error, reason: reason, details: %{moment_index: moment_index}
@@ -217,7 +264,7 @@ defmodule Xitdb do
   @spec hash_map(Enumerable.t()) :: Collection.t()
   def hash_map(map), do: %Collection{kind: :hash_map, data: map}
 
-  @doc "Wraps `map` to be stored as a `Counted_Hash_Map` with $O(1)$ `Enum.count/1`."
+  @doc "Wraps `map` to be stored as a `Counted_Hash_Map` with `O(1)` `Enum.count/1`."
   @spec counted_map(Enumerable.t()) :: Collection.t()
   def counted_map(map), do: %Collection{kind: :counted_hash_map, data: map}
 
@@ -237,7 +284,7 @@ defmodule Xitdb do
   @spec hash_set(Enumerable.t()) :: Collection.t()
   def hash_set(members), do: %Collection{kind: :hash_set, data: members}
 
-  @doc "Wraps `members` to be stored as a `Counted_Hash_Set` with $O(1)$ `Enum.count/1`."
+  @doc "Wraps `members` to be stored as a `Counted_Hash_Set` with `O(1)` `Enum.count/1`."
   @spec counted_set(Enumerable.t()) :: Collection.t()
   def counted_set(members), do: %Collection{kind: :counted_hash_set, data: members}
 
@@ -255,55 +302,65 @@ defmodule Xitdb do
   Accepts either:
   - A map of top-level keys/subtrees (`Xitdb.transact(db, %{"users" => ...}, opts)`), or
   - A 1-arity callback receiving the root `%Xitdb.Cursor{}` (`Xitdb.transact(db, fn root -> put_in(root["a"]["b"], 1) end)`).
+
+  ## Options
+  #{NimbleOptions.docs(@transact_schema)}
   """
-  @spec transact(t(), map() | (Cursor.t() -> Cursor.t() | {:abort, term()}), keyword()) ::
+  @spec transact(t(), map() | (Cursor.t() -> Cursor.t() | map() | {:abort, term()}), keyword()) ::
           {:ok, t()} | {:error, Error.t()}
   def transact(db, map_or_fun, opts \\ [])
 
   def transact(%__MODULE__{} = db, map, opts) when is_map(map) and not is_struct(map) do
-    ops = TxCompiler.compile_moment_map(map, opts)
-    transact_ops(db, ops, opts)
+    with {:ok, validated} <- validate_opts(opts, @transact_schema) do
+      ops = TxCompiler.compile_moment_map(map, Keyword.delete(validated, :index_rules))
+      do_transact_ops(db, ops, validated)
+    end
   end
 
   def transact(%__MODULE__{db_ref: db_ref} = db, fun, opts) when is_function(fun, 1) do
-    base_moment = Keyword.get(opts, :base_moment, -1)
+    with {:ok, validated} <- validate_opts(opts, @transact_schema) do
+      base_moment = validated[:base_moment]
 
-    root_cursor = %Cursor{
-      db_ref: db_ref,
-      tag: :hash_map,
-      tag_id: -1,
-      value: base_moment,
-      moment: base_moment,
-      tx_mode: true
-    }
+      root_cursor = %Cursor{
+        db_ref: db_ref,
+        tag: :hash_map,
+        tag_id: -1,
+        value: base_moment,
+        moment: base_moment,
+        root: true,
+        tx_mode: true
+      }
 
-    try do
-      case fun.(root_cursor) do
-        %Cursor{staged_ops: ops} ->
-          transact_ops(db, :lists.reverse(ops), opts)
+      try do
+        case fun.(root_cursor) do
+          %Cursor{staged_ops: ops} ->
+            do_transact_ops(db, :lists.reverse(ops), validated)
 
-        {:abort, reason} ->
-          {:error, %Error{reason: reason}}
+          {:abort, reason} ->
+            {:error, %Error{reason: reason}}
 
-        other when is_map(other) ->
-          transact(db, other, opts)
+          other when is_map(other) and not is_struct(other) ->
+            ops = TxCompiler.compile_moment_map(other, Keyword.delete(validated, :index_rules))
+            do_transact_ops(db, ops, validated)
+
+          other ->
+            {:error, %Error{reason: :invalid_transaction_return, details: %{value: other}}}
+        end
+      rescue
+        e in Error ->
+          {:error, e}
+
+        e ->
+          {:error, %Error{reason: :transaction_exception, details: %{exception: e}}}
       end
-    rescue
-      e in Error ->
-        {:error, e}
-
-      e ->
-        {:error, %Error{reason: :transaction_exception, details: %{exception: e}}}
     end
   end
 
   @doc "Same as `transact/3`, but raises `Xitdb.Error` on failure."
-  @spec transact!(t(), map() | (Cursor.t() -> Cursor.t()), keyword()) :: t()
+  @spec transact!(t(), map() | (Cursor.t() -> Cursor.t() | map() | {:abort, term()}), keyword()) ::
+          t()
   def transact!(%__MODULE__{} = db, map_or_fun, opts \\ []) do
-    case transact(db, map_or_fun, opts) do
-      {:ok, db} -> db
-      {:error, err} -> raise err
-    end
+    db |> transact(map_or_fun, opts) |> Error.unwrap!()
   end
 
   @doc """
@@ -311,16 +368,35 @@ defmodule Xitdb do
   in a single atomic NIF transaction commit.
   """
   @spec transact_ops(t(), list(), keyword()) :: {:ok, t()} | {:error, Error.t()}
-  def transact_ops(%__MODULE__{db_ref: db_ref} = db, ops, opts \\ []) when is_list(ops) do
-    base_moment = Keyword.get(opts, :base_moment, -1)
-    doc = Keyword.get(opts, :doc, "")
+  def transact_ops(%__MODULE__{} = db, ops, opts \\ []) when is_list(ops) do
+    with {:ok, validated} <- validate_opts(opts, @transact_schema) do
+      do_transact_ops(db, ops, validated)
+    end
+  end
+
+  defp do_transact_ops(%__MODULE__{db_ref: db_ref} = db, ops, validated) do
+    base_moment = validated[:base_moment]
+    doc = validated[:doc]
+
+    existing_index_ops =
+      for {:index_on, _, _, _} = op <- ops, into: MapSet.new(), do: op
+
+    index_ops =
+      validated
+      |> Keyword.get(:index_rules, [])
+      |> Enum.map(fn {:index_on, src, field, idx} ->
+        {:index_on, to_string(src), to_string(field), to_string(idx)}
+      end)
+      |> Enum.uniq()
+      |> Enum.reject(&MapSet.member?(existing_index_ops, &1))
 
     opt_ops =
-      case Keyword.get(opts, :instant) do
-        inst when is_integer(inst) -> [{:instant, inst}]
-        _ -> []
-      end ++
-        case Keyword.get(opts, :meta) do
+      index_ops ++
+        case validated[:instant] do
+          inst when is_integer(inst) -> [{:instant, inst}]
+          _ -> []
+        end ++
+        case validated[:meta] do
           meta when is_map(meta) or is_list(meta) ->
             Enum.map(meta, fn {k, v} -> {:meta, to_string(k), v} end)
 
@@ -335,7 +411,7 @@ defmodule Xitdb do
   end
 
   @doc """
-  Stages an $O(\\log N)$ insertion into a `Linked_Array_List` at `path_or_selector` and `index`
+  Stages an `O(log N)` insertion into a `Linked_Array_List` at `path_or_selector` and `index`
   on a root `%Xitdb.Cursor{}` inside `Xitdb.transact/2`.
 
   `path_or_selector` can be a selector string (`path(users[id].queue)`) or a list of keys /
@@ -349,7 +425,7 @@ defmodule Xitdb do
   end
 
   @doc """
-  Stages an $O(\\log N)$ removal from a `Linked_Array_List` at `path_or_selector` and `index`
+  Stages an `O(log N)` removal from a `Linked_Array_List` at `path_or_selector` and `index`
   on a root `%Xitdb.Cursor{}` inside `Xitdb.transact/2`.
   """
   @spec delete_at(Cursor.t(), String.t() | [term()], integer()) :: Cursor.t()
@@ -363,7 +439,7 @@ defmodule Xitdb do
   end
 
   @doc """
-  Stages an $O(1)$ zero-copy structural clone (`tx_fork`) from `from_selector` to `to_selector`.
+  Stages an `O(1)` zero-copy structural clone (`tx_fork`) from `from_selector` to `to_selector`.
   """
   @spec fork(Cursor.t(), String.t(), String.t()) :: Cursor.t()
   def fork(%Cursor{} = root, from_selector, to_selector) do
@@ -398,15 +474,25 @@ defmodule Xitdb do
   def materialize(scalar), do: scalar
 
   @doc """
-  Resolves a canonical `xitdb` selector string (`~x|.users["101"].todos[1]|`) against `db` or a `%Xitdb.Cursor{}`.
+  Resolves a canonical root-anchored `xitdb` selector string (`~x|.users["101"].todos[1]|`)
+  against `db` or a committed root snapshot `%Xitdb.Cursor{}` (from `Xitdb.db/1` or `Xitdb.as_of/2`).
   """
   @spec select(t() | Cursor.t(), String.t()) :: {:ok, term()} | {:error, Error.t()}
   def select(%__MODULE__{db_ref: db_ref}, selector) when is_binary(selector) do
     do_select(db_ref, -1, selector)
   end
 
-  def select(%Cursor{db_ref: db_ref, moment: moment}, selector) when is_binary(selector) do
+  def select(%Cursor{root: true, tx_mode: false, db_ref: db_ref, moment: moment}, selector)
+      when is_binary(selector) do
     do_select(db_ref, moment, selector)
+  end
+
+  def select(%Cursor{tag: tag, tx_mode: tx_mode}, selector) when is_binary(selector) do
+    {:error,
+     %Error{
+       reason: :non_root_cursor,
+       details: %{tag: tag, tx_mode: tx_mode, selector: selector}
+     }}
   end
 
   defp do_select(db_ref, moment, selector) do
@@ -418,12 +504,7 @@ defmodule Xitdb do
 
   @doc "Same as `select/2`, but raises `Xitdb.Error` on failure."
   @spec select!(t() | Cursor.t(), String.t()) :: term()
-  def select!(target, selector) do
-    case select(target, selector) do
-      {:ok, val} -> val
-      {:error, err} -> raise err
-    end
-  end
+  def select!(target, selector), do: target |> select(selector) |> Error.unwrap!()
 
   @doc """
   Executes a Datomic-style Pull projection against a `%Xitdb.Cursor{}` or `%Xitdb{}` handle.
@@ -439,10 +520,7 @@ defmodule Xitdb do
   def pull(%Cursor{} = cursor, pattern) when is_binary(pattern) do
     %Cursor{db_ref: db_ref, tag_id: tag_id, value: val} = Cursor.ensure_resolved(cursor)
 
-    case NIF.nif_pull(db_ref, tag_id, val, pattern) do
-      {:ok, projected} -> {:ok, projected}
-      {:error, reason} -> {:error, %Error{reason: reason, details: %{pattern: pattern}}}
-    end
+    db_ref |> NIF.nif_pull(tag_id, val, pattern) |> Error.wrap(%{pattern: pattern})
   end
 
   def pull(%Cursor{} = cursor, pattern) when is_list(pattern) do
@@ -453,24 +531,16 @@ defmodule Xitdb do
 
   @doc "Same as `pull/2`, but raises `Xitdb.Error` on failure."
   @spec pull!(t() | Cursor.t(), Pull.pattern()) :: term()
-  def pull!(target, pattern) do
-    case pull(target, pattern) do
-      {:ok, val} -> val
-      {:error, err} -> raise err
-    end
-  end
+  def pull!(target, pattern), do: target |> pull(pattern) |> Error.unwrap!()
 
   @doc """
   Computes the structural diff between `moment_a` and `moment_b`, skipping unchanged
-  subtrees in $O(1)$ via 9-byte `Slot` equality.
+  subtrees in `O(1)` via 9-byte `Slot` equality.
   """
   @spec diff_moments(t(), integer(), integer()) :: {:ok, [map()]} | {:error, Error.t()}
   def diff_moments(%__MODULE__{db_ref: db_ref}, moment_a, moment_b)
       when is_integer(moment_a) and is_integer(moment_b) do
-    case NIF.nif_diff_moments(db_ref, moment_a, moment_b) do
-      {:ok, changes} -> {:ok, changes}
-      {:error, reason} -> {:error, %Error{reason: reason}}
-    end
+    db_ref |> NIF.nif_diff_moments(moment_a, moment_b) |> Error.wrap()
   end
 
   @doc """
@@ -478,71 +548,70 @@ defmodule Xitdb do
   """
   @spec history_of(t(), String.t()) :: {:ok, [map()]} | {:error, Error.t()}
   def history_of(%__MODULE__{db_ref: db_ref}, selector) when is_binary(selector) do
-    case NIF.nif_history_of(db_ref, selector) do
-      {:ok, entries} -> {:ok, entries}
-      {:error, reason} -> {:error, %Error{reason: reason, details: %{selector: selector}}}
-    end
+    db_ref |> NIF.nif_history_of(selector) |> Error.wrap(%{selector: selector})
   end
 
   @doc """
   Executes a Datalog query (`~q"find ?e, ?name where ..."`) against `db` or a `%Xitdb.Cursor{}`.
+
+  ## Options
+  #{NimbleOptions.docs(@query_schema)}
   """
   @spec query(t() | Cursor.t(), String.t(), keyword()) ::
           {:ok, %{vars: [String.t()], rows: [[term()]]}} | {:error, Error.t()}
   def query(target, query_str, opts \\ [])
 
   def query(%__MODULE__{db_ref: db_ref}, query_str, opts) when is_binary(query_str) do
-    moment = Keyword.get(opts, :moment, -1)
-    do_query(db_ref, moment, query_str)
+    with {:ok, validated} <- validate_opts(opts, @query_schema) do
+      moment = Keyword.get(validated, :moment, -1)
+      do_query(db_ref, moment, query_str)
+    end
   end
 
-  def query(%Cursor{db_ref: db_ref, moment: moment}, query_str, _opts)
+  def query(%Cursor{db_ref: db_ref, moment: cursor_moment}, query_str, opts)
       when is_binary(query_str) do
-    do_query(db_ref, moment, query_str)
+    with {:ok, validated} <- validate_opts(opts, @query_schema) do
+      moment = Keyword.get(validated, :moment, cursor_moment)
+      do_query(db_ref, moment, query_str)
+    end
   end
 
   defp do_query(db_ref, moment, query_str) do
-    case NIF.nif_query_datalog(db_ref, moment, query_str) do
-      {:ok, res} -> {:ok, res}
-      {:error, reason} -> {:error, %Error{reason: reason}}
-    end
+    db_ref |> NIF.nif_query_datalog(moment, query_str) |> Error.wrap()
   end
 
   @doc "Same as `query/3`, but raises `Xitdb.Error` on failure."
   @spec query!(t() | Cursor.t(), String.t(), keyword()) :: %{vars: [String.t()], rows: [[term()]]}
   def query!(target, query_str, opts \\ []) do
-    case query(target, query_str, opts) do
-      {:ok, res} -> res
-      {:error, err} -> raise err
-    end
+    target |> query(query_str, opts) |> Error.unwrap!()
   end
 
   @doc """
   Compacts `db` into a new database keeping only the latest committed moment and deduplicating
   reachable slots.
+
+  ## Options
+  #{NimbleOptions.docs(@compact_schema)}
   """
   @spec compact(t(), keyword()) :: {:ok, t()} | {:error, Error.t()}
   def compact(%__MODULE__{db_ref: db_ref, hash: hash}, opts \\ []) do
-    target_path = Keyword.get(opts, :path, "")
-    backend = if target_path == "", do: :memory, else: :buffered_file
+    with {:ok, validated} <- validate_opts(opts, @compact_schema) do
+      target_path = validated[:path]
+      backend = if target_path == "", do: :memory, else: :buffered_file
 
-    case NIF.nif_compact(db_ref, target_path) do
-      {:ok, new_ref} ->
-        {:ok, %__MODULE__{db_ref: new_ref, backend: backend, path: target_path, hash: hash}}
+      case NIF.nif_compact(db_ref, target_path) do
+        {:ok, new_ref} ->
+          {:ok, %__MODULE__{db_ref: new_ref, backend: backend, path: target_path, hash: hash}}
 
-      {:error, reason} ->
-        {:error, %Error{reason: reason}}
+        {:error, reason} ->
+          {:error, %Error{reason: reason}}
+      end
     end
   end
 
   @doc "Same as `compact/2`, but raises `Xitdb.Error` on failure."
   @spec compact!(t(), keyword()) :: t()
-  def compact!(%__MODULE__{} = db, opts \\ []) do
-    case compact(db, opts) do
-      {:ok, comp_db} -> comp_db
-      {:error, err} -> raise err
-    end
-  end
+  def compact!(%__MODULE__{} = db, opts \\ []), do: db |> compact(opts) |> Error.unwrap!()
 
   # ============================================================================
   # Access Delegation on `%Xitdb{}` (`db["users"]["alice"]`)
@@ -551,7 +620,7 @@ defmodule Xitdb do
   @impl Access
   def fetch(%__MODULE__{db_ref: db_ref}, key) do
     Cursor.fetch(
-      %Cursor{db_ref: db_ref, tag: :hash_map, tag_id: -1, value: -1, moment: -1},
+      %Cursor{db_ref: db_ref, tag: :hash_map, tag_id: -1, value: -1, moment: -1, root: true},
       key
     )
   end
@@ -568,6 +637,12 @@ defmodule Xitdb do
           "cannot mutate %Xitdb{} directly; wrap pop_in inside Xitdb.transact/3 or Xitdb.DSL.tx/3"
   end
 
+  @doc """
+  Returns an `Access` lens function for positive or negative integer list indices
+  that works on both `%Xitdb.Cursor{}` list collections and standard Elixir lists
+  (unlike `Access.at/1`, which guards `when is_list(data)`).
+  """
+  @spec at(integer()) :: Access.access_fun(Cursor.t() | list(), term())
   def at(index) when is_integer(index) do
     fn
       :get, data, next ->
@@ -581,13 +656,24 @@ defmodule Xitdb do
     end
   end
 
-  defp validate_opts(opts, schema) do
+  @doc false
+  @spec validate_transact_opts(term()) :: {:ok, keyword()} | {:error, Error.t()}
+  def validate_transact_opts(opts), do: validate_opts(opts, @transact_schema)
+
+  defp validate_opts(opts, schema) when is_list(opts) do
     case NimbleOptions.validate(opts, schema) do
       {:ok, validated} ->
         {:ok, validated}
 
       {:error, %NimbleOptions.ValidationError{} = err} ->
-        {:error, %Error{reason: :invalid_options, details: %{message: Exception.message(err)}}}
+        {:error, Error.wrap(:invalid_options, %{message: Exception.message(err)})}
     end
+  end
+
+  defp validate_opts(other, _schema) do
+    {:error,
+     Error.wrap(:invalid_options, %{
+       message: "expected keyword list of options, got: #{inspect(other)}"
+     })}
   end
 end

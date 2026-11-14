@@ -8,9 +8,9 @@ defmodule Xitdb.Cursor do
   - Can be passed across BEAM processes (`Task.async/1`, GenServers, ETS, LiveView assigns)
     with zero mutexes or dangling pointer hazards.
   - Implements `Access` (`cursor["key"]`, `cursor[0]`, `get_in/2`, `put_in/3`, `update_in/3`, `pop_in/2`).
-  - Implements `Enumerable` (`Enum.count/1` in $O(1)$ on counted collections,
-    `Enum.member?/2` in $O(1)$ / $O(\\log N)$ via HAMT/B+Tree lookup,
-    `Enum.slice/2` in $O(\\log N)$ via index seek, and `Enum.to_list/1` / `Stream.*`).
+  - Implements `Enumerable` (`Enum.count/1` in `O(1)` on counted collections,
+    `Enum.member?/2` in `O(1)` / `O(log N)` via HAMT/B+Tree lookup,
+    `Enum.slice/2` in `O(log N)` via index seek, and `Enum.to_list/1` / `Stream.*`).
   - Implements `Inspect` with a safe, bounded preview.
   """
 
@@ -26,6 +26,7 @@ defmodule Xitdb.Cursor do
     :value,
     full: false,
     moment: -1,
+    root: false,
     tx_mode: false,
     path_steps: [],
     staged_ops: [],
@@ -40,6 +41,7 @@ defmodule Xitdb.Cursor do
           value: integer(),
           full: boolean(),
           moment: integer(),
+          root: boolean(),
           tx_mode: boolean(),
           path_steps: [{atom(), String.t() | integer()}],
           staged_ops: list(),

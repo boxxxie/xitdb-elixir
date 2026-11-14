@@ -1,29 +1,23 @@
 defmodule Xitdb.DSL.TxRuntime do
   @moduledoc false
 
-  alias Xitdb.{Collection, Cursor, Error, NIF, TxCompiler}
+  alias Xitdb.{Collection, Cursor, NIF, TxCompiler}
 
   @enforce_keys [:db, :opts]
   defstruct [:db, :opts, index_ops: [], ops: [], staged_log: nil]
 
   def init_state(db, opts, track_staged? \\ false) do
-    if is_list(opts) do
+    with {:ok, validated} <- Xitdb.validate_transact_opts(opts) do
       tx_ref = make_ref()
 
       state = %__MODULE__{
         db: db,
-        opts: opts,
+        opts: validated,
         staged_log: if(track_staged?, do: [], else: nil)
       }
 
       Process.put(tx_ref, state)
       {:ok, tx_ref}
-    else
-      {:error,
-       %Error{
-         reason: :invalid_options,
-         details: %{message: "expected keyword list of options, got: #{inspect(opts)}"}
-       }}
     end
   end
 

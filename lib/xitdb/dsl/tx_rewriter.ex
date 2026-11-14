@@ -72,10 +72,7 @@ defmodule Xitdb.DSL.TxRewriter do
 
   defp wrap_bang(tx_quoted) do
     quote do
-      case unquote(tx_quoted) do
-        {:ok, updated_db} -> updated_db
-        {:error, err} -> raise err
-      end
+      Xitdb.Error.unwrap!(unquote(tx_quoted))
     end
   end
 

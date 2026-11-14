@@ -115,7 +115,7 @@ Each track has its own specification and implementation plan in [`./tracks/`](./
 
 ---
 
-- [ ] **Track 7 [Wave 4 — Core Client Polish]: `Xitdb.Error` Helpers, Compile-Time `NimbleOptions` Validation, Root-Cursor Guard & IEx Docstring Cleanups**
+- [x] **Track 7 [Wave 4 — Core Client Polish]: `Xitdb.Error` Helpers, Compile-Time `NimbleOptions` Validation, Root-Cursor Guard & IEx Docstring Cleanups**
   *Link: [./tracks/remaining_improvements_20261112/](./tracks/remaining_improvements_20261112/)*
   *Note:* Uses `TxRewriter` from Track 6 in Phase 1; keep sequenced after Track 6.
 
