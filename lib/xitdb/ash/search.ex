@@ -598,6 +598,10 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     end
 
     @spec apply_diff(term(), String.t(), String.t(), map()) :: term()
+    def apply_diff(db, _collection, _doc_key, %{doc_count_delta: 0, len_delta: 0, term_ops: []}) do
+      db
+    end
+
     def apply_diff(db, collection, doc_key, diff) do
       col_str = TxCompiler.format_key(collection)
       doc_str = TxCompiler.format_key(doc_key)
@@ -628,7 +632,10 @@ if Code.ensure_loaded?(Ash.DataLayer) do
                 {:put, doc_path <> ".terms." <> TxCompiler.format_key(term), weight}
               end)
 
-            [{:put, doc_path <> ".len", len} | put_terms]
+            [
+              {:put, doc_path <> ".len", len},
+              {:reset_col, doc_path <> ".terms", "hash_map"} | put_terms
+            ]
         end
 
       term_ops =
@@ -649,10 +656,19 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         end)
 
       ops = meta_ops ++ doc_ops ++ term_ops
-      {:ok, new_db} = Xitdb.transact_ops(db, ops)
-      new_db
+
+      case db do
+        {%Xitdb{} = raw_db, moment} when is_integer(moment) ->
+          {:ok, new_db} = Xitdb.transact_ops(raw_db, ops, base_moment: moment)
+          {new_db, Xitdb.moment_count(new_db) - 1}
+
+        %Xitdb{} = raw_db ->
+          {:ok, new_db} = Xitdb.transact_ops(raw_db, ops)
+          new_db
+      end
     end
 
+    defp root_cursor({%Xitdb{} = db, moment}) when is_integer(moment), do: Xitdb.as_of(db, moment)
     defp root_cursor(%Xitdb.Cursor{} = cursor), do: cursor
     defp root_cursor(%Xitdb{} = db), do: Xitdb.db(db)
     defp root_cursor(_), do: nil

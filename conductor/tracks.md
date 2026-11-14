@@ -57,7 +57,7 @@ Each track has its own specification and implementation plan in [`./tracks/`](./
 
 ---
 
-- [ ] **Track 11A [Wave 2 — MVP DataLayer Engine]: Order-Preserving Binary Key Codec (`Xitdb.Ash.Codec`) & Flat Top-Level B+Tree Indexer (`Xitdb.Ash.Indexer`)**
+- [x] **Track 11A [Wave 2 — MVP DataLayer Engine]: Order-Preserving Binary Key Codec (`Xitdb.Ash.Codec`) & Flat Top-Level B+Tree Indexer (`Xitdb.Ash.Indexer`)**
   *Link: [./tracks/ash_codec_and_indexer_20261111/](./tracks/ash_codec_and_indexer_20261111/)*
   *MVP Scope:* Implement **Phase 1** (`i64`, `f64`, scale-normalized `Decimal`, truncated `:utc_datetime` vs microsecond `:utc_datetime_usec`, fixed-width Gregorian `:date` and microsecond `:time` keys, `CiString`, `counted_set_fields`, composite secondary keys, and `nil`-safe tenant-prefixed composite identities), **Phase 2** flat index op planning (prefix-aware composite bounds for `:inclusive` max / `:exclusive` min), and **Phase 3** pure `Xitdb.transact_ops/3` tuple emission + `NIF.nif_slot_entries` range streaming. Defer physical `nested_in` storage to **Track 11B** (stubbing `nested_cursors_for_parent/3` to `[]`).
 
