@@ -63,7 +63,7 @@ Each track has its own specification and implementation plan in [`./tracks/`](./
 
 ---
 
-- [ ] **Track 12 [Wave 2 — MVP DataLayer Engine]: Six-Stage Query Execution Engine (`Xitdb.Ash.Query`)**
+- [x] **Track 12 [Wave 2 — MVP DataLayer Engine]: Six-Stage Query Execution Engine (`Xitdb.Ash.Query`)**
   *Link: [./tracks/ash_query_engine_20261111/](./tracks/ash_query_engine_20261111/)*
   *MVP Scope:* Implement query shaping callbacks and all six execution stages for flat collections (PK seek, attribute-tenant-aware unique identity seek, single secondary-index seek/range bounds supporting `AshOban` keyset streams, and `all_cursors/2` fallback; hydration; unrelated & batched single-hop relationship aggregates with `parent_stack`; `Ash.Expr.eval/2` + `Ash.Resource.Calculation` modules; `Ash.Filter.Runtime`; `runtime_sort/3`, distinct, pagination, and select masking). Defer `nested_in` parent-jump planning to **Track 11B**.
 

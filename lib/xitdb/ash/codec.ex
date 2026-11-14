@@ -410,7 +410,11 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           end
 
         _complex ->
-          Ash.Type.dump_to_embedded(attr.type, value, constraints)
+          case Ash.Type.dump_to_embedded(attr.type, value, constraints) do
+            {:ok, dumped} -> {:ok, dumped}
+            {:error, _} = err -> err
+            :error -> {:error, {:dump_failed, attr.name}}
+          end
       end
     end
 
@@ -480,14 +484,25 @@ if Code.ensure_loaded?(Ash.DataLayer) do
               {:error, _} = err -> err
             end
           else
-            Ash.Type.cast_stored(attr.type, items, attr.constraints)
+            normalize_cast_stored(
+              Ash.Type.cast_stored(attr.type, items, attr.constraints),
+              attr.name
+            )
           end
 
         _other ->
           materialized = materialize_cursor_term(raw)
-          Ash.Type.cast_stored(attr.type, materialized, attr.constraints)
+
+          normalize_cast_stored(
+            Ash.Type.cast_stored(attr.type, materialized, attr.constraints),
+            attr.name
+          )
       end
     end
+
+    defp normalize_cast_stored({:ok, val}, _attr_name), do: {:ok, val}
+    defp normalize_cast_stored({:error, _} = err, _attr_name), do: err
+    defp normalize_cast_stored(:error, attr_name), do: {:error, {:load_failed, attr_name}}
 
     defp build_loaded_struct(resource, field_map, tenant) do
       record = struct(resource, field_map)
@@ -618,7 +633,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           tenant
 
         nil ->
-          nil
+          tenant
       end
     end
 
