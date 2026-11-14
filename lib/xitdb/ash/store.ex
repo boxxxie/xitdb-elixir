@@ -4,9 +4,10 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     Caller-supervised single-writer store, lock-free snapshot coordinator, and savepoint
     transaction manager for `Xitdb.Ash.DataLayer`.
 
-    Reads resolve in ~10ns via `Xitdb.Ash.Store.Snapshot` without touching this `GenServer`.
-    Transactions acquire a monitored writer lease and execute inside the caller process so
-    `self()`, `$callers`, `Swoosh` sandboxes, and multi-store transactions behave naturally.
+    Reads resolve in ~10ns via `:persistent_term` and `:atomics` snapshot state without
+    touching this `GenServer`. Transactions acquire a monitored writer lease and execute
+    inside the caller process so `self()`, `$callers`, `Swoosh` sandboxes, and multi-store
+    transactions behave naturally.
 
     ## Supervision
 
@@ -35,6 +36,12 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     alias Xitdb.Ash.Store.{Backend, LeaseQueue, Snapshot}
 
     @type working_snapshot :: {Xitdb.t(), non_neg_integer()}
+    @type reverse_fk :: %{
+            source_resource: module(),
+            source_collection: atom(),
+            foreign_key: atom(),
+            on_delete: :delete | :nilify | :restrict
+          }
 
     @options_schema NimbleOptions.new!(
                       name: [
@@ -210,7 +217,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     @doc """
     Returns incoming same-store foreign-key rules compiled at boot for `resource`.
     """
-    @spec reverse_fks(module(), module()) :: [Snapshot.reverse_fk()]
+    @spec reverse_fks(module(), module()) :: [reverse_fk()]
     def reverse_fks(store, resource) when is_atom(store) and is_atom(resource) do
       Snapshot.reverse_fks(store, resource)
     end

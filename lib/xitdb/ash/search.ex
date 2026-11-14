@@ -63,7 +63,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
                     db: [
                       type: :any,
                       default: nil,
-                      doc: "Explicit `%Xitdb{}` handle; defaults to `Snapshot.current_db/1`."
+                      doc:
+                        "Explicit `%Xitdb{}` handle; defaults to `Xitdb.Ash.Store.current_db/1`."
                     ],
                     as_of: [
                       type: {:or, [:integer, {:in, [nil]}]},

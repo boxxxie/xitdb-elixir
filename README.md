@@ -1,6 +1,6 @@
 # Xitdb — Idiomatic Elixir Client for `xitdb`
 
-[![Hex.pm](https://img.shields.io/badge/hex-1.0.2-blue.svg)](https://hex.pm/packages/xitdb)
+[![Hex.pm](https://img.shields.io/badge/hex-1.1.0-blue.svg)](https://hex.pm/packages/xitdb)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 `Xitdb` is an idiomatic Elixir client and Odin NIF wrapper for [`xitdb`](https://github.com/xit-vcs/xitdb) (backed by [`odin-xitdb`](https://github.com/boxxxie/odin-xitdb)), an embeddable, immutable, append-only database with persistent structural sharing.
@@ -21,8 +21,8 @@ Rather than re-implementing `xitdb`'s wire format in pure Elixir or requiring qu
   Pin historical snapshots in `O(1)` with `Xitdb.as_of(db, moment)`, diff any two moments in `O(delta)` with `Xitdb.diff_moments/3`, and inspect attribute lineage with `Xitdb.history_of/2`.
 - **Compile-Time Validated Sigils (`~x`, `~q`), Macro DSL (`Xitdb.DSL`), Pull & Datalog:**
   Use standard `Access` for lazy navigation or `use Xitdb.DSL` for compile-time path selectors (`path(users[id].todos[[0]])`), zero-read atomic transaction blocks (`tx db do ... end`), structural Pull patterns (`[:username, todos: 0..2]`), and Ecto-style Datalog queries with `^var` pinning.
-- **Ash & Spark DSL Extension (`Xitdb.Ash.Resource`):**
-  Declare a `xitdb do ... end` block directly on any `Ash.Resource` to configure collections, survivorship/lock fields, field aliases, and secondary B+Tree indexes with compile-time sync verification (`VerifySyncProjection`), automatic change wiring (`WireChanges`), `O(1)` precompiled Pull patterns (`Xitdb.Ash.Info`), and resource-aware transactions (`tx_for` / `tx_for!`).
+- **Native Ash Framework DataLayer, BM25 Search & Spark DSL (`Xitdb.Ash.DataLayer`, `Xitdb.Ash.Resource`):**
+  Persist `Ash.Resource` domains directly in immutable `.xit` files with `data_layer: Xitdb.Ash.DataLayer`—complete with ~10ns lock-free `:persistent_term` snapshot reads (`Xitdb.Ash.Store`), single/composite B+Tree secondary indexes (`index [:status, :inserted_at]`), transactional Odin NIF BM25 + prefix search (`Xitdb.Ash.Search`), incoming/outgoing FK cascades (`references`), co-located `nested_in` subtrees, historical time-travel (`Store.with_as_of/3`), and `async: true` sandboxes (`Xitdb.Ash.TestSandbox`)—or attach `extensions: [Xitdb.Ash.Resource]` as a hybrid MDM sync projection extension.
 
 ---
 
@@ -33,7 +33,7 @@ Add `xitdb` to your list of dependencies in `mix.exs`:
 ```elixir
 def deps do
   [
-    {:xitdb, "~> 1.0"}
+    {:xitdb, "~> 1.1"}
   ]
 end
 ```
@@ -150,9 +150,77 @@ min_age = 21
 
 ---
 
-## Ash & Spark DSL (`Xitdb.Ash.Resource`)
+## Ash Framework Integration (`Xitdb.Ash.DataLayer` & `Xitdb.Ash.Resource`)
 
-When pairing `Xitdb` with [`Ash`](https://hexdocs.pm/ash) (e.g., as an immutable Master Data Management engine, audit graph, or secondary projection store), add `Xitdb.Ash.Resource` to `extensions:` on your `Ash.Resource` to declare collections, survivorship/lock fields, and secondary B+Tree indexes in a compile-time verified `xitdb do ... end` block:
+`Xitdb` supports two complementary integration modes with [`Ash`](https://hexdocs.pm/ash):
+
+### 1. Native Lock-Free Ash Storage & BM25 Search (`data_layer: Xitdb.Ash.DataLayer`)
+
+Use `Xitdb.Ash.DataLayer` with a supervised `Xitdb.Ash.Store` for full Ash 3.37.2+ CRUD, atomic updates, relationships, aggregates, calculations, composite B+Tree secondary indexes, same-store FK cascades, time-travel queries, and transactional Odin NIF BM25 + prefix search—with **zero SQL migrations**:
+
+```elixir
+defmodule MyApp.Accounts.Profile do
+  use Ash.Resource,
+    domain: MyApp.Accounts,
+    data_layer: Xitdb.Ash.DataLayer
+
+  xitdb do
+    store MyApp.Store
+    collection :profiles
+
+    # Single-field and composite B+Tree (:sorted_map) secondary indexes
+    index [:status, :inserted_at]
+
+    # Transactional in-Xitdb BM25 + B+Tree prefix search
+    search_field :full_name, boost: 3.0
+    search_field :headline, boost: 1.5
+
+    references do
+      reference :organization, on_delete: :nilify
+    end
+  end
+
+  attributes do
+    integer_primary_key :id
+    attribute :full_name, :string, allow_nil?: false, public?: true
+    attribute :headline, :string, public?: true
+    attribute :status, :atom, default: :active, public?: true
+    timestamps()
+  end
+
+  relationships do
+    belongs_to :organization, MyApp.Accounts.Organization,
+      attribute_type: :integer,
+      public?: true
+  end
+
+  actions do
+    defaults [:read, :destroy, create: :*, update: :*]
+  end
+end
+```
+
+Query BM25 search rankings, pin historical time-travel snapshots, and isolate `async: true` tests via `Xitdb.Ash.TestSandbox`:
+
+```elixir
+# 1. Ranked BM25 + prefix search preserved on an Ash.Query:
+ranked_ids = Xitdb.Ash.Search.ids(MyApp.Accounts.Profile, "alice principal", limit: 25)
+
+profiles =
+  MyApp.Accounts.Profile
+  |> Ash.Query.filter(id in ^ranked_ids)
+  |> Xitdb.Ash.Search.sort_by_rank(ranked_ids)
+  |> Ash.read!()
+
+# 2. Time-travel any Ash read, aggregate, or BM25 search to an earlier moment:
+MyApp.Store.with_as_of(moment_v0, fn ->
+  Ash.read!(MyApp.Accounts.Profile)
+end)
+```
+
+### 2. Hybrid MDM Sync Extension (`extensions: [Xitdb.Ash.Resource]`)
+
+When pairing `Xitdb` with an external primary store (such as `Ash.DataLayer.Postgres`) as an immutable Master Data Management engine or secondary audit graph, add `Xitdb.Ash.Resource` to `extensions:` to configure collections, survivorship/lock fields, nested sub-collections (`nested_in`), and compile-time verified sync projections (`VerifySyncProjection`):
 
 ```elixir
 defmodule MyApp.Accounts.Organization do
@@ -221,7 +289,7 @@ Xitdb.pull!(db["organizations"]["101"], pattern)
 - **[Path Selector & Structural Pull DSL (`docs/path-and-pull-dsl.md`)](docs/path-and-pull-dsl.md)** — `path/1`, typed collection modifiers (`counted`, `sorted`, `[[idx]]`), set member probes, wildcard scans (`*`), and structural `Xitdb.pull/2` patterns.
 - **[Declarative Transaction Block DSL (`docs/transaction-dsl.md`)](docs/transaction-dsl.md)** — `tx/2,3`, `tx_for/3,4`, `put` (including 1-arity set member additions), `update/2,3`, `rm`, `append`, `insert`, `slice`, `fork`, `index_on`, `meta`, `instant`, `savepoint`, and `abort`.
 - **[Declarative Datalog Query DSL (`docs/datalog-dsl.md`)](docs/datalog-dsl.md)** — `datalog/1` and `query/2,3`, `^var` pinning, entity generators (`u <- users`), set membership, transitive graph reachability (`reach/3,4`), cross-moment queries (`at_moment/2`), and aggregations.
-- **[Ash & Spark Integration (`docs/ash-and-spark.md`)](docs/ash-and-spark.md)** — `Xitdb.Ash.Resource` Spark DSL extension (`xitdb do ... end`), compile-time `VerifySyncProjection` verifier and `WireChanges` transformer, `Xitdb.Ash.Info` introspection, and `tx_for` / `tx_for!` automatic secondary index transactions.
+- **[Ash & Spark Integration (`docs/ash-and-spark.md`)](docs/ash-and-spark.md)** — Native `Xitdb.Ash.DataLayer`, `Xitdb.Ash.Store`, `Xitdb.Ash.Search` (BM25 + prefix search), `Xitdb.Ash.TestSandbox`, `Xitdb.Ash.Resource` Spark DSL extension, `Xitdb.Ash.Info` introspection, and `tx_for` / `tx_for!`.
 
 ---
 
@@ -229,15 +297,15 @@ Xitdb.pull!(db["organizations"]["101"], pattern)
 
 ```
 ┌────────────────────────────────────────────────────────────────────────────┐
-│ Elixir Client Layer (lib/xitdb*.ex)                                        │
+│ Elixir Client & Ash DataLayer (lib/xitdb*.ex)                              │
 │  • %Xitdb{} handle + %Xitdb.Cursor{db_ref, tag, tag_id, value, moment}     │
 │  • Access, Enumerable, Inspect protocols                                   │
 │  • Xitdb.DSL + Xitdb.Pull + Xitdb.TxCompiler + Xitdb.Sigils (~x, ~q)       │
-│  • Xitdb.Ash.Resource (Spark DSL, VerifySyncProjection, WireChanges, Info) │
+│  • Xitdb.Ash.{DataLayer, Store, Search, TestSandbox, Resource, Info, Tx}   │
 ├────────────────────────────────────────────────────────────────────────────┤
 │ C-ABI Erlang NIF Boundary (native/nif_entry.c + native/xitdb_nif.odin)     │
 │  • ErlNifResourceType + ErlNifRWLock thread safety                         │
-│  • Coarse-grained transaction batching & chunked iterator pagination       │
+│  • Coarse-grained transaction batching, B+Tree seek & BM25 search pushdown │
 ├────────────────────────────────────────────────────────────────────────────┤
 │ Native Engine Submodule (native/xitdb-odin/xitdb)                          │
 │  • 16-way HAMT, Radix Trie, Counted B-Tree, B+Tree, Compactor & Datalog    │

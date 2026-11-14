@@ -177,10 +177,8 @@ def pool_records($recs):
 
 def latest_snapshot_for_lang($all; $lang):
   ($all | map(select(.lang == $lang))) as $lang_recs |
-  ($lang_recs | group_by(.name) | map(
-    (last.commit // "unknown") as $lc |
-    map(select((.commit // "unknown") == $lc)) | pool_records(.)
-  ) | sort_by(.rank));
+  (if $target_commit != "" then $target_commit else ($lang_recs | last.commit // "unknown") end) as $lc |
+  ($lang_recs | map(select((.commit // "unknown") == $lc)) | group_by(.name) | map(pool_records(.)) | sort_by(.rank));
 
 def tier_table_ns($list):
   "| # | Benchmark | Med\u00a0(`ns`) | Mean\u00a0±\u00a0σ | CV | Min\u00a0`ops/s` | Max\u00a0`ops/s` | IQR | `p95` | `p99` | Min | Max | Ops |",
@@ -211,7 +209,7 @@ def single_lang_section($sec_num; $lang_label; $flags; $sha; $list):
   tier_table_us($multi_us);
 
 def compare_1v1_table($list; $ex_map; $unit):
-  "| # | Benchmark | NIF\u00a0Ratio | Raw\u00a0Odin\u00a0Med\u00a0(`\($unit)`) | Elixir\u00a0Med\u00a0(`\($unit)`) | Welch\u00a0$z$ | Odin\u00a0Mean\u00a0±\u00a0σ | Odin\u00a0CV | Elixir\u00a0Mean\u00a0±\u00a0σ | Elixir\u00a0CV |",
+  "| # | Benchmark | NIF\u00a0Ratio | Raw\u00a0Odin\u00a0Med\u00a0(`\($unit)`) | Elixir\u00a0Med\u00a0(`\($unit)`) | Welch\u00a0`z` | Odin\u00a0Mean\u00a0±\u00a0σ | Odin\u00a0CV | Elixir\u00a0Mean\u00a0±\u00a0σ | Elixir\u00a0CV |",
   "| ---: | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
   ($list[] | . as $o | $ex_map[$o.name] as $e |
     welch_z($o; $e) as $wz |

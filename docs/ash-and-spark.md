@@ -1,6 +1,11 @@
-# Ash & Spark Integration (`Xitdb.Ash.Resource`, `Xitdb.Ash.Info`, `tx_for`)
+# Ash & Spark Integration (`Xitdb.Ash.DataLayer`, `Xitdb.Ash.Store`, `Xitdb.Ash.Search`, `Xitdb.Ash.Resource`)
 
-When using `Xitdb` alongside [`Ash`](https://hexdocs.pm/ash) (for example, as an immutable Master Data Management (MDM) engine, audit graph, or secondary projection store), `Xitdb` provides a declarative [`Spark`](https://hexdocs.pm/spark) DSL extension (`Xitdb.Ash.Resource`), zero-allocation introspection helpers (`Xitdb.Ash.Info`), a compile-time projection/index verifier (`Xitdb.Ash.Verifiers.VerifySyncProjection`), and resource-aware transaction macros (`tx_for/3,4` and `tx_for!/3,4`).
+`Xitdb` integrates with [`Ash`](https://hexdocs.pm/ash) in two complementary ways:
+
+1. **Native Lock-Free Ash Storage & BM25 Search (`data_layer: Xitdb.Ash.DataLayer`):**
+   Persist `Ash.Resource` entities directly in immutable copy-on-write `.xit` files managed by `Xitdb.Ash.Store`—with ~10ns lock-free `:persistent_term` snapshot reads, single/composite B+Tree secondary indexes (`index`), transactional Odin NIF BM25 + prefix search (`search_field` & `Xitdb.Ash.Search`), incoming/outgoing FK cascades (`references`), co-located parent subtrees (`nested_in`), historical time-travel (`Store.with_as_of/3`), and `async: true` sandboxes (`Xitdb.Ash.TestSandbox`).
+2. **Hybrid MDM Sync Extension (`extensions: [Xitdb.Ash.Resource]`):**
+   Attach a declarative [`Spark`](https://hexdocs.pm/spark) DSL extension onto resources backed by another data layer (such as `Ash.DataLayer.Postgres`) for Master Data Management (MDM) projections, survivorship field locks, zero-allocation introspection (`Xitdb.Ash.Info`), compile-time sync verification (`Xitdb.Ash.Verifiers.VerifySyncProjection`), and resource-aware transactions (`tx_for/3,4` and `tx_for!/3,4`).
 
 ---
 
@@ -283,6 +288,39 @@ end)
 ```
 
 For resources persisted directly in `.xit` files without Postgres, set `data_layer: Xitdb.Ash.DataLayer` (which automatically includes the `xitdb do ... end` DSL, secondary `index` / `search_field` / `references` entities, and `Store` transaction coordination) and isolate concurrent tests in `test_helper.exs` / `DataCase` via `Xitdb.Ash.TestSandbox.init()` and `Xitdb.Ash.TestSandbox.checkout([MyApp.MDM.Store])`.
+
+```elixir
+defmodule MyApp.Accounts.Profile do
+  use Ash.Resource,
+    domain: MyApp.Accounts,
+    data_layer: Xitdb.Ash.DataLayer,
+    authorizers: [Ash.Policy.Authorizer]
+
+  xitdb do
+    store MyApp.MDM.Store
+    collection :profiles
+
+    # Explicit single-field or composite B+Tree (:sorted_map) secondary indexes
+    # (belongs_to foreign keys are indexed automatically when index_relationships? is true)
+    index [:status, :inserted_at]
+
+    # Transactional in-Xitdb BM25 + B+Tree prefix search fields
+    search_field :full_name, boost: 3.0
+    search_field :headline, boost: 1.5
+
+    search_field :firm_name,
+      boost: 2.0,
+      resolver: fn profile, db ->
+        Xitdb.Ash.Search.lookup_field(db, :organizations, profile.organization_id, "name")
+      end
+
+    # Incoming/outgoing foreign-key cascade actions within the same store
+    references do
+      reference :organization, on_delete: :nilify
+    end
+  end
+end
+```
 
 ### 2. Reference `lock_change` Module (`MyApp.MDM.Changes.ModifyLockedFields`)
 

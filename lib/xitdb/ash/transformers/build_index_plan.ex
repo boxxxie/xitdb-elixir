@@ -1,6 +1,10 @@
 if Code.ensure_loaded?(Ash.DataLayer) do
   defmodule Xitdb.Ash.Transformers.BuildIndexPlan do
-    @moduledoc false
+    @moduledoc """
+    Spark DSL transformer that validates and persists `xitdb` store, collection,
+    secondary B+Tree index (`index`), BM25 search field (`search_field`), foreign-key
+    reference (`references`), and co-located `nested_in` plans for `Xitdb.Ash.DataLayer` resources.
+    """
     use Spark.Dsl.Transformer
 
     alias Spark.Dsl.Transformer

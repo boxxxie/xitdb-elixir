@@ -1,6 +1,10 @@
 if Code.ensure_loaded?(Ash.DataLayer) do
   defmodule Xitdb.Ash.Verifiers.VerifyNoSqlFragments do
-    @moduledoc false
+    @moduledoc """
+    Spark DSL verifier ensuring that `Xitdb.Ash.DataLayer` resources do not use SQL
+    `fragment(...)` calls in calculations, aggregates, relationships, identities,
+    validations, actions, or policies.
+    """
     use Spark.Dsl.Verifier
 
     alias Spark.Dsl.Verifier

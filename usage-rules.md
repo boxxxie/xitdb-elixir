@@ -313,6 +313,21 @@ Profile
 
 When a referenced parent entity changes a field used in a child's `search_field` `resolver:` (for example, `Organization.name` indexed onto `Profile`), call `Xitdb.Ash.Search.reindex_records/3` in an `after_action` hook on the same store so both updates commit in one moment.
 
+### Time-Travel Queries (`with_as_of/3`, `xitdb_moment`, `as_of:`)
+
+Pin historical moments across `Ash.read`, `Ash.count`, aggregates, relationship loads, and BM25 search without touching the `Store` GenServer:
+
+```elixir
+# 1. Scoped historical block for all Ash reads & BM25 searches on a store:
+MyApp.MDM.Store.with_as_of(prev_moment, fn ->
+  Ash.read!(MyApp.Accounts.Profile)
+end)
+
+# 2. Per-query Ash context or Search option:
+Ash.read!(MyApp.Accounts.Profile, context: %{xitdb_moment: prev_moment})
+Xitdb.Ash.Search.ids(MyApp.Accounts.Profile, "northleaf", as_of: prev_moment)
+```
+
 ### Concurrent Testing (`Xitdb.Ash.TestSandbox`)
 
 - **DO** check out stores in `DataCase` `setup` via `Xitdb.Ash.TestSandbox.checkout([MyApp.MDM.Store, MyApp.AppStore])` and run tests with `async: true`.

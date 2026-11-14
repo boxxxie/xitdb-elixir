@@ -1,6 +1,10 @@
 if Code.ensure_loaded?(Ash.DataLayer) do
   defmodule Xitdb.Ash.Verifiers.VerifyCrossStoreReferences do
-    @moduledoc false
+    @moduledoc """
+    Spark DSL verifier ensuring that `references` (`on_delete: :delete | :nilify | :restrict`)
+    and co-located `nested_in` declarations on `Xitdb.Ash.DataLayer` resources target
+    resources within the same `Xitdb.Ash.Store`.
+    """
     use Spark.Dsl.Verifier
 
     alias Spark.Dsl.Verifier
