@@ -34,10 +34,13 @@ defmodule Xitdb.Ash.NestedIn do
   """
 
   @type t :: %__MODULE__{
-          parent: module(),
-          as: atom(),
-          parent_key: atom(),
+          parent: module() | nil,
+          as: atom() | nil,
+          parent_key: atom() | nil,
           key: atom() | nil,
+          parent_collection: atom() | nil,
+          foreign_key: atom() | nil,
+          path: atom() | nil,
           cardinality: :one | :many,
           __identifier__: term(),
           __spark_metadata__: term()
@@ -48,6 +51,9 @@ defmodule Xitdb.Ash.NestedIn do
     :as,
     :parent_key,
     :key,
+    :parent_collection,
+    :foreign_key,
+    :path,
     cardinality: :many,
     __identifier__: nil,
     __spark_metadata__: nil

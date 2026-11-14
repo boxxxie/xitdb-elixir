@@ -10,6 +10,7 @@ defmodule Xitdb.MixProject do
       version: @version,
       elixir: "~> 1.18",
       elixirc_paths: elixirc_paths(Mix.env()),
+      consolidate_protocols: Mix.env() != :test,
       test_pattern: "*_{test,spec}.exs",
       test_load_filters: [~r/_(test|spec)\.exs$/],
       compilers: [:odin_nif] ++ Mix.compilers(),
@@ -42,12 +43,14 @@ defmodule Xitdb.MixProject do
 
   defp deps do
     [
-      {:nimble_options, "~> 1.1"},
-      {:telemetry, "~> 1.3"},
-      {:ash, "~> 3.0", optional: true},
+      {:ash, "~> 3.37 and >= 3.37.2", optional: true},
       {:spark, "~> 2.2", optional: true},
+      {:nimble_options, "~> 1.1 and >= 1.1.1"},
+      {:telemetry, "~> 1.3"},
+      {:ash_phoenix, "~> 2.1", only: :test},
+      {:simple_sat, "~> 0.1", only: :test},
       {:stream_data, "~> 1.1", optional: true},
-      {:ex_doc, "~> 0.34", only: :dev, runtime: false}
+      {:ex_doc, "~> 0.35", only: :dev, runtime: false}
     ]
   end
 
