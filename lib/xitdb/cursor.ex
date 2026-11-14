@@ -47,6 +47,15 @@ defmodule Xitdb.Cursor do
           deleted_paths: MapSet.t()
         }
 
+  defmodule PreviewTag do
+    @moduledoc false
+    defstruct [:tag]
+
+    defimpl Inspect do
+      def inspect(%PreviewTag{tag: tag}, _opts), do: "<#{tag}>"
+    end
+  end
+
   @doc false
   def from_nif_tuple(db_ref, {:cursor, tag_atom, tag_id, val, full_int}, moment, path_steps \\ []) do
     %__MODULE__{
@@ -61,16 +70,10 @@ defmodule Xitdb.Cursor do
   end
 
   @doc false
-  def unwrap_nif_value(db_ref, {:cursor, tag_atom, tag_id, val, full_int}, moment, path_steps) do
-    %__MODULE__{
-      db_ref: db_ref,
-      tag: tag_atom,
-      tag_id: tag_id,
-      value: val,
-      full: full_int != 0,
-      moment: moment,
-      path_steps: path_steps
-    }
+  def unwrap_nif_value(db_ref, raw, moment, path_steps \\ [])
+
+  def unwrap_nif_value(db_ref, {:cursor, _, _, _, _} = tuple, moment, path_steps) do
+    from_nif_tuple(db_ref, tuple, moment, path_steps)
   end
 
   def unwrap_nif_value(_db_ref, {:__xitdb_set__, list}, _moment, _path_steps) do
@@ -92,147 +95,105 @@ defmodule Xitdb.Cursor do
   # ============================================================================
 
   @impl Access
-  def fetch(
-        %__MODULE__{tx_mode: false} = raw_cursor,
-        key
-      )
-      when is_integer(key) do
-    %__MODULE__{db_ref: db_ref, tag_id: tag_id, value: val, moment: moment} =
-      ensure_resolved(raw_cursor)
-
-    case NIF.nif_slot_get_index(db_ref, tag_id, val, key) do
-      {:ok, {:cursor, c_tag, c_tag_id, c_val, c_full}} ->
-        {:ok,
-         %__MODULE__{
-           db_ref: db_ref,
-           tag: c_tag,
-           tag_id: c_tag_id,
-           value: c_val,
-           full: c_full != 0,
-           moment: moment
-         }}
-
-      {:ok, scalar} ->
-        {:ok, scalar}
-
-      :error ->
-        :error
-    end
-  end
-
-  def fetch(
-        %__MODULE__{tx_mode: false, db_ref: db_ref, tag_id: tag_id, value: val, moment: moment},
-        key
-      )
-      when is_binary(key) do
-    case NIF.nif_slot_get_key(db_ref, tag_id, val, key) do
-      {:ok, {:cursor, c_tag, c_tag_id, c_val, c_full}} ->
-        {:ok,
-         %__MODULE__{
-           db_ref: db_ref,
-           tag: c_tag,
-           tag_id: c_tag_id,
-           value: c_val,
-           full: c_full != 0,
-           moment: moment
-         }}
-
-      {:ok, scalar} ->
-        {:ok, scalar}
-
-      :error ->
-        :error
-    end
-  end
-
-  def fetch(%__MODULE__{tx_mode: false} = cursor, key) when is_atom(key) do
+  def fetch(%__MODULE__{} = cursor, key) when is_atom(key) do
     fetch(cursor, Atom.to_string(key))
   end
 
-  def fetch(%__MODULE__{tx_mode: true} = cursor, key) when is_integer(key) do
-    cursor = ensure_resolved(cursor)
-    child_steps = [{cursor.tag, key} | cursor.path_steps]
+  def fetch(%__MODULE__{tx_mode: false} = raw_cursor, key)
+      when is_integer(key) or is_binary(key) do
+    cursor = if is_integer(key), do: ensure_resolved(raw_cursor), else: raw_cursor
 
-    if map_size(cursor.staged_overrides) == 0 and MapSet.size(cursor.deleted_paths) == 0 do
-      case NIF.nif_slot_get_index(cursor.db_ref, cursor.tag_id, cursor.value, key) do
-        {:ok, raw} ->
-          val = unwrap_nif_value(cursor.db_ref, raw, cursor.moment, child_steps)
-          {:ok, inherit_staged(val, cursor)}
+    case nif_slot_get(cursor, key) do
+      {:ok, {:cursor, _, _, _, _} = tuple} ->
+        {:ok, from_nif_tuple(cursor.db_ref, tuple, cursor.moment)}
 
-        :error ->
-          :error
-      end
-    else
-      selector = steps_to_selector(child_steps)
+      {:ok, scalar} ->
+        {:ok, scalar}
 
-      cond do
-        MapSet.member?(cursor.deleted_paths, selector) ->
-          :error
-
-        Map.has_key?(cursor.staged_overrides, selector) ->
-          {:ok, Map.fetch!(cursor.staged_overrides, selector)}
-
-        true ->
-          case NIF.nif_slot_get_index(cursor.db_ref, cursor.tag_id, cursor.value, key) do
-            {:ok, raw} ->
-              val = unwrap_nif_value(cursor.db_ref, raw, cursor.moment, child_steps)
-              {:ok, inherit_staged(val, cursor)}
-
-            :error ->
-              :error
-          end
-      end
+      :error ->
+        :error
     end
   end
 
-  def fetch(%__MODULE__{tx_mode: true} = cursor, key) when is_binary(key) or is_atom(key) do
-    key_str = if is_binary(key), do: key, else: Atom.to_string(key)
-    child_steps = [{cursor.tag, key_str} | cursor.path_steps]
+  def fetch(%__MODULE__{tx_mode: true} = raw_cursor, key)
+      when is_integer(key) or is_binary(key) do
+    cursor = if is_integer(key), do: ensure_resolved(raw_cursor), else: raw_cursor
+    child_steps = [{cursor.tag, key} | cursor.path_steps]
 
-    if map_size(cursor.staged_overrides) == 0 and MapSet.size(cursor.deleted_paths) == 0 do
-      case NIF.nif_slot_get_key(cursor.db_ref, cursor.tag_id, cursor.value, key_str) do
-        {:ok, raw} ->
-          val = unwrap_nif_value(cursor.db_ref, raw, cursor.moment, child_steps)
-          {:ok, inherit_staged(val, cursor)}
+    case lookup_staged(cursor, child_steps) do
+      {:staged, val} ->
+        {:ok, val}
 
-        :error ->
-          :error
-      end
+      :deleted ->
+        :error
+
+      :miss ->
+        case nif_slot_get(cursor, key) do
+          {:ok, raw} ->
+            val = unwrap_nif_value(cursor.db_ref, raw, cursor.moment, child_steps)
+            {:ok, inherit_staged(val, cursor)}
+
+          :error ->
+            :error
+        end
+    end
+  end
+
+  defp nif_slot_get(%__MODULE__{} = cursor, idx) when is_integer(idx) do
+    %__MODULE__{db_ref: db_ref, tag_id: tag_id, value: val} = ensure_resolved(cursor)
+    NIF.nif_slot_get_index(db_ref, tag_id, val, idx)
+  end
+
+  defp nif_slot_get(%__MODULE__{db_ref: db_ref, tag_id: tag_id, value: val}, key)
+       when is_binary(key) do
+    NIF.nif_slot_get_key(db_ref, tag_id, val, key)
+  end
+
+  defp lookup_staged(
+         %__MODULE__{staged_overrides: overrides, deleted_paths: deleted},
+         child_steps
+       ) do
+    if map_size(overrides) == 0 and MapSet.size(deleted) == 0 do
+      :miss
     else
       selector = steps_to_selector(child_steps)
 
       cond do
-        MapSet.member?(cursor.deleted_paths, selector) ->
-          :error
+        MapSet.member?(deleted, selector) ->
+          :deleted
 
-        Map.has_key?(cursor.staged_overrides, selector) ->
-          {:ok, Map.fetch!(cursor.staged_overrides, selector)}
+        Map.has_key?(overrides, selector) ->
+          {:staged, Map.fetch!(overrides, selector)}
 
         true ->
-          case NIF.nif_slot_get_key(cursor.db_ref, cursor.tag_id, cursor.value, key_str) do
-            {:ok, raw} ->
-              val = unwrap_nif_value(cursor.db_ref, raw, cursor.moment, child_steps)
-              {:ok, inherit_staged(val, cursor)}
-
-            :error ->
-              :error
-          end
+          :miss
       end
     end
   end
 
   @doc false
-  def ensure_resolved(%__MODULE__{tag_id: -1, db_ref: db_ref, moment: moment} = cursor) do
-    case NIF.nif_moment_slot(db_ref, moment) do
-      {:ok, {:cursor, tag_atom, tag_id, val, full_int}} ->
-        %{cursor | tag: tag_atom, tag_id: tag_id, value: val, full: full_int != 0}
-
-      {:error, reason} ->
-        raise Xitdb.Error, reason: reason, details: %{moment_index: moment}
+  def ensure_resolved(%__MODULE__{tag_id: -1, moment: moment} = cursor) do
+    case try_resolve(cursor) do
+      {:ok, resolved} -> resolved
+      {:error, reason} -> raise Xitdb.Error, reason: reason, details: %{moment_index: moment}
     end
   end
 
   def ensure_resolved(cursor), do: cursor
+
+  @doc false
+  def try_resolve(%__MODULE__{tag_id: -1, db_ref: db_ref, moment: moment} = cursor) do
+    case NIF.nif_moment_slot(db_ref, moment) do
+      {:ok, {:cursor, tag_atom, tag_id, val, full_int}} ->
+        {:ok,
+         %__MODULE__{cursor | tag: tag_atom, tag_id: tag_id, value: val, full: full_int != 0}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  def try_resolve(%__MODULE__{} = cursor), do: {:ok, cursor}
 
   @impl Access
   def get_and_update(%__MODULE__{} = cursor, key, fun) do
@@ -374,20 +335,21 @@ defimpl Enumerable, for: Xitdb.Cursor do
     case NIF.nif_slot_count(db_ref, tag_id, val) do
       {:ok, size} ->
         {:ok, size,
-         fn start, length, step ->
-           {:ok, raw_list} =
-             NIF.nif_slot_slice(db_ref, tag_id, val, start, length * step)
+         fn
+           _start, length, _step when length <= 0 ->
+             []
 
-           unwrapped =
-             Enum.map(raw_list, fn item ->
-               unwrap_entry(db_ref, item, moment, cursor.path_steps)
-             end)
+           start, length, step ->
+             span = (length - 1) * step + 1
 
-           if step == 1 do
-             unwrapped
-           else
-             Enum.take_every(unwrapped, step)
-           end
+             case NIF.nif_slot_slice(db_ref, tag_id, val, start, span) do
+               {:ok, raw_list} ->
+                 selected = if step == 1, do: raw_list, else: Enum.take_every(raw_list, step)
+                 Enum.map(selected, &unwrap_entry(db_ref, &1, moment, cursor.path_steps))
+
+               {:error, reason} ->
+                 raise Xitdb.Error, reason: reason
+             end
          end}
 
       _ ->
@@ -445,74 +407,51 @@ defimpl Enumerable, for: Xitdb.Cursor do
     end
   end
 
-  defp unwrap_entry(db_ref, {k, {:cursor, c_tag, c_tag_id, c_val, c_full}}, moment, path_steps)
-       when is_binary(k) do
-    {k,
-     %Cursor{
-       db_ref: db_ref,
-       tag: c_tag,
-       tag_id: c_tag_id,
-       value: c_val,
-       full: c_full != 0,
-       moment: moment,
-       path_steps: path_steps
-     }}
+  defp unwrap_entry(db_ref, {k, raw_val}, moment, path_steps) when is_binary(k) do
+    {k, Cursor.unwrap_nif_value(db_ref, raw_val, moment, path_steps)}
   end
 
-  defp unwrap_entry(_db_ref, {k, _scalar} = pair, _moment, _path_steps) when is_binary(k) do
-    pair
+  defp unwrap_entry(db_ref, raw_val, moment, path_steps) do
+    Cursor.unwrap_nif_value(db_ref, raw_val, moment, path_steps)
   end
-
-  defp unwrap_entry(db_ref, {:cursor, c_tag, c_tag_id, c_val, c_full}, moment, path_steps) do
-    %Cursor{
-      db_ref: db_ref,
-      tag: c_tag,
-      tag_id: c_tag_id,
-      value: c_val,
-      full: c_full != 0,
-      moment: moment,
-      path_steps: path_steps
-    }
-  end
-
-  defp unwrap_entry(db_ref, {:__xitdb_set__, list}, moment, path_steps) do
-    Cursor.unwrap_nif_value(db_ref, {:__xitdb_set__, list}, moment, path_steps)
-  end
-
-  defp unwrap_entry(_db_ref, scalar, _moment, _path_steps), do: scalar
 end
 
 defimpl Inspect, for: Xitdb.Cursor do
   import Inspect.Algebra
+  alias Xitdb.Cursor.PreviewTag
 
   def inspect(%Xitdb.Cursor{} = raw_cursor, opts) do
-    %Xitdb.Cursor{tag: tag, value: val} = cursor = Xitdb.Cursor.ensure_resolved(raw_cursor)
+    case Xitdb.Cursor.try_resolve(raw_cursor) do
+      {:ok, %Xitdb.Cursor{tag: tag, value: val} = cursor} ->
+        preview =
+          cursor
+          |> Stream.take(5)
+          |> Enum.map(fn
+            {k, %Xitdb.Cursor{tag: child_tag}} -> {k, %PreviewTag{tag: child_tag}}
+            {k, v} -> {k, v}
+            %Xitdb.Cursor{tag: child_tag} -> %PreviewTag{tag: child_tag}
+            v -> v
+          end)
 
-    preview =
-      cursor
-      |> Stream.take(5)
-      |> Enum.map(fn
-        {k, %Xitdb.Cursor{tag: child_tag}} -> {k, :"<#{child_tag}>"}
-        {k, v} -> {k, v}
-        %Xitdb.Cursor{tag: child_tag} -> :"<#{child_tag}>"
-        v -> v
-      end)
+        count_part =
+          case Xitdb.NIF.nif_slot_count(cursor.db_ref, cursor.tag_id, val) do
+            {:ok, n} -> " count: #{n},"
+            _ -> ""
+          end
 
-    count_part =
-      case Xitdb.NIF.nif_slot_count(cursor.db_ref, cursor.tag_id, val) do
-        {:ok, n} -> " count: #{n},"
-        _ -> ""
-      end
+        concat([
+          "#Xitdb.Cursor<",
+          to_string(tag),
+          count_part,
+          " offset: ",
+          to_string(val),
+          ", preview: ",
+          to_doc(preview, opts),
+          ">"
+        ])
 
-    concat([
-      "#Xitdb.Cursor<",
-      to_string(tag),
-      count_part,
-      " offset: ",
-      to_string(val),
-      ", preview: ",
-      to_doc(preview, opts),
-      ">"
-    ])
+      {:error, reason} ->
+        concat(["#Xitdb.Cursor<unresolved (", inspect(reason), ")>"])
+    end
   end
 end

@@ -104,7 +104,7 @@ Each track has its own specification and implementation plan in [`./tracks/`](./
 
 ## Wave 4 — Deferred Core Client Refactoring & Ergonomics
 
-- [ ] **Track 5B [Wave 4 — Core Client Cleanup]: Inclusive `Xitdb.Pull` Range Semantics, `Cursor` `fetch/2` Deduplication & Stepped `Enumerable.slice/1`**
+- [x] **Track 5B [Wave 4 — Core Client Cleanup]: Inclusive `Xitdb.Pull` Range Semantics, `Cursor` `fetch/2` Deduplication & Stepped `Enumerable.slice/1`**
   *Link: [./tracks/client_fixes_and_dedup_20261111/](./tracks/client_fixes_and_dedup_20261111/)*
   *Deferred Scope:* Complete **Phase 2** (`Xitdb.Pull` inclusive slice formatting) and the remaining **Phase 4** `Cursor` internal deduplication, stepped `Enumerable.slice/1`, and `PreviewTag` inspect polish not exercised by `Xitdb.Ash.DataLayer`.
 

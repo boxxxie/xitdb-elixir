@@ -124,7 +124,7 @@ v0_role = Xitdb.select!(db, path(at_moment(0, users[id].role)))
 Xitdb.pull!(user_cursor, [
   :username,
   :age,
-  todos: 0..2,
+  todos: 0..1,
   profile: [:city, :tier]
 ])
 # => %{
@@ -141,10 +141,10 @@ Xitdb.pull!(user_cursor, [
 | :--- | :--- | :--- |
 | `:field` or `"field"` | `field` | Projects a single key |
 | `:*` or `"*"` | `*` | Wildcard: projects all keys on the map |
-| `field: first..end_exclusive` | `field[first..end_exclusive]` | Projects a half-open range `[first, end_exclusive)` of a list (`Array_List` or `Linked_Array_List`) |
+| `field: first..last` | `field[first..(last + 1)]` | Projects an inclusive Elixir range `first..last` (matching `Enum.slice/2`) of a list (`Array_List` or `Linked_Array_List`) |
 | `field: {:slice, offset, limit}` | `field[offset..(offset + limit)]` | Projects `limit` items starting at `offset` (matches `Enum.slice(list, offset, limit)`) |
 | `field: [:a, :b]` | `field{a, b}` | Recursively projects nested map attributes |
-| `field: {0..5, [:a, :b]}` | `field[0..5]{a, b}` | Slices a list of maps by range and projects nested attributes on each element |
+| `field: {0..4, [:a, :b]}` | `field[0..5]{a, b}` | Slices a list of maps by inclusive range and projects nested attributes on each element |
 | `field: {{:slice, offset, limit}, [:a, :b]}` | `field[offset..(offset + limit)]{a, b}` | Slices `limit` maps starting at `offset` and projects nested attributes on each element |
 
 ### Practical Pull Recipes
@@ -179,7 +179,7 @@ If your Pull pattern is a static literal used in a hot loop, wrap it in `pull_pa
 use Xitdb.DSL
 
 @user_card pull_pattern([:username, :age, todos: 0..2, profile: [:city]])
-# Compiled at compile time to "{username, age, todos[0..2], profile{city}}"
+# Compiled at compile time to "{username, age, todos[0..3], profile{city}}"
 
 Xitdb.pull!(user_cursor, @user_card)
 ```

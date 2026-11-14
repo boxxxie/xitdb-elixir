@@ -5,9 +5,9 @@ defmodule Xitdb.Pull do
   ## Examples
 
       iex> Xitdb.Pull.compile!([:username, :age, todos: 0..2, profile: [:city]])
-      "{username, age, todos[0..2], profile{city}}"
+      "{username, age, todos[0..3], profile{city}}"
 
-      iex> Xitdb.Pull.compile!([:*, friends: {0..5, [:username, profile: [:city]]}])
+      iex> Xitdb.Pull.compile!([:*, friends: {0..4, [:username, profile: [:city]]}])
       "{*, friends[0..5]{username, profile{city}}}"
   """
 
@@ -24,6 +24,10 @@ defmodule Xitdb.Pull do
              {{:slice, non_neg_integer(), non_neg_integer()}, [pattern_entry()]}}
 
   @type pattern :: String.t() | [pattern_entry()]
+
+  defguardp is_slice_spec(spec)
+            when is_struct(spec, Range) or
+                   (is_tuple(spec) and tuple_size(spec) == 3 and elem(spec, 0) == :slice)
 
   @doc """
   Compiles a structural Pull pattern list or validates a Pull pattern binary.
@@ -90,31 +94,40 @@ defmodule Xitdb.Pull do
     field
   end
 
-  defp compile_entry!({field, first..last//1}) do
-    format_field_name!(field) <> "[#{first}..#{last}]"
-  end
-
-  defp compile_entry!({field, {:slice, offset, limit}})
-       when is_integer(offset) and is_integer(limit) do
-    format_field_name!(field) <> "[#{offset}..#{offset + limit}]"
-  end
-
   defp compile_entry!({field, nested}) when is_list(nested) and nested != [] do
     format_field_name!(field) <> compile_list!(nested)
   end
 
-  defp compile_entry!({field, {first..last//1, nested}})
-       when is_list(nested) and nested != [] do
-    format_field_name!(field) <> "[#{first}..#{last}]" <> compile_list!(nested)
+  defp compile_entry!({field, {slice_spec, nested}})
+       when is_slice_spec(slice_spec) and is_list(nested) and nested != [] do
+    format_field_name!(field) <> format_slice_spec!(slice_spec) <> compile_list!(nested)
   end
 
-  defp compile_entry!({field, {{:slice, offset, limit}, nested}})
-       when is_integer(offset) and is_integer(limit) and is_list(nested) and nested != [] do
-    format_field_name!(field) <> "[#{offset}..#{offset + limit}]" <> compile_list!(nested)
+  defp compile_entry!({field, slice_spec}) when is_slice_spec(slice_spec) do
+    format_field_name!(field) <> format_slice_spec!(slice_spec)
   end
 
   defp compile_entry!(other) do
     raise ArgumentError, "Unsupported pull pattern entry: #{inspect(other)}"
+  end
+
+  defp format_slice_spec!(first..last//1) when first >= 0 and last >= first do
+    "[#{first}..#{last + 1}]"
+  end
+
+  defp format_slice_spec!(%Range{} = range) do
+    raise ArgumentError,
+          "Pull range must be a non-negative ascending step-1 range, got: #{inspect(range)}"
+  end
+
+  defp format_slice_spec!({:slice, offset, limit})
+       when is_integer(offset) and offset >= 0 and is_integer(limit) and limit >= 0 do
+    "[#{offset}..#{offset + limit}]"
+  end
+
+  defp format_slice_spec!({:slice, _, _} = bad_slice) do
+    raise ArgumentError,
+          "Pull slice requires non-negative integer offset and limit, got: #{inspect(bad_slice)}"
   end
 
   defp format_field_name!(field)

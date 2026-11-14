@@ -428,7 +428,7 @@ defmodule Xitdb do
   @doc """
   Executes a Datomic-style Pull projection against a `%Xitdb.Cursor{}` or `%Xitdb{}` handle.
 
-  Accepts either a raw Pull pattern string (`"{username, age, todos[0..2], profile{city}}"`)
+  Accepts either a raw Pull pattern string (`"{username, age, todos[0..3], profile{city}}"`)
   or a structural Elixir list (`[:username, :age, todos: 0..2, profile: [:city]]`).
   """
   @spec pull(t() | Cursor.t(), Pull.pattern()) :: {:ok, term()} | {:error, Error.t()}

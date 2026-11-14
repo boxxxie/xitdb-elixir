@@ -105,7 +105,7 @@ defmodule Xitdb.Features.MacroDslSpec do
             [
               :username,
               :age,
-              todos: 0..2,
+              todos: 0..1,
               profile: [:city]
             ]
           )
@@ -236,7 +236,7 @@ defmodule Xitdb.Features.MacroDslSpec do
             path(accounts["a1"]),
             pull_pattern([
               :email,
-              team: {0..2, [:username, profile: [:city]]}
+              team: {0..1, [:username, profile: [:city]]}
             ])
           )
 

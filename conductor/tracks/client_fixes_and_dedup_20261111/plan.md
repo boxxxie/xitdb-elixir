@@ -81,32 +81,32 @@
 
 ## Phase 2: Inclusive `Range` Semantics & Validation in `Xitdb.Pull` (Step 2)
 
-- [ ] Task: Update `Xitdb.Pull` range and slice translation
-    - [ ] Add `is_slice_spec/1` guard in `lib/xitdb/pull.ex`
-    - [ ] Refactor `compile_entry!/1` clauses to delegate slice formatting to `format_slice_spec!/1` while preserving `and nested != []` guards so `[profile: []]` and `[team: {0..2, []}]` deterministically raise `ArgumentError`
-    - [ ] Translate inclusive ranges `first..last//1` to `[first..last + 1]` in `format_slice_spec!/1`
-    - [ ] Validate non-negative offsets and limits, rejecting descending or stepped ranges with `ArgumentError`
-- [ ] Task: Sync documentation, doctests, and guides
-    - [ ] Update doctests in `lib/xitdb/pull.ex` and `lib/xitdb.ex`
-    - [ ] Update Pull pattern reference table and examples in `docs/path-and-pull-dsl.md`
-- [ ] Task: Add test suite and verify Step 2
-    - [ ] Create `test/xitdb/pull_compile_test.exs` covering inclusive bounds, zero-length slices, and invalid/empty nested patterns (`Pull.compile/1` and `Pull.compile!/1`)
-    - [ ] Verify existing test assertions in the test suite for pull range bounds
-    - [ ] Run `mix test test/xitdb/pull_compile_test.exs` and verify Green
+- [x] Task: Update `Xitdb.Pull` range and slice translation
+    - [x] Add `is_slice_spec/1` guard in `lib/xitdb/pull.ex`
+    - [x] Refactor `compile_entry!/1` clauses to delegate slice formatting to `format_slice_spec!/1` while preserving `and nested != []` guards so `[profile: []]` and `[team: {0..2, []}]` deterministically raise `ArgumentError`
+    - [x] Translate inclusive ranges `first..last//1` to `[first..last + 1]` in `format_slice_spec!/1`
+    - [x] Validate non-negative offsets and limits, rejecting descending or stepped ranges with `ArgumentError`
+- [x] Task: Sync documentation, doctests, and guides
+    - [x] Update doctests in `lib/xitdb/pull.ex` and `lib/xitdb.ex`
+    - [x] Update Pull pattern reference table and examples in `docs/path-and-pull-dsl.md`
+- [x] Task: Add test suite and verify Step 2
+    - [x] Create `test/xitdb/pull_compile_test.exs` covering inclusive bounds, zero-length slices, and invalid/empty nested patterns (`Pull.compile/1` and `Pull.compile!/1`)
+    - [x] Verify existing test assertions in the test suite for pull range bounds
+    - [x] Run `mix test test/xitdb/pull_compile_test.exs` and verify Green
 
 ---
 
 ## Phase 4B: Cursor Internal Deduplication, Stepped Slices & Inspect Polish (Step 4 Deferred)
 
-- [ ] Task: Deduplicate cursor construction and `fetch/2` in `lib/xitdb/cursor.ex`
-    - [ ] Extract `from_nif_tuple/4`, `unwrap_nif_value/4`, `nif_slot_get/2` (resolving `tag_id: -1` before integer index lookups), and `lookup_staged/2`
-    - [ ] Consolidate read and transaction `fetch/2` clauses
-- [ ] Task: Fix stepped `Enumerable.slice/1` and atom creation in `Inspect`
-    - [ ] Calculate exact slice span `(length - 1) * step + 1` in `Enumerable.slice/1`
-    - [ ] Filter raw items via `Enum.take_every/2` before cursor wrapping; handle `length <= 0` slices immediately
-    - [ ] Create `Xitdb.Cursor.PreviewTag` struct to avoid dynamic atom creation in `Inspect.Xitdb.Cursor`
-    - [ ] Implement `try_resolve/1` to format unresolved cursors (`#Xitdb.Cursor<unresolved (...)>`) without crashing
-- [ ] Task: Add test suite and run full precommit verification
-    - [ ] Create `test/xitdb/cursor_refactor_test.exs` testing access pipeline, unresolved root integer indexing, stepped slicing, and preview inspect
-    - [ ] Run `mix test test/xitdb/cursor_refactor_test.exs` and verify Green
-    - [ ] Run full project verification: `mix precommit` (`mix format --check-formatted`, `mix compile --warnings-as-errors`, `mix test`)
+- [x] Task: Deduplicate cursor construction and `fetch/2` in `lib/xitdb/cursor.ex`
+    - [x] Extract `from_nif_tuple/4`, `unwrap_nif_value/4`, `nif_slot_get/2` (resolving `tag_id: -1` before integer index lookups), and `lookup_staged/2`
+    - [x] Consolidate read and transaction `fetch/2` clauses
+- [x] Task: Fix stepped `Enumerable.slice/1` and atom creation in `Inspect`
+    - [x] Calculate exact slice span `(length - 1) * step + 1` in `Enumerable.slice/1`
+    - [x] Filter raw items via `Enum.take_every/2` before cursor wrapping; handle `length <= 0` slices immediately
+    - [x] Create `Xitdb.Cursor.PreviewTag` struct to avoid dynamic atom creation in `Inspect.Xitdb.Cursor`
+    - [x] Implement `try_resolve/1` to format unresolved cursors (`#Xitdb.Cursor<unresolved (...)>`) without crashing
+- [x] Task: Add test suite and run full precommit verification
+    - [x] Create `test/xitdb/cursor_refactor_test.exs` testing access pipeline, unresolved root integer indexing, stepped slicing, and preview inspect
+    - [x] Run `mix test test/xitdb/cursor_refactor_test.exs` and verify Green
+    - [x] Run full project verification: `mix precommit` (`mix format --check-formatted`, `mix compile --warnings-as-errors`, `mix test`)
