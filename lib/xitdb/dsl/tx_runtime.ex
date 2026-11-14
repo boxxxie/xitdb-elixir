@@ -630,6 +630,11 @@ defmodule Xitdb.DSL.TxRuntime do
     do_parse_steps(tail, [{:array_list, String.to_integer(int_str)} | acc])
   end
 
+  defp do_parse_steps(bin, acc) do
+    {key, tail} = parse_key_token(bin)
+    do_parse_steps(tail, [{:hash_map, key} | acc])
+  end
+
   defp parse_key_token(<<?[, ?", rest::binary>>) do
     {unescaped, <<?], tail::binary>>} = parse_quoted_string(rest, [])
     {unescaped, tail}
