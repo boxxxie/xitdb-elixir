@@ -36,6 +36,21 @@ if Code.ensure_loaded?(Spark.Dsl.Transformer) and Code.ensure_loaded?(Ash.Resour
           lock_action = XitdbInfo.xitdb_lock_action!(dsl_state)
           unlock_action = XitdbInfo.xitdb_unlock_action!(dsl_state)
 
+          dsl_state =
+            if Transformer.get_persisted(dsl_state, :xitdb_lock_change) == nil and
+                 (Ash.Resource.Info.action(dsl_state, lock_action) != nil or
+                    Ash.Resource.Info.action(dsl_state, unlock_action) != nil) do
+              Transformer.eval(
+                dsl_state,
+                [],
+                quote do
+                  _ = Application.compile_env(:xitdb, :default_lock_change)
+                end
+              )
+            else
+              dsl_state
+            end
+
           dsl_state
           |> maybe_attach_lock_change(lock_action, lock_change_mod, :lock)
           |> maybe_attach_lock_change(unlock_action, lock_change_mod, :unlock)
@@ -53,13 +68,6 @@ if Code.ensure_loaded?(Spark.Dsl.Transformer) and Code.ensure_loaded?(Ash.Resour
       lock_change = Transformer.get_persisted(dsl_state, :xitdb_lock_change)
       normalized_indexes = Transformer.get_persisted(dsl_state, :xitdb_normalized_indexes)
 
-      compile_env_quoted =
-        if is_nil(lock_change) do
-          quote do
-            _ = Application.compile_env(:xitdb, :default_lock_change)
-          end
-        end
-
       Transformer.eval(
         dsl_state,
         [
@@ -73,8 +81,6 @@ if Code.ensure_loaded?(Spark.Dsl.Transformer) and Code.ensure_loaded?(Ash.Resour
           normalized_indexes: normalized_indexes
         ],
         quote do
-          unquote(compile_env_quoted)
-
           @doc false
           def __xitdb_collection__, do: unquote(Macro.escape(collection))
 

@@ -39,12 +39,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     @spec to_cursor_map(module(), struct() | map()) ::
             {:ok, %{String.t() => term()}} | {:error, term()}
     def to_cursor_map(resource, record) when is_atom(resource) and is_map(record) do
-      counted_sets =
-        if function_exported?(Info, :counted_set_fields, 1) do
-          MapSet.new(apply(Info, :counted_set_fields, [resource]))
-        else
-          MapSet.new()
-        end
+      counted_sets = counted_set_fields(resource)
 
       resource
       |> Ash.Resource.Info.attributes()
@@ -70,13 +65,16 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     """
     @spec from_cursor(module(), term(), term()) :: {:ok, struct()} | {:error, term()}
     def from_cursor(resource, cursor, tenant \\ nil) when is_atom(resource) do
+      counted_sets = counted_set_fields(resource)
+
       attrs_result =
         resource
         |> Ash.Resource.Info.attributes()
         |> Enum.reduce_while({:ok, %{}}, fn %Attribute{} = attr, {:ok, acc} ->
           raw = fetch_cursor_field(cursor, Atom.to_string(attr.name))
+          as_counted_set? = MapSet.member?(counted_sets, attr.name)
 
-          case load_attribute(attr, raw) do
+          case load_attribute(attr, raw, as_counted_set?) do
             {:ok, loaded} ->
               {:cont, {:ok, Map.put(acc, attr.name, loaded)}}
 
@@ -147,8 +145,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     """
     @spec encode_scalar_key(Attribute.t(), term()) :: binary()
     def encode_scalar_key(%Attribute{} = attr, value) when not is_nil(value) do
-      {kind, _constraints} = unwrap_type(attr.type, attr.constraints)
-      encode_typed_scalar(kind, value)
+      {_kind, scalar} = encode_attr_scalar(attr, value)
+      scalar
     end
 
     @doc """
@@ -418,9 +416,18 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       end
     end
 
-    defp load_attribute(_attr, nil), do: {:ok, nil}
+    defp counted_set_fields(resource) do
+      if function_exported?(Info, :counted_set_fields, 1) do
+        MapSet.new(apply(Info, :counted_set_fields, [resource]))
+      else
+        MapSet.new()
+      end
+    end
 
-    defp load_attribute(%Attribute{} = attr, raw) do
+    defp load_attribute(attr, raw, as_counted_set? \\ false)
+    defp load_attribute(_attr, nil, _as_counted_set?), do: {:ok, nil}
+
+    defp load_attribute(%Attribute{} = attr, raw, as_counted_set?) do
       {kind, constraints} = unwrap_type(attr.type, attr.constraints)
 
       case kind do
@@ -474,7 +481,14 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           if is_list(items) do
             items
             |> Enum.reduce_while({:ok, []}, fn item, {:ok, acc} ->
-              case load_attribute(elem_attr, item) do
+              decoded =
+                if as_counted_set? do
+                  decode_stringified_set_member(elem_attr, item)
+                else
+                  item
+                end
+
+              case load_attribute(elem_attr, decoded) do
                 {:ok, loaded_item} -> {:cont, {:ok, [loaded_item | acc]}}
                 {:error, _} = err -> {:halt, err}
               end
@@ -500,6 +514,36 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       end
     end
 
+    defp decode_stringified_set_member(%Attribute{} = elem_attr, item) when is_binary(item) do
+      {kind, _constraints} = unwrap_type(elem_attr.type, elem_attr.constraints)
+
+      case kind do
+        k when k in [:integer, :utc_datetime, :utc_datetime_usec, :datetime, :naive_datetime] ->
+          case Integer.parse(item) do
+            {int, ""} -> int
+            _ -> item
+          end
+
+        :float ->
+          case Float.parse(item) do
+            {f, ""} -> f
+            _ -> item
+          end
+
+        :boolean ->
+          case item do
+            "true" -> true
+            "false" -> false
+            _ -> item
+          end
+
+        _ ->
+          item
+      end
+    end
+
+    defp decode_stringified_set_member(_elem_attr, item), do: item
+
     defp normalize_cast_stored({:ok, val}, _attr_name), do: {:ok, val}
     defp normalize_cast_stored({:error, _} = err, _attr_name), do: err
     defp normalize_cast_stored(:error, attr_name), do: {:error, {:load_failed, attr_name}}
@@ -521,6 +565,31 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       end
     end
 
+    @doc """
+    Checks whether a hydrated `record` matches `tenant` according to `resource`'s
+    multitenancy strategy and `global?` setting.
+    """
+    @spec matches_tenant?(module(), map(), term()) :: boolean()
+    def matches_tenant?(resource, record, tenant) do
+      strategy = Ash.Resource.Info.multitenancy_strategy(resource)
+      global? = Ash.Resource.Info.multitenancy_global?(resource)
+      tenant_attr = Ash.Resource.Info.multitenancy_attribute(resource)
+      matches_attribute_tenant?(record, strategy, tenant_attr, global?, tenant)
+    end
+
+    @doc false
+    @spec matches_attribute_tenant?(map(), atom() | nil, atom() | nil, boolean(), term()) ::
+            boolean()
+    def matches_attribute_tenant?(_record, :attribute, _attr, false, nil), do: false
+    def matches_attribute_tenant?(_record, :attribute, _attr, true, nil), do: true
+
+    def matches_attribute_tenant?(record, :attribute, tenant_attr, _global?, tenant) do
+      record_tenant = Map.get(record, tenant_attr)
+      Comp.equal?(record_tenant, tenant) or record_tenant == tenant
+    end
+
+    def matches_attribute_tenant?(_record, _strategy, _attr, _global?, _tenant), do: true
+
     # -- B+Tree Key Encoding Helpers --
 
     defp encode_single_component(_attr, nil), do: <<@null_tag>>
@@ -532,8 +601,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     defp encode_composite_component(_attr, nil), do: <<@null_tag>>
 
     defp encode_composite_component(%Attribute{} = attr, value) do
-      {kind, _constraints} = unwrap_type(attr.type, attr.constraints)
-      scalar = encode_typed_scalar(kind, value)
+      {kind, scalar} = encode_attr_scalar(attr, value)
 
       if fixed_width_kind?(kind) do
         <<@value_tag, scalar::binary>>
@@ -541,6 +609,48 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         <<@value_tag, escape_null_terminated(scalar)::binary>>
       end
     end
+
+    defp encode_attr_scalar(%Attribute{} = attr, value) do
+      {kind, constraints} = unwrap_type(attr.type, attr.constraints)
+
+      {effective_kind, effective_value} =
+        if is_atom(kind) and not canonical_atom_kind?(kind) and Ash.Type.ash_type?(kind) do
+          storage_type = Ash.Type.storage_type(kind, constraints)
+          {storage_kind, _} = unwrap_type(storage_type, [])
+
+          dumped =
+            case Ash.Type.dump_to_embedded(kind, value, constraints) do
+              {:ok, val} -> val
+              _ -> value
+            end
+
+          {storage_kind, dumped}
+        else
+          {kind, value}
+        end
+
+      {effective_kind, encode_typed_scalar(effective_kind, effective_value)}
+    end
+
+    @canonical_kinds [
+      :integer,
+      :string,
+      :ci_string,
+      :boolean,
+      :float,
+      :decimal,
+      :atom,
+      :utc_datetime,
+      :utc_datetime_usec,
+      :datetime,
+      :naive_datetime,
+      :date,
+      :time,
+      :time_usec,
+      :uuid
+    ]
+
+    defp canonical_atom_kind?(kind), do: kind in @canonical_kinds
 
     defp encode_length_prefixed_part(_attr, nil), do: <<@null_tag>>
 

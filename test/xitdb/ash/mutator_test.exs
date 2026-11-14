@@ -1297,5 +1297,119 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         assert Search.ids(CascadeDeleteChild, "beta") == [c2.id]
       end
     end
+
+    describe "update freshness and create_atomics" do
+      defmodule ProfileCalcDomain do
+        use Ash.Domain, validate_config_inclusion?: false
+
+        resources do
+          allow_unregistered?(true)
+        end
+      end
+
+      defmodule ProfileCalcResource do
+        use Ash.Resource,
+          domain: ProfileCalcDomain,
+          data_layer: Xitdb.Ash.DataLayer
+
+        xitdb do
+          store(MutatorPrimaryStore)
+          collection(:mutator_profile_calcs)
+        end
+
+        attributes do
+          attribute(:id, :integer,
+            primary_key?: true,
+            allow_nil?: false,
+            writable?: true,
+            public?: true
+          )
+
+          attribute(:slug, :string, allow_nil?: false, public?: true)
+          attribute(:headline, :string, allow_nil?: false, public?: true)
+        end
+
+        identities do
+          identity(:unique_slug, [:slug])
+        end
+
+        calculations do
+          calculate(:display_badge, :string, expr("Badge: " <> headline))
+        end
+
+        actions do
+          defaults([:read, :destroy])
+
+          create :create do
+            primary?(true)
+            accept([:id, :slug, :headline])
+          end
+
+          update :update do
+            primary?(true)
+            accept([:headline])
+          end
+        end
+      end
+
+      test "update does not leak stale calculations from changeset.data" do
+        created =
+          ProfileCalcResource
+          |> Ash.Changeset.for_create(
+            :create,
+            %{id: 1, slug: "alice", headline: "Old Headline"},
+            domain: ProfileCalcDomain
+          )
+          |> Ash.create!(domain: ProfileCalcDomain)
+
+        loaded = Ash.load!(created, :display_badge, domain: ProfileCalcDomain)
+        assert loaded.display_badge == "Badge: Old Headline"
+
+        updated =
+          loaded
+          |> Ash.Changeset.for_update(:update, %{headline: "New Headline"},
+            domain: ProfileCalcDomain
+          )
+          |> Ash.update!(domain: ProfileCalcDomain)
+
+        assert updated.headline == "New Headline"
+        assert %Ash.NotLoaded{type: :calculation, field: :display_badge} = updated.display_badge
+
+        reloaded = Ash.load!(updated, :display_badge, domain: ProfileCalcDomain)
+        assert reloaded.display_badge == "Badge: New Headline"
+      end
+
+      test "create_atomics populates allow_nil?: false attributes in create and upsert" do
+        import Ash.Expr
+
+        cs_create =
+          ProfileCalcResource
+          |> Ash.Changeset.for_create(:create, %{id: 10, slug: "bob"}, domain: ProfileCalcDomain)
+          |> Map.put(:create_atomics, headline: expr(slug <> " Atomic"))
+
+        assert {:ok, created} = Xitdb.Ash.Mutator.create(ProfileCalcResource, cs_create)
+        assert created.headline == "bob Atomic"
+
+        # Upsert matching existing record via upsert key computed in create_atomics
+        cs_upsert =
+          ProfileCalcResource
+          |> Ash.Changeset.for_create(:create, %{id: 10, headline: "Updated Via Upsert"},
+            domain: ProfileCalcDomain
+          )
+          |> Map.put(:create_atomics, slug: expr("b" <> "ob"))
+
+        assert {:ok, upserted} =
+                 Xitdb.Ash.Mutator.upsert(
+                   ProfileCalcResource,
+                   cs_upsert,
+                   [:slug],
+                   Ash.Resource.Info.identity(ProfileCalcResource, :unique_slug)
+                 )
+
+        assert upserted.id == 10
+        assert upserted.slug == "bob"
+        assert upserted.headline == "Updated Via Upsert"
+      end
+    end
   end
 end

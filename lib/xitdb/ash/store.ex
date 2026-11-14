@@ -380,7 +380,16 @@ if Code.ensure_loaded?(Ash.DataLayer) do
            %State{state | db: committed_db, moment: committed_moment, queue: next_queue}}
 
         {:error, :lease_expired} = err ->
-          {:reply, err, state}
+          next_state =
+            if is_nil(state.queue.active) do
+              {restored_db, restored_moment} = Backend.reconcile_tip(state.db, state.moment)
+              :ok = Backend.publish_commit(state.name, state.moment, restored_moment)
+              %State{state | db: restored_db, moment: restored_moment}
+            else
+              state
+            end
+
+          {:reply, err, next_state}
       end
     end
 
@@ -401,30 +410,29 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
     @impl GenServer
     def handle_info({:DOWN, mref, :process, _pid, _reason}, %State{} = state) do
-      {restored_db, restored_moment} = Backend.reconcile_tip(state.db, state.moment)
-      :ok = Backend.publish_commit(state.name, state.moment, restored_moment)
-      snapshot = {restored_db, restored_moment}
-
-      case LeaseQueue.handle_down(state.queue, mref, state.name, snapshot) do
-        {:matched, next_queue} ->
-          {:noreply, %State{state | db: restored_db, moment: restored_moment, queue: next_queue}}
-
-        :unmatched ->
-          {:noreply, %State{state | db: restored_db, moment: restored_moment}}
+      if match?(%{monitor_ref: ^mref}, state.queue.active) do
+        {restored_db, restored_moment} = Backend.reconcile_tip(state.db, state.moment)
+        :ok = Backend.publish_commit(state.name, state.moment, restored_moment)
+        snapshot = {restored_db, restored_moment}
+        {:matched, next_queue} = LeaseQueue.handle_down(state.queue, mref, state.name, snapshot)
+        {:noreply, %State{state | db: restored_db, moment: restored_moment, queue: next_queue}}
+      else
+        {:noreply, state}
       end
     end
 
     def handle_info({:xitdb_lease_expired, name, lease_ref}, %State{name: name} = state) do
-      {restored_db, restored_moment} = Backend.reconcile_tip(state.db, state.moment)
-      :ok = Backend.publish_commit(state.name, state.moment, restored_moment)
-      snapshot = {restored_db, restored_moment}
+      if match?(%{ref: ^lease_ref}, state.queue.active) do
+        {restored_db, restored_moment} = Backend.reconcile_tip(state.db, state.moment)
+        :ok = Backend.publish_commit(state.name, state.moment, restored_moment)
+        snapshot = {restored_db, restored_moment}
 
-      case LeaseQueue.handle_expired(state.queue, lease_ref, state.name, snapshot) do
-        {:matched, next_queue} ->
-          {:noreply, %State{state | db: restored_db, moment: restored_moment, queue: next_queue}}
+        {:matched, next_queue} =
+          LeaseQueue.handle_expired(state.queue, lease_ref, state.name, snapshot)
 
-        :unmatched ->
-          {:noreply, %State{state | db: restored_db, moment: restored_moment}}
+        {:noreply, %State{state | db: restored_db, moment: restored_moment, queue: next_queue}}
+      else
+        {:noreply, state}
       end
     end
 
@@ -517,7 +525,13 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           end
 
           abort_fn = fn ->
-            GenServer.cast(store, {:abort_lease, lease_ref, self()})
+            try do
+              GenServer.call(store, {:abort_lease, lease_ref}, call_timeout)
+            catch
+              :exit, _ ->
+                GenServer.cast(store, {:abort_lease, lease_ref, self()})
+            end
+
             :ok
           end
 

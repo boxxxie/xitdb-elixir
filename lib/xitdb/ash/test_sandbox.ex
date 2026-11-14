@@ -122,7 +122,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
             end
           end)
 
-        Enum.each(coords, &Coordinator.stop/1)
+        Enum.each(coords, &Coordinator.checkin_stores(&1, stores))
         purge_owner_entries(@checkouts_table, stores, owner)
       end
 
@@ -204,7 +204,13 @@ if Code.ensure_loaded?(Ash.DataLayer) do
               end
 
               abort_fn = fn ->
-                GenServer.cast(coord_pid, {:abort, store, lease_ref, self()})
+                try do
+                  GenServer.call(coord_pid, {:abort, store, lease_ref}, call_timeout)
+                catch
+                  :exit, _ ->
+                    GenServer.cast(coord_pid, {:abort, store, lease_ref, self()})
+                end
+
                 :ok
               end
 
@@ -360,6 +366,17 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       GenServer.start(__MODULE__, {owner, initial_snapshots, lease_timeout, table})
     end
 
+    @spec checkin_stores(pid(), [module()]) :: :ok
+    def checkin_stores(pid, stores) when is_pid(pid) and is_list(stores) do
+      if Process.alive?(pid) do
+        GenServer.call(pid, {:checkin_stores, stores}, 5_000)
+      else
+        :ok
+      end
+    catch
+      :exit, _ -> :ok
+    end
+
     @spec stop(pid()) :: :ok
     def stop(pid) when is_pid(pid) do
       if Process.alive?(pid) do
@@ -392,6 +409,25 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     end
 
     @impl GenServer
+    def handle_call({:checkin_stores, stores}, _from, %__MODULE__{} = state) do
+      TestSandbox.purge_owner_entries(state.table, stores, state.owner)
+
+      {closing, remaining_snapshots} = Map.split(state.snapshots, stores)
+
+      Enum.each(closing, fn {_store, {db, _moment}} ->
+        Backend.close_db(db)
+      end)
+
+      next_queues = Map.drop(state.queues, stores)
+      next_state = %__MODULE__{state | snapshots: remaining_snapshots, queues: next_queues}
+
+      if map_size(remaining_snapshots) == 0 do
+        {:stop, :normal, :ok, next_state}
+      else
+        {:reply, :ok, next_state}
+      end
+    end
+
     def handle_call({:acquire, store, req_ref, call_timeout}, from, %__MODULE__{} = state) do
       queue = Map.fetch!(state.queues, store)
       snapshot = Map.fetch!(state.snapshots, store)
@@ -434,7 +470,16 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           {:reply, :ok, next_state}
 
         {:error, :lease_expired} = err ->
-          {:reply, err, state}
+          next_state =
+            if is_nil(queue.active) do
+              {db, moment} = Map.fetch!(state.snapshots, store)
+              restored_snap = Backend.reconcile_tip(db, moment)
+              %__MODULE__{state | snapshots: Map.put(state.snapshots, store, restored_snap)}
+            else
+              state
+            end
+
+          {:reply, err, next_state}
       end
     end
 
@@ -464,16 +509,14 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       {next_snapshots, next_queues} =
         Enum.reduce(state.queues, {state.snapshots, state.queues}, fn {store, queue},
                                                                       {snaps_acc, queues_acc} ->
-          {db, moment} = Map.fetch!(snaps_acc, store)
-          {restored_db, restored_moment} = Backend.reconcile_tip(db, moment)
-          restored_snap = {restored_db, restored_moment}
-
-          case LeaseQueue.handle_down(queue, mref, store, restored_snap) do
-            {:matched, updated} ->
-              {Map.put(snaps_acc, store, restored_snap), Map.put(queues_acc, store, updated)}
-
-            :unmatched ->
-              {snaps_acc, queues_acc}
+          if match?(%{monitor_ref: ^mref}, queue.active) do
+            {db, moment} = Map.fetch!(snaps_acc, store)
+            {restored_db, restored_moment} = Backend.reconcile_tip(db, moment)
+            restored_snap = {restored_db, restored_moment}
+            {:matched, updated} = LeaseQueue.handle_down(queue, mref, store, restored_snap)
+            {Map.put(snaps_acc, store, restored_snap), Map.put(queues_acc, store, updated)}
+          else
+            {snaps_acc, queues_acc}
           end
         end)
 
@@ -483,21 +526,22 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     def handle_info({:xitdb_lease_expired, store, lease_ref}, %__MODULE__{} = state) do
       case Map.fetch(state.queues, store) do
         {:ok, queue} ->
-          {db, moment} = Map.fetch!(state.snapshots, store)
-          {restored_db, restored_moment} = Backend.reconcile_tip(db, moment)
-          restored_snap = {restored_db, restored_moment}
+          if match?(%{ref: ^lease_ref}, queue.active) do
+            {db, moment} = Map.fetch!(state.snapshots, store)
+            {restored_db, restored_moment} = Backend.reconcile_tip(db, moment)
+            restored_snap = {restored_db, restored_moment}
 
-          case LeaseQueue.handle_expired(queue, lease_ref, store, restored_snap) do
-            {:matched, next_queue} ->
-              {:noreply,
-               %__MODULE__{
-                 state
-                 | snapshots: Map.put(state.snapshots, store, restored_snap),
-                   queues: Map.put(state.queues, store, next_queue)
-               }}
+            {:matched, next_queue} =
+              LeaseQueue.handle_expired(queue, lease_ref, store, restored_snap)
 
-            :unmatched ->
-              {:noreply, state}
+            {:noreply,
+             %__MODULE__{
+               state
+               | snapshots: Map.put(state.snapshots, store, restored_snap),
+                 queues: Map.put(state.queues, store, next_queue)
+             }}
+          else
+            {:noreply, state}
           end
 
         :error ->

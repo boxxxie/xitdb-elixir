@@ -11,6 +11,10 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       use Ash.Type.NewType, subtype_of: :integer, constraints: [min: 0]
     end
 
+    defmodule EnumStatus do
+      use Ash.Type.Enum, values: [:alpha, :beta, :gamma]
+    end
+
     defmodule TypedRecord do
       use Ash.Resource,
         domain: nil,
@@ -31,6 +35,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         attribute(:score, :float, public?: true)
         attribute(:amount, :decimal, public?: true)
         attribute(:status, :atom, public?: true)
+        attribute(:enum_status, EnumStatus, public?: true)
         attribute(:rank, PositiveIntNewType, public?: true)
         attribute(:tags, {:array, :string}, default: [], public?: true)
         attribute(:published_on, :date, public?: true)
@@ -542,6 +547,90 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         # Struct non-nil attribute (42) wins over explicit fallback (999)
         assert k_fallback == k_explicit_on_struct
         assert k_fallback != k_other_tenant
+      end
+    end
+
+    describe "custom Ash.Type.Enum handling" do
+      test "encodes scalar and composite keys using storage type instead of ETF and round-trips atoms" do
+        enum_attr = Ash.Resource.Info.attribute(TypedRecord, :enum_status)
+        name_attr = Ash.Resource.Info.attribute(TypedRecord, :name)
+
+        assert Codec.encode_scalar_key(enum_attr, :alpha) == "alpha"
+        assert Codec.encode_scalar_key(enum_attr, "alpha") == "alpha"
+        assert Codec.encode_scalar_key(enum_attr, :beta) == "beta"
+
+        k_alpha = Codec.encode_index_key([enum_attr, name_attr], [:alpha, "z"])
+        k_beta = Codec.encode_index_key([enum_attr, name_attr], [:beta, "a"])
+        assert k_alpha < k_beta
+        refute String.starts_with?(k_alpha, <<0x01, 131>>)
+
+        record = %TypedRecord{id: 1, enum_status: :beta}
+        assert {:ok, dumped} = Codec.to_cursor_map(TypedRecord, record)
+        assert dumped["enum_status"] == "beta"
+        assert {:ok, loaded} = Codec.from_cursor(TypedRecord, dumped)
+        assert loaded.enum_status == :beta
+      end
+    end
+
+    describe "counted_set_fields with non-string array element types" do
+      defmodule CountedSetTypedResource do
+        use Ash.Resource,
+          domain: nil,
+          data_layer: Xitdb.Ash.DataLayer
+
+        xitdb do
+          store(DummyStore)
+          collection(:counted_set_typed)
+          counted_set_fields([:int_ids, :uuid_ids, :flags, :scores, :timestamps])
+        end
+
+        attributes do
+          integer_primary_key(:id)
+          attribute(:int_ids, {:array, :integer}, default: [])
+          attribute(:uuid_ids, {:array, :uuid}, default: [])
+          attribute(:flags, {:array, :boolean}, default: [])
+          attribute(:scores, {:array, :float}, default: [])
+          attribute(:timestamps, {:array, :utc_datetime}, default: [])
+        end
+      end
+
+      test "round-trips integer, uuid, boolean, float, and utc_datetime counted_set_fields" do
+        u1 = Ash.UUID.generate()
+        u2 = Ash.UUID.generate()
+        ts = ~U[2026-11-14 12:00:00Z]
+
+        assert {:ok, dumped} =
+                 Codec.to_cursor_map(CountedSetTypedResource, %{
+                   id: 1,
+                   int_ids: [10, 20, 30],
+                   uuid_ids: [u1, u2],
+                   flags: [true, false],
+                   scores: [1.5, 2.25],
+                   timestamps: [ts]
+                 })
+
+        {:ok, db} = Xitdb.open(backend: :memory)
+
+        on_exit(fn ->
+          try do
+            Xitdb.close(db)
+          catch
+            _, _ -> :ok
+          end
+        end)
+
+        {:ok, _} =
+          Xitdb.transact(db, fn root ->
+            put_in(root["counted_set_typed"], %{"1" => dumped})
+          end)
+
+        cursor = Xitdb.db(db)["counted_set_typed"]["1"]
+        assert {:ok, loaded} = Codec.from_cursor(CountedSetTypedResource, cursor)
+        assert Enum.sort(loaded.int_ids) == [10, 20, 30]
+        assert Enum.sort(loaded.uuid_ids) == Enum.sort([u1, u2])
+        assert Enum.sort(loaded.flags) == [false, true]
+        assert Enum.sort(loaded.scores) == [1.5, 2.25]
+        assert loaded.timestamps == [ts]
       end
     end
   end

@@ -170,17 +170,21 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
       with {:ok, raw_cursors} <- stage1_narrow(db_or_cursor, query, resource),
            {:ok, hydrated} <- stage2_hydrate(raw_cursors, query, resource),
-           {:ok, prefiltered, already_filtered?} <- stage3_prefilter(hydrated, query, resource),
+           {:ok, prefiltered, residual_filter} <- stage3_prefilter(hydrated, query, resource),
+           {stage4_query, post_slice_query} <-
+             partition_derived_work(query, residual_filter, resource),
            {:ok, enriched_and_filtered} <-
              stage4_enrich_and_filter(
                db_or_cursor,
                prefiltered,
-               already_filtered?,
-               query,
+               residual_filter,
+               stage4_query,
                resource
              ),
-           ordered = stage5_order_and_slice(enriched_and_filtered, query, resource) do
-        {:ok, stage6_project(ordered, query, resource)}
+           ordered = stage5_order_and_slice(enriched_and_filtered, query, resource),
+           {:ok, post_enriched} <-
+             attach_derived(db_or_cursor, ordered, post_slice_query, resource) do
+        {:ok, stage6_project(post_enriched, query, resource)}
       end
     end
 
@@ -601,6 +605,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
     defp split_and(nil), do: []
     defp split_and(true), do: []
+    defp split_and(%Ash.Filter{expression: expr}), do: split_and(expr)
 
     defp split_and(%BooleanExpression{op: :and, left: l, right: r}),
       do: split_and(l) ++ split_and(r)
@@ -642,10 +647,10 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
     defp extract_predicate(%Eq{left: left, right: right}) do
       cond do
-        local_attr_ref?(left) and literal_value?(right) ->
+        local_attr_ref?(left) and literal_value?(right) and not is_nil(right) ->
           {:eq, attr_ref_name(left), right}
 
-        local_attr_ref?(right) and literal_value?(left) ->
+        local_attr_ref?(right) and literal_value?(left) and not is_nil(left) ->
           {:eq, attr_ref_name(right), left}
 
         true ->
@@ -655,7 +660,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
     defp extract_predicate(%In{left: left, right: right}) do
       if local_attr_ref?(left) and is_enum_of_literals?(right) do
-        {:in, attr_ref_name(left), Enum.to_list(right)}
+        vals = Enum.to_list(right)
+        if Enum.any?(vals, &is_nil/1), do: :skip, else: {:in, attr_ref_name(left), vals}
       else
         :skip
       end
@@ -837,7 +843,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       |> Enum.reduce_while({:ok, []}, fn {_doc_id, cursor}, {:ok, acc} ->
         case Codec.from_cursor(resource, cursor, tenant) do
           {:ok, record} ->
-            if matches_attribute_tenant?(record, strategy, tenant_attr, global?, tenant) do
+            if Codec.matches_attribute_tenant?(record, strategy, tenant_attr, global?, tenant) do
               {:cont, {:ok, [record | acc]}}
             else
               {:cont, {:ok, acc}}
@@ -850,31 +856,65 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       |> reverse_ok()
     end
 
-    defp matches_attribute_tenant?(_record, :attribute, _attr, false, nil), do: false
-    defp matches_attribute_tenant?(_record, :attribute, _attr, true, nil), do: true
-
-    defp matches_attribute_tenant?(record, :attribute, tenant_attr, _global?, tenant) do
-      record_tenant = Map.get(record, tenant_attr)
-      Comp.equal?(record_tenant, tenant) or record_tenant == tenant
-    end
-
-    defp matches_attribute_tenant?(_record, _strategy, _attr, _global?, _tenant), do: true
-
     # ==========================================================================
     # Stage 3: Pure-Attribute Pre-Filtering
     # ==========================================================================
 
-    defp stage3_prefilter(records, %__MODULE__{filter: nil}, _resource), do: {:ok, records, true}
-    defp stage3_prefilter([], _query, _resource), do: {:ok, [], true}
+    defp stage3_prefilter(records, %__MODULE__{filter: nil}, _resource), do: {:ok, records, nil}
+    defp stage3_prefilter([], _query, _resource), do: {:ok, [], nil}
+
+    defp stage3_prefilter(records, %__MODULE__{filter: %Ash.Filter{} = filter} = query, resource) do
+      conjuncts = split_and_conjuncts(filter.expression)
+
+      {derived_conjuncts, pure_conjuncts} =
+        Enum.split_with(conjuncts, &expr_uses_derived_or_related?(&1, resource))
+
+      cond do
+        pure_conjuncts == [] ->
+          {:ok, records, filter}
+
+        derived_conjuncts == [] ->
+          with {:ok, filtered} <- run_runtime_filter(records, query, resource) do
+            {:ok, filtered, nil}
+          end
+
+        true ->
+          pure_filter = %Ash.Filter{filter | expression: combine_and_conjuncts(pure_conjuncts)}
+
+          residual_filter = %Ash.Filter{
+            filter
+            | expression: combine_and_conjuncts(derived_conjuncts)
+          }
+
+          with {:ok, filtered} <-
+                 run_runtime_filter(records, %{query | filter: pure_filter}, resource) do
+            {:ok, filtered, residual_filter}
+          end
+      end
+    end
 
     defp stage3_prefilter(records, %__MODULE__{filter: filter} = query, resource) do
       if filter_uses_derived_or_related?(filter, resource) do
-        {:ok, records, false}
+        {:ok, records, filter}
       else
         with {:ok, filtered} <- run_runtime_filter(records, query, resource) do
-          {:ok, filtered, true}
+          {:ok, filtered, nil}
         end
       end
+    end
+
+    defp split_and_conjuncts(%Ash.Query.BooleanExpression{op: :and, left: left, right: right}) do
+      split_and_conjuncts(left) ++ split_and_conjuncts(right)
+    end
+
+    defp split_and_conjuncts(expr), do: [expr]
+
+    defp combine_and_conjuncts([single]), do: single
+
+    defp combine_and_conjuncts([head | tail]) do
+      Enum.reduce(tail, head, fn expr, acc ->
+        %Ash.Query.BooleanExpression{op: :and, left: acc, right: expr}
+      end)
     end
 
     defp filter_uses_derived_or_related?(nil, _resource), do: false
@@ -934,16 +974,152 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     # Stage 4: Derived Enrichment (Aggregates + Calculations) & Residual Filter
     # ==========================================================================
 
-    defp stage4_enrich_and_filter(_db, [], _already_filtered?, _query, _resource), do: {:ok, []}
+    defp partition_derived_work(
+           %__MODULE__{aggregates: [], calculations: []} = query,
+           _residual_filter,
+           _resource
+         ) do
+      {query, query}
+    end
 
-    defp stage4_enrich_and_filter(db_or_cursor, records, already_filtered?, query, resource) do
-      with {:ok, with_aggs} <- attach_aggregates(db_or_cursor, records, query, resource),
-           {:ok, with_calcs} <- attach_calculations(with_aggs, query, resource) do
-        if already_filtered? do
-          {:ok, with_calcs}
-        else
-          run_runtime_filter(with_calcs, query, resource)
+    defp partition_derived_work(%__MODULE__{} = query, residual_filter, _resource) do
+      seed_names =
+        MapSet.new()
+        |> collect_expr_ref_names(residual_filter)
+        |> collect_sort_or_distinct_names(query.sort)
+        |> collect_sort_or_distinct_names(query.distinct)
+        |> collect_sort_or_distinct_names(query.distinct_sort)
+
+      needed = expand_calc_dependencies(seed_names, query.calculations)
+
+      case needed do
+        :all ->
+          {query, %{query | aggregates: [], calculations: []}}
+
+        %MapSet{} = needed_set ->
+          {stage4_aggs, post_aggs} =
+            Enum.split_with(query.aggregates, fn agg ->
+              MapSet.member?(needed_set, agg.name) or
+                (not is_nil(agg.load) and MapSet.member?(needed_set, agg.load))
+            end)
+
+          {stage4_calcs, post_calcs} =
+            Enum.split_with(query.calculations, fn {calc, _expr} ->
+              MapSet.member?(needed_set, calc.name) or
+                (not is_nil(calc.load) and MapSet.member?(needed_set, calc.load))
+            end)
+
+          {
+            %{query | aggregates: stage4_aggs, calculations: stage4_calcs},
+            %{query | aggregates: post_aggs, calculations: post_calcs}
+          }
+      end
+    end
+
+    defp collect_expr_ref_names(acc, nil), do: acc
+
+    defp collect_expr_ref_names(acc, %Ash.Filter{expression: expr}),
+      do: collect_expr_ref_names(acc, expr)
+
+    defp collect_expr_ref_names(acc, expr) do
+      refs =
+        Ash.Filter.list_refs(expr)
+
+      Enum.reduce(refs, acc, fn
+        %Ref{attribute: %Calculation{name: name, load: load}}, set ->
+          set |> add_if_atom(name) |> add_if_atom(load)
+
+        %Ref{attribute: %Aggregate{name: name, load: load}}, set ->
+          set |> add_if_atom(name) |> add_if_atom(load)
+
+        %Ref{attribute: name}, set when is_atom(name) ->
+          MapSet.put(set, name)
+
+        _, set ->
+          set
+      end)
+    end
+
+    defp collect_sort_or_distinct_names(acc, nil), do: acc
+
+    defp collect_sort_or_distinct_names(acc, items) when is_list(items) do
+      Enum.reduce(items, acc, fn
+        {key, _dir}, set -> add_sort_key_names(set, key)
+        key, set -> add_sort_key_names(set, key)
+      end)
+    end
+
+    defp add_sort_key_names(set, name) when is_atom(name), do: add_if_atom(set, name)
+
+    defp add_sort_key_names(set, %Calculation{name: name, load: load}) do
+      set |> add_if_atom(name) |> add_if_atom(load)
+    end
+
+    defp add_sort_key_names(set, %Aggregate{name: name, load: load}) do
+      set |> add_if_atom(name) |> add_if_atom(load)
+    end
+
+    defp add_sort_key_names(set, _other), do: set
+
+    defp add_if_atom(set, nil), do: set
+    defp add_if_atom(set, atom) when is_atom(atom), do: MapSet.put(set, atom)
+
+    defp expand_calc_dependencies(needed_set, calculations) do
+      Enum.reduce_while(calculations, {:cont, needed_set}, fn {calc, expr}, {_, acc} ->
+        needed? =
+          MapSet.member?(acc, calc.name) or
+            (not is_nil(calc.load) and MapSet.member?(acc, calc.load))
+
+        cond do
+          not needed? ->
+            {:cont, {:cont, acc}}
+
+          is_nil(expr) and calc.module != Ash.Resource.Calculation.Expression ->
+            {:halt, :all}
+
+          true ->
+            {:cont, {:cont, collect_expr_ref_names(acc, expr)}}
         end
+      end)
+      |> case do
+        :all ->
+          :all
+
+        {:cont, expanded} ->
+          if MapSet.equal?(expanded, needed_set) do
+            expanded
+          else
+            expand_calc_dependencies(expanded, calculations)
+          end
+      end
+    end
+
+    defp stage4_enrich_and_filter(_db, [], _residual_filter, _query, _resource), do: {:ok, []}
+
+    defp stage4_enrich_and_filter(db_or_cursor, records, residual_filter, query, resource) do
+      with {:ok, enriched} <- attach_derived(db_or_cursor, records, query, resource) do
+        if is_nil(residual_filter) do
+          {:ok, enriched}
+        else
+          run_runtime_filter(enriched, %{query | filter: residual_filter}, resource)
+        end
+      end
+    end
+
+    defp attach_derived(_db_or_cursor, [], _query, _resource), do: {:ok, []}
+
+    defp attach_derived(
+           _db_or_cursor,
+           records,
+           %__MODULE__{aggregates: [], calculations: []},
+           _resource
+         ) do
+      {:ok, records}
+    end
+
+    defp attach_derived(db_or_cursor, records, query, resource) do
+      with {:ok, with_aggs} <- attach_aggregates(db_or_cursor, records, query, resource) do
+        attach_calculations(with_aggs, query, resource)
       end
     end
 
@@ -1283,6 +1459,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
            {:ok, filtered_frontier} <-
              apply_step_join_filter(
                next_frontier,
+               rel.destination,
                root_by_idx,
                Map.get(join_filters, next_prefix),
                domain,
@@ -1322,7 +1499,16 @@ if Code.ensure_loaded?(Ash.DataLayer) do
                {idx, if(curr == [], do: [], else: dest_records)}
              end)}
           else
-            grouped = Enum.group_by(dest_records, &Map.get(&1, rel.destination_attribute))
+            key_attr =
+              join_attr_for_pair(
+                Ash.Resource.Info.attribute(rel.source, rel.source_attribute),
+                Ash.Resource.Info.attribute(dest_res, rel.destination_attribute)
+              )
+
+            grouped =
+              Enum.group_by(dest_records, fn rec ->
+                join_key_value(key_attr, Map.get(rec, rel.destination_attribute))
+              end)
 
             next_frontier =
               Map.new(frontier, fn {idx, curr_list} ->
@@ -1330,7 +1516,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
                   Enum.flat_map(curr_list, fn c ->
                     case Map.get(c, rel.source_attribute) do
                       nil -> []
-                      key -> Map.get(grouped, key, [])
+                      key -> Map.get(grouped, join_key_value(key_attr, key), [])
                     end
                   end)
 
@@ -1354,11 +1540,23 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         join_db = resolve_db_for_resource(db_or_cursor, root_res, join_res)
         dest_db = resolve_db_for_resource(db_or_cursor, root_res, dest_res)
 
+        src_join_attr =
+          join_attr_for_pair(
+            Ash.Resource.Info.attribute(rel.source, rel.source_attribute),
+            Ash.Resource.Info.attribute(join_res, rel.source_attribute_on_join_resource)
+          )
+
+        dest_join_attr =
+          join_attr_for_pair(
+            Ash.Resource.Info.attribute(join_res, rel.destination_attribute_on_join_resource),
+            Ash.Resource.Info.attribute(dest_res, rel.destination_attribute)
+          )
+
         source_vals =
           all_curr
           |> Enum.map(&Map.get(&1, rel.source_attribute))
           |> Enum.reject(&is_nil/1)
-          |> Enum.uniq()
+          |> Enum.uniq_by(&join_key_value(src_join_attr, &1))
 
         with {:ok, join_records} <-
                fetch_matching_destination_records(
@@ -1372,7 +1570,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
                join_records
                |> Enum.map(&Map.get(&1, rel.destination_attribute_on_join_resource))
                |> Enum.reject(&is_nil/1)
-               |> Enum.uniq(),
+               |> Enum.uniq_by(&join_key_value(dest_join_attr, &1)),
              {:ok, raw_dest_records} <-
                fetch_matching_destination_records(
                  dest_db,
@@ -1384,9 +1582,14 @@ if Code.ensure_loaded?(Ash.DataLayer) do
              {:ok, filtered_dest} <-
                apply_optional_filter(domain, raw_dest_records, rel.filter, tenant, actor, nil) do
           joins_by_src =
-            Enum.group_by(join_records, &Map.get(&1, rel.source_attribute_on_join_resource))
+            Enum.group_by(join_records, fn rec ->
+              join_key_value(src_join_attr, Map.get(rec, rel.source_attribute_on_join_resource))
+            end)
 
-          dest_by_key = Enum.group_by(filtered_dest, &Map.get(&1, rel.destination_attribute))
+          dest_by_key =
+            Enum.group_by(filtered_dest, fn rec ->
+              join_key_value(dest_join_attr, Map.get(rec, rel.destination_attribute))
+            end)
 
           next_frontier =
             Map.new(frontier, fn {idx, curr_list} ->
@@ -1394,10 +1597,10 @@ if Code.ensure_loaded?(Ash.DataLayer) do
                 for curr <- curr_list,
                     src_val = Map.get(curr, rel.source_attribute),
                     not is_nil(src_val),
-                    join_row <- Map.get(joins_by_src, src_val, []),
+                    join_row <- Map.get(joins_by_src, join_key_value(src_join_attr, src_val), []),
                     dest_val = Map.get(join_row, rel.destination_attribute_on_join_resource),
                     not is_nil(dest_val),
-                    dest_row <- Map.get(dest_by_key, dest_val, []) do
+                    dest_row <- Map.get(dest_by_key, join_key_value(dest_join_attr, dest_val), []) do
                   dest_row
                 end
 
@@ -1418,11 +1621,17 @@ if Code.ensure_loaded?(Ash.DataLayer) do
             dest_res
           )
         else
+          key_attr =
+            join_attr_for_pair(
+              Ash.Resource.Info.attribute(rel.source, rel.source_attribute),
+              Ash.Resource.Info.attribute(dest_res, rel.destination_attribute)
+            )
+
           source_vals =
             source_records
             |> Enum.map(&Map.get(&1, rel.source_attribute))
             |> Enum.reject(&is_nil/1)
-            |> Enum.uniq()
+            |> Enum.uniq_by(&join_key_value(key_attr, &1))
 
           fetch_matching_destination_records(
             dest_db,
@@ -1491,16 +1700,42 @@ if Code.ensure_loaded?(Ash.DataLayer) do
             end
         end
 
+      dest_attr_def = Ash.Resource.Info.attribute(dest_res, dest_attr)
+
       with {:ok, hydrated} <- stage2_hydrate(cursors, %__MODULE__{tenant: tenant}, dest_res) do
-        allowed = MapSet.new(values)
-        {:ok, Enum.filter(hydrated, &MapSet.member?(allowed, Map.get(&1, dest_attr)))}
+        allowed = MapSet.new(values, &join_key_value(dest_attr_def, &1))
+
+        {:ok,
+         Enum.filter(hydrated, fn rec ->
+           MapSet.member?(allowed, join_key_value(dest_attr_def, Map.get(rec, dest_attr)))
+         end)}
       end
     end
 
-    defp apply_step_join_filter(frontier, _root_by_idx, nil, _domain, _tenant, _actor),
+    defp join_attr_for_pair(%Attribute{type: t1} = a1, %Attribute{} = a2) do
+      if t1 in [:ci_string, Ash.Type.CiString], do: a1, else: a2
+    end
+
+    defp join_attr_for_pair(a1, a2), do: a2 || a1
+
+    defp join_key_value(_attr, nil), do: nil
+    defp join_key_value(%Attribute{} = attr, val), do: Codec.encode_scalar_key(attr, val)
+    defp join_key_value(nil, %Decimal{} = dec), do: Codec.encode_decimal_key(dec)
+    defp join_key_value(nil, %Ash.CiString{string: s}), do: String.downcase(s)
+    defp join_key_value(nil, val), do: val
+
+    defp apply_step_join_filter(frontier, _dest_res, _root_by_idx, nil, _domain, _tenant, _actor),
       do: {:ok, frontier}
 
-    defp apply_step_join_filter(frontier, root_by_idx, join_filter, domain, tenant, actor) do
+    defp apply_step_join_filter(
+           frontier,
+           dest_res,
+           root_by_idx,
+           join_filter,
+           domain,
+           tenant,
+           actor
+         ) do
       if filter_uses_parent?(join_filter) do
         frontier
         |> Enum.reduce_while({:ok, %{}}, fn {idx, candidates}, {:ok, acc} ->
@@ -1519,16 +1754,41 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           end
         end)
       else
-        all_candidates = frontier |> Map.values() |> List.flatten()
-        # Deduplicate only for filter checking using object identity / PK where possible
+        pk_fields = Ash.Resource.Info.primary_key(dest_res)
+        raw_candidates = frontier |> Map.values() |> List.flatten()
+
+        all_candidates =
+          if pk_fields != [] do
+            Enum.uniq_by(raw_candidates, &Map.take(&1, pk_fields))
+          else
+            raw_candidates
+          end
+
         case apply_optional_filter(domain, all_candidates, join_filter, tenant, actor, nil) do
           {:ok, kept_list} ->
-            kept_set = MapSet.new(kept_list)
+            if pk_fields != [] do
+              kept_by_pk = index_records_by_pk(kept_list, dest_res)
 
-            {:ok,
-             Map.new(frontier, fn {idx, candidates} ->
-               {idx, Enum.filter(candidates, &MapSet.member?(kept_set, &1))}
-             end)}
+              {:ok,
+               Map.new(frontier, fn {idx, candidates} ->
+                 kept =
+                   Enum.flat_map(candidates, fn cand ->
+                     case Map.fetch(kept_by_pk, Map.take(cand, pk_fields)) do
+                       {:ok, kept_rec} -> [kept_rec]
+                       :error -> []
+                     end
+                   end)
+
+                 {idx, kept}
+               end)}
+            else
+              kept_set = MapSet.new(kept_list)
+
+              {:ok,
+               Map.new(frontier, fn {idx, candidates} ->
+                 {idx, Enum.filter(candidates, &MapSet.member?(kept_set, &1))}
+               end)}
+            end
 
           {:error, _} = err ->
             err
@@ -1592,6 +1852,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     defp compute_aggregate_value(records, %Aggregate{} = agg, target_resource) do
       pk_fields = Ash.Resource.Info.primary_key(target_resource)
       field = agg.field || List.first(pk_fields)
+      field_attr = Ash.Resource.Info.attribute(target_resource, field)
       kind = agg.kind
       uniq? = Map.get(agg, :uniq?, false)
       include_nil? = Map.get(agg, :include_nil?, false)
@@ -1599,12 +1860,18 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
       case kind do
         :count ->
-          values =
-            records
-            |> Enum.map(&field_value(&1, field))
-            |> Enum.reject(&is_nil/1)
+          if is_nil(agg.field) and not uniq? do
+            length(records)
+          else
+            values =
+              records
+              |> Enum.map(&field_value(&1, field))
+              |> Enum.reject(&is_nil/1)
 
-          if uniq?, do: values |> Enum.uniq() |> length(), else: length(values)
+            if uniq?,
+              do: values |> Enum.uniq_by(&agg_uniq_key(&1, field_attr)) |> length(),
+              else: length(values)
+          end
 
         :exists ->
           records != []
@@ -1625,12 +1892,14 @@ if Code.ensure_loaded?(Ash.DataLayer) do
             records
             |> Enum.map(&field_value(&1, field))
             |> then(fn vals -> if include_nil?, do: vals, else: Enum.reject(vals, &is_nil/1) end)
-            |> then(fn vals -> if uniq?, do: Enum.uniq(vals), else: vals end)
+            |> then(fn vals ->
+              if uniq?, do: Enum.uniq_by(vals, &agg_uniq_key(&1, field_attr)), else: vals
+            end)
 
           if values == [] and is_list(default_value), do: default_value, else: values
 
         :sum ->
-          values = extract_non_nil_agg_values(records, field, uniq?)
+          values = extract_non_nil_agg_values(records, field, field_attr, uniq?)
 
           case values do
             [] ->
@@ -1644,21 +1913,21 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           end
 
         :min ->
-          case extract_non_nil_agg_values(records, field, uniq?) do
+          case extract_non_nil_agg_values(records, field, field_attr, uniq?) do
             [] -> default_value
             [%Decimal{} = first | rest] -> Enum.reduce(rest, first, &Decimal.min/2)
             values -> Enum.min(values)
           end
 
         :max ->
-          case extract_non_nil_agg_values(records, field, uniq?) do
+          case extract_non_nil_agg_values(records, field, field_attr, uniq?) do
             [] -> default_value
             [%Decimal{} = first | rest] -> Enum.reduce(rest, first, &Decimal.max/2)
             values -> Enum.max(values)
           end
 
         :avg ->
-          values = extract_non_nil_agg_values(records, field, uniq?)
+          values = extract_non_nil_agg_values(records, field, field_attr, uniq?)
 
           case values do
             [] ->
@@ -1675,12 +1944,20 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       end
     end
 
-    defp extract_non_nil_agg_values(records, field, uniq?) do
+    defp extract_non_nil_agg_values(records, field, field_attr, uniq?) do
       records
       |> Enum.map(&field_value(&1, field))
       |> Enum.reject(&is_nil/1)
-      |> then(fn vals -> if uniq?, do: Enum.uniq(vals), else: vals end)
+      |> then(fn vals ->
+        if uniq?, do: Enum.uniq_by(vals, &agg_uniq_key(&1, field_attr)), else: vals
+      end)
     end
+
+    defp agg_uniq_key(nil, _attr), do: nil
+    defp agg_uniq_key(val, %Attribute{} = attr), do: Codec.encode_scalar_key(attr, val)
+    defp agg_uniq_key(%Decimal{} = dec, nil), do: {:decimal, Codec.encode_decimal_key(dec)}
+    defp agg_uniq_key(%Ash.CiString{string: s}, nil), do: {:ci_string, String.downcase(s)}
+    defp agg_uniq_key(val, nil), do: val
 
     defp put_aggregate_result(record, %Aggregate{load: load_key, name: name}, value) do
       aggs = record |> Map.get(:aggregates, %{}) |> Map.put(name, value)

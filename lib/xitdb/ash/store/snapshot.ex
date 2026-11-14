@@ -69,12 +69,13 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     """
     @spec current_db(module()) :: term()
     def current_db(store) when is_atom(store) do
-      key = {:xitdb_as_of_db, store}
+      as_of_key = {:xitdb_as_of_db, store}
+      tx_key = {:xitdb_tx_db, store}
 
       cond do
-        as_of_db = Process.get(key) -> as_of_db
-        tx_db = Process.get({:xitdb_tx_db, store}) -> tx_db
-        as_of_db = caller_as_of_db(key, Process.get(:"$callers")) -> as_of_db
+        as_of_db = Process.get(as_of_key) -> as_of_db
+        tx_db = Process.get(tx_key) -> tx_db
+        inherited = caller_dict_lookup(Process.get(:"$callers"), as_of_key, tx_key) -> inherited
         true -> sandbox_or_committed_db(store)
       end
     end
@@ -127,12 +128,18 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       :persistent_term.erase(pt_key(store))
     end
 
-    defp caller_as_of_db(key, callers) when is_list(callers) do
+    defp caller_dict_lookup(callers, as_of_key, tx_key) when is_list(callers) do
       Enum.find_value(callers, fn
         pid when is_pid(pid) ->
-          case :erlang.process_info(pid, {:dictionary, key}) do
-            {{:dictionary, ^key}, val} when val != :undefined and val != nil -> val
-            _ -> nil
+          case :erlang.process_info(pid, {:dictionary, as_of_key}) do
+            {{:dictionary, ^as_of_key}, val} when val != :undefined and val != nil ->
+              val
+
+            _ ->
+              case :erlang.process_info(pid, {:dictionary, tx_key}) do
+                {{:dictionary, ^tx_key}, val} when val != :undefined and val != nil -> val
+                _ -> nil
+              end
           end
 
         _ ->
@@ -140,7 +147,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       end)
     end
 
-    defp caller_as_of_db(_key, _callers), do: nil
+    defp caller_dict_lookup(_callers, _as_of_key, _tx_key), do: nil
 
     defp sandbox_or_committed_db(store) do
       if Code.ensure_loaded?(TestSandbox) and function_exported?(TestSandbox, :checkout_db, 1) do

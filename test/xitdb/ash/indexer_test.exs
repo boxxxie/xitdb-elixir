@@ -245,17 +245,16 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     } do
       m0 = Xitdb.moment_count(db)
 
-      a1 =
-        struct(Article,
-          id: 1,
-          slug: Ash.CiString.new("Alpha-One"),
-          status: :published,
-          category: "tech",
-          tier: 1,
-          rank: 10,
-          title: "Distributed BTree Engines",
-          summary: "Immutable indexing guide"
-        )
+      a1 = %Article{
+        id: 1,
+        slug: Ash.CiString.new("Alpha-One"),
+        status: :published,
+        category: "tech",
+        tier: 1,
+        rank: 10,
+        title: "Distributed BTree Engines",
+        summary: "Immutable indexing guide"
+      }
 
       assert {:ok, db} = Indexer.put_record(db, Article, nil, a1)
       assert Xitdb.moment_count(db) == m0 + 1
@@ -274,7 +273,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       # Update in place commits in 1 moment and also works via {db, moment} snapshots
       moment = Xitdb.moment_count(db) - 1
 
-      a1_updated = %{a1 | status: :archived, rank: 20, summary: "Cold storage guide"}
+      a1_updated = %Article{a1 | status: :archived, rank: 20, summary: "Cold storage guide"}
       assert {:ok, {db, next_moment}} = Indexer.put_record({db, moment}, Article, a1, a1_updated)
       assert next_moment == moment + 1
       assert Xitdb.moment_count(db) == m0 + 2
@@ -298,7 +297,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       m0 = Xitdb.moment_count(db)
 
       records = [
-        struct(Article,
+        %Article{
           id: 1,
           slug: Ash.CiString.new("one"),
           status: :published,
@@ -306,8 +305,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           tier: 1,
           rank: 5,
           title: "Neural Search"
-        ),
-        struct(Article,
+        },
+        %Article{
           id: 2,
           slug: Ash.CiString.new("two"),
           status: :published,
@@ -315,7 +314,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           tier: 1,
           rank: 8,
           title: "Neural Ranking"
-        )
+        }
       ]
 
       {ops, _final_batch} =
@@ -357,13 +356,12 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       slug_ident = Ash.Resource.Info.identity(Article, :unique_slug)
       active_ident = Ash.Resource.Info.identity(Article, :unique_active_slug)
 
-      a1 =
-        struct(Article,
-          id: 1,
-          slug: Ash.CiString.new("Flagship"),
-          status: :published,
-          category: "macro"
-        )
+      a1 = %Article{
+        id: 1,
+        slug: Ash.CiString.new("Flagship"),
+        status: :published,
+        category: "macro"
+      }
 
       {:ok, db} = Indexer.put_record(db, Article, nil, a1)
 
@@ -372,28 +370,26 @@ if Code.ensure_loaded?(Ash.DataLayer) do
                Indexer.lookup_by_identity(db, Article, slug_ident, %{slug: "FLAGSHIP"})
 
       # Self-update with same identity succeeds
-      assert {:ok, db} = Indexer.put_record(db, Article, a1, %{a1 | title: "Updated"})
+      assert {:ok, db} = Indexer.put_record(db, Article, a1, %Article{a1 | title: "Updated"})
 
       # Different PK with colliding slug fails with InvalidChanges
-      dup =
-        struct(Article,
-          id: 2,
-          slug: Ash.CiString.new("flagship"),
-          status: :draft,
-          category: "macro"
-        )
+      dup = %Article{
+        id: 2,
+        slug: Ash.CiString.new("flagship"),
+        status: :draft,
+        category: "macro"
+      }
 
       assert {:error, %InvalidChanges{fields: [:slug]}} =
                Indexer.put_record(db, Article, nil, dup)
 
       # Partial where: identity (`status == :published`): draft with same active key does NOT collide
-      other_published =
-        struct(Article,
-          id: 3,
-          slug: Ash.CiString.new("other"),
-          status: :draft,
-          category: "macro"
-        )
+      other_published = %Article{
+        id: 3,
+        slug: Ash.CiString.new("other"),
+        status: :draft,
+        category: "macro"
+      }
 
       {:ok, db} = Indexer.put_record(db, Article, nil, other_published)
 
@@ -405,7 +401,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
       # Even sharing {category, slug} when one is :draft does not conflict on unique_active_slug
       # (we test with a distinct unique_slug vs same active_slug by making first :archived)
-      {:ok, db} = Indexer.put_record(db, Article, a1, %{a1 | status: :archived})
+      {:ok, db} = Indexer.put_record(db, Article, a1, %Article{a1 | status: :archived})
 
       assert :none ==
                Indexer.lookup_by_identity(db, Article, active_ident, %{
@@ -413,13 +409,12 @@ if Code.ensure_loaded?(Ash.DataLayer) do
                  slug: "flagship"
                })
 
-      reusing_active_slug =
-        struct(Article,
-          id: 4,
-          slug: Ash.CiString.new("flagship-v2"),
-          status: :published,
-          category: "macro"
-        )
+      reusing_active_slug = %Article{
+        id: 4,
+        slug: Ash.CiString.new("flagship-v2"),
+        status: :published,
+        category: "macro"
+      }
 
       {:ok, db} = Indexer.put_record(db, Article, nil, reusing_active_slug)
 
@@ -430,7 +425,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
                })
 
       # Transitioning archived a1 back to :published on same slug works, while another record with same {category, slug} if forced fails
-      assert {:ok, _db} = Indexer.put_record(db, Article, %{a1 | status: :archived}, a1)
+      assert {:ok, _db} = Indexer.put_record(db, Article, %Article{a1 | status: :archived}, a1)
     end
 
     test "multitenant :context and :attribute isolation in indexes and identities", %{db: db} do
@@ -573,15 +568,14 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
       db =
         Enum.reduce(rows, db, fn {id, cat, tier, rank}, acc ->
-          rec =
-            struct(Article,
-              id: id,
-              slug: Ash.CiString.new("art-#{id}"),
-              status: :published,
-              category: cat,
-              tier: tier,
-              rank: rank
-            )
+          rec = %Article{
+            id: id,
+            slug: Ash.CiString.new("art-#{id}"),
+            status: :published,
+            category: cat,
+            tier: tier,
+            rank: rank
+          }
 
           {:ok, next} = Indexer.put_record(acc, Article, nil, rec)
           next
@@ -624,20 +618,19 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
     test "BM25 stale-token cleanup on update/delete and Search.reindex_records({db, moment}) snapshot",
          %{db: db} do
-      a1 =
-        struct(Article,
-          id: 1,
-          slug: Ash.CiString.new("quant-1"),
-          title: "Quantum Credit",
-          summary: "Arbitrage strategies"
-        )
+      a1 = %Article{
+        id: 1,
+        slug: Ash.CiString.new("quant-1"),
+        title: "Quantum Credit",
+        summary: "Arbitrage strategies"
+      }
 
       {:ok, db} = Indexer.put_record(db, Article, nil, a1)
       assert [1] == Search.ids(Article, "quantum", db: db)
       assert [1] == Search.ids(Article, "arbitrage", db: db)
 
       # Updating title/summary removes old tokens atomically in the same commit
-      a1_v2 = %{a1 | title: "Venture Growth", summary: "Late stage buyouts"}
+      a1_v2 = %Article{a1 | title: "Venture Growth", summary: "Late stage buyouts"}
       {:ok, db} = Indexer.put_record(db, Article, a1, a1_v2)
 
       assert [] == Search.ids(Article, "quantum", db: db)

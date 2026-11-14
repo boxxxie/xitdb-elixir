@@ -95,7 +95,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     def prefer_lateral_join_for_many_to_many?, do: false
 
     @impl Ash.DataLayer
-    def prefer_transaction?(_resource), do: false
+    def prefer_transaction?(_resource), do: true
 
     @impl Ash.DataLayer
     def prefer_transaction_for_atomic_updates?(_resource), do: false
@@ -293,9 +293,20 @@ if Code.ensure_loaded?(Ash.DataLayer) do
             case Ash.Filter.hydrate_refs(expr, %{resource: resource, public?: false}) do
               {:ok, hydrated} ->
                 case Ash.Expr.eval_hydrated(hydrated, eval_opts) do
-                  {:ok, val} -> {:cont, {:ok, [val | acc]}}
-                  :unknown -> {:cont, {:ok, [nil | acc]}}
-                  {:error, _} = err -> {:halt, err}
+                  {:ok, val} ->
+                    {:cont, {:ok, [val | acc]}}
+
+                  :unknown ->
+                    record = Map.get(context, :record) || Map.get(plain_ctx, :record)
+
+                    case eval_relational_fallback(hydrated, record, domain, actor, tenant) do
+                      {:ok, val} -> {:cont, {:ok, [val | acc]}}
+                      :unknown -> {:cont, {:ok, [nil | acc]}}
+                      {:error, _} = err -> {:halt, err}
+                    end
+
+                  {:error, _} = err ->
+                    {:halt, err}
                 end
 
               {:error, _} = err ->
@@ -310,6 +321,22 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         {:ok, rev} -> {:ok, Enum.reverse(rev)}
         {:error, _} = err -> err
       end
+    end
+
+    defp eval_relational_fallback(_expr, nil, _domain, _actor, _tenant), do: :unknown
+
+    defp eval_relational_fallback(expr, record, domain, actor, tenant) when is_map(record) do
+      case Ash.Filter.Runtime.filter_matches(domain, [record], expr,
+             actor: actor,
+             tenant: tenant,
+             authorize?: false
+           ) do
+        {:ok, [_ | _]} -> {:ok, true}
+        {:ok, []} -> {:ok, false}
+        {:error, _} = err -> err
+      end
+    rescue
+      _ -> :unknown
     end
 
     # -- Mutation & Transaction Callbacks --

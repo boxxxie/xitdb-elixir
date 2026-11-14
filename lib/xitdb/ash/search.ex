@@ -17,7 +17,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     require Ash.Query
     require Ash.Sort
 
-    alias Xitdb.Ash.Info
+    alias Xitdb.Ash.{Codec, Info}
     alias Xitdb.Ash.Search.Storage
 
     @weight_scale 100
@@ -87,6 +87,11 @@ if Code.ensure_loaded?(Ash.DataLayer) do
                       default: :auto,
                       doc:
                         "Selects native Odin NIF pushdown (`:nif`), cursor-backed Elixir baseline (`:elixir`), or automatic NIF dispatch (`:auto`)."
+                    ],
+                    tenant: [
+                      type: :any,
+                      default: nil,
+                      doc: "Optional Ash tenant for `:context`-multitenant resources."
                     ]
                   )
 
@@ -127,12 +132,14 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     @spec sort_by_rank(Ash.Query.t(), [integer() | String.t()]) :: Ash.Query.t()
     def sort_by_rank(%Ash.Query{} = ash_query, []), do: ash_query
 
-    def sort_by_rank(%Ash.Query{} = ash_query, ranked_ids) when is_list(ranked_ids) do
+    def sort_by_rank(%Ash.Query{resource: resource} = ash_query, ranked_ids)
+        when is_list(ranked_ids) do
+      [pk_field | _] = Ash.Resource.Info.primary_key(resource)
       max_rank = length(ranked_ids)
 
       rank_expr =
         Enum.reduce(Enum.with_index(ranked_ids), Ash.Expr.expr(^max_rank), fn {id, rank}, acc ->
-          Ash.Expr.expr(if(id == ^id, ^rank, ^acc))
+          Ash.Expr.expr(if(^Ash.Expr.ref(pk_field) == ^id, ^rank, ^acc))
         end)
 
       Ash.Query.sort(ash_query, [{Ash.Sort.expr_sort(^rank_expr), :asc}])
@@ -169,16 +176,17 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     Incrementally updates `idx.search.<collection>` for `record` inside a write transaction.
     No-ops when `resource` declares zero `search_field` entities.
     """
-    @spec index_record(term(), module(), struct()) :: term()
-    def index_record(db, resource, %_{} = record) when is_atom(resource) do
+    @spec index_record(term(), module(), struct(), term()) :: term()
+    def index_record(db, resource, %_{} = record, tenant \\ nil) when is_atom(resource) do
       case Info.search_fields(resource) do
         [] ->
           db
 
         search_fields ->
-          collection = Info.collection!(resource) |> Atom.to_string()
-          pk_attr = resource |> Ash.Resource.Info.primary_key() |> hd()
-          doc_key = record |> Map.fetch!(pk_attr) |> encode_doc_key()
+          collection = Codec.scoped_collection(resource, tenant)
+          [pk_name | _] = Ash.Resource.Info.primary_key(resource)
+          pk_attr = Ash.Resource.Info.attribute(resource, pk_name)
+          doc_key = Codec.encode_pk_doc_id(pk_attr, Map.fetch!(record, pk_name))
           new_terms = extract_weighted_terms(record, search_fields, db)
           apply_doc_diff(db, collection, doc_key, new_terms)
       end
@@ -188,25 +196,27 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     Re-indexes a list of dependent structs in one working `%Xitdb{}` transaction
     (for example, re-indexing `Profile` records when their parent `Organization` updates).
     """
-    @spec reindex_records(term(), module(), Enumerable.t()) :: term()
-    def reindex_records(db, resource, records) when is_atom(resource) do
+    @spec reindex_records(term(), module(), Enumerable.t(), term()) :: term()
+    def reindex_records(db, resource, records, tenant \\ nil) when is_atom(resource) do
       Enum.reduce(records, db, fn record, acc_db ->
-        index_record(acc_db, resource, record)
+        index_record(acc_db, resource, record, tenant)
       end)
     end
 
     @doc """
     Removes `doc_id` from `idx.search.<collection>` inside a `destroy` transaction.
     """
-    @spec remove_record(term(), module(), term()) :: term()
-    def remove_record(db, resource, doc_id) when is_atom(resource) do
+    @spec remove_record(term(), module(), term(), term()) :: term()
+    def remove_record(db, resource, doc_id, tenant \\ nil) when is_atom(resource) do
       case Info.search_fields(resource) do
         [] ->
           db
 
         _fields ->
-          collection = Info.collection!(resource) |> Atom.to_string()
-          apply_doc_diff(db, collection, encode_doc_key(doc_id), %{})
+          collection = Codec.scoped_collection(resource, tenant)
+          [pk_name | _] = Ash.Resource.Info.primary_key(resource)
+          pk_attr = Ash.Resource.Info.attribute(resource, pk_name)
+          apply_doc_diff(db, collection, Codec.encode_pk_doc_id(pk_attr, doc_id), %{})
       end
     end
 
@@ -214,7 +224,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
     defp execute_ranked_query(resource, tokens, opts) do
       collection_atom = Info.collection!(resource)
-      collection = Atom.to_string(collection_atom)
+      collection = Codec.scoped_collection(resource, opts[:tenant])
       meta = %{resource: resource, collection: collection_atom}
 
       :telemetry.span([:xitdb, :ash, :search], meta, fn ->
@@ -225,7 +235,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
             true -> resolve_active_db(resource)
           end
 
-        hits = score_collection(db, collection, tokens, opts, pk_type(resource))
+        hits = score_collection(db, collection, tokens, opts, resource)
 
         {hits,
          meta
@@ -254,10 +264,10 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       end
     end
 
-    defp score_collection(db, collection, tokens, opts, pk_kind) do
+    defp score_collection(db, collection, tokens, opts, resource) do
       case resolve_backend(opts[:backend], db) do
-        :nif -> score_collection_nif(db, collection, tokens, opts, pk_kind)
-        :elixir -> score_collection_elixir(db, collection, tokens, opts, pk_kind)
+        :nif -> score_collection_nif(db, collection, tokens, opts, resource)
+        :elixir -> score_collection_elixir(db, collection, tokens, opts, resource)
       end
     end
 
@@ -274,7 +284,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       end
     end
 
-    defp score_collection_nif(db, collection, tokens, opts, pk_kind) do
+    defp score_collection_nif(db, collection, tokens, opts, resource) do
       case Storage.root_cursor(db) do
         %Xitdb.Cursor{tx_mode: false, db_ref: db_ref, tag_id: root_tag_id, value: root_val_int} ->
           nif_opts = %{
@@ -299,7 +309,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
                ) do
             {:ok, raw_hits} ->
               Enum.map(raw_hits, fn {doc_key, score} ->
-                {decode_doc_key(doc_key, pk_kind), score}
+                {decode_doc_key(resource, doc_key), score}
               end)
 
             {:error, reason} ->
@@ -312,7 +322,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       end
     end
 
-    defp score_collection_elixir(db, collection, tokens, opts, pk_kind) do
+    defp score_collection_elixir(db, collection, tokens, opts, resource) do
       %{doc_count: doc_count, total_len: total_len} = Storage.read_corpus_stats(db, collection)
 
       if doc_count <= 0 or total_len <= 0 do
@@ -330,7 +340,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           doc_count,
           avg_dl,
           opts,
-          pk_kind
+          resource
         )
       end
     end
@@ -340,7 +350,6 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     defp collect_token_postings(db, collection, token, opts) do
       exact_boost = opts[:exact_boost]
       prefix_weight = opts[:prefix_weight]
-      exact_postings = Storage.lookup_term(db, collection, token)
 
       prefix_postings =
         if opts[:prefix?] and String.length(token) >= opts[:min_prefix_length] do
@@ -355,7 +364,13 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           []
         end
 
-      merged =
+      if prefix_postings == [] do
+        db
+        |> Storage.lookup_term(collection, token)
+        |> Map.new(fn {doc_key, scaled_tf} ->
+          {doc_key, scaled_tf / @weight_scale * exact_boost}
+        end)
+      else
         Enum.reduce(prefix_postings, %{}, fn {matched_term, postings}, acc ->
           multiplier = if matched_term == token, do: exact_boost, else: prefix_weight
 
@@ -364,13 +379,6 @@ if Code.ensure_loaded?(Ash.DataLayer) do
             Map.update(inner, doc_key, tf, &(&1 + tf))
           end)
         end)
-
-      if prefix_postings == [] do
-        Map.new(exact_postings, fn {doc_key, scaled_tf} ->
-          {doc_key, scaled_tf / @weight_scale * exact_boost}
-        end)
-      else
-        merged
       end
     end
 
@@ -400,7 +408,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
            doc_count,
            avg_dl,
            opts,
-           pk_kind
+           resource
          ) do
       k1 = opts[:k1]
       b = opts[:b]
@@ -434,7 +442,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       end)
       |> Enum.sort_by(fn {doc_key, score} -> {-score, doc_key} end)
       |> Enum.take(opts[:limit])
-      |> Enum.map(fn {doc_key, score} -> {decode_doc_key(doc_key, pk_kind), score} end)
+      |> Enum.map(fn {doc_key, score} -> {decode_doc_key(resource, doc_key), score} end)
     end
 
     # -- Internal Indexing & Diff Calculation --
@@ -520,33 +528,15 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       end)
     end
 
-    defp pk_type(resource) do
-      pk_name = resource |> Ash.Resource.Info.primary_key() |> hd()
-      attr = Ash.Resource.Info.attribute(resource, pk_name)
-
-      if attr && attr.type in [:integer, Ash.Type.Integer], do: :integer, else: :string
-    end
-
     defp encode_doc_key(id) when is_integer(id), do: Integer.to_string(id)
     defp encode_doc_key(id) when is_binary(id), do: id
     defp encode_doc_key(id), do: to_string(id)
 
-    defp decode_doc_key(key, :integer), do: String.to_integer(key)
-    defp decode_doc_key(key, :string), do: key
-  end
-
-  defmodule Xitdb.Ash.Search.RankCalculation do
-    @moduledoc false
-    use Ash.Resource.Calculation
-
-    @impl true
-    def calculate(records, opts, _context) do
-      ranks = Keyword.fetch!(opts, :ranks)
-      default = Keyword.fetch!(opts, :default)
-
-      Enum.map(records, fn record ->
-        Map.get(ranks, record.id, default)
-      end)
+    defp decode_doc_key(resource, key) do
+      case Codec.decode_doc_id(resource, key) do
+        {:ok, pk_val} -> pk_val
+        _ -> key
+      end
     end
   end
 

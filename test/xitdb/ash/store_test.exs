@@ -380,5 +380,20 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       assert_receive {:telemetry, [:xitdb, :ash, :transaction, :stop], _,
                       %{store: ^store, mode: :leased, status: :ok}}
     end
+
+    test "synchronous abort_lease releases lease before returning and unmatched :DOWN does not interfere" do
+      {store, pid} = start_ephemeral_store()
+
+      assert {:error, :rolled_back} =
+               Store.transact(store, fn ->
+                 # Simulate an unrelated process dying while we hold the active lease
+                 send(pid, {:DOWN, make_ref(), :process, self(), :normal})
+                 Store.rollback(store, :rolled_back)
+               end)
+
+      # Immediately after rollback returns, the store lease is already released
+      state = :sys.get_state(pid)
+      assert state.queue.active == nil
+    end
   end
 end

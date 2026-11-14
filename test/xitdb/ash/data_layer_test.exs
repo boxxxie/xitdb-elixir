@@ -263,7 +263,12 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
         create :create do
           primary?(true)
-          accept([:title, :start_time])
+          accept([:title, :start_time, :notes])
+        end
+
+        update :update do
+          primary?(true)
+          accept([:title, :start_time, :notes])
         end
       end
 
@@ -271,6 +276,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         integer_primary_key(:id)
         attribute(:title, :string, allow_nil?: false, public?: true)
         attribute(:start_time, :utc_datetime, allow_nil?: false, public?: true)
+        attribute(:notes, :string, public?: true)
       end
 
       calculations do
@@ -657,6 +663,144 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       end
     end
 
+    defmodule CiParent do
+      use Ash.Resource,
+        domain: Xitdb.Ash.DataLayerTest.TestDomain,
+        data_layer: Xitdb.Ash.DataLayer
+
+      xitdb do
+        store TestMdmStore
+        collection :ci_parents
+      end
+
+      actions do
+        defaults([:read, :destroy])
+
+        create :create do
+          primary?(true)
+          accept([:domain_key, :amount_key])
+        end
+
+        update :update_with_failing_after_action do
+          primary?(true)
+          accept([:domain_key])
+          require_atomic?(false)
+
+          change(fn changeset, _ctx ->
+            Ash.Changeset.after_action(changeset, fn _cs, _rec ->
+              {:error, "boom after_action"}
+            end)
+          end)
+        end
+      end
+
+      attributes do
+        integer_primary_key(:id)
+        attribute(:domain_key, :ci_string, allow_nil?: false, public?: true)
+        attribute(:amount_key, :decimal, public?: true)
+      end
+
+      relationships do
+        has_many(:children, Xitdb.Ash.DataLayerTest.CiChild,
+          source_attribute: :domain_key,
+          destination_attribute: :parent_domain_key
+        )
+
+        has_many(:decimal_children, Xitdb.Ash.DataLayerTest.CiChild,
+          source_attribute: :amount_key,
+          destination_attribute: :parent_amount_key
+        )
+      end
+
+      aggregates do
+        count(:unique_child_emails, :children, field: :tag, uniq?: true, public?: true)
+
+        count(:unique_child_amounts, :children,
+          field: :parent_amount_key,
+          uniq?: true,
+          public?: true
+        )
+      end
+    end
+
+    defmodule CiChild do
+      use Ash.Resource,
+        domain: Xitdb.Ash.DataLayerTest.TestDomain,
+        data_layer: Xitdb.Ash.DataLayer
+
+      xitdb do
+        store TestMdmStore
+        collection :ci_children
+        index :parent_domain_key
+        index :parent_amount_key
+      end
+
+      actions do
+        defaults([:read, :destroy])
+
+        create :create do
+          primary?(true)
+          accept([:parent_domain_key, :parent_amount_key, :tag])
+        end
+      end
+
+      attributes do
+        integer_primary_key(:id)
+        attribute(:parent_domain_key, :ci_string, allow_nil?: false, public?: true)
+        attribute(:parent_amount_key, :decimal, public?: true)
+        attribute(:tag, :ci_string, public?: true)
+      end
+
+      defmodule TagUpperCalc do
+        use Ash.Resource.Calculation
+
+        @impl true
+        def calculate(records, _opts, _context) do
+          Enum.map(records, fn r -> String.upcase(to_string(r.tag)) end)
+        end
+      end
+
+      calculations do
+        calculate(:tag_upper, :string, TagUpperCalc, public?: true)
+      end
+    end
+
+    defmodule CiTenantItem do
+      use Ash.Resource,
+        domain: Xitdb.Ash.DataLayerTest.TestDomain,
+        data_layer: Xitdb.Ash.DataLayer
+
+      xitdb do
+        store TestMdmStore
+        collection :ci_tenant_items
+      end
+
+      multitenancy do
+        strategy(:attribute)
+        attribute(:tenant_slug)
+      end
+
+      actions do
+        defaults([:read, :destroy])
+
+        create :create do
+          primary?(true)
+          accept([:label, :tenant_slug])
+        end
+
+        update :update do
+          primary?(true)
+          accept([:label])
+        end
+      end
+
+      attributes do
+        integer_primary_key(:id)
+        attribute(:tenant_slug, :ci_string, allow_nil?: false, public?: true)
+        attribute(:label, :string, allow_nil?: false, public?: true)
+      end
+    end
+
     defmodule TestDomain do
       use Ash.Domain, validate_config_inclusion?: false
 
@@ -716,6 +860,10 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           define(:create_tenant_doc, action: :create)
           define(:list_tenant_docs, action: :read)
         end
+
+        resource(CiParent)
+        resource(CiChild)
+        resource(CiTenantItem)
 
         resource Deal do
           define(:create_deal, action: :create)
@@ -1389,6 +1537,55 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         assert TestDomain.list_sessions!(authorize?: false) == []
         assert Xitdb.Ash.Search.ids(AgendaSession, "helios") == []
       end
+
+      test "updating a parent resource preserves its nested_in children and removes nilified attributes" do
+        organizer =
+          TestDomain.create_user!(%{email: unique_email("parent_upd_org")}, authorize?: false)
+
+        ev =
+          TestDomain.create_event!(
+            %{
+              title: "Original Summit",
+              start_time: ~U[2026-11-01 09:00:00Z],
+              notes: "Initial notes"
+            },
+            authorize?: false
+          )
+
+        session =
+          TestDomain.create_session!(
+            %{event_id: ev.id, title: "Preserved Session", room: "Cedar"},
+            authorize?: false
+          )
+
+        conf =
+          TestDomain.create_conference!(
+            %{event_id: ev.id, organizer_id: organizer.id, title: "Preserved Conf"},
+            authorize?: false
+          )
+
+        updated_ev =
+          ev
+          |> Ash.Changeset.for_update(:update, %{title: "Renamed Summit", notes: nil})
+          |> Ash.update!(authorize?: false)
+
+        assert updated_ev.title == "Renamed Summit"
+        assert is_nil(updated_ev.notes)
+
+        root = Xitdb.Ash.Store.root(TestMdmStore)
+        assert root["events"][to_string(ev.id)]["title"] == "Renamed Summit"
+        assert root["events"][to_string(ev.id)]["notes"] == nil
+
+        assert root["events"][to_string(ev.id)]["sessions"][to_string(session.id)]["title"] ==
+                 "Preserved Session"
+
+        assert root["events"][to_string(ev.id)]["conference"]["title"] == "Preserved Conf"
+
+        assert TestDomain.get_session!(session.id, authorize?: false).title ==
+                 "Preserved Session"
+
+        assert TestDomain.get_conference_by_event_id!(ev.id, authorize?: false).id == conf.id
+      end
     end
 
     describe "TestSandbox `$callers` isolation & VerifyNoSqlFragments verifier" do
@@ -1555,6 +1752,143 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         # Outside `with_as_of`, reads return to the latest state
         assert length(TestDomain.list_orgs!(authorize?: false)) == 2
         assert TestDomain.get_session!(session.id, authorize?: false).title == "Solar Closing"
+      end
+    end
+
+    describe "second-pass integrity, query-engine, and atomicity fixes" do
+      test "joins and uniq?: true aggregates normalize :ci_string casing and :decimal scale" do
+        parent =
+          CiParent
+          |> Ash.Changeset.for_create(:create, %{
+            domain_key: "Polar.CA",
+            amount_key: Decimal.new("10.0")
+          })
+          |> Ash.create!(authorize?: false)
+
+        _c1 =
+          CiChild
+          |> Ash.Changeset.for_create(:create, %{
+            parent_domain_key: "polar.ca",
+            parent_amount_key: Decimal.new("10.00"),
+            tag: "Alice@Polar.ca"
+          })
+          |> Ash.create!(authorize?: false)
+
+        _c2 =
+          CiChild
+          |> Ash.Changeset.for_create(:create, %{
+            parent_domain_key: "POLAR.CA",
+            parent_amount_key: Decimal.new("10.000"),
+            tag: "alice@polar.ca"
+          })
+          |> Ash.create!(authorize?: false)
+
+        loaded =
+          Ash.load!(
+            parent,
+            [:children, :decimal_children, :unique_child_emails, :unique_child_amounts],
+            authorize?: false
+          )
+
+        assert length(loaded.children) == 2
+        assert length(loaded.decimal_children) == 2
+        assert loaded.unique_child_emails == 1
+        assert loaded.unique_child_amounts == 1
+      end
+
+      test "join_filter matching on relationship aggregates survives calculation hydration" do
+        require Ash.Query
+
+        parent =
+          CiParent
+          |> Ash.Changeset.for_create(:create, %{domain_key: "joinfilter.ca"})
+          |> Ash.create!(authorize?: false)
+
+        _c1 =
+          CiChild
+          |> Ash.Changeset.for_create(:create, %{
+            parent_domain_key: "joinfilter.ca",
+            tag: "keep"
+          })
+          |> Ash.create!(authorize?: false)
+
+        _c2 =
+          CiChild
+          |> Ash.Changeset.for_create(:create, %{
+            parent_domain_key: "joinfilter.ca",
+            tag: "drop"
+          })
+          |> Ash.create!(authorize?: false)
+
+        # Evaluate a join_filter that uses a calculation on CiChild (which hydrates :tag_upper)
+        join_filter = Ash.Filter.parse!(CiChild, tag_upper: "KEEP")
+
+        agg = %Ash.Query.Aggregate{
+          name: :kept_children,
+          relationship_path: [:children],
+          kind: :count,
+          resource: CiChild,
+          query: %Ash.Query{filter: nil, sort: nil},
+          join_filters: %{[:children] => join_filter}
+        }
+
+        {:ok, [enriched]} =
+          Xitdb.Ash.Query.execute(
+            Xitdb.Ash.Store.root(TestMdmStore),
+            %Xitdb.Ash.Query{
+              resource: CiParent,
+              domain: TestDomain,
+              filter: Ash.Filter.parse!(CiParent, id: parent.id),
+              aggregates: [agg]
+            },
+            CiParent
+          )
+
+        assert enriched.aggregates[:kept_children] == 1
+      end
+
+      test "Mutator enforces global?: false and case-insensitive :ci_string attribute multitenancy" do
+        item =
+          CiTenantItem
+          |> Ash.Changeset.for_create(:create, %{label: "initial", tenant_slug: "Polar.CA"},
+            tenant: "Polar.CA"
+          )
+          |> Ash.create!(authorize?: false)
+
+        # nil tenant must fail when global?: false
+        item_no_tenant_meta = put_in(item.__metadata__[:tenant], nil)
+
+        assert {:error, _} =
+                 item_no_tenant_meta
+                 |> Ash.Changeset.for_update(:update, %{label: "hacked"}, tenant: nil)
+                 |> Ash.update(authorize?: false)
+
+        # Different casing binary tenant must match :ci_string tenant_slug
+        updated =
+          item_no_tenant_meta
+          |> Ash.Changeset.for_update(:update, %{label: "updated"}, tenant: "polar.ca")
+          |> Ash.update!(authorize?: false)
+
+        assert updated.label == "updated"
+      end
+
+      test "prefer_transaction?/1 is true and rolls back primary write when after_action fails" do
+        assert Xitdb.Ash.DataLayer.prefer_transaction?(CiParent) == true
+
+        parent =
+          CiParent
+          |> Ash.Changeset.for_create(:create, %{domain_key: "atomic.ca"})
+          |> Ash.create!(authorize?: false)
+
+        assert {:error, _} =
+                 parent
+                 |> Ash.Changeset.for_update(:update_with_failing_after_action, %{
+                   domain_key: "rolled_back.ca"
+                 })
+                 |> Ash.update(authorize?: false)
+
+        reloaded = Ash.get!(CiParent, parent.id, authorize?: false)
+        assert to_string(reloaded.domain_key) == "atomic.ca"
       end
     end
   end

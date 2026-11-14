@@ -185,8 +185,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       cursor_root = Xitdb.as_of(db, moment)
       tenant = changeset.tenant
 
-      with {:ok, base_record} <- Ash.Changeset.apply_attributes(changeset),
-           {:ok, after_atomics} <- apply_create_atomics(base_record, resource, changeset),
+      with {:ok, after_atomics} <- apply_create_record(resource, changeset),
            {:ok, record_with_pk, seq_ops, _seq_map} <-
              Sequences.plan_pk(cursor_root, resource, after_atomics, tenant, %{}),
            :ok <- verify_pk_unused(cursor_root, resource, record_with_pk, tenant, MapSet.new()),
@@ -218,8 +217,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
             tenant = cs.tenant
             scoped_col = Codec.scoped_collection(resource, tenant)
 
-            with {:ok, base_record} <- Ash.Changeset.apply_attributes(cs),
-                 {:ok, after_atomics} <- apply_create_atomics(base_record, resource, cs),
+            with {:ok, after_atomics} <- apply_create_record(resource, cs),
                  {:ok, record_with_pk, seq_ops, next_seq_state} <-
                    Sequences.plan_pk(cursor_root, resource, after_atomics, tenant, seq_state),
                  :ok <- verify_pk_unused(cursor_root, resource, record_with_pk, tenant, seen_pks),
@@ -330,7 +328,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
                        tenant
                      ),
                    {:ok, next_snapshot} <- commit_ops({db, moment}, seq_ops ++ index_ops) do
-                {:ok, next_snapshot, retain_changeset_data_fields(synced_with_seq, changeset)}
+                {:ok, next_snapshot, synced_with_seq}
               end
 
             :filtered_out ->
@@ -353,7 +351,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       cursor_root = Xitdb.as_of(db, moment)
       tenant = changeset.tenant
 
-      with {:ok, candidate_record} <- Ash.Changeset.apply_attributes(changeset) do
+      with {:ok, candidate_record} <- apply_create_record(resource, changeset) do
         case find_upsert_target(cursor_root, resource, candidate_record, keys, identity, tenant) do
           :none ->
             case create_in_snapshot(snapshot, resource, changeset) do
@@ -434,81 +432,115 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       end
     end
 
-    defp apply_bulk_updates(initial_snapshot, candidates, resource, %Ash.Changeset{} = changeset) do
+    defp apply_bulk_updates(
+           {db, moment} = initial_snapshot,
+           candidates,
+           resource,
+           %Ash.Changeset{} = changeset
+         ) do
       tenant = changeset.tenant
+      cursor_root = Xitdb.as_of(db, moment)
 
       candidates
-      |> Enum.reduce_while({:ok, initial_snapshot, []}, fn current_record,
-                                                           {:ok, {acc_db, acc_moment} = snap,
-                                                            acc_records} ->
+      |> Enum.reduce_while({:ok, [], %{}, []}, fn current_record,
+                                                  {:ok, ops_chunks, batch_state, acc_records} ->
         case build_updated_record(current_record, resource, changeset, :all_non_upsert) do
           {:ok, updated_record} ->
-            cursor_root = Xitdb.as_of(acc_db, acc_moment)
             final_record = finalize_loaded_record(resource, updated_record, tenant)
 
-            with {:ok, index_ops} <-
-                   Indexer.plan_put_ops(
-                     cursor_root,
-                     resource,
-                     current_record,
-                     final_record,
-                     tenant
-                   ),
-                 {:ok, next_snap} <- commit_ops(snap, index_ops) do
-              tagged =
-                Ash.Actions.Helpers.Bulk.put_metadata(
-                  final_record,
-                  %Ash.Changeset{changeset | data: current_record}
-                )
+            case Indexer.plan_put_ops_batched(
+                   cursor_root,
+                   resource,
+                   current_record,
+                   final_record,
+                   tenant,
+                   batch_state
+                 ) do
+              {:ok, index_ops, next_batch} ->
+                tagged =
+                  Ash.Actions.Helpers.Bulk.put_metadata(
+                    final_record,
+                    %Ash.Changeset{changeset | data: current_record}
+                  )
 
-              {:cont, {:ok, next_snap, [tagged | acc_records]}}
-            else
+                {:cont, {:ok, [index_ops | ops_chunks], next_batch, [tagged | acc_records]}}
+
               {:error, _} = err ->
                 {:halt, err}
             end
 
           :filtered_out ->
-            {:cont, {:ok, snap, acc_records}}
+            {:cont, {:ok, ops_chunks, batch_state, acc_records}}
 
           {:error, _} = err ->
             {:halt, err}
         end
       end)
       |> case do
-        {:ok, final_snap, rev_records} -> {:ok, final_snap, Enum.reverse(rev_records)}
-        {:error, _} = err -> err
+        {:ok, ops_chunks, _batch_state, rev_records} ->
+          all_ops = ops_chunks |> Enum.reverse() |> List.flatten()
+
+          with {:ok, final_snap} <- commit_ops(initial_snapshot, all_ops) do
+            {:ok, final_snap, Enum.reverse(rev_records)}
+          end
+
+        {:error, _} = err ->
+          err
       end
     end
 
-    defp apply_bulk_destroys(initial_snapshot, candidates, resource, %Ash.Changeset{} = changeset) do
+    defp apply_bulk_destroys(
+           {db, moment} = initial_snapshot,
+           candidates,
+           resource,
+           %Ash.Changeset{} = changeset
+         ) do
       tenant = changeset.tenant
+      cursor_root = Xitdb.as_of(db, moment)
 
       candidates
-      |> Enum.reduce_while({:ok, initial_snapshot, []}, fn current_record,
-                                                           {:ok, snap, acc_records} ->
-        with :ok <- verify_changeset_filter(current_record, changeset, nil),
-             :ok <-
-               verify_atomic_validations(current_record, current_record, resource, changeset),
-             {:ok, next_snap} <-
-               cascade_and_delete(snap, resource, current_record, tenant, MapSet.new()) do
-          tagged =
-            Ash.Actions.Helpers.Bulk.put_metadata(
-              current_record,
-              %Ash.Changeset{changeset | data: current_record}
-            )
+      |> Enum.reduce_while(
+        {:ok, [], MapSet.new(), %{}, []},
+        fn current_record, {:ok, ops_chunks, visited, batch_state, acc_records} ->
+          with :ok <- verify_changeset_filter(current_record, changeset, nil),
+               :ok <-
+                 verify_atomic_validations(current_record, current_record, resource, changeset),
+               {:ok, del_ops, next_visited, next_batch} <-
+                 stage_cascade_delete(
+                   cursor_root,
+                   resource,
+                   current_record,
+                   tenant,
+                   visited,
+                   batch_state
+                 ) do
+            tagged =
+              Ash.Actions.Helpers.Bulk.put_metadata(
+                current_record,
+                %Ash.Changeset{changeset | data: current_record}
+              )
 
-          {:cont, {:ok, next_snap, [tagged | acc_records]}}
-        else
-          :filtered_out ->
-            {:cont, {:ok, snap, acc_records}}
+            {:cont,
+             {:ok, [del_ops | ops_chunks], next_visited, next_batch, [tagged | acc_records]}}
+          else
+            :filtered_out ->
+              {:cont, {:ok, ops_chunks, visited, batch_state, acc_records}}
 
-          {:error, _} = err ->
-            {:halt, err}
+            {:error, _} = err ->
+              {:halt, err}
+          end
         end
-      end)
+      )
       |> case do
-        {:ok, final_snap, rev_records} -> {:ok, final_snap, Enum.reverse(rev_records)}
-        {:error, _} = err -> err
+        {:ok, ops_chunks, _visited, _batch_state, rev_records} ->
+          all_ops = ops_chunks |> Enum.reverse() |> List.flatten()
+
+          with {:ok, final_snap} <- commit_ops(initial_snapshot, all_ops) do
+            {:ok, final_snap, Enum.reverse(rev_records)}
+          end
+
+        {:error, _} = err ->
+          err
       end
     end
 
@@ -667,6 +699,50 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         {:ok, [_matched]} -> :ok
         {:ok, []} -> :filtered_out
         {:error, _} = err -> err
+      end
+    end
+
+    defp apply_create_record(_resource, %Ash.Changeset{create_atomics: []} = changeset) do
+      Ash.Changeset.apply_attributes(changeset)
+    end
+
+    defp apply_create_record(resource, %Ash.Changeset{create_atomics: create_atomics} = changeset) do
+      atomic_fields = MapSet.new(create_atomics, fn {field, _expr} -> field end)
+
+      non_resolved_errors =
+        Enum.reject(changeset.errors, fn
+          %Ash.Error.Changes.Required{field: field, type: :attribute} ->
+            MapSet.member?(atomic_fields, field)
+
+          _ ->
+            false
+        end)
+
+      if non_resolved_errors != [] do
+        {:error, Ash.Error.to_error_class(non_resolved_errors, changeset: changeset)}
+      else
+        with {:ok, base_record} <- Ash.Changeset.apply_attributes(changeset, force?: true),
+             {:ok, after_atomics} <- apply_create_atomics(base_record, resource, changeset),
+             :ok <- validate_required_after_atomics(resource, after_atomics) do
+          {:ok, after_atomics}
+        end
+      end
+    end
+
+    defp validate_required_after_atomics(resource, record) do
+      missing =
+        resource
+        |> Ash.Resource.Info.attributes()
+        |> Enum.find(fn attr ->
+          attr.allow_nil? == false and not attr.generated? and is_nil(Map.get(record, attr.name))
+        end)
+
+      case missing do
+        nil ->
+          :ok
+
+        attr ->
+          {:error, Ash.Error.Changes.Required.exception(field: attr.name, type: :attribute)}
       end
     end
 
@@ -1098,56 +1174,98 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     # -- Same-Store Reverse FK `on_delete` Enforcement --
 
     defp cascade_and_delete({db, moment} = snapshot, resource, record, tenant, visited) do
+      cursor_root = Xitdb.as_of(db, moment)
+
+      with {:ok, ops, _next_visited, _next_batch} <-
+             stage_cascade_delete(cursor_root, resource, record, tenant, visited, %{}) do
+        commit_ops(snapshot, ops)
+      end
+    end
+
+    defp stage_cascade_delete(cursor_root, resource, record, tenant, visited, batch_state) do
       [pk_name | _] = Ash.Resource.Info.primary_key(resource)
       pk_attr = Ash.Resource.Info.attribute(resource, pk_name)
       pk_val = Map.fetch!(record, pk_name)
       visit_key = {resource, Codec.encode_pk_doc_id(pk_attr, pk_val)}
 
       if MapSet.member?(visited, visit_key) do
-        {:ok, snapshot}
+        {:ok, [], visited, batch_state}
       else
         next_visited = MapSet.put(visited, visit_key)
         store = Info.store!(resource)
         rules = Store.reverse_fks(store, resource)
 
-        with {:ok, {after_db, after_moment} = snap_after_fks} <-
-               apply_reverse_fk_rules({db, moment}, rules, record, tenant, next_visited),
-             cursor_root = Xitdb.as_of(after_db, after_moment),
-             {:ok, del_ops} <- Indexer.plan_delete_ops(cursor_root, resource, record, tenant) do
-          commit_ops(snap_after_fks, del_ops)
+        with {:ok, fk_ops, visited_after_fks, batch_after_fks} <-
+               stage_reverse_fk_rules(
+                 cursor_root,
+                 rules,
+                 record,
+                 tenant,
+                 next_visited,
+                 batch_state
+               ),
+             {:ok, del_ops, final_batch} <-
+               Indexer.plan_delete_ops_batched(
+                 cursor_root,
+                 resource,
+                 record,
+                 tenant,
+                 batch_after_fks
+               ) do
+          {:ok, fk_ops ++ del_ops, visited_after_fks, final_batch}
         end
       end
     end
 
-    defp apply_reverse_fk_rules(snapshot, [], _record, _tenant, _visited), do: {:ok, snapshot}
+    defp stage_reverse_fk_rules(_cursor_root, [], _record, _tenant, visited, batch_state) do
+      {:ok, [], visited, batch_state}
+    end
 
-    defp apply_reverse_fk_rules(snapshot, rules, parent_record, tenant, visited) do
-      Enum.reduce_while(rules, {:ok, snapshot}, fn rule, {:ok, acc_snap} ->
+    defp stage_reverse_fk_rules(cursor_root, rules, parent_record, tenant, visited, batch_state) do
+      Enum.reduce_while(rules, {:ok, [], visited, batch_state}, fn rule,
+                                                                   {:ok, ops_acc, vis_acc, b_acc} ->
         dest_val = Map.get(parent_record, rule.destination_attribute)
 
         if is_nil(dest_val) do
-          {:cont, {:ok, acc_snap}}
+          {:cont, {:ok, ops_acc, vis_acc, b_acc}}
         else
-          case apply_single_fk_rule(acc_snap, rule, dest_val, tenant, visited) do
-            {:ok, updated_snap} -> {:cont, {:ok, updated_snap}}
-            {:error, _} = err -> {:halt, err}
+          case stage_single_fk_rule(cursor_root, rule, dest_val, tenant, vis_acc, b_acc) do
+            {:ok, rule_ops, next_vis, next_b} ->
+              {:cont, {:ok, [rule_ops | ops_acc], next_vis, next_b}}
+
+            {:error, _} = err ->
+              {:halt, err}
           end
         end
       end)
+      |> case do
+        {:ok, ops_chunks, final_vis, final_b} ->
+          {:ok, ops_chunks |> Enum.reverse() |> List.flatten(), final_vis, final_b}
+
+        {:error, _} = err ->
+          err
+      end
     end
 
-    defp apply_single_fk_rule(snapshot, %{on_delete: :nothing}, _dest_val, _tenant, _visited) do
-      {:ok, snapshot}
+    defp stage_single_fk_rule(
+           _cursor_root,
+           %{on_delete: :nothing},
+           _dest_val,
+           _tenant,
+           visited,
+           batch_state
+         ) do
+      {:ok, [], visited, batch_state}
     end
 
-    defp apply_single_fk_rule(
-           {db, moment} = snapshot,
+    defp stage_single_fk_rule(
+           cursor_root,
            %{on_delete: :restrict} = rule,
            dest_val,
            tenant,
-           _visited
+           visited,
+           batch_state
          ) do
-      cursor_root = Xitdb.as_of(db, moment)
       child_count = count_referencing_children(cursor_root, rule, dest_val, tenant)
 
       if child_count > 0 do
@@ -1157,51 +1275,82 @@ if Code.ensure_loaded?(Ash.DataLayer) do
            message: "cannot be destroyed while referenced by #{inspect(rule.source_collection)}"
          )}
       else
-        {:ok, snapshot}
+        {:ok, [], visited, batch_state}
       end
     end
 
-    defp apply_single_fk_rule(
-           {db, moment} = snapshot,
+    defp stage_single_fk_rule(
+           cursor_root,
            %{on_delete: :nilify} = rule,
            dest_val,
            tenant,
-           _visited
+           visited,
+           batch_state
          ) do
-      cursor_root = Xitdb.as_of(db, moment)
       children = load_referencing_children(cursor_root, rule, dest_val, tenant)
 
-      Enum.reduce_while(children, {:ok, snapshot}, fn child,
-                                                      {:ok, {cur_db, cur_moment} = cur_snap} ->
+      Enum.reduce_while(children, {:ok, [], batch_state}, fn child, {:ok, ops_acc, b_acc} ->
         nilified = Map.put(child, rule.source_attribute, nil)
-        cur_root = Xitdb.as_of(cur_db, cur_moment)
 
-        with {:ok, ops} <-
-               Indexer.plan_put_ops(cur_root, rule.source_resource, child, nilified, tenant),
-             {:ok, next_snap} <- commit_ops(cur_snap, ops) do
-          {:cont, {:ok, next_snap}}
-        else
-          {:error, _} = err -> {:halt, err}
+        case Indexer.plan_put_ops_batched(
+               cursor_root,
+               rule.source_resource,
+               child,
+               nilified,
+               tenant,
+               b_acc
+             ) do
+          {:ok, ops, next_b} ->
+            {:cont, {:ok, [ops | ops_acc], next_b}}
+
+          {:error, _} = err ->
+            {:halt, err}
         end
       end)
+      |> case do
+        {:ok, ops_chunks, final_b} ->
+          {:ok, ops_chunks |> Enum.reverse() |> List.flatten(), visited, final_b}
+
+        {:error, _} = err ->
+          err
+      end
     end
 
-    defp apply_single_fk_rule(
-           {db, moment} = snapshot,
+    defp stage_single_fk_rule(
+           cursor_root,
            %{on_delete: :delete} = rule,
            dest_val,
            tenant,
-           visited
+           visited,
+           batch_state
          ) do
-      cursor_root = Xitdb.as_of(db, moment)
       children = load_referencing_children(cursor_root, rule, dest_val, tenant)
 
-      Enum.reduce_while(children, {:ok, snapshot}, fn child, {:ok, cur_snap} ->
-        case cascade_and_delete(cur_snap, rule.source_resource, child, tenant, visited) do
-          {:ok, next_snap} -> {:cont, {:ok, next_snap}}
-          {:error, _} = err -> {:halt, err}
+      Enum.reduce_while(children, {:ok, [], visited, batch_state}, fn child,
+                                                                      {:ok, ops_acc, vis_acc,
+                                                                       b_acc} ->
+        case stage_cascade_delete(
+               cursor_root,
+               rule.source_resource,
+               child,
+               tenant,
+               vis_acc,
+               b_acc
+             ) do
+          {:ok, ops, next_vis, next_b} ->
+            {:cont, {:ok, [ops | ops_acc], next_vis, next_b}}
+
+          {:error, _} = err ->
+            {:halt, err}
         end
       end)
+      |> case do
+        {:ok, ops_chunks, final_vis, final_b} ->
+          {:ok, ops_chunks |> Enum.reverse() |> List.flatten(), final_vis, final_b}
+
+        {:error, _} = err ->
+          err
+      end
     end
 
     defp count_referencing_children(
@@ -1305,22 +1454,11 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         {:ok, cursor} ->
           case Codec.from_cursor(resource, cursor, tenant) do
             {:ok, record} ->
-              if matches_tenant?(resource, record, tenant), do: {:ok, record}, else: :none
+              if Codec.matches_tenant?(resource, record, tenant), do: {:ok, record}, else: :none
 
             {:error, _} ->
               :none
           end
-      end
-    end
-
-    defp matches_tenant?(_resource, _record, nil), do: true
-
-    defp matches_tenant?(resource, record, tenant) do
-      if Ash.Resource.Info.multitenancy_strategy(resource) == :attribute do
-        tenant_attr = Ash.Resource.Info.multitenancy_attribute(resource)
-        Map.get(record, tenant_attr) == tenant
-      else
-        true
       end
     end
 
@@ -1367,18 +1505,6 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         Map.put(acc, rel.name, Map.get(empty, rel.name))
       end)
     end
-
-    defp retain_changeset_data_fields(record, %Ash.Changeset{data: %struct_mod{} = data}) do
-      if struct_mod == record.__struct__ do
-        attr_names = Enum.map(Ash.Resource.Info.attributes(struct_mod), & &1.name)
-        take = [:__metadata__, :__meta__ | attr_names]
-        Map.merge(data, Map.take(record, take))
-      else
-        record
-      end
-    end
-
-    defp retain_changeset_data_fields(record, _changeset), do: record
 
     defp attach_bulk_metadata(record, %Ash.Changeset{} = cs, fallback_idx) do
       case get_in(cs.context, [:bulk_create]) do

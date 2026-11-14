@@ -65,10 +65,18 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
       with {:ok, cursor_map} <- Codec.to_cursor_map(resource, new_record),
            {:ok, identity_ops} <-
-             plan_identity_ops(db_or_cursor, resource, old_record, new_record, tenant),
+             plan_identity_ops(
+               db_or_cursor,
+               resource,
+               old_record,
+               new_record,
+               tenant,
+               batch_state
+             ),
            {:ok, locator_plan} <-
              plan_entity_location(db_or_cursor, resource, old_record, new_record, tenant) do
         secondary_ops = plan_secondary_ops(resource, old_record, new_record)
+        removed_fields = removed_attribute_fields(resource, old_record, cursor_map)
 
         {entity_and_idx_ops, batch_after_idx} =
           Storage.compile_put_ops(
@@ -78,7 +86,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
             locator_plan,
             identity_ops,
             secondary_ops,
-            batch_state
+            batch_state,
+            removed_fields
           )
 
         {search_ops, batch_after_search} =
@@ -109,28 +118,37 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       pk_attr = pk_attribute(resource)
       pk_val = Map.fetch!(record, pk_attr.name)
       doc_id = Codec.encode_pk_doc_id(pk_attr, pk_val)
+      deleted_key = {:deleted_doc, collection, doc_id}
 
-      {child_ops, batch_after_children} =
-        plan_purge_nested_children_ops(db_or_cursor, resource, pk_val, tenant, batch_state)
+      if Map.has_key?(batch_state, deleted_key) do
+        {:ok, [], batch_state}
+      else
+        batch_state = Map.put(batch_state, deleted_key, true)
 
-      {:ok, identity_ops} = plan_identity_ops(db_or_cursor, resource, record, nil, tenant)
-      secondary_ops = plan_secondary_ops(resource, record, nil)
-      delete_location = build_delete_location(resource, record, pk_attr, pk_val, doc_id, tenant)
+        {child_ops, batch_after_children} =
+          plan_purge_nested_children_ops(db_or_cursor, resource, pk_val, tenant, batch_state)
 
-      {own_delete_ops, batch_after_idx} =
-        Storage.compile_delete_ops(
-          db_or_cursor,
-          collection,
-          delete_location,
-          identity_ops,
-          secondary_ops,
-          batch_after_children
-        )
+        {:ok, identity_ops} =
+          plan_identity_ops(db_or_cursor, resource, record, nil, tenant, batch_after_children)
 
-      {search_ops, batch_after_search} =
-        plan_search_ops(db_or_cursor, resource, collection, nil, doc_id, batch_after_idx)
+        secondary_ops = plan_secondary_ops(resource, record, nil)
+        delete_location = build_delete_location(resource, record, pk_attr, pk_val, doc_id, tenant)
 
-      {:ok, child_ops ++ own_delete_ops ++ search_ops, batch_after_search}
+        {own_delete_ops, batch_after_idx} =
+          Storage.compile_delete_ops(
+            db_or_cursor,
+            collection,
+            delete_location,
+            identity_ops,
+            secondary_ops,
+            batch_after_children
+          )
+
+        {search_ops, batch_after_search} =
+          plan_search_ops(db_or_cursor, resource, collection, nil, doc_id, batch_after_idx)
+
+        {:ok, child_ops ++ own_delete_ops ++ search_ops, batch_after_search}
+      end
     end
 
     @doc """
@@ -667,7 +685,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       end
     end
 
-    defp plan_identity_ops(db_or_cursor, resource, old_record, new_record, tenant) do
+    defp plan_identity_ops(db_or_cursor, resource, old_record, new_record, tenant, batch_state) do
       collection = Codec.scoped_collection(resource, tenant)
       pk_attr = pk_attribute(resource)
 
@@ -693,7 +711,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
                slot,
                new_key,
                current_doc_id,
-               identity
+               identity,
+               batch_state
              ) do
           :ok ->
             ops = diff_unique_keys(slot, old_key, new_key, current_doc_id)
@@ -732,7 +751,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       end
     end
 
-    defp check_identity_collision(_db, _collection, _slot, nil, _doc_id, _identity), do: :ok
+    defp check_identity_collision(_db, _collection, _slot, nil, _doc_id, _identity, _batch_state),
+      do: :ok
 
     defp check_identity_collision(
            db_or_cursor,
@@ -740,9 +760,17 @@ if Code.ensure_loaded?(Ash.DataLayer) do
            slot,
            new_key,
            current_doc_id,
-           identity
+           identity,
+           batch_state
          ) do
-      case Storage.lookup_unique(db_or_cursor, collection, slot, new_key) do
+      lookup_res =
+        case Map.fetch(batch_state, {:unique_slot, collection, slot, new_key}) do
+          {:ok, :deleted} -> :none
+          {:ok, doc_id} -> {:ok, doc_id}
+          :error -> Storage.lookup_unique(db_or_cursor, collection, slot, new_key)
+        end
+
+      case lookup_res do
         :none ->
           :ok
 
@@ -788,6 +816,22 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         new_key = encode_record_index_key(attrs, fields, new_record)
 
         diff_set_keys(slot, old_key, new_key, doc_id)
+      end)
+    end
+
+    defp removed_attribute_fields(_resource, nil, _cursor_map), do: []
+
+    defp removed_attribute_fields(resource, old_record, cursor_map) do
+      resource
+      |> Ash.Resource.Info.attributes()
+      |> Enum.reduce([], fn %{name: name}, acc ->
+        field_str = Atom.to_string(name)
+
+        if Map.get(old_record, name) != nil and not Map.has_key?(cursor_map, field_str) do
+          [field_str | acc]
+        else
+          acc
+        end
       end)
     end
 
@@ -1118,18 +1162,20 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           []
 
         %Xitdb.Cursor{} = btree ->
-          case Xitdb.NIF.nif_slot_count(btree.db_ref, btree.tag_id, btree.value) do
-            {:ok, total_count} when total_count > 0 ->
-              start_idx = find_btree_start_index(btree, start_hex, 0, total_count)
-              stream_btree_entries(btree, start_idx)
-
-            _ ->
-              []
-          end
+          stream_btree_from_key(btree, start_hex)
       end
     end
 
-    @spec compile_put_ops(term(), String.t(), map(), tuple(), [tuple()], [tuple()], map()) ::
+    @spec compile_put_ops(
+            term(),
+            String.t(),
+            map(),
+            tuple(),
+            [tuple()],
+            [tuple()],
+            map(),
+            [String.t()]
+          ) ::
             {[tuple()], map()}
     def compile_put_ops(
           db_or_cursor,
@@ -1138,10 +1184,18 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           locator_plan,
           identity_ops,
           secondary_ops,
-          batch_state \\ %{}
+          batch_state \\ %{},
+          removed_fields \\ []
         ) do
       {entity_ops, b1} =
-        compile_write_entity_ops(db_or_cursor, collection, cursor_map, locator_plan, batch_state)
+        compile_write_entity_ops(
+          db_or_cursor,
+          collection,
+          cursor_map,
+          locator_plan,
+          batch_state,
+          removed_fields
+        )
 
       {unique_ops, b2} = compile_unique_ops(db_or_cursor, collection, identity_ops, b1)
       {set_ops, b3} = compile_set_ops(db_or_cursor, collection, secondary_ops, b2)
@@ -1299,13 +1353,14 @@ if Code.ensure_loaded?(Ash.DataLayer) do
            collection,
            cursor_map,
            {:top_level, doc_id},
-           batch_state
+           batch_state,
+           removed_fields
          ) do
       prefix =
         TxCompiler.format_step(:hash_map, collection) <>
           TxCompiler.format_step(:hash_map, doc_id)
 
-      {TxCompiler.compile_node(prefix, cursor_map, true), batch_state}
+      {compile_entity_map_ops(prefix, cursor_map, removed_fields), batch_state}
     end
 
     defp compile_write_entity_ops(
@@ -1313,7 +1368,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
            collection,
            cursor_map,
            {:nested, plan},
-           batch_state
+           batch_state,
+           removed_fields
          ) do
       %{
         parent_collection: parent_col,
@@ -1350,7 +1406,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           :many -> parent_prefix <> TxCompiler.format_step(:hash_map, doc_id)
         end
 
-      write_ops = TxCompiler.compile_node(target_prefix, cursor_map, true)
+      write_ops = compile_entity_map_ops(target_prefix, cursor_map, removed_fields)
 
       {parent_locator_ops, next_batch} =
         compile_unique_ops(
@@ -1361,6 +1417,27 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         )
 
       {reparent_rm_ops ++ write_ops ++ parent_locator_ops, next_batch}
+    end
+
+    defp compile_entity_map_ops(prefix, cursor_map, removed_fields) do
+      init_op = {:init_col, prefix, "hash_map"}
+
+      put_ops =
+        :maps.fold(
+          fn k, v, acc ->
+            TxCompiler.compile_node(prefix <> TxCompiler.format_step(:hash_map, k), v, true) ++
+              acc
+          end,
+          [],
+          cursor_map
+        )
+
+      rm_ops =
+        Enum.map(removed_fields, fn field_str ->
+          {:rm, prefix <> TxCompiler.format_step(:hash_map, field_str)}
+        end)
+
+      [init_op | put_ops] ++ rm_ops
     end
 
     defp compile_remove_entity_ops(
@@ -1462,14 +1539,24 @@ if Code.ensure_loaded?(Ash.DataLayer) do
               {[{:init_col, slot_path, "sorted_map"}], Map.put(b_acc, init_key, true)}
             end
 
+          b_next = Map.put(b_next, {:unique_slot, collection, slot, raw_key}, doc_id)
           {init_op ++ [{:put, slot_path <> "$" <> hex_key, doc_id}], b_next}
 
         {:del_unique, slot, raw_key, expected_doc_id}, b_acc ->
-          case lookup_unique(db_or_cursor, collection, slot, raw_key) do
+          unique_key = {:unique_slot, collection, slot, raw_key}
+
+          current_res =
+            case Map.fetch(b_acc, unique_key) do
+              {:ok, :deleted} -> :none
+              {:ok, doc_id} -> {:ok, doc_id}
+              :error -> lookup_unique(db_or_cursor, collection, slot, raw_key)
+            end
+
+          case current_res do
             {:ok, current} when is_nil(expected_doc_id) or current == expected_doc_id ->
               hex_key = encode_btree_key(raw_key)
               slot_path = ".idx" <> col_step <> TxCompiler.format_step(:hash_map, slot)
-              {[{:rm, slot_path <> "$" <> hex_key}], b_acc}
+              {[{:rm, slot_path <> "$" <> hex_key}], Map.put(b_acc, unique_key, :deleted)}
 
             _ ->
               {[], b_acc}
@@ -1566,31 +1653,24 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       end)
     end
 
-    defp find_btree_start_index(btree, start_hex, low, high) when low < high do
-      mid = div(low + high, 2)
+    defp stream_btree_from_key(btree, start_hex) do
+      Stream.unfold(start_hex, fn
+        nil ->
+          nil
 
-      case Xitdb.NIF.nif_slot_entries(btree.db_ref, btree.tag_id, btree.value, mid, 1) do
-        {:ok, [{hex_key, _}]} ->
-          if hex_key < start_hex do
-            find_btree_start_index(btree, start_hex, mid + 1, high)
-          else
-            find_btree_start_index(btree, start_hex, low, mid)
+        cursor_key ->
+          case Xitdb.NIF.nif_sorted_map_seek(
+                 btree.db_ref,
+                 btree.tag_id,
+                 btree.value,
+                 cursor_key,
+                 64,
+                 false
+               ) do
+            {:ok, [], _next} -> nil
+            {:ok, chunk, next_cursor} -> {chunk, next_cursor}
+            _ -> nil
           end
-
-        _ ->
-          low
-      end
-    end
-
-    defp find_btree_start_index(_btree, _start_hex, low, _high), do: low
-
-    defp stream_btree_entries(btree, start_idx) do
-      Stream.unfold(start_idx, fn idx ->
-        case Xitdb.NIF.nif_slot_entries(btree.db_ref, btree.tag_id, btree.value, idx, 64) do
-          {:ok, []} -> nil
-          {:ok, chunk} -> {chunk, idx + length(chunk)}
-          _ -> nil
-        end
       end)
       |> Stream.flat_map(& &1)
       |> Stream.map(fn {hex_key, raw_set} ->

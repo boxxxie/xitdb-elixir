@@ -56,6 +56,24 @@ defmodule Xitdb.Ash.SearchNifTest do
     {rest, exhausted} = Storage.scan_prefix_cursors(db, "int_docs", next_key, 10)
     assert Enum.map(rest, &elem(&1, 0)) == ["capstone"]
     assert exhausted == nil
+
+    # Arity-6 with prefix_only: false continues past the initial prefix boundary
+    btree = Xitdb.db(db)["idx"]["search"]["int_docs"]["terms"]
+
+    assert {:ok, all_after_cap, nil} =
+             Xitdb.NIF.nif_sorted_map_seek(
+               btree.db_ref,
+               btree.tag_id,
+               btree.value,
+               "cap",
+               20,
+               false
+             )
+
+    terms = Enum.map(all_after_cap, &elem(&1, 0))
+    assert "cap" in terms
+    assert "delta" in terms
+    assert "gamma" in terms
   end
 
   test "honors Xitdb.as_of/2 historical moments and UTF-8 doc_key tie-breaking on integer PKs" do

@@ -790,5 +790,95 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         assert Enum.map(q_results, &{&1.name, &1.bonus}) == [{"Alice", 140}, {"Cara", 80}]
       end
     end
+
+    describe "Stage 3 partial prefilter and post-slice projection enrichment" do
+      defmodule TrackingCalc do
+        use Ash.Resource.Calculation
+
+        @impl true
+        def calculate(records, _opts, context) do
+          if pid = context.source_context[:tracking_pid] do
+            send(pid, {:tracking_calc_batch, length(records), Enum.map(records, & &1.name)})
+          end
+
+          Enum.map(records, fn r -> String.upcase(r.name) end)
+        end
+      end
+
+      defmodule SlicedDomain do
+        use Ash.Domain, validate_config_inclusion?: false
+
+        resources do
+          allow_unregistered?(true)
+        end
+      end
+
+      defmodule SlicedItem do
+        use Ash.Resource,
+          domain: SlicedDomain,
+          data_layer: Xitdb.Ash.DataLayer
+
+        xitdb do
+          store(PrimaryStore)
+          collection(:query_sliced_items)
+        end
+
+        attributes do
+          attribute(:id, :integer,
+            primary_key?: true,
+            allow_nil?: false,
+            writable?: true,
+            public?: true
+          )
+
+          attribute(:name, :string, allow_nil?: false, public?: true)
+          attribute(:active, :boolean, default: true, allow_nil?: false, public?: true)
+          attribute(:score, :integer, default: 0, allow_nil?: false, public?: true)
+        end
+
+        calculations do
+          calculate(:doubled_score, :integer, expr(score * 2))
+          calculate(:upper_name, :string, {TrackingCalc, []})
+        end
+
+        actions do
+          defaults([:read, :destroy])
+
+          create :create do
+            primary?(true)
+            accept([:id, :name, :active, :score])
+          end
+        end
+      end
+
+      test "splits pure-attribute AND conjuncts before Stage 4 and evaluates projection-only calcs after Stage 5 limit" do
+        for {id, name, active, score} <- [
+              {1, "Alpha", true, 10},
+              {2, "Bravo", true, 30},
+              {3, "Charlie", false, 50},
+              {4, "Delta", true, 20}
+            ] do
+          Ash.create!(SlicedItem, %{id: id, name: name, active: active, score: score},
+            domain: SlicedDomain
+          )
+        end
+
+        require Ash.Query
+
+        results =
+          SlicedItem
+          |> Ash.Query.set_context(%{tracking_pid: self()})
+          |> Ash.Query.filter(active == true and doubled_score >= 40)
+          |> Ash.Query.sort(score: :desc)
+          |> Ash.Query.limit(1)
+          |> Ash.Query.load(:upper_name)
+          |> Ash.read!(domain: SlicedDomain)
+
+        assert [%{id: 2, name: "Bravo", upper_name: "BRAVO"}] = results
+
+        # TrackingCalc was only invoked on the 1 post-limit record, NOT on Delta or Charlie
+        assert_received {:tracking_calc_batch, 1, ["Bravo"]}
+      end
+    end
   end
 end
