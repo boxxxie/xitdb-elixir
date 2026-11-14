@@ -59,7 +59,7 @@
     - [ ] Run `StreamData` differential property tests comparing `Xitdb.Ash.Search.query(..., backend: :nif)` and `ids(..., backend: :nif)` against `backend: :elixir` (`< 1.0e-5` score tolerance and exact ID ordering) across `:all`/`:any`, prefix flags/caps, custom `k1`/`b`/boosts, UTF-8 multibyte strings, and `:integer`/UUID tie-breaks
     - [ ] Verify MVCC time-travel (`Xitdb.as_of/2`) and concurrent `Xitdb.Ash.TestSandbox` snapshot isolation
 - [ ] Task: Add `1v1` BM25 search & B+Tree prefix-seek benchmarks in `benchmarks/bench_elixir.exs` and `benchmarks/bench_client.odin`, and run `./benchmarks/compare_1v1.py --runs 5 --warmup 1`
-- [ ] Task: Verify Odin typecheck (`odin check native -no-entry-point -collection:xitdb=native/xitdb-odin/xitdb`) and run Valgrind / heap leak verification confirming zero retained TLS or heap blocks across `10,000` `nif_bm25_search/7` invocations
+- [ ] Task: Verify Odin typecheck (`odin check native -no-entry-point -collection:xitdb=native/xitdb-odin/xitdb -vet -strict-style -disallow-do -warnings-as-errors`) and run Valgrind / heap leak verification confirming zero retained TLS or heap blocks across `10,000` `nif_bm25_search/7` invocations
 
 ---
 
@@ -79,5 +79,5 @@
     - [ ] Activate Stage 1 `nested_in` parent-FK `O(1)` subtree jump + secondary-index intersection and relationship aggregate fast-path in `lib/xitdb/ash/query.ex` ([`../ash_query_engine_20261111/reference.md`](../ash_query_engine_20261111/reference.md))
     - [ ] Activate `nested?: true` cascade checks via `Indexer.nested_cursors_for_parent/4` in `lib/xitdb/ash/mutator.ex` ([`../ash_mutator_and_cascades_20261111/reference.md`](../ash_mutator_and_cascades_20261111/reference.md))
 - [ ] Task: Enable full `nested_in` verification suites and pass precommit gate
-    - [ ] Extend `test/xitdb/ash/indexer_test.exs` and `test/xitdb/ash/data_layer_test.exs` ([`../ash_datalayer_and_verification_suite_20261111/references/ash3_contract_fixes_and_verification_suite.md`](../ash_datalayer_and_verification_suite_20261111/references/ash3_contract_fixes_and_verification_suite.md)) for `:many` (`AgendaSession`) and `:one` (`EventConfig`) nested subtrees, reparenting, and parent-destroy cascades (including nested child BM25 search cleanup)
+    - [ ] Extend `test/xitdb/ash/indexer_test.exs` and `test/xitdb/ash/data_layer_test.exs` ([`../ash_datalayer_and_verification_suite_20261111/references/ash3_contract_fixes_and_verification_suite.md`](../ash_datalayer_and_verification_suite_20261111/references/ash3_contract_fixes_and_verification_suite.md)) for `:many` (`AgendaSession`) and `:one` (`Conference`) nested subtrees, reparenting, and parent-destroy cascades (including nested child BM25 search cleanup)
     - [ ] Run `mix precommit` and verify zero warnings, clean formatting, and 100% green test suite

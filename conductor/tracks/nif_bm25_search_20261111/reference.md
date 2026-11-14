@@ -1218,7 +1218,7 @@ To complete **100% of Wave 3** (`wave3_deferred_native_search_and_nesting`), exe
   3. **Foreign-Key Reparenting Cleanup:**
      When an update mutates `nested.foreign_key` (`old_parent_id != new_parent_id`), remove the stale child slot from `root[p_col][old_parent_id][path]` and overwrite `idx.<col>._parent[pk_key]` with `new_parent_id` in the same atomic transaction.
   4. **Recursive Child Index Purging (`plan_purge_nested_children_ops/5` + Native BM25 Search Cleanup):**
-     Before deleting a parent entity cursor, traverse incoming `Store.reverse_fk_rules(store, parent_resource)` entries marked `nested?: true`, hydrate each nested child cursor, and recursively invoke `delete_record/4` so child `_parent`, unique identity, secondary B+Tree, **and** `Xitdb.Ash.Search.remove_record/4` (`.idx.search.<child_col>`) postings are atomically purged before the parent subtree is removed.
+     Before deleting a parent entity cursor, traverse incoming `Store.reverse_fks(store, parent_resource)` entries marked `nested?: true`, hydrate each nested child cursor, and recursively invoke `plan_delete_ops_batched/5` so child `_parent`, unique identity, secondary B+Tree, **and** `idx.search.<child_col>` postings are atomically purged before the parent subtree is removed.
 
 ### 6.2 `lib/xitdb/ash/store.ex` — Boot-Time Implicit `nested_in` Reverse-FK Rule Synthesis
 - **Reference Source:** [`../ash_store_and_test_sandbox_20261111/reference.md`](../ash_store_and_test_sandbox_20261111/reference.md) (`build_nested_fk_rules/4`)
@@ -1234,10 +1234,10 @@ To complete **100% of Wave 3** (`wave3_deferred_native_search_and_nesting`), exe
   2. In `Xitdb.Ash.Mutator`, evaluate `:restrict` counts and `:delete` cascade targets via `Indexer.nested_cursors_for_parent/4` whenever `rule.nested?` is `true`.
 
 ### 6.4 `test/xitdb/ash/indexer_test.exs` & `test/xitdb/ash/data_layer_test.exs` — Nested Subtree Verification
-- **Reference Source:** [`../ash_datalayer_and_verification_suite_20261111/references/ash3_contract_fixes_and_verification_suite.md`](../ash_datalayer_and_verification_suite_20261111/references/ash3_contract_fixes_and_verification_suite.md) (`AgendaSession` `:many` and `EventConfig` `:one` nested resources)
+- **Reference Source:** [`../ash_datalayer_and_verification_suite_20261111/references/ash3_contract_fixes_and_verification_suite.md`](../ash_datalayer_and_verification_suite_20261111/references/ash3_contract_fixes_and_verification_suite.md) (`AgendaSession` `:many` and `Conference` `:one` nested resources)
 - **Verification Gate:**
   Un-skip / enable all `nested_in` `:many` and `:one` scenarios (`_parent` direct PK lookup, parent-FK `O(1)` subtree reads, foreign-key reparenting, `:restrict` vs `:delete` parent destruction, and nested child BM25 search index cleanup), then verify:
   ```bash
-  odin check native -no-entry-point -collection:xitdb=native/xitdb-odin/xitdb
+  odin check native -no-entry-point -collection:xitdb=native/xitdb-odin/xitdb -vet -strict-style -disallow-do -warnings-as-errors
   mix precommit
   ```

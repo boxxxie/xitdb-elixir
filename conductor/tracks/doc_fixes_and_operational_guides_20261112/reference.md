@@ -191,15 +191,6 @@ diff --git a/docs/transaction-dsl.md b/docs/transaction-dsl.md
 diff --git a/docs/ash-and-spark.md b/docs/ash-and-spark.md
 --- a/docs/ash-and-spark.md
 +++ b/docs/ash-and-spark.md
-@@ -152,7 +152,7 @@
- ### 1. `Xitdb.Ash.Transformers.WireChanges`
- At compile time, `WireChanges`:
- - Automatically attaches `{lock_change_mod, op: :lock}` to `lock_action` and `{lock_change_mod, op: :unlock}` to `unlock_action` (idempotently skipping any action that already declares `lock_change_mod` or does not exist on the resource).
--- Precomputes and compiles literal module callbacks (`__xitdb_editable_field_strings__/0`, `__xitdb_pull_fields__/0`, `__xitdb_pull_pattern__/0`, `__xitdb_collection__/0`, `__xitdb_indexes__/0`, `__xitdb_store__/0`, `__xitdb_lock_change__/0`, plus pre-merged companion pair lookups) directly onto the resource module so runtime `Xitdb.Ash.Info` lookups run in **$O(1)$ (~30 ns)** with zero heap allocations.
-+- Precomputes and compiles literal module callbacks (`__xitdb_editable_field_strings__/0`, `__xitdb_pull_fields__/0`, `__xitdb_pull_pattern__/0`, `__xitdb_collection__/0`, `__xitdb_indexes__/0`, `__xitdb_store__/0`, `__xitdb_lock_change__/0`, plus pre-merged companion pair lookups) directly onto the resource module so runtime `Xitdb.Ash.Info` lookups run in **`O(1)` (~30 ns)** with zero heap allocations.
- 
- ### 2. `Xitdb.Ash.Verifiers.VerifySyncProjection`
- At compile time, `VerifySyncProjection` verifies four invariants and raises a `Spark.Error.DslError` if any fails:
 @@ -228,4 +228,79 @@
    def __xitdb_collection__, do: :items
    def __xitdb_indexes__, do: [sku: "sku->item_id"]
