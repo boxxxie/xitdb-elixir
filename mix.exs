@@ -1,7 +1,7 @@
 defmodule Xitdb.MixProject do
   use Mix.Project
 
-  @version "1.0.2"
+  @version "1.1.0"
   @source_url "https://github.com/boxxxie/xitdb-elixir"
 
   def project do
@@ -18,7 +18,7 @@ defmodule Xitdb.MixProject do
       aliases: aliases(),
       deps: deps(),
       description:
-        "Idiomatic Elixir client and Odin NIF wrapper for xitdb with Clojure-style lazy Access & Enumerable cursors, time-travel moments, Pull projections, and Datalog.",
+        "Idiomatic Elixir client, Odin NIF wrapper, and native Ash Framework DataLayer & BM25 search engine for xitdb with lazy Access & Enumerable cursors, time-travel moments, Pull projections, and Datalog.",
       source_url: @source_url,
       homepage_url: @source_url,
       package: package(),
@@ -93,6 +93,46 @@ defmodule Xitdb.MixProject do
           "docs/transaction-dsl.md",
           "docs/datalog-dsl.md",
           "docs/ash-and-spark.md"
+        ]
+      ],
+      groups_for_modules: [
+        "Client & Lazy Cursors": [
+          Xitdb,
+          Xitdb.Cursor,
+          Xitdb.Collection,
+          Xitdb.Error
+        ],
+        "Macro DSLs, Selectors & Pull": [
+          Xitdb.DSL,
+          Xitdb.Pull,
+          Xitdb.Selector,
+          Xitdb.Sigils,
+          Xitdb.TxCompiler
+        ],
+        "Ash DataLayer, Store & Search": [
+          Xitdb.Ash.DataLayer,
+          Xitdb.Ash.Store,
+          Xitdb.Ash.Search,
+          Xitdb.Ash.TestSandbox,
+          Xitdb.Ash.Resource,
+          Xitdb.Ash.Info,
+          Xitdb.Ash.Tx,
+          Xitdb.Ash.LeaseError,
+          Xitdb.Ash.Index,
+          Xitdb.Ash.SearchField,
+          Xitdb.Ash.Reference,
+          Xitdb.Ash.NestedIn,
+          Xitdb.Ash.Codec,
+          Xitdb.Ash.Indexer,
+          Xitdb.Ash.Query,
+          Xitdb.Ash.Mutator
+        ],
+        "Ash Spark Transformers & Verifiers": [
+          Xitdb.Ash.Transformers.BuildIndexPlan,
+          Xitdb.Ash.Transformers.WireChanges,
+          Xitdb.Ash.Verifiers.VerifySyncProjection,
+          Xitdb.Ash.Verifiers.VerifyNoSqlFragments,
+          Xitdb.Ash.Verifiers.VerifyCrossStoreReferences
         ]
       ],
       source_ref: "v#{@version}",
