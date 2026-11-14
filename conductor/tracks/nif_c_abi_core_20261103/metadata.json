@@ -1,8 +1,8 @@
 {
   "track_id": "nif_c_abi_core_20261103",
   "type": "feature",
-  "status": "new",
+  "status": "completed",
   "created_at": "2026-11-03T14:00:00Z",
-  "updated_at": "2026-11-03T14:00:00Z",
-  "description": "Odin C-ABI NIF Core, ErlNifResourceType Lifecycle & Coarse-Grained ETF Bridge"
+  "updated_at": "2026-11-12T18:40:00Z",
+  "description": "Track 2: Odin C-ABI NIF Core, ErlNifResourceType Lifecycle & Coarse-Grained ETF Bridge"
 }

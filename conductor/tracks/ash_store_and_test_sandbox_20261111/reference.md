@@ -3,31 +3,38 @@
 > [!IMPORTANT]
 > **Track Reference Metadata:**
 > - **Associated Track:** [`ash_store_and_test_sandbox_20261111`](./index.md)
+> - **Wave:** Wave 2
 > - **Target Repository:** `xitdb` (`/home/pauli/projects/elixir/xitdb`)
 > - **Primary Modules:** `lib/xitdb/ash/store.ex`, `lib/xitdb/ash/test_sandbox.ex`
-> - **Purpose:** Complete specification and reference implementation for the single-writer store GenServer, monitored caller-process writer leases, nested savepoint rollback, boot-time reverse-FK compilation, and per-test CoW isolation sandbox.
+> - **Purpose:** Complete specification and reference implementation for the single-writer store GenServer, `{db, moment}` snapshot pinning, monitored caller-process writer leases, nested savepoint rollback, file-backed `.xit` tip reconciliation, boot-time reverse-FK compilation, and per-test isolated `:memory` handle sandbox.
 
 ---
 
 ## 1. Concurrency & Safety Invariants
 
-### 1.1 Shared `LeaseQueue` with Zombie-Commit Protection
-Both production `Store` processes and per-test `TestSandbox.Coordinator` processes share `Xitdb.Ash.Store.LeaseQueue`. If a caller crashes (`:DOWN`) or exceeds `lease_timeout`, the uncommitted working handle is discarded and stale `lease_ref` tokens are rejected with `Xitdb.Ash.LeaseError` so a hung caller can never overwrite a later transaction.
+### 1.1 `{db, moment}` Working State & File-Backed Rollback Hygiene
+`%Xitdb{}` wraps an append-only native `db_ref` resource. Appending a commit via `Xitdb.transact_ops(db, ops, base_moment: moment)` mutates the underlying `db_ref` and increments `Xitdb.moment_count(db)` while returning the identical `%Xitdb{}` Elixir struct. Therefore:
+- Both `Store` and `TestSandbox.Coordinator` seed moment `0` (`[{:init_col, ".meta", "hash_map"}]`) on empty databases so `moment >= 0` always holds, and track `{db, moment}` explicitly.
+- Active transactions store `{db, moment}` in `{:xitdb_tx_state, store}` for writers (`Store.mutate/3`) and `Xitdb.as_of(db, moment)` (`%Xitdb.Cursor{moment: moment}`) in `{:xitdb_tx_db, store}` so `Snapshot.current_db/1` serves lock-free reads strictly pinned to `moment`.
+- On commit, `Backend.publish_commit(store, prev_moment, new_moment)` compares integer moments (`prev_moment` vs `new_moment`) rather than struct equality, and `Backend.reconcile_tip/2` appends a lightweight root-restore moment from `base_moment: target_moment` whenever an aborted transaction or rolled-back inner savepoint left uncommitted moments at the tail of `db`.
 
-### 1.2 Cross-Store Savepoint Hygiene
-`rollback/2` throws `{:xitdb_ash_rollback, store, reason}`. If a nested transaction across `MDM.Store` and `AppStore` aborts the outer store from inside the inner store's block, the inner store restores its own `prev_db` before re-throwing the outer store's rollback tag.
+### 1.2 Shared `LeaseQueue` with Zombie-Commit & Timeout-Race Protection
+Both production `Store` processes and per-test `TestSandbox.Coordinator` processes share `Xitdb.Ash.Store.LeaseQueue`. Each `active_lease` stores both `lease_ref` and the originating `req_ref`. If a queued caller times out in `GenServer.call/3` at the exact instant the previous holder releases the lease and `grant_next_waiter/3` promotes that caller to `active`, `LeaseQueue.cancel_waiter/4` detects `active.req_ref == req_ref`, cleans up the orphaned active lease, and immediately grants the next live waiter. If a caller crashes (`:DOWN`) or exceeds `lease_timeout`, uncommitted moments are reconciled back to `state.moment` and stale `lease_ref` tokens are rejected with `Xitdb.Ash.LeaseError`.
 
-### 1.3 Implicit `nested_in` Index Cleanup Graph
-At boot, `Store` compiles incoming `references` across `domains` and automatically synthesizes `:delete` cleanup entries for `nested_in` children (unless overridden with `:restrict`), ensuring parent deletes purge child `_parent`, secondary, identity, and `idx.search` entries.
+### 1.3 Cross-Store Savepoint Hygiene & Timeout-Safe Aborts
+`rollback/2` throws `{:xitdb_ash_rollback, store, reason}`. If a nested transaction across `MDM.Store` and `AppStore` aborts the outer store from inside the inner store's block, the inner store restores its own `{prev_db, prev_moment}` snapshot before re-throwing the outer store's rollback tag. Aborts notify the coordinator via `GenServer.cast/2` (`{:abort_lease, lease_ref, self()}`) so an exhausted `call_timeout` never raises a secondary `:timeout` exit that masks the original rollback or exception.
 
-### 1.4 Per-Test Lease Serialization + Lock-Free ETS Reads
-`TestSandbox` serves `Snapshot.current_db/1` reads directly from a public `read_concurrency: true` ETS table while serializing concurrent writes *within* the same test (`Task.async_stream`, LiveView + async tasks) via a per-checkout coordinator—giving production-identical single-writer guarantees with zero cross-test contention.
+### 1.4 Canonical Reverse-FK & `nested_in` Cleanup Graph
+At boot, `Store` compiles incoming same-store `references` across `domains` and `resources` into `%{source_resource, source_collection, source_attribute, destination_attribute, on_delete, nested?}` rules matching `Snapshot.reverse_fk()`, `Mutator`, and `Indexer`, and synthesizes `:delete` cleanup rules from `Info.nested_in/1` / `Info.nested_mappings/1` (returning `[]` when no `nested_in` is configured in Wave 2 and activating seamlessly in Wave 3 Track 11B).
+
+### 1.5 Per-Test Isolated `:memory` Handles + Heir-Protected ETS Reads
+`TestSandbox` clones an independent `:memory` `%Xitdb{}` handle per test checkout via `Xitdb.compact!/1` so `async: true` tests never mutate a shared `db_ref`, assigns `:kernel_sup` as the ETS `:heir` so `@templates_table` and `@checkouts_table` survive dynamic caller exits, serves pinned `%Xitdb.Cursor{}` snapshots from ETS (`read_concurrency: true`), and closes sandbox `%Xitdb{}` handles in `Coordinator.terminate/2`.
 
 ---
 
 ## 2. Reference Implementation: `lib/xitdb/ash/store.ex`
 
-Supports both direct supervision (`{Xitdb.Ash.Store, name: CaasaConnect.AppStore, path: path, domains: [...]}`) and module-based stores (`use Xitdb.Ash.Store`), plus `Store.mutate/3` so `Mutator` operations stay pure `db -> {:ok, new_db, result} | {:error, reason}` functions.
+Supports both direct supervision (`{Xitdb.Ash.Store, name: MyApp.AppStore, path: path, domains: [...]}`) and module-based stores (`use Xitdb.Ash.Store`), plus `Store.mutate/3` operating on `{db, moment}` snapshots.
 
 ```elixir
 if Code.ensure_loaded?(Ash.DataLayer) do
@@ -54,6 +61,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
     @type active_lease :: %{
             ref: reference(),
+            req_ref: reference(),
             holder: pid(),
             monitor_ref: reference(),
             timer_ref: reference()
@@ -79,14 +87,29 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
     @spec acquire(t(), term(), reference(), GenServer.from(), timeout(), timeout(), term()) ::
             {:granted, reference(), t()} | {:queued, t()}
-    def acquire(%__MODULE__{active: nil} = queue, owner_key, req_ref, from, lease_timeout, _call_timeout, _db) do
+    def acquire(
+          %__MODULE__{active: nil} = queue,
+          owner_key,
+          req_ref,
+          from,
+          lease_timeout,
+          _call_timeout,
+          _snapshot
+        ) do
       {caller_pid, _tag} = from
-      {lease_ref, active} = build_active_lease(owner_key, caller_pid, lease_timeout)
-      _ = req_ref
+      {lease_ref, active} = build_active_lease(owner_key, req_ref, caller_pid, lease_timeout)
       {:granted, lease_ref, %__MODULE__{queue | active: active}}
     end
 
-    def acquire(%__MODULE__{} = queue, _owner_key, req_ref, from, lease_timeout, call_timeout, _db) do
+    def acquire(
+          %__MODULE__{} = queue,
+          _owner_key,
+          req_ref,
+          from,
+          lease_timeout,
+          call_timeout,
+          _snapshot
+        ) do
       waiter = %{
         req_ref: req_ref,
         from: from,
@@ -98,11 +121,21 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       {:queued, %__MODULE__{queue | waiters: :queue.in(waiter, queue.waiters)}}
     end
 
-    @spec cancel_waiter(t(), reference()) :: t()
-    def cancel_waiter(%__MODULE__{} = queue, req_ref) when is_reference(req_ref) do
-      filtered =
-        :queue.filter(fn %{req_ref: r} -> r != req_ref end, queue.waiters)
+    @spec cancel_waiter(t(), reference(), term(), term()) :: t()
+    def cancel_waiter(
+          %__MODULE__{active: %{req_ref: req_ref} = active} = queue,
+          req_ref,
+          owner_key,
+          latest_snapshot
+        )
+        when is_reference(req_ref) do
+      cleanup_active(active)
+      grant_next_waiter(%__MODULE__{queue | active: nil}, owner_key, latest_snapshot)
+    end
 
+    def cancel_waiter(%__MODULE__{} = queue, req_ref, _owner_key, _latest_snapshot)
+        when is_reference(req_ref) do
+      filtered = :queue.filter(fn %{req_ref: r} -> r != req_ref end, queue.waiters)
       %__MODULE__{queue | waiters: filtered}
     end
 
@@ -111,28 +144,38 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     def verify_holder(%__MODULE__{}, _ref, _pid), do: {:error, :lease_expired}
 
     @spec release_and_grant_next(t(), term(), term()) :: t()
-    def release_and_grant_next(%__MODULE__{active: active} = queue, owner_key, latest_db) do
+    def release_and_grant_next(%__MODULE__{active: active} = queue, owner_key, latest_snapshot) do
       cleanup_active(active)
-      grant_next_waiter(%__MODULE__{queue | active: nil}, owner_key, latest_db)
+      grant_next_waiter(%__MODULE__{queue | active: nil}, owner_key, latest_snapshot)
     end
 
     @spec handle_down(t(), reference(), term(), term()) :: {:matched, t()} | :unmatched
-    def handle_down(%__MODULE__{active: %{monitor_ref: mref} = active} = queue, mref, owner_key, latest_db) do
+    def handle_down(
+          %__MODULE__{active: %{monitor_ref: mref} = active} = queue,
+          mref,
+          owner_key,
+          latest_snapshot
+        ) do
       cancel_timer(active.timer_ref)
-      {:matched, grant_next_waiter(%__MODULE__{queue | active: nil}, owner_key, latest_db)}
+      {:matched, grant_next_waiter(%__MODULE__{queue | active: nil}, owner_key, latest_snapshot)}
     end
 
-    def handle_down(%__MODULE__{}, _mref, _owner_key, _latest_db), do: :unmatched
+    def handle_down(%__MODULE__{}, _mref, _owner_key, _latest_snapshot), do: :unmatched
 
     @spec handle_expired(t(), reference(), term(), term()) :: {:matched, t()} | :unmatched
-    def handle_expired(%__MODULE__{active: %{ref: ref} = active} = queue, ref, owner_key, latest_db) do
+    def handle_expired(
+          %__MODULE__{active: %{ref: ref} = active} = queue,
+          ref,
+          owner_key,
+          latest_snapshot
+        ) do
       Process.demonitor(active.monitor_ref, [:flush])
-      {:matched, grant_next_waiter(%__MODULE__{queue | active: nil}, owner_key, latest_db)}
+      {:matched, grant_next_waiter(%__MODULE__{queue | active: nil}, owner_key, latest_snapshot)}
     end
 
-    def handle_expired(%__MODULE__{}, _ref, _owner_key, _latest_db), do: :unmatched
+    def handle_expired(%__MODULE__{}, _ref, _owner_key, _latest_snapshot), do: :unmatched
 
-    defp grant_next_waiter(%__MODULE__{} = queue, owner_key, latest_db) do
+    defp grant_next_waiter(%__MODULE__{} = queue, owner_key, latest_snapshot) do
       now_ms = System.monotonic_time(:millisecond)
 
       case :queue.out(queue.waiters) do
@@ -144,11 +187,13 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           {caller_pid, _tag} = waiter.from
 
           if waiter_alive_and_valid?(caller_pid, waiter, now_ms) do
-            {lease_ref, active} = build_active_lease(owner_key, caller_pid, waiter.lease_timeout)
-            GenServer.reply(waiter.from, {:ok, lease_ref, latest_db})
+            {lease_ref, active} =
+              build_active_lease(owner_key, waiter.req_ref, caller_pid, waiter.lease_timeout)
+
+            GenServer.reply(waiter.from, {:ok, lease_ref, latest_snapshot})
             %__MODULE__{next_queue | active: active}
           else
-            grant_next_waiter(next_queue, owner_key, latest_db)
+            grant_next_waiter(next_queue, owner_key, latest_snapshot)
           end
       end
     end
@@ -165,7 +210,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       alive? and not_expired?
     end
 
-    defp build_active_lease(owner_key, holder_pid, lease_timeout) do
+    defp build_active_lease(owner_key, req_ref, holder_pid, lease_timeout) do
       lease_ref = make_ref()
       monitor_ref = Process.monitor(holder_pid)
 
@@ -180,6 +225,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
       active = %{
         ref: lease_ref,
+        req_ref: req_ref,
         holder: holder_pid,
         monitor_ref: monitor_ref,
         timer_ref: timer_ref
@@ -234,7 +280,9 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     use GenServer
 
     alias Xitdb.Ash.{Info, LeaseError, TestSandbox}
-    alias Xitdb.Ash.Store.{LeaseQueue, Snapshot}
+    alias Xitdb.Ash.Store.{Backend, LeaseQueue, Snapshot}
+
+    @type working_snapshot :: {Xitdb.t(), non_neg_integer()}
 
     @options_schema NimbleOptions.new!(
                       name: [
@@ -271,12 +319,13 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
     defmodule State do
       @moduledoc false
-      defstruct [:name, :path, :db, :lease_timeout, :queue]
+      defstruct [:name, :path, :db, :moment, :lease_timeout, :queue]
 
       @type t :: %__MODULE__{
               name: module(),
               path: String.t() | :memory,
-              db: term(),
+              db: Xitdb.t(),
+              moment: non_neg_integer(),
               lease_timeout: timeout(),
               queue: LeaseQueue.t()
             }
@@ -300,6 +349,9 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
         @spec current_db() :: term()
         def current_db, do: Xitdb.Ash.Store.current_db(__MODULE__)
+
+        @spec root() :: Xitdb.Cursor.t()
+        def root, do: Xitdb.Ash.Store.root(__MODULE__)
 
         @spec in_transaction?() :: boolean()
         def in_transaction?, do: Xitdb.Ash.Store.in_transaction?(__MODULE__)
@@ -336,11 +388,22 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     end
 
     @doc """
-    Returns the active `%Xitdb{}` handle for `store` (transaction working handle ->
-    `TestSandbox` handle -> latest committed `Snapshot` moment) with zero `GenServer.call`s.
+    Returns the active snapshot handle for `store` (transaction `%Xitdb.Cursor{}` ->
+    `TestSandbox` `%Xitdb.Cursor{}` -> latest committed `Snapshot` moment) with zero `GenServer.call`s.
     """
     @spec current_db(module()) :: term()
     def current_db(store) when is_atom(store), do: Snapshot.current_db(store)
+
+    @doc """
+    Returns the active root `%Xitdb.Cursor{}` for `store` pinned to the caller's visible moment.
+    """
+    @spec root(module()) :: Xitdb.Cursor.t()
+    def root(store) when is_atom(store) do
+      case current_db(store) do
+        %Xitdb.Cursor{} = cursor -> cursor
+        %Xitdb{} = db -> Xitdb.db(db)
+      end
+    end
 
     @doc """
     Returns incoming same-store foreign-key rules compiled at boot for `resource`.
@@ -351,11 +414,11 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     end
 
     @doc """
-    Returns `true` if the calling process currently holds an active working handle for `store`.
+    Returns `true` if the calling process currently holds an active working snapshot for `store`.
     """
     @spec in_transaction?(module()) :: boolean()
     def in_transaction?(store) when is_atom(store) do
-      Process.get(tx_key(store)) != nil
+      Process.get(tx_state_key(store)) != nil
     end
 
     @doc """
@@ -367,18 +430,22 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     end
 
     @doc """
-    Applies a pure mutation `fun :: (db -> {:ok, new_db, result} | {:error, reason})`
-    against the active transaction handle, or wraps it in `transact/3` automatically.
+    Applies a pure mutation `fun :: ({db, moment} -> {:ok, {new_db, new_moment}, result} | {:error, reason})`
+    against the active transaction snapshot, or wraps it in `transact/3` automatically.
     """
-    @spec mutate(module(), (term() -> {:ok, term(), term()} | {:error, term()}), keyword()) ::
-            {:ok, term()} | {:error, term()}
+    @spec mutate(
+            module(),
+            (working_snapshot() -> {:ok, working_snapshot(), term()} | {:error, term()}),
+            keyword()
+          ) :: {:ok, term()} | {:error, term()}
     def mutate(store, fun, opts \\ []) when is_atom(store) and is_function(fun, 1) do
       if in_transaction?(store) do
-        db = Process.get(tx_key(store))
+        snapshot = Process.get(tx_state_key(store))
 
-        case fun.(db) do
-          {:ok, new_db, result} ->
-            Process.put(tx_key(store), new_db)
+        case fun.(snapshot) do
+          {:ok, {new_db, new_moment} = next_snapshot, result} ->
+            put_working_snapshot(store, next_snapshot)
+            _ = {new_db, new_moment}
             {:ok, result}
 
           {:error, _reason} = error ->
@@ -388,11 +455,11 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         transact(
           store,
           fn ->
-            db = Process.get(tx_key(store))
+            snapshot = Process.get(tx_state_key(store))
 
-            case fun.(db) do
-              {:ok, new_db, result} ->
-                Process.put(tx_key(store), new_db)
+            case fun.(snapshot) do
+              {:ok, {_new_db, _new_moment} = next_snapshot, result} ->
+                put_working_snapshot(store, next_snapshot)
                 result
 
               {:error, reason} ->
@@ -448,8 +515,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       Process.flag(:trap_exit, true)
       name = Keyword.fetch!(opts, :name)
       path = Keyword.fetch!(opts, :path)
-      db = opts[:db] || Backend.open_db!(path)
-      initial_moment = Backend.latest_moment(db)
+      raw_db = opts[:db] || Backend.open_db!(path)
+      {db, initial_moment} = Backend.ensure_seeded!(raw_db)
       reverse_fks = compile_reverse_fks(name, opts[:domains], opts[:resources])
 
       :ok = Snapshot.put_base(name, db, moment: initial_moment, reverse_fks: reverse_fks)
@@ -458,6 +525,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         name: name,
         path: path,
         db: db,
+        moment: initial_moment,
         lease_timeout: Keyword.fetch!(opts, :lease_timeout),
         queue: LeaseQueue.new()
       }
@@ -468,6 +536,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     @impl GenServer
     def handle_call({:acquire_lease, req_ref, call_timeout}, from, %State{} = state) do
       lease_timeout = min_timeout(state.lease_timeout, call_timeout)
+      snapshot = {state.db, state.moment}
 
       case LeaseQueue.acquire(
              state.queue,
@@ -476,22 +545,30 @@ if Code.ensure_loaded?(Ash.DataLayer) do
              from,
              lease_timeout,
              call_timeout,
-             state.db
+             snapshot
            ) do
         {:granted, lease_ref, next_queue} ->
-          {:reply, {:ok, lease_ref, state.db}, %State{state | queue: next_queue}}
+          {:reply, {:ok, lease_ref, snapshot}, %State{state | queue: next_queue}}
 
         {:queued, next_queue} ->
           {:noreply, %State{state | queue: next_queue}}
       end
     end
 
-    def handle_call({:commit_lease, lease_ref, new_db}, {caller_pid, _}, %State{} = state) do
+    def handle_call(
+          {:commit_lease, lease_ref, {new_db, new_moment}},
+          {caller_pid, _},
+          %State{} = state
+        ) do
       case LeaseQueue.verify_holder(state.queue, lease_ref, caller_pid) do
         :ok ->
-          :ok = Backend.publish_commit(state.name, state.db, new_db)
-          next_queue = LeaseQueue.release_and_grant_next(state.queue, state.name, new_db)
-          {:reply, :ok, %State{state | db: new_db, queue: next_queue}}
+          {committed_db, committed_moment} = Backend.reconcile_tip(new_db, new_moment)
+          :ok = Backend.publish_commit(state.name, state.moment, committed_moment)
+          next_snapshot = {committed_db, committed_moment}
+          next_queue = LeaseQueue.release_and_grant_next(state.queue, state.name, next_snapshot)
+
+          {:reply, :ok,
+           %State{state | db: committed_db, moment: committed_moment, queue: next_queue}}
 
         {:error, :lease_expired} = err ->
           {:reply, err, state}
@@ -499,33 +576,46 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     end
 
     def handle_call({:abort_lease, lease_ref}, {caller_pid, _}, %State{} = state) do
-      case LeaseQueue.verify_holder(state.queue, lease_ref, caller_pid) do
-        :ok ->
-          next_queue = LeaseQueue.release_and_grant_next(state.queue, state.name, state.db)
-          {:reply, :ok, %State{state | queue: next_queue}}
-
-        {:error, :lease_expired} ->
-          {:reply, :ok, state}
-      end
+      {:reply, :ok, release_aborted_lease(state, lease_ref, caller_pid)}
     end
 
     @impl GenServer
+    def handle_cast({:abort_lease, lease_ref, caller_pid}, %State{} = state) do
+      {:noreply, release_aborted_lease(state, lease_ref, caller_pid)}
+    end
+
     def handle_cast({:cancel_waiter, req_ref}, %State{} = state) do
-      {:noreply, %State{state | queue: LeaseQueue.cancel_waiter(state.queue, req_ref)}}
+      snapshot = {state.db, state.moment}
+      next_queue = LeaseQueue.cancel_waiter(state.queue, req_ref, state.name, snapshot)
+      {:noreply, %State{state | queue: next_queue}}
     end
 
     @impl GenServer
     def handle_info({:DOWN, mref, :process, _pid, _reason}, %State{} = state) do
-      case LeaseQueue.handle_down(state.queue, mref, state.name, state.db) do
-        {:matched, next_queue} -> {:noreply, %State{state | queue: next_queue}}
-        :unmatched -> {:noreply, state}
+      {restored_db, restored_moment} = Backend.reconcile_tip(state.db, state.moment)
+      :ok = Backend.publish_commit(state.name, state.moment, restored_moment)
+      snapshot = {restored_db, restored_moment}
+
+      case LeaseQueue.handle_down(state.queue, mref, state.name, snapshot) do
+        {:matched, next_queue} ->
+          {:noreply, %State{state | db: restored_db, moment: restored_moment, queue: next_queue}}
+
+        :unmatched ->
+          {:noreply, %State{state | db: restored_db, moment: restored_moment}}
       end
     end
 
     def handle_info({:xitdb_lease_expired, name, lease_ref}, %State{name: name} = state) do
-      case LeaseQueue.handle_expired(state.queue, lease_ref, state.name, state.db) do
-        {:matched, next_queue} -> {:noreply, %State{state | queue: next_queue}}
-        :unmatched -> {:noreply, state}
+      {restored_db, restored_moment} = Backend.reconcile_tip(state.db, state.moment)
+      :ok = Backend.publish_commit(state.name, state.moment, restored_moment)
+      snapshot = {restored_db, restored_moment}
+
+      case LeaseQueue.handle_expired(state.queue, lease_ref, state.name, snapshot) do
+        {:matched, next_queue} ->
+          {:noreply, %State{state | db: restored_db, moment: restored_moment, queue: next_queue}}
+
+        :unmatched ->
+          {:noreply, %State{state | db: restored_db, moment: restored_moment}}
       end
     end
 
@@ -538,25 +628,39 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       :ok
     end
 
+    defp release_aborted_lease(%State{} = state, lease_ref, caller_pid) do
+      case LeaseQueue.verify_holder(state.queue, lease_ref, caller_pid) do
+        :ok ->
+          {restored_db, restored_moment} = Backend.reconcile_tip(state.db, state.moment)
+          :ok = Backend.publish_commit(state.name, state.moment, restored_moment)
+          snapshot = {restored_db, restored_moment}
+          next_queue = LeaseQueue.release_and_grant_next(state.queue, state.name, snapshot)
+          %State{state | db: restored_db, moment: restored_moment, queue: next_queue}
+
+        {:error, :lease_expired} ->
+          state
+      end
+    end
+
     # -- Internal Savepoint & Lease Execution --
 
     @doc false
     @spec run_with_working_db(
             module(),
-            term(),
+            working_snapshot(),
             (-> term()),
-            (term() -> :ok | {:error, :lease_expired}),
+            (working_snapshot() -> :ok | {:error, :lease_expired}),
             (-> :ok)
           ) :: {:ok, term()} | {:error, term()}
-    def run_with_working_db(store, initial_db, fun, commit_fn, abort_fn) do
-      Process.put(tx_key(store), initial_db)
+    def run_with_working_db(store, initial_snapshot, fun, commit_fn, abort_fn) do
+      put_working_snapshot(store, initial_snapshot)
 
       try do
         value = fun.()
-        final_db = Process.get(tx_key(store))
-        Process.delete(tx_key(store))
+        final_snapshot = Process.get(tx_state_key(store))
+        delete_working_snapshot(store)
 
-        case commit_fn.(final_db) do
+        case commit_fn.(final_snapshot) do
           :ok ->
             {:ok, value}
 
@@ -565,31 +669,31 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         end
       catch
         :throw, {:xitdb_ash_rollback, ^store, reason} ->
-          Process.delete(tx_key(store))
+          delete_working_snapshot(store)
           abort_fn.()
           {:error, reason}
 
         kind, payload ->
           stacktrace = __STACKTRACE__
-          Process.delete(tx_key(store))
+          delete_working_snapshot(store)
           abort_fn.()
           :erlang.raise(kind, payload, stacktrace)
       end
     end
 
     defp run_savepoint(store, fun) do
-      prev_db = Process.get(tx_key(store))
+      prev_snapshot = Process.get(tx_state_key(store))
 
       try do
         {:ok, fun.()}
       catch
         :throw, {:xitdb_ash_rollback, ^store, reason} ->
-          Process.put(tx_key(store), prev_db)
+          put_working_snapshot(store, prev_snapshot)
           {:error, reason}
 
         kind, payload ->
           stacktrace = __STACKTRACE__
-          Process.put(tx_key(store), prev_db)
+          put_working_snapshot(store, prev_snapshot)
           :erlang.raise(kind, payload, stacktrace)
       end
     end
@@ -598,17 +702,17 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       req_ref = make_ref()
 
       case acquire_store_lease(store, req_ref, call_timeout) do
-        {:ok, lease_ref, initial_db} ->
-          commit_fn = fn final_db ->
-            GenServer.call(store, {:commit_lease, lease_ref, final_db}, call_timeout)
+        {:ok, lease_ref, initial_snapshot} ->
+          commit_fn = fn final_snapshot ->
+            GenServer.call(store, {:commit_lease, lease_ref, final_snapshot}, call_timeout)
           end
 
           abort_fn = fn ->
-            _ = GenServer.call(store, {:abort_lease, lease_ref}, call_timeout)
+            GenServer.cast(store, {:abort_lease, lease_ref, self()})
             :ok
           end
 
-          run_with_working_db(store, initial_db, fun, commit_fn, abort_fn)
+          run_with_working_db(store, initial_snapshot, fun, commit_fn, abort_fn)
 
         {:error, _} = err ->
           err
@@ -623,96 +727,109 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         {:error, %LeaseError{store: store, reason: :lease_timeout}}
     end
 
+    defp put_working_snapshot(store, {db, moment} = snapshot) do
+      Process.put(tx_state_key(store), snapshot)
+      Process.put(tx_db_key(store), Xitdb.as_of(db, moment))
+      :ok
+    end
+
+    defp delete_working_snapshot(store) do
+      Process.delete(tx_state_key(store))
+      Process.delete(tx_db_key(store))
+      :ok
+    end
+
     # -- Boot-Time Reverse Foreign-Key Graph Compiler --
 
-    defp compile_reverse_fks(store_name, domains, extra_resources) do
-      store_resources =
-        domains
-        |> Enum.flat_map(&Ash.Domain.Info.resources/1)
-        |> Kernel.++(extra_resources)
+    @doc false
+    @spec compile_reverse_fks(module(), [module()] | nil, [module()] | nil) ::
+            Snapshot.reverse_fk_map()
+    def compile_reverse_fks(store_mod, domains, explicit_resources) do
+      domain_resources = Enum.flat_map(domains || [], &Ash.Domain.Info.resources/1)
+
+      local_resources =
+        (domain_resources ++ (explicit_resources || []))
         |> Enum.uniq()
         |> Enum.filter(fn resource ->
           Ash.Resource.Info.data_layer(resource) == Xitdb.Ash.DataLayer and
-            Info.store!(resource) == store_name
+            resource_store_matches?(resource, store_mod)
         end)
 
-      by_collection =
-        Map.new(store_resources, fn resource -> {Info.collection!(resource), resource} end)
+      local_set = MapSet.new(local_resources)
+      by_collection = Map.new(local_resources, fn res -> {resolve_collection(res), res} end)
 
-      Enum.reduce(store_resources, %{}, fn source_resource, acc ->
-        explicit_rules = build_explicit_fk_rules(store_name, source_resource)
-        nested_rules = build_nested_fk_rules(source_resource, explicit_rules, by_collection)
+      explicit_pairs =
+        for child <- local_resources,
+            refs = Map.new(Info.references(child), &{&1.relationship, &1.on_delete}),
+            %Ash.Resource.Relationships.BelongsTo{} = rel <-
+              Ash.Resource.Info.relationships(child),
+            MapSet.member?(local_set, rel.destination),
+            on_delete = Map.get(refs, rel.name, :nothing),
+            on_delete in [:restrict, :nilify, :delete] do
+          rule = %{
+            source_resource: child,
+            source_collection: resolve_collection(child),
+            source_attribute: rel.source_attribute,
+            destination_attribute: rel.destination_attribute,
+            on_delete: on_delete,
+            nested?: resource_nested?(child)
+          }
 
-        Enum.reduce(explicit_rules ++ nested_rules, acc, fn {dest_resource, rule}, map ->
-          Map.update(map, dest_resource, [rule], &[rule | &1])
+          {rel.destination, rule}
+        end
+
+      nested_pairs =
+        Enum.flat_map(local_resources, fn child ->
+          build_nested_fk_rules(child, explicit_pairs, by_collection, local_set)
         end)
+
+      Enum.reduce(explicit_pairs ++ nested_pairs, %{}, fn {dest, rule}, acc ->
+        Map.update(acc, dest, [rule], &[rule | &1])
       end)
     end
 
-    defp build_explicit_fk_rules(store_name, source_resource) do
-      source_collection = Info.collection!(source_resource)
-
-      source_resource
-      |> Info.references()
-      |> Enum.reject(&(&1.on_delete == :nothing))
-      |> Enum.map(fn %{relationship: rel_name, on_delete: on_delete} ->
-        rel = Ash.Resource.Info.relationship(source_resource, rel_name)
-
-        if rel == nil or rel.type != :belongs_to do
-          raise ArgumentError,
-                "#{inspect(source_resource)} reference #{inspect(rel_name)} must target a belongs_to relationship"
-        end
-
-        dest_store = Info.store!(rel.destination)
-
-        if dest_store != store_name do
-          raise ArgumentError,
-                "Cross-store on_delete reference from #{inspect(source_resource)} (#{inspect(store_name)}) " <>
-                  "to #{inspect(rel.destination)} (#{inspect(dest_store)}) is not allowed; use Ash.Signals instead"
-        end
+    # Synthesizes `:delete` cleanup rules for `nested_in` children when no explicit
+    # `reference` block already covers `(parent, foreign_key)`. Returns `[]` in Wave 2
+    # when no `nested_in` is configured, and activates automatically in Track 11B.
+    defp build_nested_fk_rules(child, explicit_pairs, by_collection, local_set) do
+      for spec <- resolve_nested_specs(child),
+          {parent, fk_attr} <- normalize_nested_parent(child, spec, by_collection),
+          MapSet.member?(local_set, parent),
+          not Enum.any?(explicit_pairs, fn {dest, rule} ->
+            dest == parent and rule.source_resource == child and rule.source_attribute == fk_attr
+          end) do
+        dest_attr = resolve_destination_attribute(child, parent, fk_attr)
 
         rule = %{
-          source_resource: source_resource,
-          source_collection: source_collection,
-          source_attribute: rel.source_attribute,
-          destination_attribute: rel.destination_attribute,
-          on_delete: on_delete,
-          nested?: Info.nested_in(source_resource) != nil
+          source_resource: child,
+          source_collection: resolve_collection(child),
+          source_attribute: fk_attr,
+          destination_attribute: dest_attr,
+          on_delete: :delete,
+          nested?: true
         }
 
-        {rel.destination, rule}
-      end)
-    end
-
-    # Ensures destroying a parent entity also purges nested children's `_parent`, secondary,
-    # identity, and BM25 search indexes even when no explicit `reference` block was written.
-    defp build_nested_fk_rules(source_resource, explicit_rules, by_collection) do
-      case Info.nested_in(source_resource) do
-        nil ->
-          []
-
-        %{parent_collection: parent_col, foreign_key: fk_attr} ->
-          already_covered? =
-            Enum.any?(explicit_rules, fn {_dest, rule} -> rule.source_attribute == fk_attr end)
-
-          parent_resource = resolve_parent_resource(source_resource, fk_attr, parent_col, by_collection)
-
-          if already_covered? or parent_resource == nil do
-            []
-          else
-            rule = %{
-              source_resource: source_resource,
-              source_collection: Info.collection!(source_resource),
-              source_attribute: fk_attr,
-              destination_attribute: parent_resource |> Ash.Resource.Info.primary_key() |> hd(),
-              on_delete: :delete,
-              nested?: true
-            }
-
-            [{parent_resource, rule}]
-          end
+        {parent, rule}
       end
     end
+
+    defp normalize_nested_parent(_child, %{parent: parent, parent_key: fk_attr}, _by_collection)
+         when is_atom(parent) and not is_nil(parent) do
+      [{parent, fk_attr}]
+    end
+
+    defp normalize_nested_parent(
+           child,
+           %{parent_collection: parent_col, foreign_key: fk_attr},
+           by_collection
+         ) do
+      case resolve_parent_resource(child, fk_attr, parent_col, by_collection) do
+        nil -> []
+        parent -> [{parent, fk_attr}]
+      end
+    end
+
+    defp normalize_nested_parent(_child, _other, _by_collection), do: []
 
     defp resolve_parent_resource(source_resource, fk_attr, parent_col, by_collection) do
       rel_match =
@@ -726,57 +843,131 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       end
     end
 
+    defp resolve_destination_attribute(child, parent, fk_attr) do
+      rel_match =
+        child
+        |> Ash.Resource.Info.relationships()
+        |> Enum.find(fn rel ->
+          rel.type == :belongs_to and rel.destination == parent and
+            rel.source_attribute == fk_attr
+        end)
+
+      case rel_match do
+        %{destination_attribute: dest_attr} -> dest_attr
+        nil -> parent |> Ash.Resource.Info.primary_key() |> hd()
+      end
+    end
+
+    defp resource_store_matches?(resource, store_mod) do
+      case Info.store(resource) do
+        {:ok, ^store_mod} -> true
+        ^store_mod -> true
+        _ -> false
+      end
+    end
+
+    defp resolve_collection(resource) do
+      case Info.collection(resource) do
+        {:ok, col} -> col
+        col when is_atom(col) -> col
+        _ -> nil
+      end
+    end
+
+    defp resolve_nested_specs(resource) do
+      cond do
+        function_exported?(Info, :nested_mappings, 1) ->
+          case Info.nested_mappings(resource) do
+            [_ | _] = list -> list
+            [] -> resolve_single_nested_in(resource)
+          end
+
+        true ->
+          resolve_single_nested_in(resource)
+      end
+    end
+
+    defp resolve_single_nested_in(resource) do
+      if function_exported?(Info, :nested_in, 1) do
+        case apply(Info, :nested_in, [resource]) do
+          nil -> []
+          list when is_list(list) -> list
+          spec -> [spec]
+        end
+      else
+        []
+      end
+    end
+
+    defp resource_nested?(resource), do: resolve_nested_specs(resource) != []
+
     defp normalize_timeout(nil), do: 15_000
     defp normalize_timeout(:infinity), do: :infinity
     defp normalize_timeout(ms) when is_integer(ms) and ms > 0, do: ms
 
-    defp min_timeout(:infinity, b), do: b
-    defp min_timeout(a, :infinity), do: a
-    defp min_timeout(a, b), do: min(a, b)
+    @doc false
+    def min_timeout(:infinity, b), do: b
+    def min_timeout(a, :infinity), do: a
+    def min_timeout(a, b), do: min(a, b)
 
-    defp tx_key(store), do: {:xitdb_tx_db, store}
+    defp tx_db_key(store), do: {:xitdb_tx_db, store}
+    defp tx_state_key(store), do: {:xitdb_tx_state, store}
 
     defmodule Backend do
       @moduledoc false
-      # Localized 4-function adapter over core `Xitdb` handle lifecycle primitives.
+      # Localized adapter over core `Xitdb` handle lifecycle and moment-pinning primitives.
 
-      @spec open_db!(String.t() | :memory) :: term()
+      @spec open_db!(String.t() | :memory) :: Xitdb.t()
       def open_db!(:memory), do: Xitdb.open!(backend: :memory)
-      def open_db!(path) when is_binary(path), do: Xitdb.open!(path: path)
+      def open_db!(path) when is_binary(path), do: Xitdb.open!(backend: :buffered_file, path: path)
 
-      @spec latest_moment(term()) :: integer()
-      def latest_moment(db) do
-        if function_exported?(Xitdb, :moment, 1) do
-          case Xitdb.moment(db) do
-            m when is_integer(m) and m >= 0 -> m
-            _ -> -1
-          end
-        else
-          -1
+      @spec ensure_seeded!(Xitdb.t()) :: {Xitdb.t(), non_neg_integer()}
+      def ensure_seeded!(%Xitdb{} = db) do
+        case Xitdb.moment_count(db) do
+          0 ->
+            {:ok, seeded_db} = Xitdb.transact_ops(db, [{:init_col, ".meta", "hash_map"}])
+            {seeded_db, Xitdb.moment_count(seeded_db) - 1}
+
+          count when count > 0 ->
+            {db, count - 1}
         end
       end
 
-      @spec publish_commit(module(), term(), term()) :: :ok
-      def publish_commit(_store, prev_db, prev_db), do: :ok
+      @spec latest_moment(Xitdb.t()) :: integer()
+      def latest_moment(%Xitdb{} = db), do: Xitdb.moment_count(db) - 1
 
-      def publish_commit(store, _prev_db, new_db) do
-        case latest_moment(new_db) do
-          moment when moment >= 0 ->
-            Snapshot.advance_moment(store, moment)
+      @spec reconcile_tip(Xitdb.t(), non_neg_integer()) :: {Xitdb.t(), non_neg_integer()}
+      def reconcile_tip(%Xitdb{} = db, target_moment) when is_integer(target_moment) do
+        tail_moment = latest_moment(db)
 
-          _unindexed ->
-            Snapshot.swap_compacted_base(store, new_db, -1)
+        if tail_moment > target_moment do
+          {:ok, restored_db} =
+            Xitdb.transact_ops(
+              db,
+              [{:meta, "restored_moment", target_moment}],
+              base_moment: target_moment
+            )
+
+          {restored_db, latest_moment(restored_db)}
+        else
+          {db, target_moment}
         end
+      end
+
+      @spec publish_commit(module(), non_neg_integer(), non_neg_integer()) :: :ok
+      def publish_commit(_store, prev_moment, prev_moment), do: :ok
+
+      def publish_commit(store, _prev_moment, new_moment) when new_moment >= 0 do
+        Snapshot.advance_moment(store, new_moment)
       end
 
       @spec close_db(term()) :: :ok
-      def close_db(db) do
-        if function_exported?(Xitdb, :close, 1) do
-          _ = Xitdb.close(db)
-        end
-
+      def close_db(%Xitdb{} = db) do
+        _ = Xitdb.close(db)
         :ok
       end
+
+      def close_db(_other), do: :ok
     end
   end
 end
@@ -786,13 +977,13 @@ end
 
 ## 3. Reference Implementation: `lib/xitdb/ash/test_sandbox.ex`
 
-Provides zero-disk-I/O CoW handle isolation for `async: true` suites. Reads bypass all processes via `:ets.lookup/2` (`read_concurrency: true`), while concurrent writes spawned inside the same test (`$callers`, `Task.Supervisor`, LiveViews, or `TestSandbox.allow/3`) serialize cleanly through a per-test `Coordinator` that terminates automatically when the test exits.
+Provides zero-disk-I/O `:memory` handle isolation for `async: true` suites. Each test checkout compacts the seeded template into an independent `:memory` `%Xitdb{}` handle so concurrent tests never contend on or mutate a shared `db_ref`. Reads bypass all processes via `:ets.lookup/2` (`read_concurrency: true`) returning a pinned `%Xitdb.Cursor{}`, while concurrent writes spawned inside the same test (`$callers`, `Task.Supervisor`, LiveViews, or `TestSandbox.allow/3`) serialize cleanly through a per-test `Coordinator` that closes its `:memory` handles automatically on exit.
 
 ```elixir
 if Code.ensure_loaded?(Ash.DataLayer) do
   defmodule Xitdb.Ash.TestSandbox do
     @moduledoc """
-    Lock-free copy-on-write `%Xitdb{}` test sandbox for `async: true` ExUnit suites.
+    Lock-free isolated `:memory` `%Xitdb{}` test sandbox for `async: true` ExUnit suites.
 
     ## Usage in `test_helper.exs`
 
@@ -812,7 +1003,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     """
 
     alias Xitdb.Ash.{LeaseError, Store}
-    alias Xitdb.Ash.Store.{LeaseQueue, Snapshot}
+    alias Xitdb.Ash.Store.{Backend, LeaseQueue, Snapshot}
     alias Xitdb.Ash.TestSandbox.Coordinator
 
     @checkouts_table :xitdb_ash_sandbox_checkouts
@@ -832,7 +1023,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
                      )
 
     @doc """
-    Idempotently initializes the public ETS registries for sandbox templates and checkouts.
+    Idempotently initializes the public ETS registries for sandbox templates and checkouts,
+    assigning `:kernel_sup` as `:heir` so tables survive dynamic `async: true` process exits.
     """
     @spec init() :: :ok
     def init do
@@ -850,8 +1042,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     end
 
     @doc """
-    Registers a schema-seeded in-memory `%Xitdb{}` template for `store` at `test_helper.exs` boot.
-    When omitted, `checkout/2` forks directly from `Snapshot.committed_db(store)`.
+    Registers a schema-seeded in-memory `%Xitdb{}` (or `%Xitdb.Cursor{}`) template for `store`
+    at `test_helper.exs` boot. When omitted, `checkout/2` clones `Snapshot.committed_db(store)`.
     """
     @spec seed_template(module(), term()) :: :ok
     def seed_template(store, template_db) when is_atom(store) do
@@ -861,7 +1053,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     end
 
     @doc """
-    Checks out isolated CoW `%Xitdb{}` handles for `store_or_stores` keyed to `self()`.
+    Checks out isolated `:memory` `{db, moment}` snapshots for `store_or_stores` keyed to `self()`.
 
     ## Options
     #{NimbleOptions.docs(@checkout_schema)}
@@ -875,16 +1067,16 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       init()
       checkin(stores, owner)
 
-      initial_dbs =
+      initial_snapshots =
         Map.new(stores, fn store ->
           {store, template_for(store)}
         end)
 
       {:ok, coord_pid} =
-        Coordinator.start(owner, initial_dbs, opts[:lease_timeout], @checkouts_table)
+        Coordinator.start(owner, initial_snapshots, opts[:lease_timeout], @checkouts_table)
 
-      Enum.each(initial_dbs, fn {store, db} ->
-        :ets.insert(@checkouts_table, {{:db, store, owner}, db})
+      Enum.each(initial_snapshots, fn {store, {db, moment}} ->
+        :ets.insert(@checkouts_table, {{:db, store, owner}, Xitdb.as_of(db, moment)})
         :ets.insert(@checkouts_table, {{:coord, store, owner}, coord_pid})
 
         if opts[:shared] do
@@ -949,14 +1141,14 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     end
 
     @doc """
-    Resolves the caller's isolated `%Xitdb{}` handle in `O(1)` via ETS without any `GenServer` calls.
+    Resolves the caller's isolated `%Xitdb.Cursor{}` snapshot in `O(1)` via ETS without any `GenServer` calls.
     """
-    @spec checkout_db(module()) :: {:ok, term()} | :none
+    @spec checkout_db(module()) :: {:ok, Xitdb.Cursor.t()} | :none
     def checkout_db(store) when is_atom(store) do
       case resolve_owner(store) do
         {:ok, owner} ->
           case :ets.lookup(@checkouts_table, {:db, store, owner}) do
-            [{_, db}] -> {:ok, db}
+            [{_, cursor}] -> {:ok, cursor}
             [] -> :none
           end
 
@@ -984,17 +1176,21 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           req_ref = make_ref()
 
           case acquire_sandbox_lease(coord_pid, store, req_ref, call_timeout) do
-            {:ok, lease_ref, initial_db} ->
-              commit_fn = fn final_db ->
-                GenServer.call(coord_pid, {:commit, store, lease_ref, final_db}, call_timeout)
+            {:ok, lease_ref, initial_snapshot} ->
+              commit_fn = fn final_snapshot ->
+                GenServer.call(
+                  coord_pid,
+                  {:commit, store, lease_ref, final_snapshot},
+                  call_timeout
+                )
               end
 
               abort_fn = fn ->
-                _ = GenServer.call(coord_pid, {:abort, store, lease_ref}, call_timeout)
+                GenServer.cast(coord_pid, {:abort, store, lease_ref, self()})
                 :ok
               end
 
-              Store.run_with_working_db(store, initial_db, fun, commit_fn, abort_fn)
+              Store.run_with_working_db(store, initial_snapshot, fun, commit_fn, abort_fn)
 
             {:error, _} = err ->
               err
@@ -1068,21 +1264,28 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
     defp template_for(store) do
       case :ets.lookup(@templates_table, store) do
-        [{^store, template_db}] -> fork_template(template_db)
-        [] -> store |> Snapshot.committed_db() |> fork_template()
+        [{^store, template}] -> clone_isolated_snapshot(template)
+        [] -> store |> Snapshot.committed_db() |> clone_isolated_snapshot()
       end
     end
 
-    defp fork_template(db) do
-      if function_exported?(Xitdb, :fork, 1) do
-        Xitdb.fork(db)
+    defp clone_isolated_snapshot(%Xitdb.Cursor{db_ref: db_ref}) do
+      source_db = %Xitdb{db_ref: db_ref, backend: :memory, path: ""}
+      clone_isolated_snapshot(source_db)
+    end
+
+    defp clone_isolated_snapshot(%Xitdb{} = source_db) do
+      if Xitdb.moment_count(source_db) > 0 do
+        compacted = Xitdb.compact!(source_db)
+        Backend.ensure_seeded!(compacted)
       else
-        db
+        :memory |> Backend.open_db!() |> Backend.ensure_seeded!()
       end
     end
 
     defp register_ex_unit_cleanup(stores, owner) do
-      if Code.ensure_loaded?(ExUnit.Callbacks) and function_exported?(ExUnit.Callbacks, :on_exit, 2) do
+      if Code.ensure_loaded?(ExUnit.Callbacks) and
+           function_exported?(ExUnit.Callbacks, :on_exit, 2) do
         try do
           ExUnit.Callbacks.on_exit({__MODULE__, owner, stores}, fn ->
             checkin(stores, owner)
@@ -1095,8 +1298,16 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
     defp ensure_table(name, opts) do
       if :ets.whereis(name) == :undefined do
+        # `:heir` is set atomically at creation, so tables outlive the creating process
+        # without a helper process or a `give_away/3` race.
+        table_opts =
+          case Process.whereis(:kernel_sup) do
+            pid when is_pid(pid) -> [{:heir, pid, nil} | opts]
+            nil -> opts
+          end
+
         try do
-          _ = :ets.new(name, opts)
+          _ = :ets.new(name, table_opts)
           :ok
         rescue
           ArgumentError -> :ok
@@ -1111,23 +1322,24 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     @moduledoc false
     use GenServer
 
-    alias Xitdb.Ash.Store.LeaseQueue
-    alias Xitdb.Ash.TestSandbox
+    alias Xitdb.Ash.{Store, TestSandbox}
+    alias Xitdb.Ash.Store.{Backend, LeaseQueue}
 
-    defstruct [:owner, :owner_mref, :table, :lease_timeout, :dbs, :queues]
+    defstruct [:owner, :owner_mref, :table, :lease_timeout, :snapshots, :queues]
 
     @type t :: %__MODULE__{
             owner: pid(),
             owner_mref: reference(),
             table: atom(),
             lease_timeout: timeout(),
-            dbs: %{optional(module()) => term()},
+            snapshots: %{optional(module()) => Store.working_snapshot()},
             queues: %{optional(module()) => LeaseQueue.t()}
           }
 
-    @spec start(pid(), %{module() => term()}, timeout(), atom()) :: GenServer.on_start()
-    def start(owner, initial_dbs, lease_timeout, table) do
-      GenServer.start(__MODULE__, {owner, initial_dbs, lease_timeout, table})
+    @spec start(pid(), %{module() => Store.working_snapshot()}, timeout(), atom()) ::
+            GenServer.on_start()
+    def start(owner, initial_snapshots, lease_timeout, table) do
+      GenServer.start(__MODULE__, {owner, initial_snapshots, lease_timeout, table})
     end
 
     @spec stop(pid()) :: :ok
@@ -1142,16 +1354,19 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     end
 
     @impl GenServer
-    def init({owner, initial_dbs, lease_timeout, table}) do
+    def init({owner, initial_snapshots, lease_timeout, table}) do
+      Process.flag(:trap_exit, true)
       owner_mref = Process.monitor(owner)
-      queues = Map.new(initial_dbs, fn {store, _db} -> {store, LeaseQueue.new()} end)
+
+      queues =
+        Map.new(initial_snapshots, fn {store, _snapshot} -> {store, LeaseQueue.new()} end)
 
       state = %__MODULE__{
         owner: owner,
         owner_mref: owner_mref,
         table: table,
         lease_timeout: lease_timeout,
-        dbs: initial_dbs,
+        snapshots: initial_snapshots,
         queues: queues
       }
 
@@ -1161,28 +1376,40 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     @impl GenServer
     def handle_call({:acquire, store, req_ref, call_timeout}, from, %__MODULE__{} = state) do
       queue = Map.fetch!(state.queues, store)
-      db = Map.fetch!(state.dbs, store)
+      snapshot = Map.fetch!(state.snapshots, store)
+      lease_timeout = Store.min_timeout(state.lease_timeout, call_timeout)
 
-      case LeaseQueue.acquire(queue, store, req_ref, from, state.lease_timeout, call_timeout, db) do
+      case LeaseQueue.acquire(queue, store, req_ref, from, lease_timeout, call_timeout, snapshot) do
         {:granted, lease_ref, next_queue} ->
-          {:reply, {:ok, lease_ref, db}, put_queue(state, store, next_queue)}
+          {:reply, {:ok, lease_ref, snapshot}, put_queue(state, store, next_queue)}
 
         {:queued, next_queue} ->
           {:noreply, put_queue(state, store, next_queue)}
       end
     end
 
-    def handle_call({:commit, store, lease_ref, new_db}, {caller_pid, _}, %__MODULE__{} = state) do
+    def handle_call(
+          {:commit, store, lease_ref, {new_db, new_moment}},
+          {caller_pid, _},
+          %__MODULE__{} = state
+        ) do
       queue = Map.fetch!(state.queues, store)
 
       case LeaseQueue.verify_holder(queue, lease_ref, caller_pid) do
         :ok ->
-          :ets.insert(state.table, {{:db, store, state.owner}, new_db})
-          next_queue = LeaseQueue.release_and_grant_next(queue, store, new_db)
+          {committed_db, committed_moment} = Backend.reconcile_tip(new_db, new_moment)
+          next_snapshot = {committed_db, committed_moment}
+
+          :ets.insert(
+            state.table,
+            {{:db, store, state.owner}, Xitdb.as_of(committed_db, committed_moment)}
+          )
+
+          next_queue = LeaseQueue.release_and_grant_next(queue, store, next_snapshot)
 
           next_state = %__MODULE__{
             state
-            | dbs: Map.put(state.dbs, store, new_db),
+            | snapshots: Map.put(state.snapshots, store, next_snapshot),
               queues: Map.put(state.queues, store, next_queue)
           }
 
@@ -1194,53 +1421,65 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     end
 
     def handle_call({:abort, store, lease_ref}, {caller_pid, _}, %__MODULE__{} = state) do
-      queue = Map.fetch!(state.queues, store)
-      db = Map.fetch!(state.dbs, store)
-
-      case LeaseQueue.verify_holder(queue, lease_ref, caller_pid) do
-        :ok ->
-          next_queue = LeaseQueue.release_and_grant_next(queue, store, db)
-          {:reply, :ok, put_queue(state, store, next_queue)}
-
-        {:error, :lease_expired} ->
-          {:reply, :ok, state}
-      end
+      {:reply, :ok, release_aborted_sandbox_lease(state, store, lease_ref, caller_pid)}
     end
 
     @impl GenServer
+    def handle_cast({:abort, store, lease_ref, caller_pid}, %__MODULE__{} = state) do
+      {:noreply, release_aborted_sandbox_lease(state, store, lease_ref, caller_pid)}
+    end
+
     def handle_cast({:cancel_waiter, store, req_ref}, %__MODULE__{} = state) do
       queue = Map.fetch!(state.queues, store)
-      {:noreply, put_queue(state, store, LeaseQueue.cancel_waiter(queue, req_ref))}
+      snapshot = Map.fetch!(state.snapshots, store)
+      next_queue = LeaseQueue.cancel_waiter(queue, req_ref, store, snapshot)
+      {:noreply, put_queue(state, store, next_queue)}
     end
 
     @impl GenServer
     def handle_info({:DOWN, mref, :process, _pid, _reason}, %__MODULE__{owner_mref: mref} = state) do
-      TestSandbox.purge_owner_entries(state.table, Map.keys(state.dbs), state.owner)
+      TestSandbox.purge_owner_entries(state.table, Map.keys(state.snapshots), state.owner)
       {:stop, :normal, state}
     end
 
     def handle_info({:DOWN, mref, :process, _pid, _reason}, %__MODULE__{} = state) do
-      next_queues =
-        Map.new(state.queues, fn {store, queue} ->
-          db = Map.fetch!(state.dbs, store)
+      {next_snapshots, next_queues} =
+        Enum.reduce(state.queues, {state.snapshots, state.queues}, fn {store, queue},
+                                                                       {snaps_acc, queues_acc} ->
+          {db, moment} = Map.fetch!(snaps_acc, store)
+          {restored_db, restored_moment} = Backend.reconcile_tip(db, moment)
+          restored_snap = {restored_db, restored_moment}
 
-          case LeaseQueue.handle_down(queue, mref, store, db) do
-            {:matched, updated} -> {store, updated}
-            :unmatched -> {store, queue}
+          case LeaseQueue.handle_down(queue, mref, store, restored_snap) do
+            {:matched, updated} ->
+              {Map.put(snaps_acc, store, restored_snap), Map.put(queues_acc, store, updated)}
+
+            :unmatched ->
+              {snaps_acc, queues_acc}
           end
         end)
 
-      {:noreply, %__MODULE__{state | queues: next_queues}}
+      {:noreply, %__MODULE__{state | snapshots: next_snapshots, queues: next_queues}}
     end
 
     def handle_info({:xitdb_lease_expired, store, lease_ref}, %__MODULE__{} = state) do
       case Map.fetch(state.queues, store) do
         {:ok, queue} ->
-          db = Map.fetch!(state.dbs, store)
+          {db, moment} = Map.fetch!(state.snapshots, store)
+          {restored_db, restored_moment} = Backend.reconcile_tip(db, moment)
+          restored_snap = {restored_db, restored_moment}
 
-          case LeaseQueue.handle_expired(queue, lease_ref, store, db) do
-            {:matched, next_queue} -> {:noreply, put_queue(state, store, next_queue)}
-            :unmatched -> {:noreply, state}
+          case LeaseQueue.handle_expired(queue, lease_ref, store, restored_snap) do
+            {:matched, next_queue} ->
+              {:noreply,
+               %__MODULE__{
+                 state
+                 | snapshots: Map.put(state.snapshots, store, restored_snap),
+                   queues: Map.put(state.queues, store, next_queue)
+               }}
+
+            :unmatched ->
+              {:noreply, state}
           end
 
         :error ->
@@ -1249,6 +1488,38 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     end
 
     def handle_info(_other, %__MODULE__{} = state), do: {:noreply, state}
+
+    @impl GenServer
+    def terminate(_reason, %__MODULE__{} = state) do
+      TestSandbox.purge_owner_entries(state.table, Map.keys(state.snapshots), state.owner)
+
+      Enum.each(state.snapshots, fn {_store, {db, _moment}} ->
+        Backend.close_db(db)
+      end)
+
+      :ok
+    end
+
+    defp release_aborted_sandbox_lease(%__MODULE__{} = state, store, lease_ref, caller_pid) do
+      queue = Map.fetch!(state.queues, store)
+
+      case LeaseQueue.verify_holder(queue, lease_ref, caller_pid) do
+        :ok ->
+          {db, moment} = Map.fetch!(state.snapshots, store)
+          {restored_db, restored_moment} = Backend.reconcile_tip(db, moment)
+          restored_snap = {restored_db, restored_moment}
+          next_queue = LeaseQueue.release_and_grant_next(queue, store, restored_snap)
+
+          %__MODULE__{
+            state
+            | snapshots: Map.put(state.snapshots, store, restored_snap),
+              queues: Map.put(state.queues, store, next_queue)
+          }
+
+        {:error, :lease_expired} ->
+          state
+      end
+    end
 
     defp put_queue(%__MODULE__{} = state, store, queue) do
       %__MODULE__{state | queues: Map.put(state.queues, store, queue)}

@@ -3,6 +3,6 @@
   "type": "feature",
   "status": "new",
   "created_at": "2026-11-11T21:05:00Z",
-  "updated_at": "2026-11-11T21:05:00Z",
-  "description": "Track 12: Spark DSL Extension, BuildIndexPlan Transformer, Compile-Time Verifiers & Info Introspection"
+  "updated_at": "2026-11-12T23:35:00Z",
+  "description": "Track 8 [Wave 1]: Unified Spark DSL Extension, BuildIndexPlan Transformer, Compile-Time Verifiers & Additive Xitdb.Ash.Info Introspection"
 }

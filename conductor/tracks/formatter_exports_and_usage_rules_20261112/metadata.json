@@ -1,0 +1,8 @@
+{
+  "track_id": "formatter_exports_and_usage_rules_20261112",
+  "type": "chore",
+  "status": "new",
+  "created_at": "2026-11-12T10:37:39Z",
+  "updated_at": "2026-11-12T22:55:00Z",
+  "description": "Track 17 [Wave 5]: Unified Formatter Exports (.formatter.exs), Package usage-rules.md & Hex Packaging Verification"
+}

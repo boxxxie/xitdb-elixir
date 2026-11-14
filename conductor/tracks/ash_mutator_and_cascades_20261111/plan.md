@@ -1,53 +1,59 @@
-# Implementation Plan: Track 10 — Atomic Mutator, Monotonic Sequences & Foreign-Key Cascades
+# Implementation Plan: Track 13 — Atomic Mutator, Monotonic Sequences & Foreign-Key Cascades
 
 > [!IMPORTANT]
 > **Track Metadata:**
 > - **Track ID:** `ash_mutator_and_cascades_20261111`
+> - **Wave:** Wave 2
 > - **Specification:** [`./spec.md`](./spec.md)
 > - **Reference Document:** [`./reference.md`](./reference.md)
 > - **Target Repository:** `xitdb` (`/home/pauli/projects/elixir/xitdb`)
-> - **Done When:** Complete test suite passes with zero warnings, verifying sequences, duplicate-PK checks, atomic policies, optimistic locks, and cascading deletes/restrictions.
+> - **Done When:** Complete test suite passes with zero warnings, verifying single-commit op batching (`Indexer.plan_put_ops/5` + `Sequences.plan_pk/4`), duplicate-PK and intra-batch identity checks, relational `:unknown` policy/validation evaluation via `Ash.Filter.Runtime.filter_matches/4`, pre-update vs. post-update `atomics` / `atomic_validations`, PK-safe upserts across all Ash 3 `upsert_fields` shapes, `:context` multitenancy scoping, BM25 posting diffs, and same-store cascading deletes/restrictions.
 
 ---
 
-## Phase 1: Sequence Generator & Create Mutations
+## Phase 1: Staged Sequence Generator & Single-Commit Create / Bulk Create
 
-- [ ] Task: Implement sequence allocator in `meta.sequences`
-    - [ ] Auto-increment on new records via `ensure_primary_key/4`
-    - [ ] High-water mark advance on explicit IDs
-    - [ ] Duplicate PK detection and rejection via `check_duplicate_pk/3`
+- [ ] Task: Implement pure-op sequence planner `Xitdb.Ash.Mutator.Sequences` over `root["meta"]["sequences"][scoped_collection]`
+    - [ ] Read current high-water mark via `%Xitdb.Cursor{}` `Access` (`Xitdb.as_of(db, moment)`) with zero hallucinated `Xitdb.Map.*` calls
+    - [ ] Stage `{:init_col, ...}` / `{:put, ...}` ops in memory (`plan_pk/4`) for generated integer PKs and explicit high-water mark advances
+    - [ ] Thread sequence counters and seen PK / unique identity `MapSet`s across `bulk_create/3` chunks so an entire batch commits in **1** `Xitdb.transact_ops(db, ops, base_moment: moment)` call
 - [ ] Task: Implement `create/2` and `bulk_create/3` in `Xitdb.Ash.Mutator`
-    - [ ] Write entity slot, identities, secondary indexes, and BM25 postings via `Indexer.put_record/5`
+    - [ ] Evaluate `changeset.create_atomics` and `changeset.atomic_validations`
+    - [ ] Reject duplicate PKs and intra-batch unique identity collisions with `Ash.Error.Changes.InvalidChanges`
+    - [ ] Stage entity cursor, identity, secondary index, and BM25 search posting ops via `Indexer.plan_put_ops/5` and commit atomically on `{db, moment}`
 
 ---
 
-## Phase 2: Atomic Updates & Policy Enforcement
+## Phase 2: Atomic Updates, Pre/Post-Update Semantics & `:unknown` Policy Hydration
 
-- [ ] Task: Implement `update/2` and `update_query/4`
-    - [ ] Hydrate target records
-    - [ ] Enforce `changeset.filter` (`FilterCheck` write policies and optimistic locks) via `verify_changeset_filter/3`
-    - [ ] Enforce `changeset.atomic_validations` via `verify_atomic_validations/3`
-    - [ ] Evaluate `changeset.atomics` via `Ash.Expr.eval/2`
-    - [ ] Apply diffs to identities, secondary indexes, and search terms
-
----
-
-## Phase 3: Destroy Actions & Reverse FK Cascades
-
-- [ ] Task: Implement `destroy/2` and `destroy_query/4`
-- [ ] Task: Enforce reverse reference rules from `Store.reverse_fks/2`
-    - [ ] `:restrict` check raising `InvalidChanges` if matching dependents exist
-    - [ ] `:nilify` setting foreign key to `nil` on dependents via `nilify_children/5`
-    - [ ] `:delete` recursively destroying dependents via `cascade_delete_children/4` in the same transaction
-- [ ] Task: Remove search entries and clean up child indexes via `Indexer.delete_record/4`
+- [ ] Task: Implement `update/2` and `update_query/4` over `{db, moment}` working snapshots
+    - [ ] Hydrate target records scoped by `changeset.tenant` (`:attribute` and `:context` multitenancy)
+    - [ ] Enforce `changeset.filter` (`FilterCheck` write policies, optimistic locks, and `AshOban` atomic claim filters) via `Ash.Filter.Runtime.filter_matches/4` (`authorize?: false`)
+    - [ ] Evaluate all `{field, expr}` in `changeset.atomics` against pre-update `current_record` (resolving `{:_atomic_ref, f}` against `Map.merge(current_record, allowed_attrs)`, hydrating `:unknown` via `Ash.Filter.hydrate_refs/2` + `Ash.Expr.eval_hydrated/2`, and returning an error if still `:unknown`)
+    - [ ] Enforce `changeset.atomic_validations` (both 2-tuple and 3-tuple forms) by substituting `{:_atomic_ref, f}` with `Map.get(post_record, f)` while evaluating bare `%Ash.Query.Ref{}` against `current_record`, delegating `:unknown` boolean conditions (such as cross-store `exists/2` policies) to `Ash.Filter.Runtime.filter_matches/4`
+    - [ ] Commit updates via `Indexer.plan_put_ops/5` + `Sequences.plan_pk/4` in a single `Xitdb.transact_ops/3` batch
 
 ---
 
-## Phase 4: Upsert Actions & Verification
+## Phase 3: Primary-Key-Safe Upserts Across All Ash 3 `upsert_fields` Shapes
 
-- [ ] Task: Implement `upsert/4` using `find_existing_record_for_upsert/6`
+- [ ] Task: Implement `upsert/4` and bulk upsert mode in `Xitdb.Ash.Mutator`
+    - [ ] Resolve conflict target via `%Ash.Resource.Identity{}`, identity name atom, primary key, or `upsert_keys` using `Indexer.lookup_by_identity/5` and `Ash.Filter.Runtime.filter_matches/4` for `identity.where`
+    - [ ] Expand all Ash 3 `upsert_fields` variants (`nil`, `:replace_all`, `{:replace, fields}`, `{:replace_all_except, except}`, and field lists) while unconditionally excluding `Ash.Resource.Info.primary_key(resource)` so `existing_record` primary keys are never overwritten
+    - [ ] Tag `:upsert_action` metadata (`:create` or `:update`) and `update_default` attributes accurately
+
+---
+
+## Phase 4: Destroy Actions, Reverse FK Cascades & Verification Suite
+
+- [ ] Task: Implement `destroy/2` and `destroy_query/4` enforcing `Store.reverse_fks/2` rules (`%{source_resource, source_collection, source_attribute, destination_attribute, on_delete, nested?}`)
+    - [ ] `:restrict`: Check `count_referencing_children/4` (passing `tenant`) and return `Ash.Error.Changes.InvalidChanges` when `> 0`
+    - [ ] `:nilify`: Clear dependent foreign keys and update child secondary/search indexes
+    - [ ] `:delete`: Recursively cascade deletes with cycle detection (`visited` `MapSet`), removing entity cursors, secondary/identity entries, and BM25 postings via `Indexer.delete_record/4` / `Indexer.plan_delete_ops/4`
 - [ ] Task: Write ExUnit test suite in `test/xitdb/ash/mutator_test.exs`
-    - [ ] Sequences and duplicate PK checks
-    - [ ] Atomic policies and validations
-    - [ ] Cascading deletes and restrictions
+    - [ ] Single-commit `moment_count` verification for `create`, `update`, `upsert`, `destroy`, and `bulk_create`
+    - [ ] Cross-store `exists/2` atomic write policy enforcement (`:unknown` hydration regression test)
+    - [ ] Pre-update vs. post-update `atomics` (field swap `a = b, b = a`) and `atomic_validations`
+    - [ ] Upsert PK preservation across `:replace_all`, `{:replace, ...}`, `{:replace_all_except, ...}`, and `nil`
+    - [ ] `:context` multitenancy isolation and cascading `:restrict` / `:nilify` / `:delete` rules
 - [ ] Task: Confirm `mix precommit` passes with zero warnings

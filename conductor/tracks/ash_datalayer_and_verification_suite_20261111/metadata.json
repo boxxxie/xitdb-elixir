@@ -3,6 +3,6 @@
   "type": "feature",
   "status": "new",
   "created_at": "2026-11-11T20:08:00Z",
-  "updated_at": "2026-11-11T20:59:00Z",
-  "description": "Track 11: Ash 3 DataLayer Behaviour & Standalone Verification Suite"
+  "updated_at": "2026-11-12T23:55:00Z",
+  "description": "Track 14 [Wave 2]: Ash 3 Xitdb.Ash.DataLayer Behaviour & Standalone Multi-Store Verification Suite"
 }

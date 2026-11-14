@@ -3,6 +3,6 @@
   "type": "feature",
   "status": "new",
   "created_at": "2026-11-11T20:05:00Z",
-  "updated_at": "2026-11-11T20:05:00Z",
-  "description": "Track 6: Native Odin NIF BM25 Pushdown & Direct B+Tree Prefix Seek"
+  "updated_at": "2026-11-12T23:30:00Z",
+  "description": "Track 9 [Wave 3]: Native Odin NIF BM25 Pushdown & Direct B+Tree Prefix Seek (plus Wave 3 Track 11B Nesting Integration)"
 }

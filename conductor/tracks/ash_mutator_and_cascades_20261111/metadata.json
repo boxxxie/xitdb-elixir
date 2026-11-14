@@ -3,6 +3,6 @@
   "type": "feature",
   "status": "new",
   "created_at": "2026-11-11T20:05:00Z",
-  "updated_at": "2026-11-11T20:33:00Z",
-  "description": "Track 10: Atomic Mutator, Monotonic Sequences & Foreign-Key Cascades"
+  "updated_at": "2026-11-12T23:45:00Z",
+  "description": "Track 13 [Wave 2]: Atomic Mutator, Monotonic Sequences, Ash 3 Atomic Validations & Foreign-Key Cascades (Xitdb.Ash.Mutator)"
 }

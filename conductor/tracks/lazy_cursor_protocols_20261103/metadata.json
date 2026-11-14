@@ -1,8 +1,8 @@
 {
   "track_id": "lazy_cursor_protocols_20261103",
   "type": "feature",
-  "status": "new",
+  "status": "completed",
   "created_at": "2026-11-03T14:00:00Z",
-  "updated_at": "2026-11-03T14:00:00Z",
-  "description": "Clojure-Style Lazy %Xitdb.Cursor{} (Access, Enumerable, Inspect, Chunked Iteration & Collection Type Wrappers)"
+  "updated_at": "2026-11-12T18:40:00Z",
+  "description": "Track 3: Clojure-Style Lazy %Xitdb.Cursor{} (Access, Enumerable, Inspect, Chunked Iteration & Collection Type Wrappers)"
 }

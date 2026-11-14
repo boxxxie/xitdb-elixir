@@ -1,0 +1,8 @@
+{
+  "track_id": "remaining_improvements_20261112",
+  "type": "refactor",
+  "status": "new",
+  "created_at": "2026-11-12T09:51:10Z",
+  "updated_at": "2026-11-12T23:31:00Z",
+  "description": "Track 7 [Wave 4]: Xitdb.Error Helpers, Compile-Time NimbleOptions Validation, Root-Cursor Guard & IEx Docstring Cleanups (depends on Track 6)"
+}

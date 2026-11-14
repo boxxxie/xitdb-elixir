@@ -1,0 +1,8 @@
+{
+  "track_id": "client_fixes_and_dedup_20261111",
+  "type": "bugfix",
+  "status": "new",
+  "created_at": "2026-11-11T21:30:00Z",
+  "updated_at": "2026-11-12T23:25:00Z",
+  "description": "Track 5 [Wave 1 / Wave 4]: Client Bugfixes, Inclusive Pull Range Semantics, WireChanges Deadlock Elimination & Cursor Deduplication"
+}
