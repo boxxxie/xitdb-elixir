@@ -69,7 +69,7 @@ Each track has its own specification and implementation plan in [`./tracks/`](./
 
 ---
 
-- [ ] **Track 13 [Wave 2 — MVP DataLayer Engine]: Atomic Mutator, Sequences, Atomic Validations, Same-Store Cascades & Elixir BM25 Postings (`Xitdb.Ash.Mutator`)**
+- [x] **Track 13 [Wave 2 — MVP DataLayer Engine]: Atomic Mutator, Sequences, Atomic Validations, Same-Store Cascades & Elixir BM25 Postings (`Xitdb.Ash.Mutator`)**
   *Link: [./tracks/ash_mutator_and_cascades_20261111/](./tracks/ash_mutator_and_cascades_20261111/)*
   *MVP Scope:* Implement single-commit `Xitdb.transact_ops/3` batching across `meta.sequences`, entity/index writes, and BM25 search postings (`old_record` -> `new_record` diff); implement `create`, `bulk_create`, `update`, `update_query`, `destroy`, `destroy_query`, and PK-safe `upsert/4` (supporting all Ash 3 `upsert_fields` forms); enforce `verify_changeset_filter/3` and `verify_atomic_validations/3` (with `Ash.Filter.Runtime.matches?/4` fallback on `:unknown`); and execute same-store `:restrict`, `:nilify`, and `:delete` FK cascades.
 
