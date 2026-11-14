@@ -38,6 +38,16 @@ defmodule Xitdb.NIF do
   def nif_sorted_map_seek(_db_ref, _slot_tag_id, _slot_val_int, _prefix_bin, _limit_int),
     do: :erlang.nif_error(:nif_not_loaded)
 
+  def nif_sorted_map_seek(
+        _db_ref,
+        _slot_tag_id,
+        _slot_val_int,
+        _start_key_bin,
+        _limit_int,
+        _prefix_only
+      ),
+      do: :erlang.nif_error(:nif_not_loaded)
+
   def nif_bm25_search(
         _db_ref,
         _root_tag_id,

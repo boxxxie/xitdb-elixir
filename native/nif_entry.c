@@ -242,6 +242,7 @@ static ErlNifFunc nif_funcs[] = {
     {"nif_query_datalog",    3, odin_nif_query_datalog,    0},
     {"nif_compact",          2, odin_nif_compact,          ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"nif_sorted_map_seek",  5, odin_nif_sorted_map_seek,  ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_sorted_map_seek",  6, odin_nif_sorted_map_seek,  ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_bm25_search",      7, odin_nif_bm25_search,      ERL_NIF_DIRTY_JOB_CPU_BOUND}
 };
 

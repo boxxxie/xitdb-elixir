@@ -2113,7 +2113,8 @@ collect_postings_into_map :: proc(
 	return nil
 }
 
-// `nif_sorted_map_seek(db_ref, slot_tag_id, slot_val_int, prefix_bin, limit_int)` ->
+// `nif_sorted_map_seek(db_ref, slot_tag_id, slot_val_int, prefix_bin, limit_int)` or
+// `nif_sorted_map_seek(db_ref, slot_tag_id, slot_val_int, start_key_bin, limit_int, prefix_only_bool)` ->
 // `{:ok, [{term_bin, slot_tuple}, ...], next_cursor_or_nil} | {:error, reason}`
 @(export)
 odin_nif_sorted_map_seek :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {
@@ -2131,8 +2132,19 @@ odin_nif_sorted_map_seek :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_
 	context.allocator = arena_alloc
 	context.temp_allocator = arena_alloc
 
-	if argc != 5 {
+	if argc != 5 && argc != 6 {
 		return make_err(env, "badarg")
+	}
+
+	prefix_only := true
+	if argc == 6 {
+		if argv[5] == ATOM_TRUE {
+			prefix_only = true
+		} else if argv[5] == ATOM_FALSE {
+			prefix_only = false
+		} else {
+			return make_err(env, "badarg")
+		}
 	}
 
 	handle, ok := get_handle(env, argv[0])
@@ -2209,7 +2221,7 @@ odin_nif_sorted_map_seek :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_
 		if k_err != nil {
 			return make_xitdb_err(env, k_err)
 		}
-		if !strings.has_prefix(k_str, prefix) {
+		if prefix_only && !strings.has_prefix(k_str, prefix) {
 			break
 		}
 
