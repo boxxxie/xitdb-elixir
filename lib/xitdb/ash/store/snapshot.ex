@@ -61,16 +61,21 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     end
 
     @doc """
-    Resolves the active database handle in 3 lock-free tiers:
-    1. Caller's active transaction working handle (`{:xitdb_tx_db, store}`).
-    2. Caller or `$callers` isolated `TestSandbox` CoW handle.
-    3. Latest committed `Xitdb.as_of/2` moment from `{base_db, atomics}`.
+    Resolves the active database handle in 4 lock-free tiers:
+    1. Caller's active `with_as_of` / historical override (`{:xitdb_as_of_db, store}` or `$callers`).
+    2. Caller's active transaction working handle (`{:xitdb_tx_db, store}`).
+    3. Caller or `$callers` isolated `TestSandbox` CoW handle.
+    4. Latest committed `Xitdb.as_of/2` moment from `{base_db, atomics}`.
     """
     @spec current_db(module()) :: term()
     def current_db(store) when is_atom(store) do
-      case Process.get({:xitdb_tx_db, store}) do
-        nil -> sandbox_or_committed_db(store)
-        tx_db -> tx_db
+      key = {:xitdb_as_of_db, store}
+
+      cond do
+        as_of_db = Process.get(key) -> as_of_db
+        tx_db = Process.get({:xitdb_tx_db, store}) -> tx_db
+        as_of_db = caller_as_of_db(key, Process.get(:"$callers")) -> as_of_db
+        true -> sandbox_or_committed_db(store)
       end
     end
 
@@ -85,6 +90,24 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         @uncommitted_moment -> base_db
         moment -> Xitdb.as_of(base_db, moment)
       end
+    end
+
+    @doc """
+    Returns a root `%Xitdb.Cursor{}` pinned to `moment` on the caller's active store handle
+    (transaction, `TestSandbox`, or committed `Snapshot`).
+    """
+    @spec as_of(module(), integer()) :: Xitdb.Cursor.t()
+    def as_of(store, moment) when is_atom(store) and is_integer(moment) do
+      {%Xitdb{} = slot_base_db, _atomics, _reverse_fks} = fetch_slot!(store)
+
+      base_db =
+        case Process.get({:xitdb_tx_db, store}) || sandbox_or_committed_db(store) do
+          %Xitdb{} = db -> db
+          %Xitdb.Cursor{db_ref: db_ref} -> %{slot_base_db | db_ref: db_ref}
+          {%Xitdb{} = db, _moment} -> db
+        end
+
+      Xitdb.as_of(base_db, moment)
     end
 
     @doc """
@@ -103,6 +126,21 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     def erase(store) when is_atom(store) do
       :persistent_term.erase(pt_key(store))
     end
+
+    defp caller_as_of_db(key, callers) when is_list(callers) do
+      Enum.find_value(callers, fn
+        pid when is_pid(pid) ->
+          case :erlang.process_info(pid, {:dictionary, key}) do
+            {{:dictionary, ^key}, val} when val != :undefined and val != nil -> val
+            _ -> nil
+          end
+
+        _ ->
+          nil
+      end)
+    end
+
+    defp caller_as_of_db(_key, _callers), do: nil
 
     defp sandbox_or_committed_db(store) do
       if Code.ensure_loaded?(TestSandbox) and function_exported?(TestSandbox, :checkout_db, 1) do

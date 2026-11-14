@@ -65,6 +65,12 @@ if Code.ensure_loaded?(Ash.DataLayer) do
                       default: nil,
                       doc: "Explicit `%Xitdb{}` handle; defaults to `Snapshot.current_db/1`."
                     ],
+                    as_of: [
+                      type: {:or, [:integer, {:in, [nil]}]},
+                      default: nil,
+                      doc:
+                        "Optional historical moment index (`Xitdb.as_of/2`); ignored when `:db` is set."
+                    ],
                     exact_boost: [
                       type: :float,
                       default: @exact_match_boost,
@@ -212,7 +218,13 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       meta = %{resource: resource, collection: collection_atom}
 
       :telemetry.span([:xitdb, :ash, :search], meta, fn ->
-        db = opts[:db] || resolve_active_db(resource)
+        db =
+          cond do
+            opts[:db] != nil -> opts[:db]
+            is_integer(opts[:as_of]) -> resolve_as_of_db(resource, opts[:as_of])
+            true -> resolve_active_db(resource)
+          end
+
         hits = score_collection(db, collection, tokens, opts, pk_type(resource))
 
         {hits,
@@ -220,6 +232,16 @@ if Code.ensure_loaded?(Ash.DataLayer) do
          |> Map.put(:result_count, length(hits))
          |> Map.put(:status, :ok)}
       end)
+    end
+
+    defp resolve_as_of_db(resource, moment) do
+      store = Info.store!(resource)
+
+      if Code.ensure_loaded?(Xitdb.Ash.Store.Snapshot) do
+        Xitdb.Ash.Store.Snapshot.as_of(store, moment)
+      else
+        raise ArgumentError, "No database handle provided and Snapshot module is not loaded"
+      end
     end
 
     defp resolve_active_db(resource) do

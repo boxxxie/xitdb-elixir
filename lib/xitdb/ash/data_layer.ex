@@ -184,8 +184,11 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       meta = %{resource: resource, collection: Info.collection!(resource)}
 
       :telemetry.span([:xitdb, :ash, :query], meta, fn ->
-        db = Store.current_db(Info.store!(resource))
-        result = Query.execute(db, query, resource)
+        result =
+          with_query_db(query, resource, fn db ->
+            Query.execute(db, query, resource)
+          end)
+
         status = if match?({:ok, _}, result), do: :ok, else: :error
         {result, Map.put(meta, :status, status)}
       end)
@@ -196,12 +199,61 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       meta = %{resource: resource, collection: Info.collection!(resource)}
 
       :telemetry.span([:xitdb, :ash, :aggregate_query], meta, fn ->
-        db = Store.current_db(Info.store!(resource))
-        result = Query.execute_aggregates(db, query, aggregates, resource)
+        result =
+          with_query_db(query, resource, fn db ->
+            Query.execute_aggregates(db, query, aggregates, resource)
+          end)
+
         status = if match?({:ok, _}, result), do: :ok, else: :error
         {result, Map.put(meta, :status, status)}
       end)
     end
+
+    defp with_query_db(%Query{context: context}, resource, fun) do
+      store = Info.store!(resource)
+
+      case extract_db_override(context) do
+        {:override, moment_or_db} ->
+          Store.with_as_of(store, moment_or_db, fn ->
+            fun.(Store.current_db(store))
+          end)
+
+        :none ->
+          fun.(Store.current_db(store))
+      end
+    end
+
+    defp extract_db_override(context) when is_map(context) do
+      dl_ctx = Map.get(context, :data_layer) || %{}
+      xitdb_ctx = Map.get(context, :xitdb) || %{}
+      shared_ctx = Map.get(context, :shared) || %{}
+
+      db =
+        Map.get(context, :xitdb_db) ||
+          (is_map(dl_ctx) && Map.get(dl_ctx, :xitdb_db)) ||
+          (is_map(xitdb_ctx) && Map.get(xitdb_ctx, :db))
+
+      moment =
+        Map.get(context, :xitdb_moment) ||
+          (is_map(dl_ctx) && (Map.get(dl_ctx, :as_of) || Map.get(dl_ctx, :xitdb_moment))) ||
+          (is_map(xitdb_ctx) && (Map.get(xitdb_ctx, :as_of) || Map.get(xitdb_ctx, :moment)))
+
+      cond do
+        db != nil ->
+          {:override, db}
+
+        is_integer(moment) ->
+          {:override, moment}
+
+        is_map(shared_ctx) and map_size(shared_ctx) > 0 ->
+          extract_db_override(Map.delete(shared_ctx, :shared))
+
+        true ->
+          :none
+      end
+    end
+
+    defp extract_db_override(_), do: :none
 
     @impl Ash.DataLayer
     def calculate(resource, expressions, context) when is_list(expressions) and is_map(context) do

@@ -106,6 +106,14 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         @spec root() :: Xitdb.Cursor.t()
         def root, do: Xitdb.Ash.Store.root(__MODULE__)
 
+        @spec as_of(integer()) :: Xitdb.Cursor.t()
+        def as_of(moment), do: Xitdb.Ash.Store.as_of(__MODULE__, moment)
+
+        @spec with_as_of(integer() | Xitdb.Cursor.t() | Xitdb.t(), (-> result)) :: result
+              when result: var
+        def with_as_of(moment_or_db, fun),
+          do: Xitdb.Ash.Store.with_as_of(__MODULE__, moment_or_db, fun)
+
         @spec in_transaction?() :: boolean()
         def in_transaction?, do: Xitdb.Ash.Store.in_transaction?(__MODULE__)
 
@@ -162,6 +170,40 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       case current_db(store) do
         %Xitdb.Cursor{} = cursor -> cursor
         %Xitdb{} = db -> Xitdb.db(db)
+      end
+    end
+
+    @doc """
+    Returns a root `%Xitdb.Cursor{}` pinned to `moment` on `store`.
+    """
+    @spec as_of(module(), integer()) :: Xitdb.Cursor.t()
+    def as_of(store, moment) when is_atom(store) and is_integer(moment) do
+      Snapshot.as_of(store, moment)
+    end
+
+    @doc """
+    Executes `fun` with all reads (`Ash.read`, `Ash.get`, `Ash.load`, `Ash.aggregate`,
+    and `Xitdb.Ash.Search.query`) on `store` pinned to `moment_or_db` (an integer moment,
+    `%Xitdb.Cursor{}`, or `%Xitdb{}`).
+    """
+    @spec with_as_of(module(), integer() | Xitdb.Cursor.t() | Xitdb.t(), (-> result)) :: result
+          when result: var
+    def with_as_of(store, moment_or_db, fun) when is_atom(store) and is_function(fun, 0) do
+      pinned_db =
+        case moment_or_db do
+          moment when is_integer(moment) -> Snapshot.as_of(store, moment)
+          %Xitdb.Cursor{} = cursor -> cursor
+          %Xitdb{} = db -> db
+        end
+
+      key = {:xitdb_as_of_db, store}
+      prev = Process.get(key)
+      Process.put(key, pinned_db)
+
+      try do
+        fun.()
+      after
+        if prev == nil, do: Process.delete(key), else: Process.put(key, prev)
       end
     end
 
@@ -254,7 +296,15 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       meta = %{store: store, mode: mode}
 
       :telemetry.span([:xitdb, :ash, :transaction], meta, fn ->
-        result = exec.()
+        as_of_key = {:xitdb_as_of_db, store}
+        prev_as_of = Process.delete(as_of_key)
+
+        result =
+          try do
+            exec.()
+          after
+            if prev_as_of != nil, do: Process.put(as_of_key, prev_as_of)
+          end
 
         status =
           case result do

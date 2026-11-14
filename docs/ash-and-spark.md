@@ -255,6 +255,17 @@ children = [
 # Lock-free root snapshot cursor (`%Xitdb.Cursor{}` pinned to the latest committed moment):
 root_cursor = MyApp.MDM.Store.root()
 
+# Historical time-travel across `Ash.read`, `Ash.count`, and `Xitdb.Ash.Search`:
+prev_moment = root_cursor.moment
+prev_orgs = Ash.read!(MyApp.Accounts.Organization, context: %{xitdb_moment: prev_moment})
+prev_hits = Xitdb.Ash.Search.ids(MyApp.Accounts.Organization, "northleaf", as_of: prev_moment)
+
+MyApp.MDM.Store.with_as_of(prev_moment, fn ->
+  # Every Ash read, aggregate, relationship load, and BM25 search inside this block
+  # resolves against `prev_moment`.
+  Ash.read!(MyApp.Accounts.Organization)
+end)
+
 # Serialized MDM `tx_for!` batch inside the store's writer lease (re-entrant inside transactions).
 # `mutate/3` passes and expects `{db, moment}` working snapshots:
 {:ok, :synced} =
