@@ -51,7 +51,7 @@ Each track has its own specification and implementation plan in [`./tracks/`](./
 
 ## Wave 2 — MVP Ash DataLayer Engine (Hybrid Cutover Critical Path)
 
-- [ ] **Track 10 [Wave 2 — MVP DataLayer Engine]: Single-Writer `Xitdb.Ash.Store` GenServer, Monitored Writer Leases, Savepoints, Hybrid FK Graph & `TestSandbox`**
+- [x] **Track 10 [Wave 2 — MVP DataLayer Engine]: Single-Writer `Xitdb.Ash.Store` GenServer, Monitored Writer Leases, Savepoints, Hybrid FK Graph & `TestSandbox`**
   *Link: [./tracks/ash_store_and_test_sandbox_20261111/](./tracks/ash_store_and_test_sandbox_20261111/)*
   *MVP Scope:* Implement `LeaseQueue` (with active-lease `req_ref` timeout release), `{db, moment}`-pinned `Xitdb.Ash.Store` working handles and nested savepoints (seeding moment `0` on empty stores so savepoint/lease rollbacks branch cleanly via `base_moment`), isolated `:memory` / `Xitdb.compact!/2` handles with `:kernel_sup` ETS table heirship in `Xitdb.Ash.TestSandbox`, and hybrid-filtered boot-time reverse-FK rules emitting `%{source_resource, source_collection, source_attribute, destination_attribute, on_delete, nested?}`. Defer `nested_in` reverse-FK auto-synthesis to **Track 11B**.
 
