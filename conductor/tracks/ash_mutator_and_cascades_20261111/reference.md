@@ -878,6 +878,9 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         {:_atomic_ref, field} when is_atom(field) ->
           Map.get(post_record, field)
 
+        %Ash.Query.Call{name: :atomic_ref, args: [field]} when is_atom(field) ->
+          Map.get(post_record, field)
+
         other ->
           other
       end)
@@ -888,8 +891,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         {:ok, %_{} = exc} when is_exception(exc) ->
           exc
 
-        {:ok, {error_mod, opts}} when is_atom(error_mod) and is_list(opts) ->
-          error_mod.exception(opts)
+        {:ok, {error_mod, opts}} when is_atom(error_mod) and (is_list(opts) or is_map(opts)) ->
+          error_mod.exception(Enum.to_list(opts))
 
         {:error, %_{} = exc} when is_exception(exc) ->
           exc

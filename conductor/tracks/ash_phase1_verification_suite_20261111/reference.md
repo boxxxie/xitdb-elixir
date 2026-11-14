@@ -32,7 +32,7 @@ defp verify_atomic_validations(pre_record, post_record, resource, %Ash.Changeset
 
     resolved_cond = substitute_atomic_refs(failure_expr, post_record)
 
-    case eval_boolean_expr(resolved_cond, pre_record, resource, changeset, actor) do
+    case eval_boolean_condition(resolved_cond, pre_record, resource, changeset, actor) do
       {:ok, true} ->
         resolved_err = substitute_atomic_refs(error_expr, post_record)
 

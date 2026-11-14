@@ -1689,33 +1689,32 @@ diff --git a/lib/xitdb/dsl.ex b/lib/xitdb/dsl.ex
  
      quote do
 -      Xitdb.query(unquote(target), unquote(query_str_ast), [])
--    end
--  end
--
--  defmacro query(target, query_str) do
--    quote do
--      Xitdb.query(unquote(target), unquote(query_str), [])
 +      Xitdb.query(unquote(target), unquote(q_ast))
      end
    end
  
+   defmacro query(target, query_str) do
+     quote do
+       Xitdb.query(unquote(target), unquote(query_str), [])
+     end
+   end
+ 
    defmacro query(target, opts, do: block) do
--    {from_opt, runtime_opts} =
--      if Keyword.keyword?(opts), do: Keyword.pop(opts, :from), else: {nil, opts}
--
+     {from_opt, runtime_opts} =
+       if Keyword.keyword?(opts), do: Keyword.pop(opts, :from), else: {nil, opts}
+ 
 -    query_str_ast = DatalogCompiler.compile(block, [from: from_opt], __CALLER__)
--
--    quote do
--      Xitdb.query(unquote(target), unquote(query_str_ast), unquote(runtime_opts))
--    end
--  end
-+    {from_opt, runtime_opts} = Keyword.pop(opts, :from)
 +    q_ast = DatalogCompiler.compile(block, [from: from_opt], __CALLER__)
  
--  defmacro query(target, query_str, opts) do
      quote do
--      Xitdb.query(unquote(target), unquote(query_str), unquote(opts))
+-      Xitdb.query(unquote(target), unquote(query_str_ast), unquote(runtime_opts))
 +      Xitdb.query(unquote(target), unquote(q_ast), unquote(runtime_opts))
+     end
+   end
+ 
+   defmacro query(target, query_str, opts) do
+     quote do
+       Xitdb.query(unquote(target), unquote(query_str), unquote(opts))
      end
    end
  
@@ -1739,12 +1738,19 @@ diff --git a/lib/xitdb/dsl.ex b/lib/xitdb/dsl.ex
      end
    end
  
++  defmacro query!(target, query_str) do
++    quote do
++      Xitdb.query!(unquote(target), unquote(query_str), [])
++    end
++  end
++
    defmacro query!(target, opts, do: block) do
 -    {from_opt, runtime_opts} =
 -      if Keyword.keyword?(opts), do: Keyword.pop(opts, :from), else: {nil, opts}
 -
 -    query_str_ast = DatalogCompiler.compile(block, [from: from_opt], __CALLER__)
-+    {from_opt, runtime_opts} = Keyword.pop(opts, :from)
++    {from_opt, runtime_opts} =
++      if Keyword.keyword?(opts), do: Keyword.pop(opts, :from), else: {nil, opts}
 +    q_ast = DatalogCompiler.compile(block, [from: from_opt], __CALLER__)
  
      quote do
@@ -1752,11 +1758,11 @@ diff --git a/lib/xitdb/dsl.ex b/lib/xitdb/dsl.ex
 -    end
 -  end
 -
--  defmacro query!(target, query_str, opts) do
--    quote do
--      Xitdb.query!(unquote(target), unquote(query_str), unquote(opts))
--    end
--  end
+   defmacro query!(target, query_str, opts) do
+     quote do
+       Xitdb.query!(unquote(target), unquote(query_str), unquote(opts))
+     end
+   end
 -
 -  # ============================================================================
 -  # Internal Runtime Helpers for `tx` and `datalog`
@@ -2044,12 +2050,15 @@ diff --git a/lib/xitdb/tx_compiler.ex b/lib/xitdb/tx_compiler.ex
  
 -  # Temporary delegates until Xitdb.DSL sub-modules are extracted in Steps 2-4
 -  defdelegate format_step(kind, key), to: Selector
--  defdelegate format_typed_step(kind, val), to: Selector
--  defdelegate format_bracket_step(val), to: Selector
--  defdelegate format_root_or_step(val), to: Selector
--  defdelegate format_path_steps(steps), to: Selector
++  # Retained for Xitdb.Ash.Indexer.Storage and Xitdb.Ash.Mutator.Sequences
++  defdelegate format_step(kind, key), to: Selector
+ -  defdelegate format_typed_step(kind, val), to: Selector
+ -  defdelegate format_bracket_step(val), to: Selector
+ -  defdelegate format_root_or_step(val), to: Selector
+ -  defdelegate format_path_steps(steps), to: Selector
 -  defdelegate format_key(key), to: Selector
--  defdelegate encode_quoted(str), to: Selector
++  defdelegate format_key(key), to: Selector
+ -  defdelegate encode_quoted(str), to: Selector
 -
    @doc """
    Compiles a nested Elixir map or `Xitdb.Collection` into a flat list of

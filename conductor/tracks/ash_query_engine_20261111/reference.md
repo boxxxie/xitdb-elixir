@@ -1914,15 +1914,18 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     end
 
     defp nested_foreign_key(resource) do
-      cond do
-        function_exported?(Info, :nested_mappings, 1) ->
-          case Info.nested_mappings(resource) do
-            [%{parent_key: fk} | _] -> fk
-            [] -> fallback_nested_fk(resource)
+      case fallback_nested_fk(resource) do
+        nil ->
+          if function_exported?(Info, :nested_mappings, 1) do
+            case Info.nested_mappings(resource) do
+              [%{parent_key: fk} | _] when not is_nil(fk) -> fk
+              [%{foreign_key: fk} | _] when not is_nil(fk) -> fk
+              _ -> nil
+            end
           end
 
-        true ->
-          fallback_nested_fk(resource)
+        fk ->
+          fk
       end
     end
 

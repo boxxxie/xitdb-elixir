@@ -39,7 +39,8 @@ diff --git a/lib/xitdb/collection.ex b/lib/xitdb/collection.ex
 +  - `:counted_hash_map` — 16-way HAMT with `O(1)` count header (`Tag.Counted_Hash_Map`, `#key`)
    - `:sorted_map` — Count-augmented B+Tree ordered lexicographically (`Tag.Sorted_Map`, `$key`)
    - `:array_list` — 16-way Radix Trie (`Tag.Array_List`, `[i]`)
-   - `:linked_array_list` — Count-augmented B-Tree with $O(\\log N)$ insert/remove/slice (`Tag.Linked_Array_List`, `[[i]]`)
+-  - `:linked_array_list` — Count-augmented B-Tree with $O(\\log N)$ insert/remove/slice (`Tag.Linked_Array_List`, `[[i]]`)
++  - `:linked_array_list` — Count-augmented B-Tree with `O(log N)` insert/remove/slice (`Tag.Linked_Array_List`, `[[i]]`)
    - `:hash_set` — 16-way HAMT set (`Tag.Hash_Set`, `%member`)
 -  - `:counted_hash_set` — 16-way HAMT set with $O(1)$ count header (`Tag.Counted_Hash_Set`, `#%member`)
 +  - `:counted_hash_set` — 16-way HAMT set with `O(1)` count header (`Tag.Counted_Hash_Set`, `#%member`)
@@ -55,9 +56,10 @@ diff --git a/lib/xitdb/cursor.ex b/lib/xitdb/cursor.ex
    - Implements `Access` (`cursor["key"]`, `cursor[0]`, `get_in/2`, `put_in/3`, `update_in/3`, `pop_in/2`).
 -  - Implements `Enumerable` (`Enum.count/1` in $O(1)$ on counted collections,
 -    `Enum.member?/2` in $O(1)$ / $O(\\log N)$ via HAMT/B+Tree lookup,
+-    `Enum.slice/2` in $O(\\log N)$ via index seek, and `Enum.to_list/1` / `Stream.*`).
 +  - Implements `Enumerable` (`Enum.count/1` in `O(1)` on counted collections,
-+    `Enum.member?/2` in `O(1)` / $O(\\log N)$ via HAMT/B+Tree lookup,
-     `Enum.slice/2` in $O(\\log N)$ via index seek, and `Enum.to_list/1` / `Stream.*`).
++    `Enum.member?/2` in `O(1)` / `O(log N)` via HAMT/B+Tree lookup,
++    `Enum.slice/2` in `O(log N)` via index seek, and `Enum.to_list/1` / `Stream.*`).
    - Implements `Inspect` with a safe, bounded preview.
    """
 @@ -26,6 +26,7 @@ defmodule Xitdb.Cursor do

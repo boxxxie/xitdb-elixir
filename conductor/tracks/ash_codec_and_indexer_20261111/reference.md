@@ -955,7 +955,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
         nested ->
           pk_key = Codec.encode_scalar_key(pk_attr, pk_value)
-          parent_col_str = resolve_parent_collection(nested, tenant)
+          parent_col_str = resolve_parent_collection(nested, tenant, resource)
 
           with {:ok, parent_doc_id} <-
                  Storage.lookup_unique(db_or_cursor, collection, @parent_slot, pk_key),
@@ -990,7 +990,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           Storage.list_top_level_cursors(db_or_cursor, collection)
 
         nested ->
-          parent_col_str = resolve_parent_collection(nested, tenant)
+          parent_col_str = resolve_parent_collection(nested, tenant, resource)
 
           db_or_cursor
           |> Storage.list_unique_entries(collection, @parent_slot)
@@ -1018,7 +1018,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         when is_atom(resource) do
       nested = resolve_nested_spec!(resource)
       pk_attr = pk_attribute(resource)
-      parent_col_str = resolve_parent_collection(nested, tenant)
+      parent_col_str = resolve_parent_collection(nested, tenant, resource)
 
       Storage.list_nested_cursors_for_parent(
         db_or_cursor,
@@ -1177,7 +1177,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
                message: "is required for nested Xitdb resource"
              )}
           else
-            parent_col_str = resolve_parent_collection(nested, tenant)
+            parent_col_str = resolve_parent_collection(nested, tenant, resource)
             new_parent_doc_id = Codec.encode_doc_id(new_parent_val)
 
             case Storage.fetch_top_level_cursor(db_or_cursor, parent_col_str, new_parent_doc_id) do
@@ -1221,7 +1221,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         nested ->
           {:nested,
            %{
-             parent_collection: resolve_parent_collection(nested, tenant),
+             parent_collection: resolve_parent_collection(nested, tenant, resource),
              parent_doc_id: record |> Map.get(nested.foreign_key) |> maybe_encode_doc_id(),
              path: nested.path,
              cardinality: nested.cardinality,
@@ -1569,15 +1569,17 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
     defp resolve_nested_spec(resource) do
       raw =
-        cond do
-          function_exported?(Info, :nested_mappings, 1) ->
-            case Info.nested_mappings(resource) do
-              [first | _] -> first
-              [] -> fallback_nested_in(resource)
+        case fallback_nested_in(resource) do
+          nil ->
+            if function_exported?(Info, :nested_mappings, 1) do
+              case Info.nested_mappings(resource) do
+                [first | _] -> first
+                [] -> nil
+              end
             end
 
-          true ->
-            fallback_nested_in(resource)
+          spec ->
+            spec
         end
 
       normalize_nested_spec(raw)
@@ -1605,7 +1607,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
            as: as_slot,
            parent_key: fk_attr,
            cardinality: cardinality
-         }) do
+         })
+         when is_atom(parent) and not is_nil(parent) do
       %{
         parent_resource: parent,
         parent_collection: Info.collection!(parent),
@@ -1620,7 +1623,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
            foreign_key: fk_attr,
            path: path,
            cardinality: cardinality
-         }) do
+         })
+         when is_atom(parent_col) and not is_nil(parent_col) do
       %{
         parent_resource: nil,
         parent_collection: parent_col,
@@ -1630,13 +1634,17 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       }
     end
 
-    defp resolve_parent_collection(%{parent_resource: parent}, tenant)
+    defp resolve_parent_collection(%{parent_resource: parent}, tenant, _resource)
          when is_atom(parent) and not is_nil(parent) do
       Codec.scoped_collection(parent, tenant)
     end
 
-    defp resolve_parent_collection(%{parent_collection: parent_col}, _tenant) do
-      Atom.to_string(parent_col)
+    defp resolve_parent_collection(%{parent_collection: parent_col}, tenant, resource) do
+      if Ash.Resource.Info.multitenancy_strategy(resource) == :context and not is_nil(tenant) do
+        "t:" <> Codec.encode_doc_id(tenant) <> ":" <> Atom.to_string(parent_col)
+      else
+        Atom.to_string(parent_col)
+      end
     end
   end
 
@@ -1855,8 +1863,12 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           new_terms,
           batch_state \\ %{}
         ) do
+      doc_state_key = {:search_doc, collection, doc_key}
+
       %{len: old_len, terms: old_terms} =
-        Xitdb.Ash.Search.Storage.read_doc(db_or_cursor, collection, doc_key)
+        Map.get_lazy(batch_state, doc_state_key, fn ->
+          Xitdb.Ash.Search.Storage.read_doc(db_or_cursor, collection, doc_key)
+        end)
 
       new_len = Enum.reduce(new_terms, 0, fn {_term, weight}, sum -> sum + weight end)
 
@@ -1893,7 +1905,9 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         new_total_len = max(0, cur_total_len + len_delta)
 
         next_batch =
-          Map.put(batch_state, stats_key, %{doc_count: new_doc_count, total_len: new_total_len})
+          batch_state
+          |> Map.put(stats_key, %{doc_count: new_doc_count, total_len: new_total_len})
+          |> Map.put(doc_state_key, %{len: new_len, terms: new_terms})
 
         meta_ops = [
           {:put, meta_prefix <> ".doc_count", new_doc_count},

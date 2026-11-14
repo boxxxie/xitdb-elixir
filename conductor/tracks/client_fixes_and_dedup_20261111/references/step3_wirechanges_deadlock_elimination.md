@@ -285,7 +285,9 @@ diff --git a/lib/xitdb/ash/info.ex b/lib/xitdb/ash/info.ex
 -      |> Extension.get_entities([:xitdb])
 -      |> Enum.filter(&match?(%Xitdb.Ash.NestedIn{}, &1))
 -      |> Enum.map(&%{&1 | __identifier__: nil, __spark_metadata__: nil})
-+      for %Xitdb.Ash.NestedIn{} = mapping <- Extension.get_entities(resource_or_dsl, [:xitdb]) do
++      for %Xitdb.Ash.NestedIn{parent: parent} = mapping <-
++            Extension.get_entities(resource_or_dsl, [:xitdb]),
++          not is_nil(parent) do
 +        %Xitdb.Ash.NestedIn{mapping | __identifier__: nil, __spark_metadata__: nil}
 +      end
      end

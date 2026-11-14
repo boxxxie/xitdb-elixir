@@ -875,15 +875,16 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     end
 
     defp resolve_nested_specs(resource) do
-      cond do
-        function_exported?(Info, :nested_mappings, 1) ->
-          case Info.nested_mappings(resource) do
-            [_ | _] = list -> list
-            [] -> resolve_single_nested_in(resource)
-          end
+      case resolve_single_nested_in(resource) do
+        [_ | _] = list ->
+          list
 
-        true ->
-          resolve_single_nested_in(resource)
+        [] ->
+          if function_exported?(Info, :nested_mappings, 1) do
+            Info.nested_mappings(resource)
+          else
+            []
+          end
       end
     end
 
