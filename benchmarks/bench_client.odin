@@ -318,7 +318,7 @@ seed_bm25_fixture_db :: proc(db: ^xitdb.Database, n: int) {
 	xitdb.tx_report_destroy(&rep, context.temp_allocator)
 }
 
-bench_raw_bm25_search :: proc(root_map: xitdb.Read_Hash_Map, collection: string, query_terms: []string, k_limit: int) -> []Bench_BM25_Hit {
+bench_raw_bm25_search :: proc(root_map: xitdb.Read_Hash_Map, collection: string, query_terms: []string, k_limit: int, allocator := context.temp_allocator) -> []Bench_BM25_Hit {
 	arena: mem.Dynamic_Arena
 	mem.dynamic_arena_init(
 		&arena,
@@ -445,7 +445,14 @@ bench_raw_bm25_search :: proc(root_map: xitdb.Read_Hash_Map, collection: string,
 		}
 	}
 	slice.sort_by(top_heap[:], bench_bm25_hit_better)
-	return top_heap[:]
+	out := make([]Bench_BM25_Hit, len(top_heap), allocator)
+	for hit, idx in top_heap {
+		out[idx] = Bench_BM25_Hit{
+			doc_key = strings.clone(hit.doc_key, allocator),
+			score   = hit.score,
+		}
+	}
+	return out
 }
 
 main :: proc() {
