@@ -283,7 +283,6 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       end
     end
 
-    # Flat top-level collection in Wave 2 (physical `nested_in` subtrees move to Wave 3 Track 11B)
     defmodule AgendaSession do
       use Ash.Resource,
         domain: Xitdb.Ash.DataLayerTest.TestDomain,
@@ -292,16 +291,20 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       xitdb do
         store TestMdmStore
         collection :agenda_sessions
-
-        references do
-          reference :event, on_delete: :delete
-        end
+        nested_in :events, foreign_key: :event_id, path: :sessions, cardinality: :many
+        index :room
+        search_field :title, boost: 2.0
       end
 
       actions do
         defaults([:read, :destroy])
 
         create :create do
+          primary?(true)
+          accept([:event_id, :title, :room])
+        end
+
+        update :update do
           primary?(true)
           accept([:event_id, :title, :room])
         end
@@ -326,6 +329,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       xitdb do
         store TestMdmStore
         collection :conferences
+        nested_in :events, foreign_key: :event_id, path: :conference, cardinality: :one
 
         references do
           reference :event, on_delete: :delete
@@ -692,7 +696,9 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
         resource AgendaSession do
           define(:create_session, action: :create)
+          define(:update_session, action: :update)
           define(:get_session, action: :read, get_by: [:id])
+          define(:list_sessions, action: :read)
         end
 
         resource Conference do
@@ -1297,6 +1303,91 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         :ok = TestDomain.destroy_message!(msg, authorize?: false)
         reloaded_rep = TestDomain.get_report!(rep.id, authorize?: false)
         assert is_nil(reloaded_rep.message_id)
+      end
+
+      test "stores nested_in (:many and :one) subtrees physically under events, supports parent-jump queries, Ash reparenting, and event destroy BM25 cleanup" do
+        organizer =
+          TestDomain.create_user!(%{email: unique_email("nested_org")}, authorize?: false)
+
+        ev1 =
+          TestDomain.create_event!(
+            %{title: "Vancouver Summit", start_time: ~U[2026-11-01 09:00:00Z]},
+            authorize?: false
+          )
+
+        ev2 =
+          TestDomain.create_event!(
+            %{title: "Zurich Forum", start_time: ~U[2026-12-01 09:00:00Z]},
+            authorize?: false
+          )
+
+        s1 =
+          TestDomain.create_session!(
+            %{event_id: ev1.id, title: "Helios Private Credit", room: "Oak"},
+            authorize?: false
+          )
+
+        s2 =
+          TestDomain.create_session!(
+            %{event_id: ev2.id, title: "Helios Venture Equity", room: "Pine"},
+            authorize?: false
+          )
+
+        conf =
+          TestDomain.create_conference!(
+            %{event_id: ev1.id, organizer_id: organizer.id, title: "CAASA West"},
+            authorize?: false
+          )
+
+        # Physical co-location under TestMdmStore root["events"]
+        root = Xitdb.Ash.Store.root(TestMdmStore)
+        assert root["agenda_sessions"] == nil
+        assert root["conferences"] == nil
+
+        assert root["events"][to_string(ev1.id)]["sessions"][to_string(s1.id)]["title"] ==
+                 s1.title
+
+        assert root["events"][to_string(ev1.id)]["conference"]["title"] == conf.title
+
+        # Direct PK lookup via _parent & parent-jump FK query + secondary intersection
+        assert TestDomain.get_session!(s1.id, authorize?: false).id == s1.id
+        assert TestDomain.get_conference_by_event_id!(ev1.id, authorize?: false).id == conf.id
+
+        ev1_sessions =
+          AgendaSession
+          |> Ash.Query.filter(event_id == ^ev1.id and room == "Oak")
+          |> Ash.read!(authorize?: false)
+
+        assert Enum.map(ev1_sessions, & &1.id) == [s1.id]
+
+        # Ash update reparenting moves physical slot from ev1 -> ev2
+        moved =
+          TestDomain.update_session!(s1, %{event_id: ev2.id, room: "Pine"}, authorize?: false)
+
+        assert moved.event_id == ev2.id
+
+        root_after_move = Xitdb.Ash.Store.root(TestMdmStore)
+        assert root_after_move["events"][to_string(ev1.id)]["sessions"][to_string(s1.id)] == nil
+
+        assert root_after_move["events"][to_string(ev2.id)]["sessions"][to_string(s1.id)]["room"] ==
+                 "Pine"
+
+        ev2_sessions =
+          AgendaSession
+          |> Ash.Query.filter(event_id == ^ev2.id and room == "Pine")
+          |> Ash.read!(authorize?: false)
+          |> Enum.map(& &1.id)
+          |> Enum.sort()
+
+        assert ev2_sessions == Enum.sort([s1.id, s2.id])
+
+        # Destroying ev2 purges both moved s1 and s2 + their BM25 search entries
+        assert Enum.sort(Xitdb.Ash.Search.ids(AgendaSession, "helios")) ==
+                 Enum.sort([s1.id, s2.id])
+
+        :ok = TestDomain.destroy_event!(ev2, authorize?: false)
+        assert TestDomain.list_sessions!(authorize?: false) == []
+        assert Xitdb.Ash.Search.ids(AgendaSession, "helios") == []
       end
     end
 

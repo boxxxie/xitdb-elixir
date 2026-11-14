@@ -96,7 +96,7 @@ Each track has its own specification and implementation plan in [`./tracks/`](./
 
 ---
 
-- [ ] **Track 11B [Wave 3 — Physical Subtree Nesting]: `nested_in` Subtree Storage, Reparenting, Parent-Jump Queries & Recursive Child Index Purging**
+- [x] **Track 11B [Wave 3 — Physical Subtree Nesting]: `nested_in` Subtree Storage, Reparenting, Parent-Jump Queries & Recursive Child Index Purging**
   *Link: [./tracks/ash_codec_and_indexer_20261111/](./tracks/ash_codec_and_indexer_20261111/)*
   *Deferred Scope:* Complete physical document-subtree nesting deferred from Tracks 10, 11, 12, and 14 (`fetch_nested_cursor/6`, `nested_cursors_for_parent/3`, foreign-key reparenting, `purge_nested_children/4`, and `Store` implicit `nested_in` `:delete` rule synthesis).
 

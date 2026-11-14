@@ -140,6 +140,92 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       end
     end
 
+    defmodule NestedEvent do
+      use Ash.Resource,
+        domain: nil,
+        validate_domain_inclusion?: false,
+        extensions: [Xitdb.Ash.Dsl]
+
+      xitdb do
+        store DummyStore
+        collection :nested_events
+      end
+
+      actions do
+        defaults([:read, :destroy])
+      end
+
+      attributes do
+        integer_primary_key(:id)
+        attribute(:title, :string, allow_nil?: false, public?: true)
+      end
+
+      relationships do
+        has_many(:sessions, Xitdb.Ash.IndexerTest.NestedSession, destination_attribute: :event_id)
+        has_one(:banner, Xitdb.Ash.IndexerTest.NestedBanner, destination_attribute: :event_id)
+      end
+    end
+
+    defmodule NestedSession do
+      use Ash.Resource,
+        domain: nil,
+        validate_domain_inclusion?: false,
+        extensions: [Xitdb.Ash.Dsl]
+
+      xitdb do
+        store DummyStore
+        collection :nested_sessions
+        nested_in :nested_events, foreign_key: :event_id, path: :sessions, cardinality: :many
+        index :room
+        search_field :title, boost: 2.0
+      end
+
+      attributes do
+        integer_primary_key(:id)
+        attribute(:slug, :ci_string, allow_nil?: false, public?: true)
+        attribute(:room, :string, public?: true)
+        attribute(:title, :string, allow_nil?: false, public?: true)
+      end
+
+      relationships do
+        belongs_to(:event, NestedEvent,
+          attribute_type: :integer,
+          allow_nil?: false,
+          public?: true
+        )
+      end
+
+      identities do
+        identity(:unique_slug, [:slug])
+      end
+    end
+
+    defmodule NestedBanner do
+      use Ash.Resource,
+        domain: nil,
+        validate_domain_inclusion?: false,
+        extensions: [Xitdb.Ash.Dsl]
+
+      xitdb do
+        store DummyStore
+        collection :nested_banners
+        nested_in :nested_events, foreign_key: :event_id, path: :banner, cardinality: :one
+      end
+
+      attributes do
+        integer_primary_key(:id)
+        attribute(:headline, :string, allow_nil?: false, public?: true)
+      end
+
+      relationships do
+        belongs_to(:event, NestedEvent,
+          attribute_type: :integer,
+          allow_nil?: false,
+          public?: true
+        )
+      end
+    end
+
     setup do
       {:ok, db} = Xitdb.open(backend: :memory)
 
@@ -573,6 +659,214 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       meta = Xitdb.db(db)["idx"]["search"]["articles"]["meta"]
       assert meta["doc_count"] == 0
       assert meta["total_len"] == 0
+    end
+
+    describe "Track 11B nested_in physical subtrees, reparenting & recursive index purge" do
+      test "stores :many and :one nested_in entities physically inside parents, maintains _parent, deduplicates all_cursors/3, and preserves 9-byte fork isolation",
+           %{db: db} do
+        ev1 = struct(NestedEvent, id: 10, title: "Toronto Summit")
+        ev2 = struct(NestedEvent, id: 20, title: "Montreal Forum")
+        {:ok, db} = Indexer.put_record(db, NestedEvent, nil, ev1)
+        {:ok, db} = Indexer.put_record(db, NestedEvent, nil, ev2)
+
+        s1 =
+          struct(NestedSession,
+            id: 101,
+            event_id: ev1.id,
+            slug: Ash.CiString.new("s-101"),
+            room: "Hall A",
+            title: "Sovereign Credit"
+          )
+
+        s2 =
+          struct(NestedSession,
+            id: 102,
+            event_id: ev1.id,
+            slug: Ash.CiString.new("s-102"),
+            room: "Hall B",
+            title: "Private Infrastructure"
+          )
+
+        s3 =
+          struct(NestedSession,
+            id: 201,
+            event_id: ev2.id,
+            slug: Ash.CiString.new("s-201"),
+            room: "Hall C",
+            title: "Timberland Yields"
+          )
+
+        b1 = struct(NestedBanner, id: 1, event_id: ev1.id, headline: "Opening Keynote")
+
+        {:ok, db} = Indexer.put_record(db, NestedSession, nil, s1)
+        {:ok, db} = Indexer.put_record(db, NestedSession, nil, s2)
+        {:ok, db} = Indexer.put_record(db, NestedSession, nil, s3)
+        {:ok, db} = Indexer.put_record(db, NestedBanner, nil, b1)
+
+        root = Xitdb.db(db)
+
+        # Physical co-location inside parent entity maps (no top-level child collections)
+        assert root["nested_sessions"] == nil
+        assert root["nested_banners"] == nil
+        assert root["nested_events"]["10"]["sessions"]["101"]["title"] == "Sovereign Credit"
+        assert root["nested_events"]["10"]["sessions"]["102"]["title"] == "Private Infrastructure"
+        assert root["nested_events"]["20"]["sessions"]["201"]["title"] == "Timberland Yields"
+        assert root["nested_events"]["10"]["banner"]["headline"] == "Opening Keynote"
+
+        # _parent locator maintains PK -> parent_doc_id for O(1) fetch_cursor/4
+        assert {:ok, s1_cur} = Indexer.fetch_cursor(db, NestedSession, s1.id)
+        assert {:ok, decoded_s1} = Codec.from_cursor(NestedSession, s1_cur)
+        assert decoded_s1.id == s1.id
+        assert decoded_s1.title == "Sovereign Credit"
+
+        assert {:ok, b1_cur} = Indexer.fetch_cursor(db, NestedBanner, b1.id)
+        assert b1_cur["headline"] == "Opening Keynote"
+
+        # O(1) parent-jump lookup for both :many and :one
+        ev1_sessions = Indexer.nested_cursors_for_parent(db, NestedSession, ev1.id)
+        assert Enum.map(ev1_sessions, &elem(&1, 0)) |> Enum.sort() == ["101", "102"]
+
+        ev1_banners = Indexer.nested_cursors_for_parent(db, NestedBanner, ev1.id)
+        assert Enum.map(ev1_banners, &elem(&1, 0)) == ["1"]
+
+        # all_cursors/3 deduplicates parents (s1 and s2 share ev1 -> returned once each, zero K^2 dupes)
+        all_ids = db |> Indexer.all_cursors(NestedSession) |> Enum.map(&elem(&1, 0))
+        assert length(all_ids) == 3
+        assert Enum.sort(all_ids) == ["101", "102", "201"]
+
+        # 9-byte fork / time-travel snapshot isolation across nested mutations
+        base_moment = Xitdb.moment_count(db) - 1
+        s1_renamed = %{s1 | title: "Updated Credit"}
+        {:ok, db2} = Indexer.put_record(db, NestedSession, s1, s1_renamed)
+
+        {:ok, old_cur} = Indexer.fetch_cursor(Xitdb.as_of(db2, base_moment), NestedSession, s1.id)
+        assert old_cur["title"] == "Sovereign Credit"
+
+        {:ok, forked_db} =
+          Xitdb.transact(db2, fn root_cur ->
+            Xitdb.fork(root_cur, ".nested_events", ".archived_events")
+          end)
+
+        assert Xitdb.db(forked_db)["archived_events"]["10"]["sessions"]["101"]["title"] ==
+                 "Updated Credit"
+
+        {:ok, forked_db_after_edit} = Indexer.put_record(forked_db, NestedSession, s1_renamed, s1)
+
+        assert Xitdb.db(forked_db_after_edit)["archived_events"]["10"]["sessions"]["101"]["title"] ==
+                 "Updated Credit"
+
+        assert {:ok, cur_tip} = Indexer.fetch_cursor(forked_db_after_edit, NestedSession, s1.id)
+        assert cur_tip["title"] == "Sovereign Credit"
+      end
+
+      test "reparents nested_in child across parents and removes old parent subtree entry", %{
+        db: db
+      } do
+        ev1 = struct(NestedEvent, id: 1, title: "Event One")
+        ev2 = struct(NestedEvent, id: 2, title: "Event Two")
+        {:ok, db} = Indexer.put_record(db, NestedEvent, nil, ev1)
+        {:ok, db} = Indexer.put_record(db, NestedEvent, nil, ev2)
+
+        s1 =
+          struct(NestedSession,
+            id: 50,
+            event_id: ev1.id,
+            slug: Ash.CiString.new("moving-session"),
+            room: "Room 1",
+            title: "Cross Border Reparenting"
+          )
+
+        {:ok, db} = Indexer.put_record(db, NestedSession, nil, s1)
+        assert Xitdb.db(db)["nested_events"]["1"]["sessions"]["50"] != nil
+
+        # Reparent s1 from ev1 -> ev2 in a single commit
+        s1_moved = %{s1 | event_id: ev2.id, room: "Room 2"}
+        {:ok, db} = Indexer.put_record(db, NestedSession, s1, s1_moved)
+
+        root = Xitdb.db(db)
+        assert root["nested_events"]["1"]["sessions"]["50"] == nil
+        assert root["nested_events"]["2"]["sessions"]["50"]["room"] == "Room 2"
+        assert Indexer.nested_cursors_for_parent(db, NestedSession, ev1.id) == []
+        assert [{"50", _}] = Indexer.nested_cursors_for_parent(db, NestedSession, ev2.id)
+
+        assert {:ok, cur} = Indexer.fetch_cursor(db, NestedSession, s1.id)
+        assert cur["event_id"] == ev2.id
+      end
+
+      test "deleting parent recursively purges all nested child _parent, identity, secondary, and BM25 indexes in 1 commit",
+           %{db: db} do
+        ev1 = struct(NestedEvent, id: 1, title: "Doomed Event")
+        ev2 = struct(NestedEvent, id: 2, title: "Survivor Event")
+        {:ok, db} = Indexer.put_record(db, NestedEvent, nil, ev1)
+        {:ok, db} = Indexer.put_record(db, NestedEvent, nil, ev2)
+
+        s1 =
+          struct(NestedSession,
+            id: 1,
+            event_id: ev1.id,
+            slug: Ash.CiString.new("doomed-1"),
+            room: "East",
+            title: "Quasar Direct Lending"
+          )
+
+        s2 =
+          struct(NestedSession,
+            id: 2,
+            event_id: ev1.id,
+            slug: Ash.CiString.new("doomed-2"),
+            room: "East",
+            title: "Quasar Mezzanine"
+          )
+
+        b1 = struct(NestedBanner, id: 10, event_id: ev1.id, headline: "Doomed Banner")
+
+        survivor =
+          struct(NestedSession,
+            id: 3,
+            event_id: ev2.id,
+            slug: Ash.CiString.new("survivor"),
+            room: "West",
+            title: "Quasar Infrastructure"
+          )
+
+        {:ok, db} = Indexer.put_record(db, NestedSession, nil, s1)
+        {:ok, db} = Indexer.put_record(db, NestedSession, nil, s2)
+        {:ok, db} = Indexer.put_record(db, NestedBanner, nil, b1)
+        {:ok, db} = Indexer.put_record(db, NestedSession, nil, survivor)
+
+        assert Enum.sort(Search.ids(NestedSession, "quasar", db: db)) == [1, 2, 3]
+        assert Xitdb.db(db)["idx"]["search"]["nested_sessions"]["meta"]["doc_count"] == 3
+
+        m_before = Xitdb.moment_count(db)
+        {:ok, db} = Indexer.delete_record(db, NestedEvent, ev1)
+        assert Xitdb.moment_count(db) == m_before + 1
+
+        # Ev1 + children completely gone from tree and all index slots
+        assert Indexer.fetch_cursor(db, NestedEvent, ev1.id) == :none
+        assert Indexer.fetch_cursor(db, NestedSession, s1.id) == :none
+        assert Indexer.fetch_cursor(db, NestedSession, s2.id) == :none
+        assert Indexer.fetch_cursor(db, NestedBanner, b1.id) == :none
+
+        [room_idx | _] = Info.indexes_for_field(NestedSession, :room)
+        slug_id = Ash.Resource.Info.identity(NestedSession, :unique_slug)
+
+        assert Indexer.lookup_secondary_eq(db, NestedSession, room_idx, ["East"]) == MapSet.new()
+
+        assert Indexer.lookup_by_identity(db, NestedSession, slug_id, %{
+                 slug: Ash.CiString.new("doomed-1")
+               }) == :none
+
+        assert Indexer.lookup_by_identity(db, NestedSession, slug_id, %{
+                 slug: Ash.CiString.new("doomed-2")
+               }) == :none
+
+        # BM25 postings for s1/s2 removed while survivor stays intact
+        assert Search.ids(NestedSession, "quasar", db: db) == [3]
+        assert Search.ids(NestedSession, "lending", db: db) == []
+        assert Search.ids(NestedSession, "mezzanine", db: db) == []
+        assert Xitdb.db(db)["idx"]["search"]["nested_sessions"]["meta"]["doc_count"] == 1
+        assert Indexer.all_cursors(db, NestedSession) |> Enum.map(&elem(&1, 0)) == ["3"]
+      end
     end
   end
 end

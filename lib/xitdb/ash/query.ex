@@ -253,7 +253,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
         {eq_map, range_map} ->
           [pk_name | _] = Ash.Resource.Info.primary_key(resource)
-          _nested_fk = nested_foreign_key(resource)
+          nested_fk = nested_foreign_key(resource)
 
           cond do
             # 1. Primary-key equality / `in` -> O(1) cursor fetch
@@ -265,15 +265,109 @@ if Code.ensure_loaded?(Ash.DataLayer) do
                 :no_match ->
               identity_hit
 
-            # 3. Secondary B+Tree equality, `in`, or composite prefix + range intersection
+            # 3. `nested_in` parent FK equality -> O(1) subtree jump
+            nested_fk != nil and Map.has_key?(eq_map, nested_fk) ->
+              parent_vals = Map.fetch!(eq_map, nested_fk)
+
+              nested_cursors =
+                fetch_nested_parent_cursors(db_or_cursor, resource, parent_vals, tenant)
+
+              intersect_cursors_with_secondary(
+                db_or_cursor,
+                resource,
+                nested_cursors,
+                eq_map,
+                range_map,
+                nested_fk,
+                tenant
+              )
+
+            # 4. Secondary B+Tree equality, `in`, or composite prefix + range intersection
             true ->
               intersect_secondary_indexes(db_or_cursor, resource, eq_map, range_map, nil, tenant)
           end
       end
     end
 
-    # Inactive in Wave 2 flat scope; activated via `Info.nested_in/1` in Track 11B.
-    defp nested_foreign_key(_resource), do: nil
+    defp nested_foreign_key(resource) do
+      case fallback_nested_fk(resource) do
+        nil ->
+          if function_exported?(Info, :nested_mappings, 1) do
+            case Info.nested_mappings(resource) do
+              [%{parent_key: fk} | _] when not is_nil(fk) -> fk
+              [%{foreign_key: fk} | _] when not is_nil(fk) -> fk
+              _ -> nil
+            end
+          end
+
+        fk ->
+          fk
+      end
+    end
+
+    defp fallback_nested_fk(resource) do
+      if function_exported?(Info, :nested_in, 1) do
+        case apply(Info, :nested_in, [resource]) do
+          %{foreign_key: fk} -> fk
+          %{parent_key: fk} -> fk
+          _ -> nil
+        end
+      else
+        nil
+      end
+    end
+
+    defp fetch_nested_parent_cursors(_db_or_cursor, _resource, [], _tenant), do: []
+
+    defp fetch_nested_parent_cursors(db_or_cursor, resource, parent_vals, tenant) do
+      parent_vals
+      |> Enum.reject(&is_nil/1)
+      |> Enum.uniq_by(&Codec.encode_doc_id/1)
+      |> Enum.flat_map(&Indexer.nested_cursors_for_parent(db_or_cursor, resource, &1, tenant))
+    end
+
+    defp intersect_cursors_with_secondary(
+           _db_or_cursor,
+           _resource,
+           [],
+           _eq_map,
+           _range_map,
+           _skip_field,
+           _tenant
+         ) do
+      {:empty}
+    end
+
+    defp intersect_cursors_with_secondary(
+           db_or_cursor,
+           resource,
+           cursors,
+           eq_map,
+           range_map,
+           skip_field,
+           tenant
+         ) do
+      case intersect_secondary_indexes(
+             db_or_cursor,
+             resource,
+             Map.delete(eq_map, skip_field),
+             range_map,
+             skip_field,
+             tenant
+           ) do
+        :full_scan ->
+          {:cursors, cursors}
+
+        {:empty} ->
+          {:empty}
+
+        {:doc_ids, allowed_ids} ->
+          narrowed =
+            Enum.filter(cursors, fn {doc_id, _} -> MapSet.member?(allowed_ids, doc_id) end)
+
+          if narrowed == [], do: {:empty}, else: {:cursors, narrowed}
+      end
+    end
 
     defp resolve_pk_candidates(_db_or_cursor, _resource, [], _tenant), do: {:empty}
 
@@ -489,12 +583,12 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     end
 
     defp doc_ids_to_cursors(db_or_cursor, resource, doc_ids, tenant) do
-      collection = Codec.scoped_collection(resource, tenant)
-
       Enum.flat_map(doc_ids, fn doc_id ->
-        case Indexer.Storage.fetch_top_level_cursor(db_or_cursor, collection, doc_id) do
-          {:ok, cursor} -> [{doc_id, cursor}]
-          :none -> []
+        with {:ok, pk_val} <- Codec.decode_doc_id(resource, doc_id),
+             {:ok, cursor} <- Indexer.fetch_cursor(db_or_cursor, resource, pk_val, tenant) do
+          [{doc_id, cursor}]
+        else
+          _ -> []
         end
       end)
     end
@@ -1349,62 +1443,58 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
     defp fetch_matching_destination_records(dest_db, dest_res, dest_attr, values, tenant) do
       [pk_name | _] = Ash.Resource.Info.primary_key(dest_res)
-      collection = Codec.scoped_collection(dest_res, tenant)
+      nested_fk = nested_foreign_key(dest_res)
 
       cursors =
-        if dest_attr == pk_name do
-          case resolve_pk_candidates(dest_db, dest_res, values, tenant) do
-            {:cursors, found} -> found
-            {:empty} -> []
-          end
-        else
-          case find_leading_index(dest_res, dest_attr) do
-            %{fields: [^dest_attr]} = idx ->
-              doc_ids =
-                Enum.reduce(values, MapSet.new(), fn val, acc ->
-                  MapSet.union(
-                    acc,
-                    Indexer.lookup_secondary_eq(dest_db, dest_res, idx, [val], tenant)
-                  )
-                end)
+        cond do
+          dest_attr == pk_name ->
+            case resolve_pk_candidates(dest_db, dest_res, values, tenant) do
+              {:cursors, found} -> found
+              {:empty} -> []
+            end
 
-              fetch_cursors_by_doc_ids(dest_db, collection, doc_ids)
+          nested_fk != nil and dest_attr == nested_fk ->
+            fetch_nested_parent_cursors(dest_db, dest_res, values, tenant)
 
-            %{fields: [^dest_attr | _]} = composite_idx ->
-              doc_ids =
-                Enum.reduce(values, MapSet.new(), fn val, acc ->
-                  MapSet.union(
-                    acc,
-                    Indexer.scan_secondary_range(
-                      dest_db,
-                      dest_res,
-                      composite_idx,
-                      %{prefix: [val], min: :unbounded, max: :unbounded},
-                      tenant
+          true ->
+            case find_leading_index(dest_res, dest_attr) do
+              %{fields: [^dest_attr]} = idx ->
+                doc_ids =
+                  Enum.reduce(values, MapSet.new(), fn val, acc ->
+                    MapSet.union(
+                      acc,
+                      Indexer.lookup_secondary_eq(dest_db, dest_res, idx, [val], tenant)
                     )
-                  )
-                end)
+                  end)
 
-              fetch_cursors_by_doc_ids(dest_db, collection, doc_ids)
+                doc_ids_to_cursors(dest_db, dest_res, doc_ids, tenant)
 
-            nil ->
-              Indexer.all_cursors(dest_db, dest_res, tenant)
-          end
+              %{fields: [^dest_attr | _]} = composite_idx ->
+                doc_ids =
+                  Enum.reduce(values, MapSet.new(), fn val, acc ->
+                    MapSet.union(
+                      acc,
+                      Indexer.scan_secondary_range(
+                        dest_db,
+                        dest_res,
+                        composite_idx,
+                        %{prefix: [val], min: :unbounded, max: :unbounded},
+                        tenant
+                      )
+                    )
+                  end)
+
+                doc_ids_to_cursors(dest_db, dest_res, doc_ids, tenant)
+
+              nil ->
+                Indexer.all_cursors(dest_db, dest_res, tenant)
+            end
         end
 
       with {:ok, hydrated} <- stage2_hydrate(cursors, %__MODULE__{tenant: tenant}, dest_res) do
         allowed = MapSet.new(values)
         {:ok, Enum.filter(hydrated, &MapSet.member?(allowed, Map.get(&1, dest_attr)))}
       end
-    end
-
-    defp fetch_cursors_by_doc_ids(db_or_cursor, collection, doc_ids) do
-      Enum.flat_map(doc_ids, fn doc_id ->
-        case Indexer.Storage.fetch_top_level_cursor(db_or_cursor, collection, doc_id) do
-          {:ok, cursor} -> [{doc_id, cursor}]
-          :none -> []
-        end
-      end)
     end
 
     defp apply_step_join_filter(frontier, _root_by_idx, nil, _domain, _tenant, _actor),

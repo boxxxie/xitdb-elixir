@@ -7,9 +7,10 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     """
 
     alias Ash.Error.Changes.InvalidChanges
-    alias Xitdb.Ash.{Codec, Info, Search}
+    alias Xitdb.Ash.{Codec, Info, Search, Store}
     alias Xitdb.Ash.Indexer.Storage
 
+    @parent_slot "_parent"
     @search_weight_scale 100
 
     @type bound :: {:inclusive | :exclusive, term()} | :unbounded
@@ -192,7 +193,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     # -- Point, Identity & B+Tree Read Operations --
 
     @doc """
-    Fetches a single raw entity cursor by primary key in `O(1)` for top-level collections.
+    Fetches a single raw entity cursor by primary key in `O(1)` for top-level collections,
+    or via `_parent` locator inside a `nested_in` parent subtree.
     """
     @spec fetch_cursor(term(), module(), term(), term()) :: {:ok, term()} | :none
     def fetch_cursor(db_or_cursor, resource, pk_value, tenant \\ nil)
@@ -203,27 +205,90 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       pk_attr = pk_attribute(resource)
       doc_id = Codec.encode_pk_doc_id(pk_attr, pk_value)
 
-      nil = resolve_nested_spec(resource)
-      Storage.fetch_top_level_cursor(db_or_cursor, collection, doc_id)
+      case resolve_nested_spec(resource) do
+        nil ->
+          Storage.fetch_top_level_cursor(db_or_cursor, collection, doc_id)
+
+        nested ->
+          pk_key = Codec.encode_scalar_key(pk_attr, pk_value)
+          parent_col_str = resolve_parent_collection(nested, tenant, resource)
+
+          with {:ok, parent_doc_id} <-
+                 Storage.lookup_unique(db_or_cursor, collection, @parent_slot, pk_key),
+               {:ok, cursor} <-
+                 Storage.fetch_nested_cursor(
+                   db_or_cursor,
+                   parent_col_str,
+                   parent_doc_id,
+                   nested.path,
+                   nested.cardinality,
+                   doc_id
+                 ),
+               true <- cursor_matches_doc_id?(cursor, pk_attr, doc_id) do
+            {:ok, cursor}
+          else
+            _ -> :none
+          end
+      end
     end
 
     @doc """
-    Returns all `{doc_id, cursor}` pairs for a collection.
+    Returns all `{doc_id, cursor}` pairs for a top-level collection or across deduplicated
+    `_parent` entries of a `nested_in` collection.
     """
     @spec all_cursors(term(), module(), term()) :: [{String.t(), term()}]
     def all_cursors(db_or_cursor, resource, tenant \\ nil) when is_atom(resource) do
       collection = Codec.scoped_collection(resource, tenant)
-      nil = resolve_nested_spec(resource)
-      Storage.list_top_level_cursors(db_or_cursor, collection)
+      pk_attr = pk_attribute(resource)
+
+      case resolve_nested_spec(resource) do
+        nil ->
+          Storage.list_top_level_cursors(db_or_cursor, collection)
+
+        nested ->
+          parent_col_str = resolve_parent_collection(nested, tenant, resource)
+
+          db_or_cursor
+          |> Storage.list_unique_entries(collection, @parent_slot)
+          |> Stream.map(&elem(&1, 1))
+          |> Stream.uniq()
+          |> Enum.flat_map(fn parent_doc_id ->
+            Storage.list_nested_cursors_for_parent(
+              db_or_cursor,
+              parent_col_str,
+              parent_doc_id,
+              nested.path,
+              nested.cardinality,
+              pk_attr
+            )
+          end)
+      end
     end
 
     @doc """
-    Returns `[]` in Wave 2 flat mode (activated for `nested_in` subtrees in Wave 3 Track 11B).
+    Jumps directly to `root[parent_col][parent_id][path]` in `O(1)` when filtering a
+    `nested_in` resource by its parent foreign key (`event_id == ^eid`).
     """
     @spec nested_cursors_for_parent(term(), module(), term(), term()) :: [{String.t(), term()}]
-    def nested_cursors_for_parent(_db_or_cursor, resource, _parent_id, _tenant \\ nil)
+    def nested_cursors_for_parent(db_or_cursor, resource, parent_id, tenant \\ nil)
         when is_atom(resource) do
-      []
+      case resolve_nested_spec(resource) do
+        nil ->
+          []
+
+        nested ->
+          pk_attr = pk_attribute(resource)
+          parent_col_str = resolve_parent_collection(nested, tenant, resource)
+
+          Storage.list_nested_cursors_for_parent(
+            db_or_cursor,
+            parent_col_str,
+            Codec.encode_doc_id(parent_id),
+            nested.path,
+            nested.cardinality,
+            pk_attr
+          )
+      end
     end
 
     @doc """
@@ -371,29 +436,235 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
     # -- Internal Planning & Search Diffing Helpers (Flat Wave 2) --
 
-    defp plan_entity_location(_db_or_cursor, resource, _old_record, new_record, _tenant) do
+    defp plan_entity_location(db_or_cursor, resource, old_record, new_record, tenant) do
       pk_attr = pk_attribute(resource)
       pk_val = Map.fetch!(new_record, pk_attr.name)
       doc_id = Codec.encode_pk_doc_id(pk_attr, pk_val)
-      nil = resolve_nested_spec(resource)
-      {:ok, {:top_level, doc_id}}
+
+      case resolve_nested_spec(resource) do
+        nil ->
+          {:ok, {:top_level, doc_id}}
+
+        nested ->
+          fk_attr = nested.foreign_key
+          new_parent_val = Map.get(new_record, fk_attr)
+
+          if is_nil(new_parent_val) do
+            {:error,
+             InvalidChanges.exception(
+               fields: [fk_attr],
+               message: "is required for nested Xitdb resource"
+             )}
+          else
+            parent_col_str = resolve_parent_collection(nested, tenant, resource)
+            new_parent_doc_id = Codec.encode_doc_id(new_parent_val)
+
+            case Storage.fetch_top_level_cursor(db_or_cursor, parent_col_str, new_parent_doc_id) do
+              :none ->
+                {:error,
+                 InvalidChanges.exception(
+                   fields: [fk_attr],
+                   message: "does not exist"
+                 )}
+
+              {:ok, _parent_cursor} ->
+                old_parent_doc_id =
+                  case old_record do
+                    nil -> nil
+                    prev -> prev |> Map.get(fk_attr) |> maybe_encode_doc_id()
+                  end
+
+                pk_key = Codec.encode_scalar_key(pk_attr, pk_val)
+
+                {:ok,
+                 {:nested,
+                  %{
+                    parent_collection: parent_col_str,
+                    old_parent_doc_id: old_parent_doc_id,
+                    new_parent_doc_id: new_parent_doc_id,
+                    path: nested.path,
+                    cardinality: nested.cardinality,
+                    doc_id: doc_id,
+                    pk_key: pk_key
+                  }}}
+            end
+          end
+      end
     end
 
-    defp build_delete_location(resource, _record, _pk_attr, _pk_val, doc_id, _tenant) do
-      nil = resolve_nested_spec(resource)
-      {:top_level, doc_id}
+    defp build_delete_location(resource, record, pk_attr, pk_val, doc_id, tenant) do
+      case resolve_nested_spec(resource) do
+        nil ->
+          {:top_level, doc_id}
+
+        nested ->
+          {:nested,
+           %{
+             parent_collection: resolve_parent_collection(nested, tenant, resource),
+             parent_doc_id: record |> Map.get(nested.foreign_key) |> maybe_encode_doc_id(),
+             path: nested.path,
+             cardinality: nested.cardinality,
+             doc_id: doc_id,
+             pk_key: Codec.encode_scalar_key(pk_attr, pk_val)
+           }}
+      end
     end
 
-    defp resolve_nested_spec(_resource), do: nil
+    defp maybe_encode_doc_id(nil), do: nil
+    defp maybe_encode_doc_id(val), do: Codec.encode_doc_id(val)
+
+    defp resolve_nested_spec(resource) do
+      raw =
+        case fallback_nested_in(resource) do
+          nil ->
+            if function_exported?(Info, :nested_mappings, 1) do
+              case Info.nested_mappings(resource) do
+                [first | _] -> first
+                [] -> nil
+              end
+            end
+
+          spec ->
+            spec
+        end
+
+      normalize_nested_spec(raw)
+    end
+
+    defp fallback_nested_in(resource) do
+      if function_exported?(Info, :nested_in, 1) do
+        apply(Info, :nested_in, [resource])
+      else
+        nil
+      end
+    end
+
+    defp normalize_nested_spec(nil), do: nil
+
+    defp normalize_nested_spec(%{
+           parent: parent,
+           as: as_slot,
+           parent_key: fk_attr,
+           cardinality: cardinality
+         })
+         when is_atom(parent) and not is_nil(parent) do
+      %{
+        parent_resource: parent,
+        parent_collection: Info.collection!(parent),
+        foreign_key: fk_attr,
+        path: Atom.to_string(as_slot),
+        cardinality: cardinality
+      }
+    end
+
+    defp normalize_nested_spec(%{
+           parent_collection: parent_col,
+           foreign_key: fk_attr,
+           path: path,
+           cardinality: cardinality
+         })
+         when is_atom(parent_col) and not is_nil(parent_col) do
+      %{
+        parent_resource: nil,
+        parent_collection: parent_col,
+        foreign_key: fk_attr,
+        path: Atom.to_string(path),
+        cardinality: cardinality
+      }
+    end
+
+    defp resolve_parent_collection(%{parent_resource: parent}, tenant, _resource)
+         when is_atom(parent) and not is_nil(parent) do
+      Codec.scoped_collection(parent, tenant)
+    end
+
+    defp resolve_parent_collection(%{parent_collection: parent_col}, tenant, resource) do
+      if Ash.Resource.Info.multitenancy_strategy(resource) == :context and not is_nil(tenant) do
+        "t:" <> Codec.encode_doc_id(tenant) <> ":" <> Atom.to_string(parent_col)
+      else
+        Atom.to_string(parent_col)
+      end
+    end
 
     defp plan_purge_nested_children_ops(
-           _db_or_cursor,
-           _parent_resource,
-           _parent_pk_val,
-           _tenant,
+           db_or_cursor,
+           parent_resource,
+           parent_pk_val,
+           tenant,
            batch_state
          ) do
-      {[], batch_state}
+      nested_children = discover_nested_children(parent_resource)
+
+      Enum.flat_map_reduce(nested_children, batch_state, fn child_resource, outer_batch ->
+        db_or_cursor
+        |> nested_cursors_for_parent(child_resource, parent_pk_val, tenant)
+        |> Enum.flat_map_reduce(outer_batch, fn {_child_doc_id, child_cursor}, inner_batch ->
+          case Codec.from_cursor(child_resource, child_cursor, tenant) do
+            {:ok, child_record} ->
+              {:ok, ops, next_batch} =
+                plan_delete_ops_batched(
+                  db_or_cursor,
+                  child_resource,
+                  child_record,
+                  tenant,
+                  inner_batch
+                )
+
+              {ops, next_batch}
+
+            {:error, _} ->
+              {[], inner_batch}
+          end
+        end)
+      end)
+    end
+
+    defp discover_nested_children(parent_resource) do
+      store_children =
+        case Info.fetch_store(parent_resource) do
+          {:ok, store} ->
+            if :persistent_term.get({Xitdb.Ash.Store.Snapshot, store}, nil) != nil do
+              store
+              |> Store.reverse_fks(parent_resource)
+              |> Enum.filter(&Map.get(&1, :nested?, false))
+              |> Enum.map(& &1.source_resource)
+            else
+              []
+            end
+
+          _ ->
+            []
+        end
+
+      parent_col =
+        case Info.fetch_collection(parent_resource) do
+          {:ok, col} -> col
+          _ -> nil
+        end
+
+      rel_children =
+        parent_resource
+        |> Ash.Resource.Info.relationships()
+        |> Enum.filter(&(&1.type in [:has_many, :has_one]))
+        |> Enum.map(& &1.destination)
+        |> Enum.filter(fn dest ->
+          case resolve_nested_spec(dest) do
+            %{parent_resource: ^parent_resource} -> true
+            %{parent_collection: ^parent_col} when not is_nil(parent_col) -> true
+            _ -> false
+          end
+        end)
+
+      Enum.uniq(store_children ++ rel_children)
+    end
+
+    defp cursor_matches_doc_id?(cursor, pk_attr, expected_doc_id) do
+      pk_field_str = Atom.to_string(pk_attr.name)
+
+      case cursor[pk_field_str] do
+        nil -> false
+        val -> Codec.encode_pk_doc_id(pk_attr, val) == expected_doc_id
+      end
     end
 
     defp plan_identity_ops(db_or_cursor, resource, old_record, new_record, tenant) do
@@ -698,11 +969,16 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     @moduledoc false
     # Slot-tree adapter built strictly over real `Xitdb` APIs:
     #   root[collection][doc_id]                         (:hash_map)
+    #   root[parent_col][parent_id][path]                (:hash_map for :many | entity map for :one)
+    #   root["idx"][collection]["_parent"][hex_pk_key]   (:sorted_map -> parent_doc_id)
     #   root["idx"][collection]["id_<name>"][hex_id_key] (:sorted_map -> doc_id)
     #   root["idx"][collection]["attr_<f>"][hex_idx_key] (:sorted_map -> :counted_hash_set(doc_id))
     #   root["idx"]["search"][collection]                (BM25 `meta` / `docs` / `terms`)
 
+    alias Xitdb.Ash.Codec
     alias Xitdb.TxCompiler
+
+    @parent_slot "_parent"
 
     @spec fetch_top_level_cursor(term(), String.t(), String.t()) :: {:ok, term()} | :none
     def fetch_top_level_cursor(db_or_cursor, collection, doc_id) do
@@ -715,11 +991,72 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       end
     end
 
+    @spec fetch_nested_cursor(
+            term(),
+            String.t(),
+            String.t(),
+            String.t(),
+            :one | :many,
+            String.t()
+          ) :: {:ok, term()} | :none
+    def fetch_nested_cursor(db_or_cursor, parent_col, parent_doc_id, path, cardinality, doc_id) do
+      with {:ok, parent} <- fetch_top_level_cursor(db_or_cursor, parent_col, parent_doc_id),
+           subtree when not is_nil(subtree) <- parent[path] do
+        case cardinality do
+          :one ->
+            {:ok, subtree}
+
+          :many ->
+            case subtree[doc_id] do
+              nil -> :none
+              cursor -> {:ok, cursor}
+            end
+        end
+      else
+        _ -> :none
+      end
+    end
+
     @spec list_top_level_cursors(term(), String.t()) :: [{String.t(), term()}]
     def list_top_level_cursors(db_or_cursor, collection) do
       with %Xitdb.Cursor{} = root <- root_cursor(db_or_cursor),
            %Xitdb.Cursor{} = col <- root[collection] do
         Enum.to_list(col)
+      else
+        _ -> []
+      end
+    end
+
+    @spec list_nested_cursors_for_parent(
+            term(),
+            String.t(),
+            String.t(),
+            String.t(),
+            :one | :many,
+            Ash.Resource.Attribute.t()
+          ) :: [{String.t(), term()}]
+    def list_nested_cursors_for_parent(
+          db_or_cursor,
+          parent_col,
+          parent_doc_id,
+          path,
+          cardinality,
+          pk_attr
+        ) do
+      pk_field = Atom.to_string(pk_attr.name)
+
+      with {:ok, parent} <- fetch_top_level_cursor(db_or_cursor, parent_col, parent_doc_id),
+           subtree when not is_nil(subtree) <- parent[path] do
+        case cardinality do
+          :many ->
+            Enum.to_list(subtree)
+
+          :one ->
+            case subtree[pk_field] do
+              nil -> []
+              pk_val -> [{Codec.encode_pk_doc_id(pk_attr, pk_val), subtree}]
+            end
+        end
       else
         _ -> []
       end
@@ -971,6 +1308,61 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       {TxCompiler.compile_node(prefix, cursor_map, true), batch_state}
     end
 
+    defp compile_write_entity_ops(
+           db_or_cursor,
+           collection,
+           cursor_map,
+           {:nested, plan},
+           batch_state
+         ) do
+      %{
+        parent_collection: parent_col,
+        old_parent_doc_id: old_parent_id,
+        new_parent_doc_id: new_parent_id,
+        path: path,
+        cardinality: cardinality,
+        doc_id: doc_id,
+        pk_key: pk_key
+      } = plan
+
+      reparent_rm_ops =
+        if old_parent_id != nil and old_parent_id != new_parent_id do
+          compile_remove_from_parent_ops(
+            db_or_cursor,
+            parent_col,
+            old_parent_id,
+            path,
+            cardinality,
+            doc_id
+          )
+        else
+          []
+        end
+
+      parent_prefix =
+        TxCompiler.format_step(:hash_map, parent_col) <>
+          TxCompiler.format_step(:hash_map, new_parent_id) <>
+          TxCompiler.format_step(:hash_map, path)
+
+      target_prefix =
+        case cardinality do
+          :one -> parent_prefix
+          :many -> parent_prefix <> TxCompiler.format_step(:hash_map, doc_id)
+        end
+
+      write_ops = TxCompiler.compile_node(target_prefix, cursor_map, true)
+
+      {parent_locator_ops, next_batch} =
+        compile_unique_ops(
+          db_or_cursor,
+          collection,
+          [{:put_unique, @parent_slot, pk_key, new_parent_id}],
+          batch_state
+        )
+
+      {reparent_rm_ops ++ write_ops ++ parent_locator_ops, next_batch}
+    end
+
     defp compile_remove_entity_ops(
            db_or_cursor,
            collection,
@@ -987,6 +1379,69 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
         :none ->
           {[], batch_state}
+      end
+    end
+
+    defp compile_remove_entity_ops(db_or_cursor, collection, {:nested, plan}, batch_state) do
+      %{
+        parent_collection: parent_col,
+        parent_doc_id: parent_id,
+        path: path,
+        cardinality: cardinality,
+        doc_id: doc_id,
+        pk_key: pk_key
+      } = plan
+
+      subtree_rm =
+        if parent_id != nil do
+          compile_remove_from_parent_ops(
+            db_or_cursor,
+            parent_col,
+            parent_id,
+            path,
+            cardinality,
+            doc_id
+          )
+        else
+          []
+        end
+
+      {locator_rm, next_batch} =
+        compile_unique_ops(
+          db_or_cursor,
+          collection,
+          [{:del_unique, @parent_slot, pk_key, parent_id}],
+          batch_state
+        )
+
+      {subtree_rm ++ locator_rm, next_batch}
+    end
+
+    defp compile_remove_from_parent_ops(
+           db_or_cursor,
+           parent_col,
+           parent_id,
+           path,
+           cardinality,
+           doc_id
+         ) do
+      case fetch_nested_cursor(db_or_cursor, parent_col, parent_id, path, cardinality, doc_id) do
+        {:ok, _} ->
+          base =
+            TxCompiler.format_step(:hash_map, parent_col) <>
+              TxCompiler.format_step(:hash_map, parent_id) <>
+              TxCompiler.format_step(:hash_map, path)
+
+          target =
+            case cardinality do
+              :one -> base
+              :many -> base <> TxCompiler.format_step(:hash_map, doc_id)
+            end
+
+          [{:rm, target}]
+
+        :none ->
+          []
       end
     end
 

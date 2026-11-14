@@ -71,24 +71,24 @@
 
 ## Phase 5: `nested_in` Physical Subtree Storage & Hierarchy
 
-- [ ] Task: Implement `nested_in` location planning & hierarchy navigation
-    - [ ] `plan_entity_location/5` with `_parent` B+Tree path routing
-    - [ ] `fetch_nested_cursor/6` inside parent document entity map
-    - [ ] Deduplicated `all_cursors/3` (`Stream.map(&elem(&1, 1)) |> Stream.uniq()`) eliminating `K^2` duplicate scans
-    - [ ] Parent-jump collection lookups (`nested_cursors_for_parent/4`)
+- [x] Task: Implement `nested_in` location planning & hierarchy navigation
+    - [x] `plan_entity_location/5` with `_parent` B+Tree path routing
+    - [x] `fetch_nested_cursor/6` inside parent document entity map
+    - [x] Deduplicated `all_cursors/3` (`Stream.map(&elem(&1, 1)) |> Stream.uniq()`) eliminating `K^2` duplicate scans
+    - [x] Parent-jump collection lookups (`nested_cursors_for_parent/4`)
 
 ---
 
 ## Phase 6: Subtree Reparenting & Recursive Index Purging
 
-- [ ] Task: Implement subtree reparenting and recursive cleanup
-    - [ ] Reparenting cleanup when parent foreign key changes
-    - [ ] Single-op-list recursive child index purging (`plan_purge_nested_children_ops/4`) before parent deletion
+- [x] Task: Implement subtree reparenting and recursive cleanup
+    - [x] Reparenting cleanup when parent foreign key changes
+    - [x] Single-op-list recursive child index purging (`plan_purge_nested_children_ops/4`) before parent deletion
 
 ---
 
 ## Phase 7: Track 11B Verification Suite
 
-- [ ] Task: Extend `test/xitdb/ash/indexer_test.exs` for nested documents
-    - [ ] Test nested entity CRUD lifecycle, deduplicated `all_cursors/3`, and 9-byte `fork` isolation
-    - [ ] Test recursive nested child cleanup on parent delete and reparenting across parents
+- [x] Task: Extend `test/xitdb/ash/indexer_test.exs` for nested documents
+    - [x] Test nested entity CRUD lifecycle, deduplicated `all_cursors/3`, and 9-byte `fork` isolation
+    - [x] Test recursive nested child cleanup on parent delete and reparenting across parents

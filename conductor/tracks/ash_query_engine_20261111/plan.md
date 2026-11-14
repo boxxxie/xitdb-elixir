@@ -15,21 +15,21 @@
 
 - [x] Task: Define `%Xitdb.Ash.Query{}` struct in `lib/xitdb/ash/query.ex`
 - [x] Task: Implement shaping functions matching `Ash.DataLayer` callback arities (delegated from `Xitdb.Ash.DataLayer`)
-    - [ ] `new/2` (`resource_to_query/2`)
-    - [ ] `filter/3`, `sort/3`, `distinct/3`, `distinct_sort/3`
-    - [ ] `limit/3`, `offset/3`, `select/3`
-    - [ ] `set_context/3`, `set_tenant/3`
-    - [ ] `add_aggregate/3`, `add_aggregates/3`, `add_calculation/4`, `add_calculations/3`
+    - [x] `new/2` (`resource_to_query/2`)
+    - [x] `filter/3`, `sort/3`, `distinct/3`, `distinct_sort/3`
+    - [x] `limit/3`, `offset/3`, `select/3`
+    - [x] `set_context/3`, `set_tenant/3`
+    - [x] `add_aggregate/3`, `add_aggregates/3`, `add_calculation/4`, `add_calculations/3`
 
 ---
 
 ## Phase 2: Tenant-Aware Narrow & Hydrate Pipeline (Stages 1 & 2)
 
 - [x] Task: Implement Stage 1 Narrow (`stage1_narrow/3` & `plan_narrowing/4`)
-    - [ ] Thread `query.tenant` into all `Indexer` calls (`fetch_cursor/4`, `all_cursors/3`, `lookup_by_identity/5`, `lookup_secondary_eq/5`, `scan_secondary_range/5`, `nested_cursors_for_parent/4`)
+    - [x] Thread `query.tenant` into all `Indexer` calls (`fetch_cursor/4`, `all_cursors/3`, `lookup_by_identity/5`, `lookup_secondary_eq/5`, `scan_secondary_range/5`, `nested_cursors_for_parent/4`)
     - [x] Exact PK seek (`resolve_pk_candidates/4`)
     - [x] Unique identity seek (`try_unique_identity_lookup/4`) inferring `effective_tenant` from `eq_map[tenant_attr]` when `query.tenant == nil` on `:attribute`-multitenant resources
-    - [ ] `nested_in` parent jump via `nested_cursors_for_parent/4` _(deferred to Track 11B)_
+    - [x] `nested_in` parent jump via `nested_cursors_for_parent/4` _(completed in Track 11B)_
     - [x] Secondary index B+Tree equality and composite prefix + range intersection
     - [x] Fallback cursor enumeration via `all_cursors/3`
 - [x] Task: Implement Stage 2 Hydrate
@@ -59,4 +59,4 @@
     - [x] Batched related aggregates, `parent/1` + `join_filters`, and unrelated aggregates
     - [x] Relational expression calculations (`exists/2` across stores) and module calculation sorts
     - [x] Pagination and `select` projection correctness
-- [ ] Task: Confirm `mix precommit` passes with zero warnings _(flat Wave 2 unit/property suites pass; full `mix precommit` runs after Tracks 13, 14, and 11B)_
+- [x] Task: Confirm `mix precommit` passes with zero warnings _(completed across Wave 2 and Track 11B)_

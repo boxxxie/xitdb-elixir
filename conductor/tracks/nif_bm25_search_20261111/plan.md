@@ -68,16 +68,16 @@
 > [!NOTE]
 > Track 11B shares [`../ash_codec_and_indexer_20261111/`](../ash_codec_and_indexer_20261111/index.md) (and sibling Wave 2 reference files) per [`../../tracks.md`](../../tracks.md). Execute all items below alongside Phases 1–3 to complete Wave 3 (detailed file-by-file walkthrough in [`./reference.md#6-wave-3-track-11b-execution-guide-physical-nested_in-subtree-storage-reparenting--recursive-child-index-purging`](./reference.md#6-wave-3-track-11b-execution-guide-physical-nested_in-subtree-storage-reparenting--recursive-child-index-purging)).
 
-- [ ] Task: Complete `nested_in` physical subtree storage & index cleanup in `lib/xitdb/ash/indexer.ex` ([`../ash_codec_and_indexer_20261111/plan.md`](../ash_codec_and_indexer_20261111/plan.md) Phases 5–7 & [`../ash_codec_and_indexer_20261111/reference.md`](../ash_codec_and_indexer_20261111/reference.md))
-    - [ ] Wire `plan_entity_location/5` with `idx.<col>._parent[pk_key] => parent_doc_id` routing and parent-existence validation
-    - [ ] Implement `Storage.fetch_nested_cursor/6`, `Storage.list_nested_cursors_for_parent/6`, and `Indexer.nested_cursors_for_parent/4` (`:one` map slot and `:many` sub-map)
-    - [ ] Implement foreign-key reparenting cleanup (removing old parent subtree slot and updating `_parent` locator on FK update)
-    - [ ] Implement `plan_purge_nested_children_ops/5` recursively purging child `_parent`, identity, secondary, and `Xitdb.Ash.Search` (`remove_record/4`) entries before parent deletion
-- [ ] Task: Enable implicit `nested_in` reverse-FK graph synthesis in `lib/xitdb/ash/store.ex` ([`../ash_store_and_test_sandbox_20261111/reference.md`](../ash_store_and_test_sandbox_20261111/reference.md))
-    - [ ] Activate `build_nested_fk_rules/4` at `Store` boot to synthesize `on_delete: :delete, nested?: true` rules (unless overridden by explicit `:restrict`)
-- [ ] Task: Enable `nested_in` parent-jump planning & cascade hooks in `lib/xitdb/ash/query.ex` and `lib/xitdb/ash/mutator.ex`
-    - [ ] Activate Stage 1 `nested_in` parent-FK `O(1)` subtree jump + secondary-index intersection and relationship aggregate fast-path in `lib/xitdb/ash/query.ex` ([`../ash_query_engine_20261111/reference.md`](../ash_query_engine_20261111/reference.md))
-    - [ ] Activate `nested?: true` cascade checks via `Indexer.nested_cursors_for_parent/4` in `lib/xitdb/ash/mutator.ex` ([`../ash_mutator_and_cascades_20261111/reference.md`](../ash_mutator_and_cascades_20261111/reference.md))
-- [ ] Task: Enable full `nested_in` verification suites and pass precommit gate
-    - [ ] Extend `test/xitdb/ash/indexer_test.exs` and `test/xitdb/ash/data_layer_test.exs` ([`../ash_datalayer_and_verification_suite_20261111/references/ash3_contract_fixes_and_verification_suite.md`](../ash_datalayer_and_verification_suite_20261111/references/ash3_contract_fixes_and_verification_suite.md)) for `:many` (`AgendaSession`) and `:one` (`Conference`) nested subtrees, reparenting, and parent-destroy cascades (including nested child BM25 search cleanup)
-    - [ ] Run `mix precommit` and verify zero warnings, clean formatting, and 100% green test suite
+- [x] Task: Complete `nested_in` physical subtree storage & index cleanup in `lib/xitdb/ash/indexer.ex` ([`../ash_codec_and_indexer_20261111/plan.md`](../ash_codec_and_indexer_20261111/plan.md) Phases 5–7 & [`../ash_codec_and_indexer_20261111/reference.md`](../ash_codec_and_indexer_20261111/reference.md))
+    - [x] Wire `plan_entity_location/5` with `idx.<col>._parent[pk_key] => parent_doc_id` routing and parent-existence validation
+    - [x] Implement `Storage.fetch_nested_cursor/6`, `Storage.list_nested_cursors_for_parent/6`, and `Indexer.nested_cursors_for_parent/4` (`:one` map slot and `:many` sub-map)
+    - [x] Implement foreign-key reparenting cleanup (removing old parent subtree slot and updating `_parent` locator on FK update)
+    - [x] Implement `plan_purge_nested_children_ops/5` recursively purging child `_parent`, identity, secondary, and `Xitdb.Ash.Search` (`remove_record/4`) entries before parent deletion
+- [x] Task: Enable implicit `nested_in` reverse-FK graph synthesis in `lib/xitdb/ash/store.ex` ([`../ash_store_and_test_sandbox_20261111/reference.md`](../ash_store_and_test_sandbox_20261111/reference.md))
+    - [x] Activate `build_nested_fk_rules/4` at `Store` boot to synthesize `on_delete: :delete, nested?: true` rules (unless overridden by explicit `:restrict`)
+- [x] Task: Enable `nested_in` parent-jump planning & cascade hooks in `lib/xitdb/ash/query.ex` and `lib/xitdb/ash/mutator.ex`
+    - [x] Activate Stage 1 `nested_in` parent-FK `O(1)` subtree jump + secondary-index intersection and relationship aggregate fast-path in `lib/xitdb/ash/query.ex` ([`../ash_query_engine_20261111/reference.md`](../ash_query_engine_20261111/reference.md))
+    - [x] Activate `nested?: true` cascade checks via `Indexer.nested_cursors_for_parent/4` in `lib/xitdb/ash/mutator.ex` ([`../ash_mutator_and_cascades_20261111/reference.md`](../ash_mutator_and_cascades_20261111/reference.md))
+- [x] Task: Enable full `nested_in` verification suites and pass precommit gate
+    - [x] Extend `test/xitdb/ash/indexer_test.exs` and `test/xitdb/ash/data_layer_test.exs` ([`../ash_datalayer_and_verification_suite_20261111/references/ash3_contract_fixes_and_verification_suite.md`](../ash_datalayer_and_verification_suite_20261111/references/ash3_contract_fixes_and_verification_suite.md)) for `:many` (`AgendaSession`) and `:one` (`Conference`) nested subtrees, reparenting, and parent-destroy cascades (including nested child BM25 search cleanup)
+    - [x] Run `mix precommit` and verify zero warnings, clean formatting, and 100% green test suite
