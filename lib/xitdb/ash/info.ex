@@ -529,20 +529,27 @@ if Code.ensure_loaded?(Spark.InfoGenerator) and Code.ensure_loaded?(Ash.Resource
 
     defp cached_pair(kind, a, b, compute_fun) do
       key = {__MODULE__, :pair, kind, a, b}
+      md5_a = module_md5(a)
+      md5_b = module_md5(b)
 
       case :persistent_term.get(key, :__miss__) do
-        :__miss__ ->
+        {^md5_a, ^md5_b, cached} when not is_nil(md5_a) and not is_nil(md5_b) ->
+          cached
+
+        _ ->
           val = compute_fun.()
 
-          if Code.ensure_loaded?(a) and function_exported?(a, :__xitdb_pull_fields__, 0) and
-               Code.ensure_loaded?(b) and function_exported?(b, :__xitdb_pull_fields__, 0) do
-            :persistent_term.put(key, val)
+          if not is_nil(md5_a) and not is_nil(md5_b) do
+            :persistent_term.put(key, {md5_a, md5_b, val})
           end
 
           val
+      end
+    end
 
-        cached ->
-          cached
+    defp module_md5(mod) when is_atom(mod) do
+      if Code.ensure_loaded?(mod) and function_exported?(mod, :__xitdb_pull_fields__, 0) do
+        mod.__info__(:md5)
       end
     end
 

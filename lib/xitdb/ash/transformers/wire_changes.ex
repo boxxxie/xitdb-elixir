@@ -59,6 +59,11 @@ if Code.ensure_loaded?(Spark.Dsl.Transformer) and Code.ensure_loaded?(Ash.Resour
       end
     end
 
+    @doc false
+    def __after_compile__(env, _bytecode) do
+      XitdbInfo.__purge_pair_cache__(env.module)
+    end
+
     defp define_direct_info_functions(dsl_state) do
       collection = Transformer.get_persisted(dsl_state, :xitdb_collection)
       nested_in = Transformer.get_persisted(dsl_state, :xitdb_nested_in, [])
@@ -89,6 +94,8 @@ if Code.ensure_loaded?(Spark.Dsl.Transformer) and Code.ensure_loaded?(Ash.Resour
           if unquote(uses_default_store?) do
             _ = Application.compile_env(:xitdb, :default_store)
           end
+
+          @after_compile {Xitdb.Ash.Transformers.WireChanges, :__after_compile__}
 
           unless Module.defines?(__MODULE__, {:__xitdb_collection__, 0}, :def) do
             @doc false

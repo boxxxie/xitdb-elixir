@@ -39,10 +39,28 @@ defmodule Xitdb.Ash.CompanionAndTxForTest do
       assert Info.editable_field_strings([MutualProfile, MutualUser]) == ["bio", "email"]
       assert Info.pull_pattern_for([MutualUser, MutualProfile]) == "{id, email, bio}"
 
-      assert :persistent_term.get(
-               {Info, :pair, :pull_pattern, MutualUser, MutualProfile},
-               nil
-             ) == "{id, email, bio}"
+      assert {md5_user, md5_profile, "{id, email, bio}"} =
+               :persistent_term.get(
+                 {Info, :pair, :pull_pattern, MutualUser, MutualProfile},
+                 nil
+               )
+
+      assert md5_user == MutualUser.__info__(:md5)
+      assert md5_profile == MutualProfile.__info__(:md5)
+
+      # Stale :persistent_term entries with a mismatched module MD5 digest are invalidated
+      :persistent_term.put(
+        {Info, :pair, :pull_pattern, MutualUser, MutualProfile},
+        {<<0::128>>, md5_profile, "{stale}"}
+      )
+
+      assert Info.pull_pattern_for([MutualUser, MutualProfile]) == "{id, email, bio}"
+
+      assert {^md5_user, ^md5_profile, "{id, email, bio}"} =
+               :persistent_term.get(
+                 {Info, :pair, :pull_pattern, MutualUser, MutualProfile},
+                 nil
+               )
 
       assert :ok == Info.__purge_pair_cache__(MutualUser)
 
