@@ -243,7 +243,27 @@ def current_git_commit() -> str:
             stderr=subprocess.DEVNULL,
             text=True,
         ).strip()
-        return out if out else "unknown"
+        if not out:
+            return "unknown"
+        status_out = subprocess.check_output(
+            [
+                "git",
+                "status",
+                "--porcelain",
+                "--untracked-files=no",
+                "--",
+                "lib",
+                "native",
+                "benchmarks/bench_elixir.exs",
+                "benchmarks/bench_client.odin",
+            ],
+            cwd=ROOT_DIR,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip()
+        if status_out:
+            return f"{out}-dirty"
+        return out
     except Exception:
         return "unknown"
 
@@ -350,16 +370,43 @@ def match_commit(record_commit: str, target_commit: Optional[str]) -> bool:
         return True
     rc = record_commit.strip()
     tc = target_commit.strip()
+    if rc.endswith("-dirty") != tc.endswith("-dirty"):
+        return False
+    if rc.endswith("-dirty"):
+        rc = rc[:-6]
+        tc = tc[:-6]
     return rc.startswith(tc) or tc.startswith(rc)
+
+
+def deduplicate_by_run_id(records: List[Dict[str, Any]], latest_run: bool = False) -> List[Dict[str, Any]]:
+    dedup: Dict[str, Dict[str, Any]] = {}
+    order: List[str] = []
+    for r in records:
+        rid = str(r.get("run_id", "run-0"))
+        if rid not in dedup:
+            order.append(rid)
+        dedup[rid] = r
+    unique_recs = [dedup[rid] for rid in order]
+    if latest_run and unique_recs:
+        return [unique_recs[-1]]
+    return unique_recs
 
 
 def pool_by_lang_and_test(
     records: List[Dict[str, Any]],
     lang: str,
     commit: Optional[str] = None,
+    latest_run: bool = False,
+    run_id: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    filtered = [r for r in records if r.get("lang") == lang and match_commit(str(r.get("commit", "unknown")), commit)]
-    if not filtered and commit:
+    filtered = [
+        r
+        for r in records
+        if r.get("lang") == lang
+        and match_commit(str(r.get("commit", "unknown")), commit)
+        and (run_id is None or str(r.get("run_id", "")) == run_id)
+    ]
+    if not filtered and (commit or run_id):
         return []
 
     overall_latest_commit = filtered[-1].get("commit", "unknown") if filtered else "unknown"
@@ -378,6 +425,7 @@ def pool_by_lang_and_test(
         if not commit and recs:
             latest_for_name = recs[-1].get("commit", "unknown")
             recs = [r for r in recs if r.get("commit", "unknown") == latest_for_name]
+        recs = deduplicate_by_run_id(recs, latest_run=latest_run)
         stat = compute_pooled_stats(recs)
         if not commit and overall_latest_commit != "unknown":
             stat["commit"] = overall_latest_commit
@@ -478,9 +526,16 @@ def print_1v1_comparison(odin_rows: List[Dict[str, Any]], elixir_rows: List[Dict
     print("=" * 176)
 
 
-def compare_commits(records: List[Dict[str, Any]], sha_a: str, sha_b: str, lang: str) -> None:
-    rows_a = pool_by_lang_and_test(records, lang, sha_a)
-    rows_b = pool_by_lang_and_test(records, lang, sha_b)
+def compare_commits(
+    records: List[Dict[str, Any]],
+    sha_a: str,
+    sha_b: str,
+    lang: str,
+    latest_run: bool = False,
+    run_id: Optional[str] = None,
+) -> None:
+    rows_a = pool_by_lang_and_test(records, lang, sha_a, latest_run=latest_run, run_id=run_id)
+    rows_b = pool_by_lang_and_test(records, lang, sha_b, latest_run=latest_run, run_id=run_id)
 
     if not rows_a:
         print(f"ERROR: No benchmark records found for commit '{sha_a}' (lang={lang}).", file=sys.stderr)
@@ -582,11 +637,19 @@ def list_commits(records: List[Dict[str, Any]]) -> None:
     print("=" * 96)
 
 
-def inspect_test(records: List[Dict[str, Any]], pattern: str, commit: Optional[str]) -> None:
+def inspect_test(
+    records: List[Dict[str, Any]],
+    pattern: str,
+    commit: Optional[str],
+    latest_run: bool = False,
+    run_id: Optional[str] = None,
+) -> None:
     pat = pattern.lower()
     matched = [
         r for r in records
-        if pat in r.get("name", "").lower() and match_commit(str(r.get("commit", "unknown")), commit)
+        if pat in r.get("name", "").lower()
+        and match_commit(str(r.get("commit", "unknown")), commit)
+        and (run_id is None or str(r.get("run_id", "")) == run_id)
     ]
     if not matched:
         print(f"No benchmark records matching '{pattern}'" + (f" at commit '{commit}'" if commit else ""))
@@ -598,7 +661,8 @@ def inspect_test(records: List[Dict[str, Any]], pattern: str, commit: Optional[s
         grouped[key].append(r)
 
     print()
-    for (c_sha, lang, name), recs in grouped.items():
+    for (c_sha, lang, name), raw_recs in grouped.items():
+        recs = deduplicate_by_run_id(raw_recs, latest_run=latest_run)
         pooled = compute_pooled_stats(recs)
         print("=" * 110)
         print(f"  Benchmark : {name}")
@@ -1683,6 +1747,9 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=1, help="In-process warmup passes before trials (default: 1)")
     parser.add_argument("--commit", type=str, default=None, help="Git commit SHA to tag or query")
     parser.add_argument("--run-id", type=str, default=None, help="Run session identifier")
+    parser.add_argument("--latest-run", dest="latest_run", action="store_true", help="Isolate the most recent run_id per commit when analyzing/comparing")
+    parser.add_argument("--pool-runs", dest="latest_run", action="store_false", help="Explicitly pool all run_ids sharing the target commit SHA (default)")
+    parser.set_defaults(latest_run=False)
     parser.add_argument("--append", action="store_true", help="Append to odin.jsonl/elixir.jsonl to accumulate multiple runs")
     parser.add_argument("--no-history", action="store_true", help="Do not append to benchmarks/history.jsonl")
     parser.add_argument("--from-jsonl", action="store_true", help="Analyze existing JSONL files without re-running binaries")
@@ -1744,7 +1811,7 @@ def main() -> None:
         return
 
     if args.inspect:
-        inspect_test(load_all_history(), args.inspect, args.commit)
+        inspect_test(load_all_history(), args.inspect, args.commit, latest_run=args.latest_run, run_id=args.run_id)
         return
 
     if args.compare_commits:
@@ -1752,9 +1819,9 @@ def main() -> None:
         records = load_all_history()
         cmp_lang = args.lang or "elixir"
         if cmp_lang in ("odin", "both"):
-            compare_commits(records, sha_a, sha_b, "odin")
+            compare_commits(records, sha_a, sha_b, "odin", latest_run=args.latest_run, run_id=args.run_id)
         if cmp_lang in ("elixir", "both"):
-            compare_commits(records, sha_a, sha_b, "elixir")
+            compare_commits(records, sha_a, sha_b, "elixir", latest_run=args.latest_run, run_id=args.run_id)
         return
 
     commit_sha = args.commit or current_git_commit()
@@ -1813,10 +1880,11 @@ def main() -> None:
         if (args.from_jsonl and not args.affected and not args.groups and not args.filter)
         else None
     )
+    analysis_run_id = args.run_id if args.from_jsonl else None
     odin_records = load_jsonl_file(ODIN_JSONL)
     elixir_records = load_jsonl_file(ELIXIR_JSONL)
-    odin_rows = pool_by_lang_and_test(odin_records, "odin", snapshot_commit)
-    elixir_rows = pool_by_lang_and_test(elixir_records, "elixir", snapshot_commit)
+    odin_rows = pool_by_lang_and_test(odin_records, "odin", snapshot_commit, latest_run=args.latest_run, run_id=analysis_run_id)
+    elixir_rows = pool_by_lang_and_test(elixir_records, "elixir", snapshot_commit, latest_run=args.latest_run, run_id=analysis_run_id)
     print_1v1_comparison(odin_rows, elixir_rows)
 
 

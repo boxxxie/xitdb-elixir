@@ -37,6 +37,10 @@ defmodule Xitdb.NifSafetyTest do
           {:fork, ".a"},
           {:init_col, ".a"},
           {:reset_col, ".a"},
+          {:merge_map},
+          {:merge_map, "not_a_map"},
+          {:merge_map, %{nil => "bad_key"}},
+          {:merge_map, %{true => "bad_key"}},
           {:rm},
           {:rm_if_exists},
           {:bogus_op, ".a", 1},
@@ -312,5 +316,73 @@ defmodule Xitdb.NifSafetyTest do
         Task.await(task, 5_000)
       end
     end
+  end
+
+  test "merge_map preserves deep-merge, nil/pure-nil removal, empty-map reset, collections, and index rules" do
+    db = Xitdb.open!(backend: :memory)
+    rules = [{:index_on, :users, :email, "email->user_id"}]
+
+    db =
+      Xitdb.transact!(
+        db,
+        %{
+          "users" => %{
+            "u1" => %{
+              "name" => "Alice",
+              "email" => "alice@old.io",
+              "meta" => %{"tier" => "gold"},
+              "flags" => MapSet.new(["verified", "oncall"])
+            },
+            "u2" => %{"name" => "Bob", "email" => "bob@acme.io"}
+          },
+          "counted" => Xitdb.counted_map(%{"k1" => 1}),
+          "sorted" => Xitdb.sorted_map(a: 10, b: 20)
+        },
+        index_rules: rules
+      )
+
+    assert db["counted"]["k1"] == 1
+    assert Enum.count(db["counted"]) == 1
+    assert Enum.count(db["users"]["u1"]["flags"]) == 2
+    assert db["email->user_id"]["alice@old.io"] == "u1"
+    assert db["email->user_id"]["bob@acme.io"] == "u2"
+
+    db =
+      Xitdb.transact!(
+        db,
+        %{
+          "users" => %{
+            "u1" => %{
+              "email" => "alice@new.io",
+              "meta" => %{}
+            },
+            "u2" => nil,
+            "missing" => %{"nested" => nil}
+          },
+          "nonexistent" => %{"deep" => %{"field" => nil}},
+          "sorted" => Xitdb.sorted_map(b: nil, c: 30)
+        },
+        index_rules: rules
+      )
+
+    # Sibling key "name" preserved while "email" updated and "meta" reset to empty map
+    assert db["users"]["u1"]["name"] == "Alice"
+    assert db["users"]["u1"]["email"] == "alice@new.io"
+    assert Xitdb.materialize(db["users"]["u1"]["meta"]) == %{}
+
+    # Record removal + pure-nil removal on absent containers
+    assert db["users"]["u2"] == nil
+    assert db["users"]["missing"] == nil
+    assert db["nonexistent"] == nil
+
+    # Secondary index eviction + re-indexing + record deletion cleanup
+    assert db["email->user_id"]["alice@old.io"] == nil
+    assert db["email->user_id"]["alice@new.io"] == "u1"
+    assert db["email->user_id"]["bob@acme.io"] == nil
+
+    # Sorted map collection merge & nil key deletion
+    assert db["sorted"]["a"] == 10
+    assert db["sorted"]["b"] == nil
+    assert db["sorted"]["c"] == 30
   end
 end

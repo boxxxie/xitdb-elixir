@@ -123,6 +123,17 @@ defmodule Xitdb.ClientBench do
 
     _ = root
 
+    u_cursors =
+      if MapSet.member?(active_ranks, 21) do
+        List.to_tuple(
+          for i <- 0..199 do
+            Xitdb.Cursor.ensure_resolved(users_cur["u#{i}"])
+          end
+        )
+      else
+        nil
+      end
+
     hist_db =
       if need_hist_db? do
         {:ok, hd} = Xitdb.open(backend: :memory)
@@ -414,8 +425,7 @@ defmodule Xitdb.ClientBench do
       {21, "Query: Datomic pull projection (4 attrs + nested slice)", 200,
        fn ->
          for i <- 0..199 do
-           cur = users_cur["u#{i}"]
-           _ = Xitdb.pull!(cur, "{name, age, roles[0..2], profile{city}}")
+           _ = Xitdb.pull!(elem(u_cursors, i), "{name, age, roles[0..2], profile{city}}")
          end
 
          0
@@ -802,8 +812,32 @@ defmodule Xitdb.ClientBench do
 
   defp resolve_git_commit do
     case System.cmd("git", ["rev-parse", "--short=12", "HEAD"], stderr_to_stdout: true) do
-      {sha, 0} -> String.trim(sha)
-      _ -> "unknown"
+      {sha, 0} ->
+        short_sha = String.trim(sha)
+
+        case System.cmd(
+               "git",
+               [
+                 "status",
+                 "--porcelain",
+                 "--untracked-files=no",
+                 "--",
+                 "lib",
+                 "native",
+                 "benchmarks/bench_elixir.exs",
+                 "benchmarks/bench_client.odin"
+               ],
+               stderr_to_stdout: true
+             ) do
+          {dirty_out, 0} ->
+            if String.trim(dirty_out) != "", do: "#{short_sha}-dirty", else: short_sha
+
+          _ ->
+            short_sha
+        end
+
+      _ ->
+        "unknown"
     end
   end
 end

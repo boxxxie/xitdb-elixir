@@ -6,7 +6,52 @@ ODIN_JSONL="${SCRIPT_DIR}/odin.jsonl"
 ELIXIR_JSONL="${SCRIPT_DIR}/elixir.jsonl"
 HISTORY_JSONL="${SCRIPT_DIR}/history.jsonl"
 README_MD="${SCRIPT_DIR}/README.md"
-TARGET_COMMIT="${1:-}"
+TARGET_COMMIT=""
+LATEST_RUN="true"
+TARGET_RUN_ID=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --latest-run)
+            LATEST_RUN="true"
+            shift
+            ;;
+        --pool-runs)
+            LATEST_RUN="false"
+            shift
+            ;;
+        --run-id)
+            if [[ $# -lt 2 ]]; then
+                echo "Error: --run-id requires a value" >&2
+                exit 1
+            fi
+            TARGET_RUN_ID="$2"
+            shift 2
+            ;;
+        --run-id=*)
+            TARGET_RUN_ID="${1#*=}"
+            shift
+            ;;
+        --commit)
+            if [[ $# -lt 2 ]]; then
+                echo "Error: --commit requires a value" >&2
+                exit 1
+            fi
+            TARGET_COMMIT="$2"
+            shift 2
+            ;;
+        --commit=*)
+            TARGET_COMMIT="${1#*=}"
+            shift
+            ;;
+        *)
+            if [[ -z "${TARGET_COMMIT}" ]]; then
+                TARGET_COMMIT="$1"
+            fi
+            shift
+            ;;
+    esac
+done
 
 if [[ ! -f "${ODIN_JSONL}" ]]; then
     echo "Error: ${ODIN_JSONL} not found. Run './benchmarks/compare_1v1.py' first." >&2
@@ -28,7 +73,7 @@ INPUT_FILES+=("${ODIN_JSONL}" "${ELIXIR_JSONL}")
 CODE_MAP_JSON=$("${SCRIPT_DIR}/compare_1v1.py" --code-map-json 2>/dev/null || echo "{}")
 PLAN_JSON=$("${SCRIPT_DIR}/compare_1v1.py" --plan-json 2>/dev/null || echo "{}")
 
-TABLES=$(jq -rn --arg target_commit "${TARGET_COMMIT}" --argjson code_map "${CODE_MAP_JSON}" --argjson plan "${PLAN_JSON}" '
+TABLES=$(jq -rn --arg target_commit "${TARGET_COMMIT}" --arg latest_run "${LATEST_RUN}" --arg target_run_id "${TARGET_RUN_ID}" --argjson code_map "${CODE_MAP_JSON}" --argjson plan "${PLAN_JSON}" '
 def commify:
   tostring |
   if test("^-?[0-9]+$") then
@@ -136,9 +181,20 @@ def welch_z($a; $b):
   end;
 
 def pool_records($recs):
-  ($recs | unique_by(.run_id // "run-0")) as $uniq_recs |
-  ($uniq_recs[0]) as $first |
-  ([ $uniq_recs[] | if (.samples_ns | type) == "array" and (.samples_ns | length) > 0 then .samples_ns[] else .ns_per_op end ]) as $samples |
+  (if $target_run_id != "" then
+     ($recs | map(select((.run_id // "") == $target_run_id)))
+   else $recs end) as $filtered |
+  (reduce $filtered[] as $r ({seen: {}, order: []};
+    ($r.run_id // "run-0") as $rid |
+    .seen[$rid] = $r |
+    if (.order | index($rid)) then . else .order += [$rid] end
+  ) | [.order[] as $rid | .seen[$rid]]) as $uniq_recs |
+  (if $latest_run == "true" and ($uniq_recs | length) > 0 then
+     [($uniq_recs | last)]
+   else $uniq_recs end) as $selected_recs |
+  if ($selected_recs | length) == 0 then empty else
+  ($selected_recs[0]) as $first |
+  ([ $selected_recs[] | if (.samples_ns | type) == "array" and (.samples_ns | length) > 0 then .samples_ns[] else .ns_per_op end ]) as $samples |
   ($samples | sort) as $sorted |
   ($sorted | length) as $n |
   percentile($sorted; 0.50) as $med |
@@ -159,7 +215,7 @@ def pool_records($recs):
     rank: $first.rank,
     lang: $first.lang,
     commit: ($first.commit // "unknown"),
-    invocations: ($uniq_recs | length),
+    invocations: ($selected_recs | length),
     name: $first.name,
     ops: $first.ops,
     runs: $n,
@@ -176,8 +232,8 @@ def pool_records($recs):
     min_ns: ($min_ns | round),
     max_ns: ($max_ns | round),
     ops_per_sec: $ops_sec,
-    bytes_used: ([ $uniq_recs[].bytes_used ] | max)
-  };
+    bytes_used: ([ $selected_recs[].bytes_used ] | max)
+  } end;
 
 def latest_snapshot_for_lang($all; $lang):
   ($all | map(select(.lang == $lang))) as $lang_recs |
@@ -222,7 +278,9 @@ def latest_snapshot_for_lang($all; $lang):
 def distinct_commits($all; $lang):
   ($all
    | map(select(.lang == $lang and (.commit // "unknown") != "unknown" and (.commit // "") != ""))
-   | reduce .[] as $r ([]; if index($r.commit) then . else . + [$r.commit] end));
+   | reduce .[] as $r ([]; if index($r.commit) then . else . + [$r.commit] end)) as $commits |
+  ($commits | map(select(endswith("-dirty") | not))) as $clean |
+  if ($clean | length) > 0 then $clean else $commits end;
 
 def pool_commit_snapshot($all; $lang; $sha):
   ($all

@@ -43,4 +43,26 @@ defmodule Xitdb.SelectorTest do
              {:put, ".cat$b", 2}
            ]
   end
+
+  test "TxCompiler.compile_moment_map emits merge_map by default and flat ops with flatten: true" do
+    input = %{"users" => %{"u1" => %{"name" => "Ada"}}}
+    rules = [{:index_on, :users, :name, "users_by_name"}]
+
+    assert TxCompiler.compile_moment_map(%{}) == []
+    assert TxCompiler.compile_moment_map(input) == [{:merge_map, input}]
+
+    assert TxCompiler.compile_moment_map(input, index_rules: rules) == [
+             {:index_on, "users", "name", "users_by_name"},
+             {:merge_map, input}
+           ]
+
+    assert TxCompiler.compile_moment_map(%{}, index_rules: rules) == [
+             {:index_on, "users", "name", "users_by_name"}
+           ]
+
+    assert TxCompiler.compile_moment_map(input, index_rules: rules, flatten: true) == [
+             {:index_on, "users", "name", "users_by_name"},
+             {:put, ".users.u1.name", "Ada"}
+           ]
+  end
 end

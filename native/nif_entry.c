@@ -171,6 +171,35 @@ int nif_get_map_value(ErlNifEnv* env, ERL_NIF_TERM map, ERL_NIF_TERM key, ERL_NI
     return enif_get_map_value(env, map, key, val_out);
 }
 
+int nif_get_map_size(ErlNifEnv* env, ERL_NIF_TERM map_term, size_t* size_out) {
+    return enif_get_map_size(env, map_term, size_out);
+}
+
+int nif_map_to_kv_arrays(
+    ErlNifEnv* env,
+    ERL_NIF_TERM map_term,
+    ERL_NIF_TERM* keys_out,
+    ERL_NIF_TERM* vals_out,
+    size_t max_cnt,
+    size_t* count_out
+) {
+    ErlNifMapIterator iter;
+    if (!enif_map_iterator_create(env, map_term, &iter, ERL_NIF_MAP_ITERATOR_FIRST)) {
+        return 0;
+    }
+    size_t idx = 0;
+    ERL_NIF_TERM k, v;
+    while (idx < max_cnt && enif_map_iterator_get_pair(env, &iter, &k, &v)) {
+        keys_out[idx] = k;
+        vals_out[idx] = v;
+        idx++;
+        enif_map_iterator_next(env, &iter);
+    }
+    enif_map_iterator_destroy(env, &iter);
+    *count_out = idx;
+    return 1;
+}
+
 // Term creation helpers
 ERL_NIF_TERM nif_make_atom_len(ErlNifEnv* env, const char* name, size_t len) {
     return enif_make_atom_len(env, name, len);

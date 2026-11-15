@@ -8,31 +8,42 @@ defmodule Xitdb.TxCompiler do
   defdelegate format_key(key), to: Selector
 
   @doc """
-  Compiles a nested Elixir map or `Xitdb.Collection` into a flat list of
-  coarse-grained NIF transaction tuples (`{:put, path, val}`, `{:init_col, path, kind}`, etc.).
+  Compiles a nested Elixir map or `Xitdb.Collection` into coarse-grained NIF
+  transaction tuples (`{:merge_map, map}` by default, or flat `{:put, path, val}` /
+  `{:init_col, path, kind}` tuples when `flatten: true`).
   """
   def compile_moment_map(map, opts \\ []) when is_map(map) do
-    acc =
+    index_ops =
       case Keyword.get(opts, :index_rules, []) do
         [] ->
           []
 
         rules ->
-          Enum.reduce(rules, [], fn {:index_on, src, field, idx}, acc ->
-            [{:index_on, to_string(src), to_string(field), to_string(idx)} | acc]
+          Enum.map(rules, fn {:index_on, src, field, idx} ->
+            {:index_on, to_string(src), to_string(field), to_string(idx)}
           end)
       end
 
-    acc =
-      :maps.fold(
-        fn k, v, a ->
-          compile_node_acc(Selector.format_step(:hash_map, k), v, false, a)
-        end,
-        acc,
-        map
-      )
+    if Keyword.get(opts, :flatten, false) do
+      acc = Enum.reverse(index_ops)
 
-    :lists.reverse(acc)
+      acc =
+        :maps.fold(
+          fn k, v, a ->
+            compile_node_acc(Selector.format_step(:hash_map, k), v, false, a)
+          end,
+          acc,
+          map
+        )
+
+      :lists.reverse(acc)
+    else
+      if map_size(map) == 0 do
+        index_ops
+      else
+        index_ops ++ [{:merge_map, map}]
+      end
+    end
   end
 
   def compile_node(prefix, node, reset?) do
