@@ -8,9 +8,9 @@
 
 | Metric | Elixir NIF Wrapper | Raw Odin Baseline | Comparison |
 | :--- | ---: | ---: | ---: |
-| **Median (`ns/op`)** | 612.0 ns (612.0 ns) | 377.0 ns (377.0 ns) | **`1.62x`** NIF Ratio |
-| **Mean ± σ (CV)** | 615.6 ns ± 9.4 ns (1.5%) | 383.0 ns ± 9.6 ns (2.5%) | Welch `z` = `38.63` |
-| **p95 / Max (`ns/op`)** | 628.4 ns / 631.0 ns | 396.2 ns / 399.0 ns | `5` vs `5` pooled samples |
+| **Median (`ns/op`)** | 626.0 ns (626.0 ns) | 380.0 ns (380.0 ns) | **`1.65x`** NIF Ratio |
+| **Mean ± σ (CV)** | 629.2 ns ± 8.1 ns (1.3%) | 388.2 ns ± 19.0 ns (4.9%) | Welch `z` = `26.14` |
+| **p95 / Max (`ns/op`)** | 639.0 ns / 640.0 ns | 414.0 ns / 422.0 ns | `5` vs `5` pooled samples |
 
 ## Benchmark Harnesses (Elixir vs. Raw Odin)
 
@@ -27,7 +27,7 @@
        end},
 ```
 
-### Raw Odin Harness ([`bench_client.odin#L785-L800`](../bench_client.odin#L785-L800))
+### Raw Odin Harness ([`bench_client.odin#L823-L838`](../bench_client.odin#L823-L838))
 
 ```odin
 	// #3: Sorted_Map B+Tree key lookup
@@ -129,7 +129,7 @@
 </details>
 
 <details>
-<summary>NIF <code>odin_nif_slot_get_key</code> — <a href="../../native/xitdb_nif.odin#L865-L943">native/xitdb_nif.odin#L865-L943</a></summary>
+<summary>NIF <code>odin_nif_slot_get_key</code> — <a href="../../native/xitdb_nif.odin#L867-L945">native/xitdb_nif.odin#L867-L945</a></summary>
 
 ```odin
 odin_nif_slot_get_key :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {

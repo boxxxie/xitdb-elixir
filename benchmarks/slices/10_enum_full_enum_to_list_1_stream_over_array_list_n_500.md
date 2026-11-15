@@ -8,9 +8,9 @@
 
 | Metric | Elixir NIF Wrapper | Raw Odin Baseline | Comparison |
 | :--- | ---: | ---: | ---: |
-| **Median (`ns/op`)** | 82.22 µs (82225.0 ns) | 35.03 µs (35028.0 ns) | **`2.35x`** NIF Ratio |
-| **Mean ± σ (CV)** | 84.34 µs ± 4.58 µs (5.4%) | 35.07 µs ± 266.1 ns (0.8%) | Welch `z` = `24.00` |
-| **p95 / Max (`ns/op`)** | 89.93 µs / 90.48 µs | 35.39 µs / 35.43 µs | `5` vs `5` pooled samples |
+| **Median (`ns/op`)** | 78.80 µs (78797.0 ns) | 35.26 µs (35262.0 ns) | **`2.23x`** NIF Ratio |
+| **Mean ± σ (CV)** | 78.85 µs ± 442.2 ns (0.6%) | 35.18 µs ± 160.1 ns (0.5%) | Welch `z` = `207.64` |
+| **p95 / Max (`ns/op`)** | 79.33 µs / 79.35 µs | 35.30 µs / 35.31 µs | `5` vs `5` pooled samples |
 
 ## Benchmark Harnesses (Elixir vs. Raw Odin)
 
@@ -27,7 +27,7 @@
        end},
 ```
 
-### Raw Odin Harness ([`bench_client.odin#L910-L931`](../bench_client.odin#L910-L931))
+### Raw Odin Harness ([`bench_client.odin#L948-L969`](../bench_client.odin#L948-L969))
 
 ```odin
 	// #10: Full Enum.to_list stream over Array_List (N=500)
@@ -145,7 +145,7 @@
 </details>
 
 <details>
-<summary>NIF <code>odin_nif_slot_entries</code> — <a href="../../native/xitdb_nif.odin#L1309-L1459">native/xitdb_nif.odin#L1309-L1459</a></summary>
+<summary>NIF <code>odin_nif_slot_entries</code> — <a href="../../native/xitdb_nif.odin#L1311-L1461">native/xitdb_nif.odin#L1311-L1461</a></summary>
 
 ```odin
 odin_nif_slot_entries :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {

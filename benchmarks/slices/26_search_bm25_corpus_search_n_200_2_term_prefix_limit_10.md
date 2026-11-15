@@ -8,9 +8,9 @@
 
 | Metric | Elixir NIF Wrapper | Raw Odin Baseline | Comparison |
 | :--- | ---: | ---: | ---: |
-| **Median (`ns/op`)** | 253.90 µs (253904.0 ns) | 165.98 µs (165976.0 ns) | **`1.53x`** NIF Ratio |
-| **Mean ± σ (CV)** | 254.21 µs ± 702.0 ns (0.3%) | 165.50 µs ± 2.29 µs (1.4%) | Welch `z` = `82.89` |
-| **p95 / Max (`ns/op`)** | 255.08 µs / 255.17 µs | 167.68 µs / 167.71 µs | `5` vs `5` pooled samples |
+| **Median (`ns/op`)** | 260.55 µs (260551.0 ns) | 154.33 µs (154327.0 ns) | **`1.69x`** NIF Ratio |
+| **Mean ± σ (CV)** | 259.28 µs ± 2.80 µs (1.1%) | 161.45 µs ± 12.95 µs (8.0%) | Welch `z` = `16.52` |
+| **p95 / Max (`ns/op`)** | 261.59 µs / 261.63 µs | 179.32 µs / 183.36 µs | `5` vs `5` pooled samples |
 
 ## Benchmark Harnesses (Elixir vs. Raw Odin)
 
@@ -36,7 +36,7 @@
        end}
 ```
 
-### Raw Odin Harness ([`bench_client.odin#L1308-L1336`](../bench_client.odin#L1308-L1336))
+### Raw Odin Harness ([`bench_client.odin#L1336-L1364`](../bench_client.odin#L1336-L1364))
 
 ```odin
 	// #26: Search: BM25 corpus search (N=200, 2-term prefix, limit=10)
@@ -268,7 +268,7 @@ bench_raw_bm25_search :: proc(root_map: xitdb.Read_Hash_Map, collection: string,
 </details>
 
 <details>
-<summary>NIF <code>odin_nif_bm25_search</code> — <a href="../../native/xitdb_nif.odin#L6872-L7200">native/xitdb_nif.odin#L6872-L7200</a></summary>
+<summary>NIF <code>odin_nif_bm25_search</code> — <a href="../../native/xitdb_nif.odin#L6874-L7202">native/xitdb_nif.odin#L6874-L7202</a></summary>
 
 ```odin
 odin_nif_bm25_search :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {
@@ -605,7 +605,7 @@ odin_nif_bm25_search :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_
 </details>
 
 <details>
-<summary>NIF <code>parse_bm25_opts</code> — <a href="../../native/xitdb_nif.odin#L6610-L6696">native/xitdb_nif.odin#L6610-L6696</a></summary>
+<summary>NIF <code>parse_bm25_opts</code> — <a href="../../native/xitdb_nif.odin#L6612-L6698">native/xitdb_nif.odin#L6612-L6698</a></summary>
 
 ```odin
 parse_bm25_opts :: proc(env: ErlNifEnv, opts_term: ERL_NIF_TERM) -> (opts: BM25_Opts, ok: bool) {
@@ -700,7 +700,7 @@ parse_bm25_opts :: proc(env: ErlNifEnv, opts_term: ERL_NIF_TERM) -> (opts: BM25_
 </details>
 
 <details>
-<summary>NIF <code>resolve_snapshot_root_cursor</code> — <a href="../../native/xitdb_nif.odin#L6577-L6596">native/xitdb_nif.odin#L6577-L6596</a></summary>
+<summary>NIF <code>resolve_snapshot_root_cursor</code> — <a href="../../native/xitdb_nif.odin#L6579-L6598">native/xitdb_nif.odin#L6579-L6598</a></summary>
 
 ```odin
 resolve_snapshot_root_cursor :: proc(
@@ -728,7 +728,7 @@ resolve_snapshot_root_cursor :: proc(
 </details>
 
 <details>
-<summary>NIF <code>read_hash_map_nonneg_int</code> — <a href="../../native/xitdb_nif.odin#L6563-L6574">native/xitdb_nif.odin#L6563-L6574</a></summary>
+<summary>NIF <code>read_hash_map_nonneg_int</code> — <a href="../../native/xitdb_nif.odin#L6565-L6576">native/xitdb_nif.odin#L6565-L6576</a></summary>
 
 ```odin
 read_hash_map_nonneg_int :: proc(hm: xitdb.Read_Hash_Map, key: string) -> (val: i64, err: xitdb.Error) {
@@ -763,7 +763,7 @@ read_key_cursor_string :: proc(cur: xitdb.Read_Cursor, sb_buf: []u8) -> (s: stri
 </details>
 
 <details>
-<summary>NIF <code>collect_postings_into_map</code> — <a href="../../native/xitdb_nif.odin#L6698-L6728">native/xitdb_nif.odin#L6698-L6728</a></summary>
+<summary>NIF <code>collect_postings_into_map</code> — <a href="../../native/xitdb_nif.odin#L6700-L6730">native/xitdb_nif.odin#L6700-L6730</a></summary>
 
 ```odin
 collect_postings_into_map :: proc(
@@ -802,7 +802,7 @@ collect_postings_into_map :: proc(
 </details>
 
 <details>
-<summary>NIF <code>bm25_heap_push</code> — <a href="../../native/xitdb_nif.odin#L6496-L6533">native/xitdb_nif.odin#L6496-L6533</a></summary>
+<summary>NIF <code>bm25_heap_push</code> — <a href="../../native/xitdb_nif.odin#L6498-L6535">native/xitdb_nif.odin#L6498-L6535</a></summary>
 
 ```odin
 bm25_heap_push :: proc(heap: ^[dynamic]BM25_Hit, item: BM25_Hit, k: int) {
@@ -848,7 +848,7 @@ bm25_heap_push :: proc(heap: ^[dynamic]BM25_Hit, item: BM25_Hit, k: int) {
 </details>
 
 <details>
-<summary>NIF <code>read_cursor_nonneg_int</code> — <a href="../../native/xitdb_nif.odin#L6547-L6561">native/xitdb_nif.odin#L6547-L6561</a></summary>
+<summary>NIF <code>read_cursor_nonneg_int</code> — <a href="../../native/xitdb_nif.odin#L6549-L6563">native/xitdb_nif.odin#L6549-L6563</a></summary>
 
 ```odin
 read_cursor_nonneg_int :: proc(cur: xitdb.Read_Cursor) -> (val: i64, ok: bool, err: xitdb.Error) {

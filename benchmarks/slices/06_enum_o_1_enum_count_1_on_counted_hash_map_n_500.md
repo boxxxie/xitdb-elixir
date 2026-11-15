@@ -8,9 +8,9 @@
 
 | Metric | Elixir NIF Wrapper | Raw Odin Baseline | Comparison |
 | :--- | ---: | ---: | ---: |
-| **Median (`ns/op`)** | 167.0 ns (167.0 ns) | 8.0 ns (8.0 ns) | **`20.88x`** NIF Ratio |
-| **Mean ± σ (CV)** | 167.8 ns ± 4.3 ns (2.5%) | 8.0 ns ± 0.0 ns (0.0%) | Welch `z` = `83.76` |
-| **p95 / Max (`ns/op`)** | 173.2 ns / 174.0 ns | 8.0 ns / 8.0 ns | `5` vs `5` pooled samples |
+| **Median (`ns/op`)** | 165.0 ns (165.0 ns) | 6.0 ns (6.0 ns) | **`27.50x`** NIF Ratio |
+| **Mean ± σ (CV)** | 175.0 ns ± 19.3 ns (11.0%) | 6.2 ns ± 0.4 ns (7.2%) | Welch `z` = `19.58` |
+| **p95 / Max (`ns/op`)** | 201.6 ns / 209.0 ns | 6.8 ns / 7.0 ns | `5` vs `5` pooled samples |
 
 ## Benchmark Harnesses (Elixir vs. Raw Odin)
 
@@ -27,7 +27,7 @@
        end},
 ```
 
-### Raw Odin Harness ([`bench_client.odin#L834-L846`](../bench_client.odin#L834-L846))
+### Raw Odin Harness ([`bench_client.odin#L872-L884`](../bench_client.odin#L872-L884))
 
 ```odin
 	// #6: O(1) Counted_Hash_Map count
@@ -69,7 +69,7 @@
 </details>
 
 <details>
-<summary>NIF <code>odin_nif_slot_count</code> — <a href="../../native/xitdb_nif.odin#L1036-L1080">native/xitdb_nif.odin#L1036-L1080</a></summary>
+<summary>NIF <code>odin_nif_slot_count</code> — <a href="../../native/xitdb_nif.odin#L1038-L1082">native/xitdb_nif.odin#L1038-L1082</a></summary>
 
 ```odin
 odin_nif_slot_count :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {

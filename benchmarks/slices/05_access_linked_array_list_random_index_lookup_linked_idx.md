@@ -8,9 +8,9 @@
 
 | Metric | Elixir NIF Wrapper | Raw Odin Baseline | Comparison |
 | :--- | ---: | ---: | ---: |
-| **Median (`ns/op`)** | 402.0 ns (402.0 ns) | 122.0 ns (122.0 ns) | **`3.30x`** NIF Ratio |
-| **Mean ± σ (CV)** | 404.2 ns ± 6.4 ns (1.6%) | 121.6 ns ± 1.1 ns (0.9%) | Welch `z` = `96.93` |
-| **p95 / Max (`ns/op`)** | 412.6 ns / 414.0 ns | 122.8 ns / 123.0 ns | `5` vs `5` pooled samples |
+| **Median (`ns/op`)** | 418.0 ns (418.0 ns) | 118.0 ns (118.0 ns) | **`3.54x`** NIF Ratio |
+| **Mean ± σ (CV)** | 433.4 ns ± 35.6 ns (8.2%) | 118.2 ns ± 1.3 ns (1.1%) | Welch `z` = `19.77` |
+| **p95 / Max (`ns/op`)** | 481.6 ns / 497.0 ns | 119.8 ns / 120.0 ns | `5` vs `5` pooled samples |
 
 ## Benchmark Harnesses (Elixir vs. Raw Odin)
 
@@ -27,7 +27,7 @@
        end},
 ```
 
-### Raw Odin Harness ([`bench_client.odin#L818-L832`](../bench_client.odin#L818-L832))
+### Raw Odin Harness ([`bench_client.odin#L856-L870`](../bench_client.odin#L856-L870))
 
 ```odin
 	// #5: Linked_Array_List random index lookup
@@ -128,7 +128,7 @@
 </details>
 
 <details>
-<summary>NIF <code>odin_nif_slot_get_index</code> — <a href="../../native/xitdb_nif.odin#L946-L1033">native/xitdb_nif.odin#L946-L1033</a></summary>
+<summary>NIF <code>odin_nif_slot_get_index</code> — <a href="../../native/xitdb_nif.odin#L948-L1035">native/xitdb_nif.odin#L948-L1035</a></summary>
 
 ```odin
 odin_nif_slot_get_index :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {

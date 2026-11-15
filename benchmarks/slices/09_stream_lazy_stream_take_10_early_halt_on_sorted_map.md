@@ -8,9 +8,9 @@
 
 | Metric | Elixir NIF Wrapper | Raw Odin Baseline | Comparison |
 | :--- | ---: | ---: | ---: |
-| **Median (`ns/op`)** | 4.95 µs (4949.0 ns) | 1.45 µs (1449.0 ns) | **`3.42x`** NIF Ratio |
-| **Mean ± σ (CV)** | 5.55 µs ± 1.31 µs (23.6%) | 1.47 µs ± 39.2 ns (2.7%) | Welch `z` = `6.98` |
-| **p95 / Max (`ns/op`)** | 7.36 µs / 7.84 µs | 1.52 µs / 1.53 µs | `5` vs `5` pooled samples |
+| **Median (`ns/op`)** | 4.75 µs (4755.0 ns) | 1.46 µs (1463.0 ns) | **`3.25x`** NIF Ratio |
+| **Mean ± σ (CV)** | 4.76 µs ± 45.5 ns (1.0%) | 1.47 µs ± 30.1 ns (2.0%) | Welch `z` = `134.55` |
+| **p95 / Max (`ns/op`)** | 4.81 µs / 4.82 µs | 1.51 µs / 1.51 µs | `5` vs `5` pooled samples |
 
 ## Benchmark Harnesses (Elixir vs. Raw Odin)
 
@@ -27,7 +27,7 @@
        end},
 ```
 
-### Raw Odin Harness ([`bench_client.odin#L885-L908`](../bench_client.odin#L885-L908))
+### Raw Odin Harness ([`bench_client.odin#L923-L946`](../bench_client.odin#L923-L946))
 
 ```odin
 	// #9: Lazy Stream.take(10) early-halt on Sorted_Map (N=500)
@@ -147,7 +147,7 @@
 </details>
 
 <details>
-<summary>NIF <code>odin_nif_slot_entries</code> — <a href="../../native/xitdb_nif.odin#L1309-L1459">native/xitdb_nif.odin#L1309-L1459</a></summary>
+<summary>NIF <code>odin_nif_slot_entries</code> — <a href="../../native/xitdb_nif.odin#L1311-L1461">native/xitdb_nif.odin#L1311-L1461</a></summary>
 
 ```odin
 odin_nif_slot_entries :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {

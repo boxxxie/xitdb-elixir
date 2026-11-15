@@ -8,9 +8,9 @@
 
 | Metric | Elixir NIF Wrapper | Raw Odin Baseline | Comparison |
 | :--- | ---: | ---: | ---: |
-| **Median (`ns/op`)** | 320.18 µs (320184.0 ns) | 188.73 µs (188732.0 ns) | **`1.70x`** NIF Ratio |
-| **Mean ± σ (CV)** | 320.13 µs ± 389.2 ns (0.1%) | 187.84 µs ± 4.05 µs (2.2%) | Welch `z` = `72.67` |
-| **p95 / Max (`ns/op`)** | 320.52 µs / 320.57 µs | 192.33 µs / 193.02 µs | `5` vs `5` pooled samples |
+| **Median (`ns/op`)** | 328.81 µs (328811.0 ns) | 177.42 µs (177420.0 ns) | **`1.85x`** NIF Ratio |
+| **Mean ± σ (CV)** | 328.81 µs ± 482.9 ns (0.1%) | 177.49 µs ± 630.6 ns (0.4%) | Welch `z` = `426.02` |
+| **p95 / Max (`ns/op`)** | 329.40 µs / 329.51 µs | 178.30 µs / 178.51 µs | `5` vs `5` pooled samples |
 
 ## Benchmark Harnesses (Elixir vs. Raw Odin)
 
@@ -27,7 +27,7 @@
        end},
 ```
 
-### Raw Odin Harness ([`bench_client.odin#L1151-L1164`](../bench_client.odin#L1151-L1164))
+### Raw Odin Harness ([`bench_client.odin#L1179-L1192`](../bench_client.odin#L1179-L1192))
 
 ```odin
 	// #19: diff_moments (1 of 200 entities mutated)
@@ -61,7 +61,7 @@
 </details>
 
 <details>
-<summary>NIF <code>odin_nif_diff_moments</code> — <a href="../../native/xitdb_nif.odin#L4328-L4399">native/xitdb_nif.odin#L4328-L4399</a></summary>
+<summary>NIF <code>odin_nif_diff_moments</code> — <a href="../../native/xitdb_nif.odin#L4330-L4401">native/xitdb_nif.odin#L4330-L4401</a></summary>
 
 ```odin
 odin_nif_diff_moments :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {

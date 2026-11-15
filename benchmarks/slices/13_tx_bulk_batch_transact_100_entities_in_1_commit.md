@@ -8,9 +8,9 @@
 
 | Metric | Elixir NIF Wrapper | Raw Odin Baseline | Comparison |
 | :--- | ---: | ---: | ---: |
-| **Median (`ns/op`)** | 404.21 µs (404209.0 ns) | 461.25 µs (461246.0 ns) | **`0.88x`** NIF Ratio |
-| **Mean ± σ (CV)** | 415.32 µs ± 27.07 µs (6.5%) | 459.93 µs ± 4.06 µs (0.9%) | Welch `z` = `3.64` |
-| **p95 / Max (`ns/op`)** | 450.06 µs / 454.70 µs | 464.41 µs / 465.18 µs | `5` vs `5` pooled samples |
+| **Median (`ns/op`)** | 414.55 µs (414547.0 ns) | 181.96 µs (181961.0 ns) | **`2.28x`** NIF Ratio |
+| **Mean ± σ (CV)** | 411.47 µs ± 11.56 µs (2.8%) | 183.26 µs ± 4.21 µs (2.3%) | Welch `z` = `41.48` |
+| **p95 / Max (`ns/op`)** | 423.76 µs / 425.01 µs | 188.95 µs / 190.27 µs | `5` vs `5` pooled samples |
 
 ## Benchmark Harnesses (Elixir vs. Raw Odin)
 
@@ -35,7 +35,7 @@
        end},
 ```
 
-### Raw Odin Harness ([`bench_client.odin#L974-L993`](../bench_client.odin#L974-L993))
+### Raw Odin Harness ([`bench_client.odin#L1007-L1021`](../bench_client.odin#L1007-L1021))
 
 ```odin
 	// #13: Bulk batch transact (100 entities in 1 commit)
@@ -45,12 +45,7 @@
 		d, _ := xitdb.database_init(&c, xitdb.sha1_hasher())
 		t0 := time.now()
 		tx := xitdb.tx_init(&d, base_moment = -1, track_changes = false, allocator = context.temp_allocator)
-		for i in 0 ..< 100 {
-			uid := fmt.tprintf("u%d", i)
-			_ = xitdb.tx_put(&tx, fmt.tprintf(".users.%s.name", uid), "Alice")
-			_ = xitdb.tx_put(&tx, fmt.tprintf(".users.%s.age", uid), u64(30))
-			_ = xitdb.tx_put(&tx, fmt.tprintf(".users.%s.dept", uid), "eng")
-		}
+		xitdb.tx_with_cursor(&tx, bench_bulk_entities_cb)
 		rep, _ := xitdb.tx_commit(&tx)
 		xitdb.tx_report_destroy(&rep, context.temp_allocator)
 		xitdb.tx_destroy(&tx)
@@ -159,7 +154,7 @@
 </details>
 
 <details>
-<summary>NIF <code>odin_nif_transact</code> — <a href="../../native/xitdb_nif.odin#L3393-L3698">native/xitdb_nif.odin#L3393-L3698</a></summary>
+<summary>NIF <code>odin_nif_transact</code> — <a href="../../native/xitdb_nif.odin#L3395-L3700">native/xitdb_nif.odin#L3395-L3700</a></summary>
 
 ```odin
 odin_nif_transact :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {
@@ -473,7 +468,7 @@ odin_nif_transact :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TER
 </details>
 
 <details>
-<summary>NIF <code>parse_escaped_steps</code> — <a href="../../native/xitdb_nif.odin#L1617-L1738">native/xitdb_nif.odin#L1617-L1738</a></summary>
+<summary>NIF <code>parse_escaped_steps</code> — <a href="../../native/xitdb_nif.odin#L1619-L1740">native/xitdb_nif.odin#L1619-L1740</a></summary>
 
 ```odin
 parse_escaped_steps :: proc(path_str: string, allocator := context.temp_allocator) -> (res: []xitdb.Path_Step, err_reason: string) {
@@ -603,7 +598,7 @@ parse_escaped_steps :: proc(path_str: string, allocator := context.temp_allocato
 </details>
 
 <details>
-<summary>NIF <code>decode_writeable_value</code> — <a href="../../native/xitdb_nif.odin#L1825-L1875">native/xitdb_nif.odin#L1825-L1875</a></summary>
+<summary>NIF <code>decode_writeable_value</code> — <a href="../../native/xitdb_nif.odin#L1827-L1877">native/xitdb_nif.odin#L1827-L1877</a></summary>
 
 ```odin
 decode_writeable_value :: proc(env: ErlNifEnv, term: ERL_NIF_TERM) -> (xitdb.Writeable_Data, bool) {
@@ -662,7 +657,7 @@ decode_writeable_value :: proc(env: ErlNifEnv, term: ERL_NIF_TERM) -> (xitdb.Wri
 </details>
 
 <details>
-<summary>NIF <code>validate_write_term</code> — <a href="../../native/xitdb_nif.odin#L1922-L2003">native/xitdb_nif.odin#L1922-L2003</a></summary>
+<summary>NIF <code>validate_write_term</code> — <a href="../../native/xitdb_nif.odin#L1924-L2005">native/xitdb_nif.odin#L1924-L2005</a></summary>
 
 ```odin
 validate_write_term :: proc(env: ErlNifEnv, term: ERL_NIF_TERM) -> bool {
@@ -752,7 +747,7 @@ validate_write_term :: proc(env: ErlNifEnv, term: ERL_NIF_TERM) -> bool {
 </details>
 
 <details>
-<summary>NIF <code>validate_merge_map_term</code> — <a href="../../native/xitdb_nif.odin#L2656-L2748">native/xitdb_nif.odin#L2656-L2748</a></summary>
+<summary>NIF <code>validate_merge_map_term</code> — <a href="../../native/xitdb_nif.odin#L2658-L2750">native/xitdb_nif.odin#L2658-L2750</a></summary>
 
 ```odin
 validate_merge_map_term :: proc(env: ErlNifEnv, term: ERL_NIF_TERM, is_root: bool = true) -> bool {
@@ -853,7 +848,7 @@ validate_merge_map_term :: proc(env: ErlNifEnv, term: ERL_NIF_TERM, is_root: boo
 </details>
 
 <details>
-<summary>NIF <code>parse_escaped_ident_or_bracket</code> — <a href="../../native/xitdb_nif.odin#L1593-L1602">native/xitdb_nif.odin#L1593-L1602</a></summary>
+<summary>NIF <code>parse_escaped_ident_or_bracket</code> — <a href="../../native/xitdb_nif.odin#L1595-L1604">native/xitdb_nif.odin#L1595-L1604</a></summary>
 
 ```odin
 parse_escaped_ident_or_bracket :: proc(s: string, start_i: int, allocator: runtime.Allocator) -> (key: string, next_i: int, err_reason: string) {
@@ -871,7 +866,7 @@ parse_escaped_ident_or_bracket :: proc(s: string, start_i: int, allocator: runti
 </details>
 
 <details>
-<summary>NIF <code>parse_escaped_bracketed_string</code> — <a href="../../native/xitdb_nif.odin#L1575-L1582">native/xitdb_nif.odin#L1575-L1582</a></summary>
+<summary>NIF <code>parse_escaped_bracketed_string</code> — <a href="../../native/xitdb_nif.odin#L1577-L1584">native/xitdb_nif.odin#L1577-L1584</a></summary>
 
 ```odin
 parse_escaped_bracketed_string :: proc(s: string, start_i: int, allocator: runtime.Allocator) -> (key: string, next_i: int, err_reason: string) {
@@ -887,7 +882,7 @@ parse_escaped_bracketed_string :: proc(s: string, start_i: int, allocator: runti
 </details>
 
 <details>
-<summary>NIF <code>validate_set_elements_term</code> — <a href="../../native/xitdb_nif.odin#L2005-L2027">native/xitdb_nif.odin#L2005-L2027</a></summary>
+<summary>NIF <code>validate_set_elements_term</code> — <a href="../../native/xitdb_nif.odin#L2007-L2029">native/xitdb_nif.odin#L2007-L2029</a></summary>
 
 ```odin
 validate_set_elements_term :: proc(env: ErlNifEnv, data_term: ERL_NIF_TERM) -> bool {
@@ -1092,13 +1087,11 @@ tx_init :: proc(db: ^Database, base_moment: Maybe(i64) = -1, track_changes := fa
 </details>
 
 <details>
-<summary><code>xitdb.tx_put</code> — <a href="../../native/xitdb-odin/xitdb/dsl.odin#L698-L702">dsl.odin#L698-L702</a></summary>
+<summary><code>xitdb.tx_with_cursor</code> — <a href="../../native/xitdb-odin/xitdb/dsl.odin#L754-L756">dsl.odin#L754-L756</a></summary>
 
 ```odin
-tx_put :: proc(tx: ^Tx, path_str: string, val: Writeable_Data) -> Error {
-	steps := parse_steps(path_str, tx.allocator) or_return
-	append(&tx.ops, Tx_Op{kind = .Put, steps = steps, val = val})
-	return nil
+tx_with_cursor :: proc(tx: ^Tx, fn: Context_Function, user_data: rawptr = nil) {
+	append(&tx.ops, Tx_Op{kind = .Callback, callback = fn, user_data = user_data})
 }
 ```
 
@@ -1246,11 +1239,11 @@ tx_doc :: proc(tx: ^Tx, doc: string) {
 </details>
 
 <details>
-<summary><code>xitdb.tx_with_cursor</code> — <a href="../../native/xitdb-odin/xitdb/dsl.odin#L754-L756">dsl.odin#L754-L756</a></summary>
+<summary><code>xitdb.tx_savepoint</code> — <a href="../../native/xitdb-odin/xitdb/dsl.odin#L749-L751">dsl.odin#L749-L751</a></summary>
 
 ```odin
-tx_with_cursor :: proc(tx: ^Tx, fn: Context_Function, user_data: rawptr = nil) {
-	append(&tx.ops, Tx_Op{kind = .Callback, callback = fn, user_data = user_data})
+tx_savepoint :: proc(tx: ^Tx) {
+	append(&tx.ops, Tx_Op{kind = .Savepoint})
 }
 ```
 

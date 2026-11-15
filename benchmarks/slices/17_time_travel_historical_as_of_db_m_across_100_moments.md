@@ -8,9 +8,9 @@
 
 | Metric | Elixir NIF Wrapper | Raw Odin Baseline | Comparison |
 | :--- | ---: | ---: | ---: |
-| **Median (`ns/op`)** | 4.13 µs (4135.0 ns) | 544.0 ns (544.0 ns) | **`7.60x`** NIF Ratio |
-| **Mean ± σ (CV)** | 4.04 µs ± 209.3 ns (5.2%) | 545.8 ns ± 6.3 ns (1.1%) | Welch `z` = `37.27` |
-| **p95 / Max (`ns/op`)** | 4.18 µs / 4.18 µs | 554.2 ns / 556.0 ns | `5` vs `5` pooled samples |
+| **Median (`ns/op`)** | 2.40 µs (2405.0 ns) | 543.0 ns (543.0 ns) | **`4.43x`** NIF Ratio |
+| **Mean ± σ (CV)** | 2.40 µs ± 35.9 ns (1.5%) | 544.8 ns ± 3.5 ns (0.6%) | Welch `z` = `115.21` |
+| **p95 / Max (`ns/op`)** | 2.45 µs / 2.46 µs | 549.6 ns / 551.0 ns | `5` vs `5` pooled samples |
 
 ## Benchmark Harnesses (Elixir vs. Raw Odin)
 
@@ -28,7 +28,7 @@
        end},
 ```
 
-### Raw Odin Harness ([`bench_client.odin#L1097-L1117`](../bench_client.odin#L1097-L1117))
+### Raw Odin Harness ([`bench_client.odin#L1125-L1145`](../bench_client.odin#L1125-L1145))
 
 ```odin
 	// #17: Time-Travel as_of(db, moment) across 100 distinct historical moments
@@ -87,7 +87,7 @@
 </details>
 
 <details>
-<summary>NIF <code>odin_nif_moment_slot</code> — <a href="../../native/xitdb_nif.odin#L817-L858">native/xitdb_nif.odin#L817-L858</a></summary>
+<summary>NIF <code>odin_nif_moment_slot</code> — <a href="../../native/xitdb_nif.odin#L819-L860">native/xitdb_nif.odin#L819-L860</a></summary>
 
 ```odin
 odin_nif_moment_slot :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {

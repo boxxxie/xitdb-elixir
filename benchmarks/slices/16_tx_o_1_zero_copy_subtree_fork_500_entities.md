@@ -8,9 +8,9 @@
 
 | Metric | Elixir NIF Wrapper | Raw Odin Baseline | Comparison |
 | :--- | ---: | ---: | ---: |
-| **Median (`ns/op`)** | 9.25 µs (9250.0 ns) | 3.85 µs (3849.0 ns) | **`2.40x`** NIF Ratio |
-| **Mean ± σ (CV)** | 8.85 µs ± 781.9 ns (8.8%) | 3.88 µs ± 68.7 ns (1.8%) | Welch `z` = `14.16` |
-| **p95 / Max (`ns/op`)** | 9.59 µs / 9.67 µs | 3.96 µs / 3.97 µs | `5` vs `5` pooled samples |
+| **Median (`ns/op`)** | 7.76 µs (7765.0 ns) | 3.74 µs (3742.0 ns) | **`2.08x`** NIF Ratio |
+| **Mean ± σ (CV)** | 8.12 µs ± 839.8 ns (10.3%) | 3.76 µs ± 135.9 ns (3.6%) | Welch `z` = `11.46` |
+| **p95 / Max (`ns/op`)** | 9.25 µs / 9.62 µs | 3.94 µs / 3.99 µs | `5` vs `5` pooled samples |
 
 ## Benchmark Harnesses (Elixir vs. Raw Odin)
 
@@ -37,7 +37,7 @@
        end},
 ```
 
-### Raw Odin Harness ([`bench_client.odin#L1046-L1073`](../bench_client.odin#L1046-L1073))
+### Raw Odin Harness ([`bench_client.odin#L1074-L1101`](../bench_client.odin#L1074-L1101))
 
 ```odin
 	// #16: O(1) zero-copy subtree fork (500 entities)
@@ -144,7 +144,7 @@
 </details>
 
 <details>
-<summary>NIF <code>odin_nif_transact</code> — <a href="../../native/xitdb_nif.odin#L3393-L3698">native/xitdb_nif.odin#L3393-L3698</a></summary>
+<summary>NIF <code>odin_nif_transact</code> — <a href="../../native/xitdb_nif.odin#L3395-L3700">native/xitdb_nif.odin#L3395-L3700</a></summary>
 
 ```odin
 odin_nif_transact :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {
@@ -458,7 +458,7 @@ odin_nif_transact :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TER
 </details>
 
 <details>
-<summary>NIF <code>parse_escaped_steps</code> — <a href="../../native/xitdb_nif.odin#L1617-L1738">native/xitdb_nif.odin#L1617-L1738</a></summary>
+<summary>NIF <code>parse_escaped_steps</code> — <a href="../../native/xitdb_nif.odin#L1619-L1740">native/xitdb_nif.odin#L1619-L1740</a></summary>
 
 ```odin
 parse_escaped_steps :: proc(path_str: string, allocator := context.temp_allocator) -> (res: []xitdb.Path_Step, err_reason: string) {
@@ -588,7 +588,7 @@ parse_escaped_steps :: proc(path_str: string, allocator := context.temp_allocato
 </details>
 
 <details>
-<summary>NIF <code>decode_writeable_value</code> — <a href="../../native/xitdb_nif.odin#L1825-L1875">native/xitdb_nif.odin#L1825-L1875</a></summary>
+<summary>NIF <code>decode_writeable_value</code> — <a href="../../native/xitdb_nif.odin#L1827-L1877">native/xitdb_nif.odin#L1827-L1877</a></summary>
 
 ```odin
 decode_writeable_value :: proc(env: ErlNifEnv, term: ERL_NIF_TERM) -> (xitdb.Writeable_Data, bool) {
@@ -647,7 +647,7 @@ decode_writeable_value :: proc(env: ErlNifEnv, term: ERL_NIF_TERM) -> (xitdb.Wri
 </details>
 
 <details>
-<summary>NIF <code>validate_write_term</code> — <a href="../../native/xitdb_nif.odin#L1922-L2003">native/xitdb_nif.odin#L1922-L2003</a></summary>
+<summary>NIF <code>validate_write_term</code> — <a href="../../native/xitdb_nif.odin#L1924-L2005">native/xitdb_nif.odin#L1924-L2005</a></summary>
 
 ```odin
 validate_write_term :: proc(env: ErlNifEnv, term: ERL_NIF_TERM) -> bool {
@@ -737,7 +737,7 @@ validate_write_term :: proc(env: ErlNifEnv, term: ERL_NIF_TERM) -> bool {
 </details>
 
 <details>
-<summary>NIF <code>validate_merge_map_term</code> — <a href="../../native/xitdb_nif.odin#L2656-L2748">native/xitdb_nif.odin#L2656-L2748</a></summary>
+<summary>NIF <code>validate_merge_map_term</code> — <a href="../../native/xitdb_nif.odin#L2658-L2750">native/xitdb_nif.odin#L2658-L2750</a></summary>
 
 ```odin
 validate_merge_map_term :: proc(env: ErlNifEnv, term: ERL_NIF_TERM, is_root: bool = true) -> bool {
@@ -838,7 +838,7 @@ validate_merge_map_term :: proc(env: ErlNifEnv, term: ERL_NIF_TERM, is_root: boo
 </details>
 
 <details>
-<summary>NIF <code>parse_escaped_ident_or_bracket</code> — <a href="../../native/xitdb_nif.odin#L1593-L1602">native/xitdb_nif.odin#L1593-L1602</a></summary>
+<summary>NIF <code>parse_escaped_ident_or_bracket</code> — <a href="../../native/xitdb_nif.odin#L1595-L1604">native/xitdb_nif.odin#L1595-L1604</a></summary>
 
 ```odin
 parse_escaped_ident_or_bracket :: proc(s: string, start_i: int, allocator: runtime.Allocator) -> (key: string, next_i: int, err_reason: string) {
@@ -856,7 +856,7 @@ parse_escaped_ident_or_bracket :: proc(s: string, start_i: int, allocator: runti
 </details>
 
 <details>
-<summary>NIF <code>parse_escaped_bracketed_string</code> — <a href="../../native/xitdb_nif.odin#L1575-L1582">native/xitdb_nif.odin#L1575-L1582</a></summary>
+<summary>NIF <code>parse_escaped_bracketed_string</code> — <a href="../../native/xitdb_nif.odin#L1577-L1584">native/xitdb_nif.odin#L1577-L1584</a></summary>
 
 ```odin
 parse_escaped_bracketed_string :: proc(s: string, start_i: int, allocator: runtime.Allocator) -> (key: string, next_i: int, err_reason: string) {
@@ -872,7 +872,7 @@ parse_escaped_bracketed_string :: proc(s: string, start_i: int, allocator: runti
 </details>
 
 <details>
-<summary>NIF <code>validate_set_elements_term</code> — <a href="../../native/xitdb_nif.odin#L2005-L2027">native/xitdb_nif.odin#L2005-L2027</a></summary>
+<summary>NIF <code>validate_set_elements_term</code> — <a href="../../native/xitdb_nif.odin#L2007-L2029">native/xitdb_nif.odin#L2007-L2029</a></summary>
 
 ```odin
 validate_set_elements_term :: proc(env: ErlNifEnv, data_term: ERL_NIF_TERM) -> bool {

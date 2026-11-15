@@ -8,9 +8,9 @@
 
 | Metric | Elixir NIF Wrapper | Raw Odin Baseline | Comparison |
 | :--- | ---: | ---: | ---: |
-| **Median (`ns/op`)** | 4.60 µs (4598.0 ns) | 1.52 µs (1524.0 ns) | **`3.02x`** NIF Ratio |
-| **Mean ± σ (CV)** | 4.64 µs ± 123.0 ns (2.6%) | 1.54 µs ± 34.3 ns (2.2%) | Welch `z` = `54.38` |
-| **p95 / Max (`ns/op`)** | 4.81 µs / 4.86 µs | 1.58 µs / 1.59 µs | `5` vs `5` pooled samples |
+| **Median (`ns/op`)** | 4.66 µs (4657.0 ns) | 1.52 µs (1518.0 ns) | **`3.07x`** NIF Ratio |
+| **Mean ± σ (CV)** | 4.65 µs ± 77.1 ns (1.7%) | 1.62 µs ± 231.4 ns (14.3%) | Welch `z` = `27.76` |
+| **p95 / Max (`ns/op`)** | 4.74 µs / 4.76 µs | 1.93 µs / 2.04 µs | `5` vs `5` pooled samples |
 
 ## Benchmark Harnesses (Elixir vs. Raw Odin)
 
@@ -34,7 +34,7 @@
        end},
 ```
 
-### Raw Odin Harness ([`bench_client.odin#L1270-L1306`](../bench_client.odin#L1270-L1306))
+### Raw Odin Harness ([`bench_client.odin#L1298-L1334`](../bench_client.odin#L1298-L1334))
 
 ```odin
 	// #25: Search: Sorted_Map B+Tree prefix seek (limit=16)
@@ -140,7 +140,7 @@ end
 </details>
 
 <details>
-<summary>NIF <code>odin_nif_sorted_map_seek</code> — <a href="../../native/xitdb_nif.odin#L6734-L6867">native/xitdb_nif.odin#L6734-L6867</a></summary>
+<summary>NIF <code>odin_nif_sorted_map_seek</code> — <a href="../../native/xitdb_nif.odin#L6736-L6869">native/xitdb_nif.odin#L6736-L6869</a></summary>
 
 ```odin
 odin_nif_sorted_map_seek :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {

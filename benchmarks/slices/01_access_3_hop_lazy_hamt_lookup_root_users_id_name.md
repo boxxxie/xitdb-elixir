@@ -8,9 +8,9 @@
 
 | Metric | Elixir NIF Wrapper | Raw Odin Baseline | Comparison |
 | :--- | ---: | ---: | ---: |
-| **Median (`ns/op`)** | 2.30 µs (2298.0 ns) | 650.0 ns (650.0 ns) | **`3.54x`** NIF Ratio |
-| **Mean ± σ (CV)** | 2.31 µs ± 23.5 ns (1.0%) | 643.2 ns ± 15.3 ns (2.4%) | Welch `z` = `133.12` |
-| **p95 / Max (`ns/op`)** | 2.34 µs / 2.35 µs | 657.8 ns / 659.0 ns | `5` vs `5` pooled samples |
+| **Median (`ns/op`)** | 2.46 µs (2462.0 ns) | 606.0 ns (606.0 ns) | **`4.06x`** NIF Ratio |
+| **Mean ± σ (CV)** | 2.47 µs ± 11.6 ns (0.5%) | 637.8 ns ± 62.0 ns (9.7%) | Welch `z` = `64.81` |
+| **p95 / Max (`ns/op`)** | 2.48 µs / 2.48 µs | 723.6 ns / 745.0 ns | `5` vs `5` pooled samples |
 
 ## Benchmark Harnesses (Elixir vs. Raw Odin)
 
@@ -27,7 +27,7 @@
        end},
 ```
 
-### Raw Odin Harness ([`bench_client.odin#L748-L767`](../bench_client.odin#L748-L767))
+### Raw Odin Harness ([`bench_client.odin#L786-L805`](../bench_client.odin#L786-L805))
 
 ```odin
 	// #1: 3-hop lazy HAMT lookup
@@ -133,7 +133,7 @@
 </details>
 
 <details>
-<summary>NIF <code>odin_nif_slot_get_key</code> — <a href="../../native/xitdb_nif.odin#L865-L943">native/xitdb_nif.odin#L865-L943</a></summary>
+<summary>NIF <code>odin_nif_slot_get_key</code> — <a href="../../native/xitdb_nif.odin#L867-L945">native/xitdb_nif.odin#L867-L945</a></summary>
 
 ```odin
 odin_nif_slot_get_key :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {

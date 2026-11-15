@@ -8,9 +8,9 @@
 
 | Metric | Elixir NIF Wrapper | Raw Odin Baseline | Comparison |
 | :--- | ---: | ---: | ---: |
-| **Median (`ns/op`)** | 6.42 µs (6422.0 ns) | 2.71 µs (2705.0 ns) | **`2.37x`** NIF Ratio |
-| **Mean ± σ (CV)** | 7.11 µs ± 1.95 µs (27.5%) | 2.72 µs ± 88.2 ns (3.2%) | Welch `z` = `5.02` |
-| **p95 / Max (`ns/op`)** | 9.75 µs / 10.56 µs | 2.84 µs / 2.87 µs | `5` vs `5` pooled samples |
+| **Median (`ns/op`)** | 6.09 µs (6094.0 ns) | 2.64 µs (2644.0 ns) | **`2.30x`** NIF Ratio |
+| **Mean ± σ (CV)** | 6.16 µs ± 201.8 ns (3.3%) | 2.67 µs ± 41.3 ns (1.5%) | Welch `z` = `37.86` |
+| **p95 / Max (`ns/op`)** | 6.43 µs / 6.52 µs | 2.72 µs / 2.72 µs | `5` vs `5` pooled samples |
 
 ## Benchmark Harnesses (Elixir vs. Raw Odin)
 
@@ -27,7 +27,7 @@
        end},
 ```
 
-### Raw Odin Harness ([`bench_client.odin#L933-L948`](../bench_client.odin#L933-L948))
+### Raw Odin Harness ([`bench_client.odin#L971-L986`](../bench_client.odin#L971-L986))
 
 ```odin
 	// #11: Subtree materialize (nested user profile)
@@ -94,7 +94,7 @@
 </details>
 
 <details>
-<summary>NIF <code>odin_nif_slot_materialize</code> — <a href="../../native/xitdb_nif.odin#L1462-L1510">native/xitdb_nif.odin#L1462-L1510</a></summary>
+<summary>NIF <code>odin_nif_slot_materialize</code> — <a href="../../native/xitdb_nif.odin#L1464-L1512">native/xitdb_nif.odin#L1464-L1512</a></summary>
 
 ```odin
 odin_nif_slot_materialize :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {

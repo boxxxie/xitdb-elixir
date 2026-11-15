@@ -8,9 +8,9 @@
 
 | Metric | Elixir NIF Wrapper | Raw Odin Baseline | Comparison |
 | :--- | ---: | ---: | ---: |
-| **Median (`ns/op`)** | 738.0 ns (738.0 ns) | 262.0 ns (262.0 ns) | **`2.82x`** NIF Ratio |
-| **Mean ± σ (CV)** | 744.0 ns ± 27.6 ns (3.7%) | 263.8 ns ± 4.2 ns (1.6%) | Welch `z` = `38.44` |
-| **p95 / Max (`ns/op`)** | 781.4 ns / 792.0 ns | 269.6 ns / 271.0 ns | `5` vs `5` pooled samples |
+| **Median (`ns/op`)** | 808.0 ns (808.0 ns) | 262.0 ns (262.0 ns) | **`3.08x`** NIF Ratio |
+| **Mean ± σ (CV)** | 813.4 ns ± 13.0 ns (1.6%) | 267.6 ns ± 8.1 ns (3.0%) | Welch `z` = `79.77` |
+| **p95 / Max (`ns/op`)** | 831.2 ns / 836.0 ns | 276.8 ns / 277.0 ns | `5` vs `5` pooled samples |
 
 ## Benchmark Harnesses (Elixir vs. Raw Odin)
 
@@ -27,7 +27,7 @@
        end},
 ```
 
-### Raw Odin Harness ([`bench_client.odin#L848-L862`](../bench_client.odin#L848-L862))
+### Raw Odin Harness ([`bench_client.odin#L886-L900`](../bench_client.odin#L886-L900))
 
 ```odin
 	// #7: O(1) Counted_Hash_Set membership check
@@ -50,7 +50,7 @@
 ## Elixir Wrapper & NIF Bridge
 
 <details>
-<summary>NIF <code>odin_nif_slot_contains</code> — <a href="../../native/xitdb_nif.odin#L1083-L1175">native/xitdb_nif.odin#L1083-L1175</a></summary>
+<summary>NIF <code>odin_nif_slot_contains</code> — <a href="../../native/xitdb_nif.odin#L1085-L1177">native/xitdb_nif.odin#L1085-L1177</a></summary>
 
 ```odin
 odin_nif_slot_contains :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {
