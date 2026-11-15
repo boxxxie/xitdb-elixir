@@ -8,13 +8,13 @@
 
 | Metric | Elixir NIF Wrapper | Raw Odin Baseline | Comparison |
 | :--- | ---: | ---: | ---: |
-| **Median (`ns/op`)** | 30.97 µs (30973.0 ns) | 12.99 µs (12986.0 ns) | **`2.39x`** NIF Ratio |
-| **Mean ± σ (CV)** | 30.95 µs ± 328.5 ns (1.1%) | 13.00 µs ± 61.8 ns (0.5%) | Welch `z` = `120.11` |
-| **p95 / Max (`ns/op`)** | 31.23 µs / 31.24 µs | 13.07 µs / 13.09 µs | `5` vs `5` pooled samples |
+| **Median (`ns/op`)** | 13.66 µs (13663.0 ns) | 12.51 µs (12511.0 ns) | **`1.09x`** NIF Ratio |
+| **Mean ± σ (CV)** | 14.21 µs ± 1.04 µs (7.3%) | 12.55 µs ± 124.0 ns (1.0%) | Welch `z` = `3.54` |
+| **p95 / Max (`ns/op`)** | 15.64 µs / 16.04 µs | 12.72 µs / 12.76 µs | `5` vs `5` pooled samples |
 
 ## Benchmark Harnesses (Elixir vs. Raw Odin)
 
-### Elixir Harness ([`bench_elixir.exs#L280-L306`](../bench_elixir.exs#L280-L306))
+### Elixir Harness ([`bench_elixir.exs#L291-L317`](../bench_elixir.exs#L291-L317))
 
 ```elixir
       {12, "Tx: Single nested entity transact commit (6 attributes)", 100,
@@ -132,38 +132,48 @@
 </details>
 
 <details>
-<summary>Elixir <code>compile_moment_map</code> — <a href="../../lib/xitdb/tx_compiler.ex#L14-L36">lib/xitdb/tx_compiler.ex#L14-L36</a></summary>
+<summary>Elixir <code>compile_moment_map</code> — <a href="../../lib/xitdb/tx_compiler.ex#L15-L47">lib/xitdb/tx_compiler.ex#L15-L47</a></summary>
 
 ```elixir
   def compile_moment_map(map, opts \\ []) when is_map(map) do
-    acc =
+    index_ops =
       case Keyword.get(opts, :index_rules, []) do
         [] ->
           []
 
         rules ->
-          Enum.reduce(rules, [], fn {:index_on, src, field, idx}, acc ->
-            [{:index_on, to_string(src), to_string(field), to_string(idx)} | acc]
+          Enum.map(rules, fn {:index_on, src, field, idx} ->
+            {:index_on, to_string(src), to_string(field), to_string(idx)}
           end)
       end
 
-    acc =
-      :maps.fold(
-        fn k, v, a ->
-          compile_node_acc(Selector.format_step(:hash_map, k), v, false, a)
-        end,
-        acc,
-        map
-      )
+    if Keyword.get(opts, :flatten, false) do
+      acc = Enum.reverse(index_ops)
 
-    :lists.reverse(acc)
+      acc =
+        :maps.fold(
+          fn k, v, a ->
+            compile_node_acc(Selector.format_step(:hash_map, k), v, false, a)
+          end,
+          acc,
+          map
+        )
+
+      :lists.reverse(acc)
+    else
+      if map_size(map) == 0 do
+        index_ops
+      else
+        index_ops ++ [{:merge_map, map}]
+      end
+    end
   end
 ```
 
 </details>
 
 <details>
-<summary>NIF <code>odin_nif_transact</code> — <a href="../../native/xitdb_nif.odin#L2565-L2857">native/xitdb_nif.odin#L2565-L2857</a></summary>
+<summary>NIF <code>odin_nif_transact</code> — <a href="../../native/xitdb_nif.odin#L3393-L3698">native/xitdb_nif.odin#L3393-L3698</a></summary>
 
 ```odin
 odin_nif_transact :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {
@@ -446,6 +456,19 @@ odin_nif_transact :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TER
 			ic.reset = (op_atom == ATOM_RESET_COL)
 			xitdb.tx_with_cursor(&tx, init_col_callback, ic)
 
+		case ATOM_MERGE_MAP:
+			if arity != 2 {
+				return make_err(env, "invalid_merge_map_op")
+			}
+			if !validate_merge_map_term(env, elems[1], true) {
+				return make_err(env, "invalid_put_op")
+			}
+			mc := new(Merge_Map_Ctx, tx.allocator)
+			mc.env = env
+			mc.map_term = elems[1]
+			mc.tx = &tx
+			xitdb.tx_with_cursor(&tx, merge_map_callback, mc)
+
 		case:
 			return make_err(env, "unknown_tx_op")
 		}
@@ -464,7 +487,7 @@ odin_nif_transact :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TER
 </details>
 
 <details>
-<summary>NIF <code>parse_escaped_steps</code> — <a href="../../native/xitdb_nif.odin#L1613-L1734">native/xitdb_nif.odin#L1613-L1734</a></summary>
+<summary>NIF <code>parse_escaped_steps</code> — <a href="../../native/xitdb_nif.odin#L1617-L1738">native/xitdb_nif.odin#L1617-L1738</a></summary>
 
 ```odin
 parse_escaped_steps :: proc(path_str: string, allocator := context.temp_allocator) -> (res: []xitdb.Path_Step, err_reason: string) {
@@ -594,7 +617,7 @@ parse_escaped_steps :: proc(path_str: string, allocator := context.temp_allocato
 </details>
 
 <details>
-<summary>NIF <code>decode_writeable_value</code> — <a href="../../native/xitdb_nif.odin#L1821-L1871">native/xitdb_nif.odin#L1821-L1871</a></summary>
+<summary>NIF <code>decode_writeable_value</code> — <a href="../../native/xitdb_nif.odin#L1825-L1875">native/xitdb_nif.odin#L1825-L1875</a></summary>
 
 ```odin
 decode_writeable_value :: proc(env: ErlNifEnv, term: ERL_NIF_TERM) -> (xitdb.Writeable_Data, bool) {
@@ -653,7 +676,7 @@ decode_writeable_value :: proc(env: ErlNifEnv, term: ERL_NIF_TERM) -> (xitdb.Wri
 </details>
 
 <details>
-<summary>NIF <code>validate_write_term</code> — <a href="../../native/xitdb_nif.odin#L1908-L1989">native/xitdb_nif.odin#L1908-L1989</a></summary>
+<summary>NIF <code>validate_write_term</code> — <a href="../../native/xitdb_nif.odin#L1922-L2003">native/xitdb_nif.odin#L1922-L2003</a></summary>
 
 ```odin
 validate_write_term :: proc(env: ErlNifEnv, term: ERL_NIF_TERM) -> bool {
@@ -743,7 +766,108 @@ validate_write_term :: proc(env: ErlNifEnv, term: ERL_NIF_TERM) -> bool {
 </details>
 
 <details>
-<summary>NIF <code>parse_escaped_ident_or_bracket</code> — <a href="../../native/xitdb_nif.odin#L1589-L1598">native/xitdb_nif.odin#L1589-L1598</a></summary>
+<summary>NIF <code>validate_merge_map_term</code> — <a href="../../native/xitdb_nif.odin#L2656-L2748">native/xitdb_nif.odin#L2656-L2748</a></summary>
+
+```odin
+validate_merge_map_term :: proc(env: ErlNifEnv, term: ERL_NIF_TERM, is_root: bool = true) -> bool {
+	if !is_root {
+		if _, ok := decode_writeable_value(env, term); ok {
+			return true
+		}
+		if nif_is_tuple(env, term) != 0 {
+			arity: c.int = 0
+			elems: [^]ERL_NIF_TERM = nil
+			if nif_get_tuple(env, term, &arity, &elems) == 0 {
+				return false
+			}
+			if arity == 2 && elems[0] == ATOM_XITDB_SET {
+				return validate_set_elements_term(env, elems[1])
+			}
+			if arity == 3 && elems[0] == ATOM_XITDB_COL {
+				kind_str, ok_k := term_to_kind_string(env, elems[1])
+				if !ok_k || !is_supported_col_kind(kind_str) {
+					return false
+				}
+				return validate_collection_data_term(env, kind_str, elems[2])
+			}
+			return false
+		}
+		if nif_is_list(env, term) != 0 {
+			head: ERL_NIF_TERM
+			tail := term
+			for nif_is_empty_list(env, tail) == 0 {
+				if nif_get_list_cell(env, tail, &head, &tail) == 0 {
+					return false
+				}
+				if !validate_merge_map_term(env, head, false) {
+					return false
+				}
+			}
+			return true
+		}
+	}
+
+	if nif_is_map(env, term) == 0 {
+		return false
+	}
+	struct_term: ERL_NIF_TERM
+	if nif_get_map_value(env, term, ATOM_STRUCT, &struct_term) != 0 {
+		if is_root {
+			return false
+		}
+		if struct_term == ATOM_XITDB_COLLECTION_MOD {
+			kind_term, data_term: ERL_NIF_TERM
+			if nif_get_map_value(env, term, ATOM_KIND, &kind_term) == 0 ||
+			   nif_get_map_value(env, term, ATOM_DATA, &data_term) == 0 {
+				return false
+			}
+			kind_str, ok_k := term_to_kind_string(env, kind_term)
+			if !ok_k || !is_supported_col_kind(kind_str) {
+				return false
+			}
+			return validate_merge_collection_data(env, kind_str, data_term)
+		}
+		if struct_term == ATOM_MAPSET_MOD {
+			ms_map: ERL_NIF_TERM
+			if nif_get_map_value(env, term, ATOM_MAP, &ms_map) == 0 || nif_is_map(env, ms_map) == 0 {
+				return false
+			}
+			sb: KV_Stack_Buf = ---
+			keys, _, ok := extract_map_kvs(env, ms_map, &sb)
+			if !ok {
+				return false
+			}
+			for k in keys {
+				if _, ok_s := term_to_key_string(env, k); !ok_s {
+					return false
+				}
+			}
+			return true
+		}
+		return false
+	}
+
+	sb: KV_Stack_Buf = ---
+	keys, vals, ok := extract_map_kvs(env, term, &sb)
+	if !ok {
+		return false
+	}
+	for i in 0 ..< len(keys) {
+		if _, ok_k := term_to_key_string(env, keys[i]); !ok_k {
+			return false
+		}
+		if !validate_merge_map_term(env, vals[i], false) {
+			return false
+		}
+	}
+	return true
+}
+```
+
+</details>
+
+<details>
+<summary>NIF <code>parse_escaped_ident_or_bracket</code> — <a href="../../native/xitdb_nif.odin#L1593-L1602">native/xitdb_nif.odin#L1593-L1602</a></summary>
 
 ```odin
 parse_escaped_ident_or_bracket :: proc(s: string, start_i: int, allocator: runtime.Allocator) -> (key: string, next_i: int, err_reason: string) {
@@ -761,7 +885,7 @@ parse_escaped_ident_or_bracket :: proc(s: string, start_i: int, allocator: runti
 </details>
 
 <details>
-<summary>NIF <code>parse_escaped_bracketed_string</code> — <a href="../../native/xitdb_nif.odin#L1571-L1578">native/xitdb_nif.odin#L1571-L1578</a></summary>
+<summary>NIF <code>parse_escaped_bracketed_string</code> — <a href="../../native/xitdb_nif.odin#L1575-L1582">native/xitdb_nif.odin#L1575-L1582</a></summary>
 
 ```odin
 parse_escaped_bracketed_string :: proc(s: string, start_i: int, allocator: runtime.Allocator) -> (key: string, next_i: int, err_reason: string) {
@@ -777,7 +901,7 @@ parse_escaped_bracketed_string :: proc(s: string, start_i: int, allocator: runti
 </details>
 
 <details>
-<summary>NIF <code>validate_set_elements_term</code> — <a href="../../native/xitdb_nif.odin#L1991-L2013">native/xitdb_nif.odin#L1991-L2013</a></summary>
+<summary>NIF <code>validate_set_elements_term</code> — <a href="../../native/xitdb_nif.odin#L2005-L2027">native/xitdb_nif.odin#L2005-L2027</a></summary>
 
 ```odin
 validate_set_elements_term :: proc(env: ErlNifEnv, data_term: ERL_NIF_TERM) -> bool {
@@ -802,25 +926,6 @@ validate_set_elements_term :: proc(env: ErlNifEnv, data_term: ERL_NIF_TERM) -> b
 		}
 	}
 	return true
-}
-```
-
-</details>
-
-<details>
-<summary>NIF <code>validate_collection_data_term</code> — <a href="../../native/xitdb_nif.odin#L2047-L2057">native/xitdb_nif.odin#L2047-L2057</a></summary>
-
-```odin
-validate_collection_data_term :: proc(env: ErlNifEnv, kind_str: string, data_term: ERL_NIF_TERM) -> bool {
-	switch kind_str {
-	case "hash_map", "counted_hash_map", "sorted_map":
-		return validate_kv_term(env, data_term)
-	case "array_list", "linked_array_list":
-		return validate_write_term(env, data_term) && nif_is_list(env, data_term) != 0
-	case "hash_set", "counted_hash_set", "sorted_set":
-		return validate_set_elements_term(env, data_term)
-	}
-	return false
 }
 ```
 

@@ -8,13 +8,13 @@
 
 | Metric | Elixir NIF Wrapper | Raw Odin Baseline | Comparison |
 | :--- | ---: | ---: | ---: |
-| **Median (`ns/op`)** | 81.84 µs (81836.0 ns) | 35.01 µs (35014.0 ns) | **`2.34x`** NIF Ratio |
-| **Mean ± σ (CV)** | 80.24 µs ± 3.14 µs (3.9%) | 35.09 µs ± 235.4 ns (0.7%) | Welch `z` = `32.10` |
-| **p95 / Max (`ns/op`)** | 83.28 µs / 83.64 µs | 35.40 µs / 35.49 µs | `5` vs `5` pooled samples |
+| **Median (`ns/op`)** | 82.22 µs (82225.0 ns) | 35.03 µs (35028.0 ns) | **`2.35x`** NIF Ratio |
+| **Mean ± σ (CV)** | 84.34 µs ± 4.58 µs (5.4%) | 35.07 µs ± 266.1 ns (0.8%) | Welch `z` = `24.00` |
+| **p95 / Max (`ns/op`)** | 89.93 µs / 90.48 µs | 35.39 µs / 35.43 µs | `5` vs `5` pooled samples |
 
 ## Benchmark Harnesses (Elixir vs. Raw Odin)
 
-### Elixir Harness ([`bench_elixir.exs#L264-L271`](../bench_elixir.exs#L264-L271))
+### Elixir Harness ([`bench_elixir.exs#L275-L282`](../bench_elixir.exs#L275-L282))
 
 ```elixir
       {10, "Enum: Full Enum.to_list/1 stream over Array_List (N=500)", 50,
@@ -145,7 +145,7 @@
 </details>
 
 <details>
-<summary>NIF <code>odin_nif_slot_entries</code> — <a href="../../native/xitdb_nif.odin#L1305-L1455">native/xitdb_nif.odin#L1305-L1455</a></summary>
+<summary>NIF <code>odin_nif_slot_entries</code> — <a href="../../native/xitdb_nif.odin#L1309-L1459">native/xitdb_nif.odin#L1309-L1459</a></summary>
 
 ```odin
 odin_nif_slot_entries :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {
@@ -304,7 +304,7 @@ odin_nif_slot_entries :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF
 </details>
 
 <details>
-<summary>NIF <code>slot_to_term</code> — <a href="../../native/xitdb_nif.odin#L289-L347">native/xitdb_nif.odin#L289-L347</a></summary>
+<summary>NIF <code>slot_to_term</code> — <a href="../../native/xitdb_nif.odin#L293-L351">native/xitdb_nif.odin#L293-L351</a></summary>
 
 ```odin
 slot_to_term :: proc(env: ErlNifEnv, db: ^xitdb.Database, slot: xitdb.Slot) -> (res: ERL_NIF_TERM, err: xitdb.Error) {
@@ -371,7 +371,7 @@ slot_to_term :: proc(env: ErlNifEnv, db: ^xitdb.Database, slot: xitdb.Slot) -> (
 </details>
 
 <details>
-<summary>NIF <code>read_key_cursor_string</code> — <a href="../../native/xitdb_nif.odin#L349-L355">native/xitdb_nif.odin#L349-L355</a></summary>
+<summary>NIF <code>read_key_cursor_string</code> — <a href="../../native/xitdb_nif.odin#L353-L359">native/xitdb_nif.odin#L353-L359</a></summary>
 
 ```odin
 read_key_cursor_string :: proc(cur: xitdb.Read_Cursor, sb_buf: []u8) -> (s: string, err: xitdb.Error) {

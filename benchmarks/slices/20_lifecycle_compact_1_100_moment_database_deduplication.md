@@ -8,13 +8,13 @@
 
 | Metric | Elixir NIF Wrapper | Raw Odin Baseline | Comparison |
 | :--- | ---: | ---: | ---: |
-| **Median (`ns/op`)** | 38.70 µs (38703.0 ns) | 18.57 µs (18574.0 ns) | **`2.08x`** NIF Ratio |
-| **Mean ± σ (CV)** | 35.98 µs ± 6.53 µs (18.2%) | 18.50 µs ± 326.2 ns (1.8%) | Welch `z` = `5.98` |
-| **p95 / Max (`ns/op`)** | 42.47 µs / 43.07 µs | 18.82 µs / 18.86 µs | `5` vs `5` pooled samples |
+| **Median (`ns/op`)** | 31.35 µs (31351.0 ns) | 21.65 µs (21650.0 ns) | **`1.45x`** NIF Ratio |
+| **Mean ± σ (CV)** | 31.05 µs ± 4.33 µs (13.9%) | 21.28 µs ± 1.19 µs (5.6%) | Welch `z` = `4.87` |
+| **p95 / Max (`ns/op`)** | 36.58 µs / 37.88 µs | 22.30 µs / 22.36 µs | `5` vs `5` pooled samples |
 
 ## Benchmark Harnesses (Elixir vs. Raw Odin)
 
-### Elixir Harness ([`bench_elixir.exs#L402-L413`](../bench_elixir.exs#L402-L413))
+### Elixir Harness ([`bench_elixir.exs#L413-L424`](../bench_elixir.exs#L413-L424))
 
 ```elixir
       {20, "Lifecycle: compact/1 100-moment database deduplication", 20,
@@ -86,7 +86,7 @@
 </details>
 
 <details>
-<summary>NIF <code>odin_nif_compact</code> — <a href="../../native/xitdb_nif.odin#L5464-L5529">native/xitdb_nif.odin#L5464-L5529</a></summary>
+<summary>NIF <code>odin_nif_compact</code> — <a href="../../native/xitdb_nif.odin#L6389-L6454">native/xitdb_nif.odin#L6389-L6454</a></summary>
 
 ```odin
 odin_nif_compact :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {

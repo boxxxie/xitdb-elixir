@@ -8,13 +8,13 @@
 
 | Metric | Elixir NIF Wrapper | Raw Odin Baseline | Comparison |
 | :--- | ---: | ---: | ---: |
-| **Median (`ns/op`)** | 628.0 ns (628.0 ns) | 375.0 ns (375.0 ns) | **`1.67x`** NIF Ratio |
-| **Mean ± σ (CV)** | 634.8 ns ± 14.5 ns (2.3%) | 379.0 ns ± 8.3 ns (2.2%) | Welch `z` = `34.17` |
-| **p95 / Max (`ns/op`)** | 654.4 ns / 658.0 ns | 390.4 ns / 393.0 ns | `5` vs `5` pooled samples |
+| **Median (`ns/op`)** | 612.0 ns (612.0 ns) | 377.0 ns (377.0 ns) | **`1.62x`** NIF Ratio |
+| **Mean ± σ (CV)** | 615.6 ns ± 9.4 ns (1.5%) | 383.0 ns ± 9.6 ns (2.5%) | Welch `z` = `38.63` |
+| **p95 / Max (`ns/op`)** | 628.4 ns / 631.0 ns | 396.2 ns / 399.0 ns | `5` vs `5` pooled samples |
 
 ## Benchmark Harnesses (Elixir vs. Raw Odin)
 
-### Elixir Harness ([`bench_elixir.exs#L208-L215`](../bench_elixir.exs#L208-L215))
+### Elixir Harness ([`bench_elixir.exs#L219-L226`](../bench_elixir.exs#L219-L226))
 
 ```elixir
       {3, "Access: Sorted_Map B+Tree key lookup (sorted[key])", 500,
@@ -129,7 +129,7 @@
 </details>
 
 <details>
-<summary>NIF <code>odin_nif_slot_get_key</code> — <a href="../../native/xitdb_nif.odin#L861-L939">native/xitdb_nif.odin#L861-L939</a></summary>
+<summary>NIF <code>odin_nif_slot_get_key</code> — <a href="../../native/xitdb_nif.odin#L865-L943">native/xitdb_nif.odin#L865-L943</a></summary>
 
 ```odin
 odin_nif_slot_get_key :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {
@@ -216,7 +216,7 @@ odin_nif_slot_get_key :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF
 </details>
 
 <details>
-<summary>NIF <code>slot_to_term</code> — <a href="../../native/xitdb_nif.odin#L289-L347">native/xitdb_nif.odin#L289-L347</a></summary>
+<summary>NIF <code>slot_to_term</code> — <a href="../../native/xitdb_nif.odin#L293-L351">native/xitdb_nif.odin#L293-L351</a></summary>
 
 ```odin
 slot_to_term :: proc(env: ErlNifEnv, db: ^xitdb.Database, slot: xitdb.Slot) -> (res: ERL_NIF_TERM, err: xitdb.Error) {

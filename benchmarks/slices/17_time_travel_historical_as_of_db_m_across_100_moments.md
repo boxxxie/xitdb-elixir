@@ -8,13 +8,13 @@
 
 | Metric | Elixir NIF Wrapper | Raw Odin Baseline | Comparison |
 | :--- | ---: | ---: | ---: |
-| **Median (`ns/op`)** | 3.25 µs (3247.0 ns) | 551.0 ns (551.0 ns) | **`5.89x`** NIF Ratio |
-| **Mean ± σ (CV)** | 4.16 µs ± 2.32 µs (55.9%) | 564.6 ns ± 27.1 ns (4.8%) | Welch `z` = `3.46` |
-| **p95 / Max (`ns/op`)** | 7.33 µs / 8.24 µs | 602.0 ns / 612.0 ns | `5` vs `5` pooled samples |
+| **Median (`ns/op`)** | 4.13 µs (4135.0 ns) | 544.0 ns (544.0 ns) | **`7.60x`** NIF Ratio |
+| **Mean ± σ (CV)** | 4.04 µs ± 209.3 ns (5.2%) | 545.8 ns ± 6.3 ns (1.1%) | Welch `z` = `37.27` |
+| **p95 / Max (`ns/op`)** | 4.18 µs / 4.18 µs | 554.2 ns / 556.0 ns | `5` vs `5` pooled samples |
 
 ## Benchmark Harnesses (Elixir vs. Raw Odin)
 
-### Elixir Harness ([`bench_elixir.exs#L377-L385`](../bench_elixir.exs#L377-L385))
+### Elixir Harness ([`bench_elixir.exs#L388-L396`](../bench_elixir.exs#L388-L396))
 
 ```elixir
       {17, "Time-Travel: Historical as_of(db, m) across 100 moments", 100,
@@ -87,7 +87,7 @@
 </details>
 
 <details>
-<summary>NIF <code>odin_nif_moment_slot</code> — <a href="../../native/xitdb_nif.odin#L813-L854">native/xitdb_nif.odin#L813-L854</a></summary>
+<summary>NIF <code>odin_nif_moment_slot</code> — <a href="../../native/xitdb_nif.odin#L817-L858">native/xitdb_nif.odin#L817-L858</a></summary>
 
 ```odin
 odin_nif_moment_slot :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {
@@ -137,7 +137,7 @@ odin_nif_moment_slot :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_
 </details>
 
 <details>
-<summary>NIF <code>slot_to_term</code> — <a href="../../native/xitdb_nif.odin#L289-L347">native/xitdb_nif.odin#L289-L347</a></summary>
+<summary>NIF <code>slot_to_term</code> — <a href="../../native/xitdb_nif.odin#L293-L351">native/xitdb_nif.odin#L293-L351</a></summary>
 
 ```odin
 slot_to_term :: proc(env: ErlNifEnv, db: ^xitdb.Database, slot: xitdb.Slot) -> (res: ERL_NIF_TERM, err: xitdb.Error) {

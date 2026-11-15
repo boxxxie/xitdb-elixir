@@ -8,13 +8,13 @@
 
 | Metric | Elixir NIF Wrapper | Raw Odin Baseline | Comparison |
 | :--- | ---: | ---: | ---: |
-| **Median (`ns/op`)** | 2.37 µs (2367.0 ns) | 613.0 ns (613.0 ns) | **`3.86x`** NIF Ratio |
-| **Mean ± σ (CV)** | 2.41 µs ± 113.5 ns (4.7%) | 629.8 ns ± 33.8 ns (5.4%) | Welch `z` = `33.65` |
-| **p95 / Max (`ns/op`)** | 2.57 µs / 2.61 µs | 676.6 ns / 689.0 ns | `5` vs `5` pooled samples |
+| **Median (`ns/op`)** | 2.30 µs (2298.0 ns) | 650.0 ns (650.0 ns) | **`3.54x`** NIF Ratio |
+| **Mean ± σ (CV)** | 2.31 µs ± 23.5 ns (1.0%) | 643.2 ns ± 15.3 ns (2.4%) | Welch `z` = `133.12` |
+| **p95 / Max (`ns/op`)** | 2.34 µs / 2.35 µs | 657.8 ns / 659.0 ns | `5` vs `5` pooled samples |
 
 ## Benchmark Harnesses (Elixir vs. Raw Odin)
 
-### Elixir Harness ([`bench_elixir.exs#L192-L199`](../bench_elixir.exs#L192-L199))
+### Elixir Harness ([`bench_elixir.exs#L203-L210`](../bench_elixir.exs#L203-L210))
 
 ```elixir
       {1, "Access: 3-hop lazy HAMT lookup (root[users][id][name])", 500,
@@ -133,7 +133,7 @@
 </details>
 
 <details>
-<summary>NIF <code>odin_nif_slot_get_key</code> — <a href="../../native/xitdb_nif.odin#L861-L939">native/xitdb_nif.odin#L861-L939</a></summary>
+<summary>NIF <code>odin_nif_slot_get_key</code> — <a href="../../native/xitdb_nif.odin#L865-L943">native/xitdb_nif.odin#L865-L943</a></summary>
 
 ```odin
 odin_nif_slot_get_key :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {
@@ -220,7 +220,7 @@ odin_nif_slot_get_key :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF
 </details>
 
 <details>
-<summary>NIF <code>slot_to_term</code> — <a href="../../native/xitdb_nif.odin#L289-L347">native/xitdb_nif.odin#L289-L347</a></summary>
+<summary>NIF <code>slot_to_term</code> — <a href="../../native/xitdb_nif.odin#L293-L351">native/xitdb_nif.odin#L293-L351</a></summary>
 
 ```odin
 slot_to_term :: proc(env: ErlNifEnv, db: ^xitdb.Database, slot: xitdb.Slot) -> (res: ERL_NIF_TERM, err: xitdb.Error) {

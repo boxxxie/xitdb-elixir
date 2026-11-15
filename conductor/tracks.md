@@ -14,5 +14,5 @@ All completed tracks from **Waves 0–5** (Tracks 1–17, including split tracks
 
 ---
 
-- [ ] **Track: Benchmark Follow-Up Optimizations: Dirty-Tree Sample Isolation, Pull Harness Parity & Bulk Tx Prefix Grouping**
+- [x] **Track: Benchmark Follow-Up Optimizations: Dirty-Tree Sample Isolation, Pull Harness Parity & Bulk Tx Prefix Grouping**
 *Link: [./tracks/benchmark_followup_optimizations_20261115/](./tracks/benchmark_followup_optimizations_20261115/)*

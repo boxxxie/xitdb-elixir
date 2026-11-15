@@ -8,13 +8,13 @@
 
 | Metric | Elixir NIF Wrapper | Raw Odin Baseline | Comparison |
 | :--- | ---: | ---: | ---: |
-| **Median (`ns/op`)** | 5.69 µs (5690.0 ns) | 2.72 µs (2718.0 ns) | **`2.09x`** NIF Ratio |
-| **Mean ± σ (CV)** | 5.73 µs ± 194.7 ns (3.4%) | 2.72 µs ± 22.4 ns (0.8%) | Welch `z` = `34.35` |
-| **p95 / Max (`ns/op`)** | 5.99 µs / 6.07 µs | 2.75 µs / 2.75 µs | `5` vs `5` pooled samples |
+| **Median (`ns/op`)** | 6.42 µs (6422.0 ns) | 2.71 µs (2705.0 ns) | **`2.37x`** NIF Ratio |
+| **Mean ± σ (CV)** | 7.11 µs ± 1.95 µs (27.5%) | 2.72 µs ± 88.2 ns (3.2%) | Welch `z` = `5.02` |
+| **p95 / Max (`ns/op`)** | 9.75 µs / 10.56 µs | 2.84 µs / 2.87 µs | `5` vs `5` pooled samples |
 
 ## Benchmark Harnesses (Elixir vs. Raw Odin)
 
-### Elixir Harness ([`bench_elixir.exs#L272-L279`](../bench_elixir.exs#L272-L279))
+### Elixir Harness ([`bench_elixir.exs#L283-L290`](../bench_elixir.exs#L283-L290))
 
 ```elixir
       {11, "Materialize: Eager subtree materialize/1 (user profile)", 200,
@@ -94,7 +94,7 @@
 </details>
 
 <details>
-<summary>NIF <code>odin_nif_slot_materialize</code> — <a href="../../native/xitdb_nif.odin#L1458-L1506">native/xitdb_nif.odin#L1458-L1506</a></summary>
+<summary>NIF <code>odin_nif_slot_materialize</code> — <a href="../../native/xitdb_nif.odin#L1462-L1510">native/xitdb_nif.odin#L1462-L1510</a></summary>
 
 ```odin
 odin_nif_slot_materialize :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {
@@ -151,7 +151,7 @@ odin_nif_slot_materialize :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL
 </details>
 
 <details>
-<summary>NIF <code>materialize_slot</code> — <a href="../../native/xitdb_nif.odin#L375-L452">native/xitdb_nif.odin#L375-L452</a></summary>
+<summary>NIF <code>materialize_slot</code> — <a href="../../native/xitdb_nif.odin#L379-L456">native/xitdb_nif.odin#L379-L456</a></summary>
 
 ```odin
 materialize_slot :: proc(env: ErlNifEnv, db: ^xitdb.Database, slot: xitdb.Slot, is_root: bool = false) -> (res: ERL_NIF_TERM, err: xitdb.Error) {
@@ -237,7 +237,7 @@ materialize_slot :: proc(env: ErlNifEnv, db: ^xitdb.Database, slot: xitdb.Slot, 
 </details>
 
 <details>
-<summary>NIF <code>slot_to_term</code> — <a href="../../native/xitdb_nif.odin#L289-L347">native/xitdb_nif.odin#L289-L347</a></summary>
+<summary>NIF <code>slot_to_term</code> — <a href="../../native/xitdb_nif.odin#L293-L351">native/xitdb_nif.odin#L293-L351</a></summary>
 
 ```odin
 slot_to_term :: proc(env: ErlNifEnv, db: ^xitdb.Database, slot: xitdb.Slot) -> (res: ERL_NIF_TERM, err: xitdb.Error) {
@@ -304,7 +304,7 @@ slot_to_term :: proc(env: ErlNifEnv, db: ^xitdb.Database, slot: xitdb.Slot) -> (
 </details>
 
 <details>
-<summary>NIF <code>read_key_cursor_string</code> — <a href="../../native/xitdb_nif.odin#L349-L355">native/xitdb_nif.odin#L349-L355</a></summary>
+<summary>NIF <code>read_key_cursor_string</code> — <a href="../../native/xitdb_nif.odin#L353-L359">native/xitdb_nif.odin#L353-L359</a></summary>
 
 ```odin
 read_key_cursor_string :: proc(cur: xitdb.Read_Cursor, sb_buf: []u8) -> (s: string, err: xitdb.Error) {

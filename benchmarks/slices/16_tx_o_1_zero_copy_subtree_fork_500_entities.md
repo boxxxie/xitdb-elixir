@@ -8,13 +8,13 @@
 
 | Metric | Elixir NIF Wrapper | Raw Odin Baseline | Comparison |
 | :--- | ---: | ---: | ---: |
-| **Median (`ns/op`)** | 8.33 µs (8326.0 ns) | 3.90 µs (3902.0 ns) | **`2.13x`** NIF Ratio |
-| **Mean ± σ (CV)** | 8.21 µs ± 297.1 ns (3.6%) | 3.92 µs ± 68.1 ns (1.7%) | Welch `z` = `31.46` |
-| **p95 / Max (`ns/op`)** | 8.49 µs / 8.50 µs | 4.01 µs / 4.02 µs | `5` vs `5` pooled samples |
+| **Median (`ns/op`)** | 9.25 µs (9250.0 ns) | 3.85 µs (3849.0 ns) | **`2.40x`** NIF Ratio |
+| **Mean ± σ (CV)** | 8.85 µs ± 781.9 ns (8.8%) | 3.88 µs ± 68.7 ns (1.8%) | Welch `z` = `14.16` |
+| **p95 / Max (`ns/op`)** | 9.59 µs / 9.67 µs | 3.96 µs / 3.97 µs | `5` vs `5` pooled samples |
 
 ## Benchmark Harnesses (Elixir vs. Raw Odin)
 
-### Elixir Harness ([`bench_elixir.exs#L359-L376`](../bench_elixir.exs#L359-L376))
+### Elixir Harness ([`bench_elixir.exs#L370-L387`](../bench_elixir.exs#L370-L387))
 
 ```elixir
       {16, "Tx: O(1) zero-copy subtree fork (500 entities)", 100,
@@ -144,7 +144,7 @@
 </details>
 
 <details>
-<summary>NIF <code>odin_nif_transact</code> — <a href="../../native/xitdb_nif.odin#L2565-L2857">native/xitdb_nif.odin#L2565-L2857</a></summary>
+<summary>NIF <code>odin_nif_transact</code> — <a href="../../native/xitdb_nif.odin#L3393-L3698">native/xitdb_nif.odin#L3393-L3698</a></summary>
 
 ```odin
 odin_nif_transact :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {
@@ -427,6 +427,19 @@ odin_nif_transact :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TER
 			ic.reset = (op_atom == ATOM_RESET_COL)
 			xitdb.tx_with_cursor(&tx, init_col_callback, ic)
 
+		case ATOM_MERGE_MAP:
+			if arity != 2 {
+				return make_err(env, "invalid_merge_map_op")
+			}
+			if !validate_merge_map_term(env, elems[1], true) {
+				return make_err(env, "invalid_put_op")
+			}
+			mc := new(Merge_Map_Ctx, tx.allocator)
+			mc.env = env
+			mc.map_term = elems[1]
+			mc.tx = &tx
+			xitdb.tx_with_cursor(&tx, merge_map_callback, mc)
+
 		case:
 			return make_err(env, "unknown_tx_op")
 		}
@@ -445,7 +458,7 @@ odin_nif_transact :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TER
 </details>
 
 <details>
-<summary>NIF <code>parse_escaped_steps</code> — <a href="../../native/xitdb_nif.odin#L1613-L1734">native/xitdb_nif.odin#L1613-L1734</a></summary>
+<summary>NIF <code>parse_escaped_steps</code> — <a href="../../native/xitdb_nif.odin#L1617-L1738">native/xitdb_nif.odin#L1617-L1738</a></summary>
 
 ```odin
 parse_escaped_steps :: proc(path_str: string, allocator := context.temp_allocator) -> (res: []xitdb.Path_Step, err_reason: string) {
@@ -575,7 +588,7 @@ parse_escaped_steps :: proc(path_str: string, allocator := context.temp_allocato
 </details>
 
 <details>
-<summary>NIF <code>decode_writeable_value</code> — <a href="../../native/xitdb_nif.odin#L1821-L1871">native/xitdb_nif.odin#L1821-L1871</a></summary>
+<summary>NIF <code>decode_writeable_value</code> — <a href="../../native/xitdb_nif.odin#L1825-L1875">native/xitdb_nif.odin#L1825-L1875</a></summary>
 
 ```odin
 decode_writeable_value :: proc(env: ErlNifEnv, term: ERL_NIF_TERM) -> (xitdb.Writeable_Data, bool) {
@@ -634,7 +647,7 @@ decode_writeable_value :: proc(env: ErlNifEnv, term: ERL_NIF_TERM) -> (xitdb.Wri
 </details>
 
 <details>
-<summary>NIF <code>validate_write_term</code> — <a href="../../native/xitdb_nif.odin#L1908-L1989">native/xitdb_nif.odin#L1908-L1989</a></summary>
+<summary>NIF <code>validate_write_term</code> — <a href="../../native/xitdb_nif.odin#L1922-L2003">native/xitdb_nif.odin#L1922-L2003</a></summary>
 
 ```odin
 validate_write_term :: proc(env: ErlNifEnv, term: ERL_NIF_TERM) -> bool {
@@ -724,7 +737,108 @@ validate_write_term :: proc(env: ErlNifEnv, term: ERL_NIF_TERM) -> bool {
 </details>
 
 <details>
-<summary>NIF <code>parse_escaped_ident_or_bracket</code> — <a href="../../native/xitdb_nif.odin#L1589-L1598">native/xitdb_nif.odin#L1589-L1598</a></summary>
+<summary>NIF <code>validate_merge_map_term</code> — <a href="../../native/xitdb_nif.odin#L2656-L2748">native/xitdb_nif.odin#L2656-L2748</a></summary>
+
+```odin
+validate_merge_map_term :: proc(env: ErlNifEnv, term: ERL_NIF_TERM, is_root: bool = true) -> bool {
+	if !is_root {
+		if _, ok := decode_writeable_value(env, term); ok {
+			return true
+		}
+		if nif_is_tuple(env, term) != 0 {
+			arity: c.int = 0
+			elems: [^]ERL_NIF_TERM = nil
+			if nif_get_tuple(env, term, &arity, &elems) == 0 {
+				return false
+			}
+			if arity == 2 && elems[0] == ATOM_XITDB_SET {
+				return validate_set_elements_term(env, elems[1])
+			}
+			if arity == 3 && elems[0] == ATOM_XITDB_COL {
+				kind_str, ok_k := term_to_kind_string(env, elems[1])
+				if !ok_k || !is_supported_col_kind(kind_str) {
+					return false
+				}
+				return validate_collection_data_term(env, kind_str, elems[2])
+			}
+			return false
+		}
+		if nif_is_list(env, term) != 0 {
+			head: ERL_NIF_TERM
+			tail := term
+			for nif_is_empty_list(env, tail) == 0 {
+				if nif_get_list_cell(env, tail, &head, &tail) == 0 {
+					return false
+				}
+				if !validate_merge_map_term(env, head, false) {
+					return false
+				}
+			}
+			return true
+		}
+	}
+
+	if nif_is_map(env, term) == 0 {
+		return false
+	}
+	struct_term: ERL_NIF_TERM
+	if nif_get_map_value(env, term, ATOM_STRUCT, &struct_term) != 0 {
+		if is_root {
+			return false
+		}
+		if struct_term == ATOM_XITDB_COLLECTION_MOD {
+			kind_term, data_term: ERL_NIF_TERM
+			if nif_get_map_value(env, term, ATOM_KIND, &kind_term) == 0 ||
+			   nif_get_map_value(env, term, ATOM_DATA, &data_term) == 0 {
+				return false
+			}
+			kind_str, ok_k := term_to_kind_string(env, kind_term)
+			if !ok_k || !is_supported_col_kind(kind_str) {
+				return false
+			}
+			return validate_merge_collection_data(env, kind_str, data_term)
+		}
+		if struct_term == ATOM_MAPSET_MOD {
+			ms_map: ERL_NIF_TERM
+			if nif_get_map_value(env, term, ATOM_MAP, &ms_map) == 0 || nif_is_map(env, ms_map) == 0 {
+				return false
+			}
+			sb: KV_Stack_Buf = ---
+			keys, _, ok := extract_map_kvs(env, ms_map, &sb)
+			if !ok {
+				return false
+			}
+			for k in keys {
+				if _, ok_s := term_to_key_string(env, k); !ok_s {
+					return false
+				}
+			}
+			return true
+		}
+		return false
+	}
+
+	sb: KV_Stack_Buf = ---
+	keys, vals, ok := extract_map_kvs(env, term, &sb)
+	if !ok {
+		return false
+	}
+	for i in 0 ..< len(keys) {
+		if _, ok_k := term_to_key_string(env, keys[i]); !ok_k {
+			return false
+		}
+		if !validate_merge_map_term(env, vals[i], false) {
+			return false
+		}
+	}
+	return true
+}
+```
+
+</details>
+
+<details>
+<summary>NIF <code>parse_escaped_ident_or_bracket</code> — <a href="../../native/xitdb_nif.odin#L1593-L1602">native/xitdb_nif.odin#L1593-L1602</a></summary>
 
 ```odin
 parse_escaped_ident_or_bracket :: proc(s: string, start_i: int, allocator: runtime.Allocator) -> (key: string, next_i: int, err_reason: string) {
@@ -742,7 +856,7 @@ parse_escaped_ident_or_bracket :: proc(s: string, start_i: int, allocator: runti
 </details>
 
 <details>
-<summary>NIF <code>parse_escaped_bracketed_string</code> — <a href="../../native/xitdb_nif.odin#L1571-L1578">native/xitdb_nif.odin#L1571-L1578</a></summary>
+<summary>NIF <code>parse_escaped_bracketed_string</code> — <a href="../../native/xitdb_nif.odin#L1575-L1582">native/xitdb_nif.odin#L1575-L1582</a></summary>
 
 ```odin
 parse_escaped_bracketed_string :: proc(s: string, start_i: int, allocator: runtime.Allocator) -> (key: string, next_i: int, err_reason: string) {
@@ -758,7 +872,7 @@ parse_escaped_bracketed_string :: proc(s: string, start_i: int, allocator: runti
 </details>
 
 <details>
-<summary>NIF <code>validate_set_elements_term</code> — <a href="../../native/xitdb_nif.odin#L1991-L2013">native/xitdb_nif.odin#L1991-L2013</a></summary>
+<summary>NIF <code>validate_set_elements_term</code> — <a href="../../native/xitdb_nif.odin#L2005-L2027">native/xitdb_nif.odin#L2005-L2027</a></summary>
 
 ```odin
 validate_set_elements_term :: proc(env: ErlNifEnv, data_term: ERL_NIF_TERM) -> bool {
@@ -783,25 +897,6 @@ validate_set_elements_term :: proc(env: ErlNifEnv, data_term: ERL_NIF_TERM) -> b
 		}
 	}
 	return true
-}
-```
-
-</details>
-
-<details>
-<summary>NIF <code>validate_collection_data_term</code> — <a href="../../native/xitdb_nif.odin#L2047-L2057">native/xitdb_nif.odin#L2047-L2057</a></summary>
-
-```odin
-validate_collection_data_term :: proc(env: ErlNifEnv, kind_str: string, data_term: ERL_NIF_TERM) -> bool {
-	switch kind_str {
-	case "hash_map", "counted_hash_map", "sorted_map":
-		return validate_kv_term(env, data_term)
-	case "array_list", "linked_array_list":
-		return validate_write_term(env, data_term) && nif_is_list(env, data_term) != 0
-	case "hash_set", "counted_hash_set", "sorted_set":
-		return validate_set_elements_term(env, data_term)
-	}
-	return false
 }
 ```
 

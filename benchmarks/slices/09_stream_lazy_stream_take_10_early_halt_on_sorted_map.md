@@ -8,13 +8,13 @@
 
 | Metric | Elixir NIF Wrapper | Raw Odin Baseline | Comparison |
 | :--- | ---: | ---: | ---: |
-| **Median (`ns/op`)** | 4.58 µs (4585.0 ns) | 1.48 µs (1479.0 ns) | **`3.10x`** NIF Ratio |
-| **Mean ± σ (CV)** | 4.59 µs ± 20.0 ns (0.4%) | 1.49 µs ± 24.7 ns (1.7%) | Welch `z` = `217.38` |
-| **p95 / Max (`ns/op`)** | 4.61 µs / 4.61 µs | 1.52 µs / 1.52 µs | `5` vs `5` pooled samples |
+| **Median (`ns/op`)** | 4.95 µs (4949.0 ns) | 1.45 µs (1449.0 ns) | **`3.42x`** NIF Ratio |
+| **Mean ± σ (CV)** | 5.55 µs ± 1.31 µs (23.6%) | 1.47 µs ± 39.2 ns (2.7%) | Welch `z` = `6.98` |
+| **p95 / Max (`ns/op`)** | 7.36 µs / 7.84 µs | 1.52 µs / 1.53 µs | `5` vs `5` pooled samples |
 
 ## Benchmark Harnesses (Elixir vs. Raw Odin)
 
-### Elixir Harness ([`bench_elixir.exs#L256-L263`](../bench_elixir.exs#L256-L263))
+### Elixir Harness ([`bench_elixir.exs#L267-L274`](../bench_elixir.exs#L267-L274))
 
 ```elixir
       {9, "Stream: Lazy Stream.take(10) early-halt on Sorted_Map", 200,
@@ -147,7 +147,7 @@
 </details>
 
 <details>
-<summary>NIF <code>odin_nif_slot_entries</code> — <a href="../../native/xitdb_nif.odin#L1305-L1455">native/xitdb_nif.odin#L1305-L1455</a></summary>
+<summary>NIF <code>odin_nif_slot_entries</code> — <a href="../../native/xitdb_nif.odin#L1309-L1459">native/xitdb_nif.odin#L1309-L1459</a></summary>
 
 ```odin
 odin_nif_slot_entries :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {
@@ -306,7 +306,7 @@ odin_nif_slot_entries :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF
 </details>
 
 <details>
-<summary>NIF <code>slot_to_term</code> — <a href="../../native/xitdb_nif.odin#L289-L347">native/xitdb_nif.odin#L289-L347</a></summary>
+<summary>NIF <code>slot_to_term</code> — <a href="../../native/xitdb_nif.odin#L293-L351">native/xitdb_nif.odin#L293-L351</a></summary>
 
 ```odin
 slot_to_term :: proc(env: ErlNifEnv, db: ^xitdb.Database, slot: xitdb.Slot) -> (res: ERL_NIF_TERM, err: xitdb.Error) {
@@ -373,7 +373,7 @@ slot_to_term :: proc(env: ErlNifEnv, db: ^xitdb.Database, slot: xitdb.Slot) -> (
 </details>
 
 <details>
-<summary>NIF <code>read_key_cursor_string</code> — <a href="../../native/xitdb_nif.odin#L349-L355">native/xitdb_nif.odin#L349-L355</a></summary>
+<summary>NIF <code>read_key_cursor_string</code> — <a href="../../native/xitdb_nif.odin#L353-L359">native/xitdb_nif.odin#L353-L359</a></summary>
 
 ```odin
 read_key_cursor_string :: proc(cur: xitdb.Read_Cursor, sb_buf: []u8) -> (s: string, err: xitdb.Error) {

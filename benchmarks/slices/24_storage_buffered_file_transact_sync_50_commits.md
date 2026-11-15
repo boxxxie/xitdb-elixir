@@ -8,13 +8,13 @@
 
 | Metric | Elixir NIF Wrapper | Raw Odin Baseline | Comparison |
 | :--- | ---: | ---: | ---: |
-| **Median (`ns/op`)** | 59.85 µs (59852.0 ns) | 50.95 µs (50946.0 ns) | **`1.17x`** NIF Ratio |
-| **Mean ± σ (CV)** | 60.13 µs ± 1.03 µs (1.7%) | 50.98 µs ± 73.2 ns (0.1%) | Welch `z` = `19.86` |
-| **p95 / Max (`ns/op`)** | 61.42 µs / 61.62 µs | 51.07 µs / 51.08 µs | `5` vs `5` pooled samples |
+| **Median (`ns/op`)** | 61.28 µs (61281.0 ns) | 52.83 µs (52831.0 ns) | **`1.16x`** NIF Ratio |
+| **Mean ± σ (CV)** | 60.92 µs ± 1.56 µs (2.6%) | 53.46 µs ± 1.79 µs (3.3%) | Welch `z` = `7.02` |
+| **p95 / Max (`ns/op`)** | 62.76 µs / 63.13 µs | 55.92 µs / 56.57 µs | `5` vs `5` pooled samples |
 
 ## Benchmark Harnesses (Elixir vs. Raw Odin)
 
-### Elixir Harness ([`bench_elixir.exs#L439-L455`](../bench_elixir.exs#L439-L455))
+### Elixir Harness ([`bench_elixir.exs#L449-L465`](../bench_elixir.exs#L449-L465))
 
 ```elixir
       {24, "Storage: Buffered_File transact + sync (50 commits)", 50,
@@ -172,7 +172,7 @@
 </details>
 
 <details>
-<summary>NIF <code>odin_nif_open</code> — <a href="../../native/xitdb_nif.odin#L564-L639">native/xitdb_nif.odin#L564-L639</a></summary>
+<summary>NIF <code>odin_nif_open</code> — <a href="../../native/xitdb_nif.odin#L568-L643">native/xitdb_nif.odin#L568-L643</a></summary>
 
 ```odin
 odin_nif_open :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {
@@ -256,7 +256,7 @@ odin_nif_open :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -
 </details>
 
 <details>
-<summary>NIF <code>odin_nif_transact</code> — <a href="../../native/xitdb_nif.odin#L2565-L2857">native/xitdb_nif.odin#L2565-L2857</a></summary>
+<summary>NIF <code>odin_nif_transact</code> — <a href="../../native/xitdb_nif.odin#L3393-L3698">native/xitdb_nif.odin#L3393-L3698</a></summary>
 
 ```odin
 odin_nif_transact :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {
@@ -539,6 +539,19 @@ odin_nif_transact :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TER
 			ic.reset = (op_atom == ATOM_RESET_COL)
 			xitdb.tx_with_cursor(&tx, init_col_callback, ic)
 
+		case ATOM_MERGE_MAP:
+			if arity != 2 {
+				return make_err(env, "invalid_merge_map_op")
+			}
+			if !validate_merge_map_term(env, elems[1], true) {
+				return make_err(env, "invalid_put_op")
+			}
+			mc := new(Merge_Map_Ctx, tx.allocator)
+			mc.env = env
+			mc.map_term = elems[1]
+			mc.tx = &tx
+			xitdb.tx_with_cursor(&tx, merge_map_callback, mc)
+
 		case:
 			return make_err(env, "unknown_tx_op")
 		}
@@ -557,7 +570,7 @@ odin_nif_transact :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TER
 </details>
 
 <details>
-<summary>NIF <code>odin_nif_sync</code> — <a href="../../native/xitdb_nif.odin#L665-L682">native/xitdb_nif.odin#L665-L682</a></summary>
+<summary>NIF <code>odin_nif_sync</code> — <a href="../../native/xitdb_nif.odin#L669-L686">native/xitdb_nif.odin#L669-L686</a></summary>
 
 ```odin
 odin_nif_sync :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {
@@ -583,7 +596,7 @@ odin_nif_sync :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -
 </details>
 
 <details>
-<summary>NIF <code>odin_nif_info</code> — <a href="../../native/xitdb_nif.odin#L685-L720">native/xitdb_nif.odin#L685-L720</a></summary>
+<summary>NIF <code>odin_nif_info</code> — <a href="../../native/xitdb_nif.odin#L689-L724">native/xitdb_nif.odin#L689-L724</a></summary>
 
 ```odin
 odin_nif_info :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {
@@ -627,7 +640,7 @@ odin_nif_info :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -
 </details>
 
 <details>
-<summary>NIF <code>odin_nif_close</code> — <a href="../../native/xitdb_nif.odin#L642-L662">native/xitdb_nif.odin#L642-L662</a></summary>
+<summary>NIF <code>odin_nif_close</code> — <a href="../../native/xitdb_nif.odin#L646-L666">native/xitdb_nif.odin#L646-L666</a></summary>
 
 ```odin
 odin_nif_close :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {
@@ -656,7 +669,7 @@ odin_nif_close :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) 
 </details>
 
 <details>
-<summary>NIF <code>parse_escaped_steps</code> — <a href="../../native/xitdb_nif.odin#L1613-L1734">native/xitdb_nif.odin#L1613-L1734</a></summary>
+<summary>NIF <code>parse_escaped_steps</code> — <a href="../../native/xitdb_nif.odin#L1617-L1738">native/xitdb_nif.odin#L1617-L1738</a></summary>
 
 ```odin
 parse_escaped_steps :: proc(path_str: string, allocator := context.temp_allocator) -> (res: []xitdb.Path_Step, err_reason: string) {
@@ -786,7 +799,7 @@ parse_escaped_steps :: proc(path_str: string, allocator := context.temp_allocato
 </details>
 
 <details>
-<summary>NIF <code>decode_writeable_value</code> — <a href="../../native/xitdb_nif.odin#L1821-L1871">native/xitdb_nif.odin#L1821-L1871</a></summary>
+<summary>NIF <code>decode_writeable_value</code> — <a href="../../native/xitdb_nif.odin#L1825-L1875">native/xitdb_nif.odin#L1825-L1875</a></summary>
 
 ```odin
 decode_writeable_value :: proc(env: ErlNifEnv, term: ERL_NIF_TERM) -> (xitdb.Writeable_Data, bool) {
@@ -845,7 +858,7 @@ decode_writeable_value :: proc(env: ErlNifEnv, term: ERL_NIF_TERM) -> (xitdb.Wri
 </details>
 
 <details>
-<summary>NIF <code>validate_write_term</code> — <a href="../../native/xitdb_nif.odin#L1908-L1989">native/xitdb_nif.odin#L1908-L1989</a></summary>
+<summary>NIF <code>validate_write_term</code> — <a href="../../native/xitdb_nif.odin#L1922-L2003">native/xitdb_nif.odin#L1922-L2003</a></summary>
 
 ```odin
 validate_write_term :: proc(env: ErlNifEnv, term: ERL_NIF_TERM) -> bool {

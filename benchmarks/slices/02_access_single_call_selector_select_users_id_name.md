@@ -8,13 +8,13 @@
 
 | Metric | Elixir NIF Wrapper | Raw Odin Baseline | Comparison |
 | :--- | ---: | ---: | ---: |
-| **Median (`ns/op`)** | 2.25 µs (2254.0 ns) | 1.06 µs (1061.0 ns) | **`2.12x`** NIF Ratio |
-| **Mean ± σ (CV)** | 2.25 µs ± 22.5 ns (1.0%) | 1.06 µs ± 10.8 ns (1.0%) | Welch `z` = `106.80` |
-| **p95 / Max (`ns/op`)** | 2.28 µs / 2.29 µs | 1.07 µs / 1.07 µs | `5` vs `5` pooled samples |
+| **Median (`ns/op`)** | 2.16 µs (2160.0 ns) | 1.04 µs (1045.0 ns) | **`2.07x`** NIF Ratio |
+| **Mean ± σ (CV)** | 2.16 µs ± 6.5 ns (0.3%) | 1.06 µs ± 21.2 ns (2.0%) | Welch `z` = `111.43` |
+| **p95 / Max (`ns/op`)** | 2.17 µs / 2.17 µs | 1.09 µs / 1.09 µs | `5` vs `5` pooled samples |
 
 ## Benchmark Harnesses (Elixir vs. Raw Odin)
 
-### Elixir Harness ([`bench_elixir.exs#L200-L207`](../bench_elixir.exs#L200-L207))
+### Elixir Harness ([`bench_elixir.exs#L211-L218`](../bench_elixir.exs#L211-L218))
 
 ```elixir
       {2, "Access: Single-call selector select(.users.<id>.name)", 500,
@@ -88,7 +88,7 @@
 </details>
 
 <details>
-<summary>NIF <code>odin_nif_select</code> — <a href="../../native/xitdb_nif.odin#L2864-L2942">native/xitdb_nif.odin#L2864-L2942</a></summary>
+<summary>NIF <code>odin_nif_select</code> — <a href="../../native/xitdb_nif.odin#L3705-L3783">native/xitdb_nif.odin#L3705-L3783</a></summary>
 
 ```odin
 odin_nif_select :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {
@@ -175,7 +175,7 @@ odin_nif_select :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM)
 </details>
 
 <details>
-<summary>NIF <code>parse_escaped_selector</code> — <a href="../../native/xitdb_nif.odin#L1739-L1770">native/xitdb_nif.odin#L1739-L1770</a></summary>
+<summary>NIF <code>parse_escaped_selector</code> — <a href="../../native/xitdb_nif.odin#L1743-L1774">native/xitdb_nif.odin#L1743-L1774</a></summary>
 
 ```odin
 parse_escaped_selector :: proc(sel_str: string, allocator := context.temp_allocator) -> (res: xitdb.Parsed_Selector, err_reason: string) {
@@ -215,7 +215,7 @@ parse_escaped_selector :: proc(sel_str: string, allocator := context.temp_alloca
 </details>
 
 <details>
-<summary>NIF <code>slot_to_term</code> — <a href="../../native/xitdb_nif.odin#L289-L347">native/xitdb_nif.odin#L289-L347</a></summary>
+<summary>NIF <code>slot_to_term</code> — <a href="../../native/xitdb_nif.odin#L293-L351">native/xitdb_nif.odin#L293-L351</a></summary>
 
 ```odin
 slot_to_term :: proc(env: ErlNifEnv, db: ^xitdb.Database, slot: xitdb.Slot) -> (res: ERL_NIF_TERM, err: xitdb.Error) {
@@ -282,7 +282,7 @@ slot_to_term :: proc(env: ErlNifEnv, db: ^xitdb.Database, slot: xitdb.Slot) -> (
 </details>
 
 <details>
-<summary>NIF <code>parse_escaped_steps</code> — <a href="../../native/xitdb_nif.odin#L1613-L1734">native/xitdb_nif.odin#L1613-L1734</a></summary>
+<summary>NIF <code>parse_escaped_steps</code> — <a href="../../native/xitdb_nif.odin#L1617-L1738">native/xitdb_nif.odin#L1617-L1738</a></summary>
 
 ```odin
 parse_escaped_steps :: proc(path_str: string, allocator := context.temp_allocator) -> (res: []xitdb.Path_Step, err_reason: string) {
@@ -412,7 +412,7 @@ parse_escaped_steps :: proc(path_str: string, allocator := context.temp_allocato
 </details>
 
 <details>
-<summary>NIF <code>parse_escaped_ident_or_bracket</code> — <a href="../../native/xitdb_nif.odin#L1589-L1598">native/xitdb_nif.odin#L1589-L1598</a></summary>
+<summary>NIF <code>parse_escaped_ident_or_bracket</code> — <a href="../../native/xitdb_nif.odin#L1593-L1602">native/xitdb_nif.odin#L1593-L1602</a></summary>
 
 ```odin
 parse_escaped_ident_or_bracket :: proc(s: string, start_i: int, allocator: runtime.Allocator) -> (key: string, next_i: int, err_reason: string) {
@@ -430,7 +430,7 @@ parse_escaped_ident_or_bracket :: proc(s: string, start_i: int, allocator: runti
 </details>
 
 <details>
-<summary>NIF <code>parse_escaped_bracketed_string</code> — <a href="../../native/xitdb_nif.odin#L1571-L1578">native/xitdb_nif.odin#L1571-L1578</a></summary>
+<summary>NIF <code>parse_escaped_bracketed_string</code> — <a href="../../native/xitdb_nif.odin#L1575-L1582">native/xitdb_nif.odin#L1575-L1582</a></summary>
 
 ```odin
 parse_escaped_bracketed_string :: proc(s: string, start_i: int, allocator: runtime.Allocator) -> (key: string, next_i: int, err_reason: string) {
@@ -446,7 +446,7 @@ parse_escaped_bracketed_string :: proc(s: string, start_i: int, allocator: runti
 </details>
 
 <details>
-<summary>NIF <code>parse_escaped_quoted</code> — <a href="../../native/xitdb_nif.odin#L1512-L1519">native/xitdb_nif.odin#L1512-L1519</a></summary>
+<summary>NIF <code>parse_escaped_quoted</code> — <a href="../../native/xitdb_nif.odin#L1516-L1523">native/xitdb_nif.odin#L1516-L1523</a></summary>
 
 ```odin
 parse_escaped_quoted :: proc(s: string, quote_i: int, allocator: runtime.Allocator) -> (key: string, next_i: int, err_reason: string) {
