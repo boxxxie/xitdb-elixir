@@ -8,9 +8,9 @@
 
 | Metric | Elixir NIF Wrapper | Raw Odin Baseline | Comparison |
 | :--- | ---: | ---: | ---: |
-| **Median (`ns/op`)** | 25.18 µs (25178.0 ns) | 18.89 µs (18894.0 ns) | **`1.33x`** NIF Ratio |
-| **Mean ± σ (CV)** | 25.15 µs ± 496.2 ns (2.0%) | 18.73 µs ± 323.6 ns (1.7%) | Welch `z` = `24.24` |
-| **p95 / Max (`ns/op`)** | 25.68 µs / 25.79 µs | 18.95 µs / 18.95 µs | `5` vs `5` pooled samples |
+| **Median (`ns/op`)** | 28.29 µs (28294.0 ns) | 19.23 µs (19228.0 ns) | **`1.47x`** NIF Ratio |
+| **Mean ± σ (CV)** | 29.35 µs ± 4.48 µs (15.3%) | 19.54 µs ± 1.14 µs (5.9%) | Welch `z` = `4.74` |
+| **p95 / Max (`ns/op`)** | 35.37 µs / 37.03 µs | 21.09 µs / 21.52 µs | `5` vs `5` pooled samples |
 
 ## Benchmark Harnesses (Elixir vs. Raw Odin)
 
@@ -60,7 +60,7 @@
 ## Elixir Wrapper & NIF Bridge
 
 <details>
-<summary>Elixir <code>compact</code> — <a href="../../lib/xitdb.ex#L682-L699">lib/xitdb.ex#L682-L699</a></summary>
+<summary>Elixir <code>compact</code> — <a href="../../lib/xitdb.ex#L751-L768">lib/xitdb.ex#L751-L768</a></summary>
 
 ```elixir
   def compact(%__MODULE__{db_ref: db_ref, hash: hash}, opts \\ []) do
@@ -86,7 +86,7 @@
 </details>
 
 <details>
-<summary>NIF <code>odin_nif_compact</code> — <a href="../../native/xitdb_nif.odin#L6391-L6456">native/xitdb_nif.odin#L6391-L6456</a></summary>
+<summary>NIF <code>odin_nif_compact</code> — <a href="../../native/xitdb_nif.odin#L6801-L6866">native/xitdb_nif.odin#L6801-L6866</a></summary>
 
 ```odin
 odin_nif_compact :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {

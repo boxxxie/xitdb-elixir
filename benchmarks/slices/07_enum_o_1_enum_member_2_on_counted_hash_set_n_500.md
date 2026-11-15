@@ -8,9 +8,9 @@
 
 | Metric | Elixir NIF Wrapper | Raw Odin Baseline | Comparison |
 | :--- | ---: | ---: | ---: |
-| **Median (`ns/op`)** | 808.0 ns (808.0 ns) | 262.0 ns (262.0 ns) | **`3.08x`** NIF Ratio |
-| **Mean ± σ (CV)** | 813.4 ns ± 13.0 ns (1.6%) | 267.6 ns ± 8.1 ns (3.0%) | Welch `z` = `79.77` |
-| **p95 / Max (`ns/op`)** | 831.2 ns / 836.0 ns | 276.8 ns / 277.0 ns | `5` vs `5` pooled samples |
+| **Median (`ns/op`)** | 846.0 ns (846.0 ns) | 282.0 ns (282.0 ns) | **`3.00x`** NIF Ratio |
+| **Mean ± σ (CV)** | 836.4 ns ± 25.2 ns (3.0%) | 285.8 ns ± 16.9 ns (5.9%) | Welch `z` = `40.50` |
+| **p95 / Max (`ns/op`)** | 862.8 ns / 866.0 ns | 306.6 ns / 309.0 ns | `5` vs `5` pooled samples |
 
 ## Benchmark Harnesses (Elixir vs. Raw Odin)
 
@@ -50,7 +50,7 @@
 ## Elixir Wrapper & NIF Bridge
 
 <details>
-<summary>NIF <code>odin_nif_slot_contains</code> — <a href="../../native/xitdb_nif.odin#L1085-L1177">native/xitdb_nif.odin#L1085-L1177</a></summary>
+<summary>NIF <code>odin_nif_slot_contains</code> — <a href="../../native/xitdb_nif.odin#L1144-L1236">native/xitdb_nif.odin#L1144-L1236</a></summary>
 
 ```odin
 odin_nif_slot_contains :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {

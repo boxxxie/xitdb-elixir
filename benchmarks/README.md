@@ -73,123 +73,123 @@ See [Lazy Cursors, `Access` & `Enumerable`](../docs/access-and-enumerable.md#5-n
 ## Reference Results (`Elixir NIF Wrapper` vs. `Raw Odin`, `Core_Memory`)
 
 <!-- BEGIN_BENCHMARK_TABLE -->
-### 1. Elixir Client Wrapper Results (`mix run + priv/xitdb_nif.so -o:speed`, Commit `a6ad2e15d006`, 5 samples across 1 run(s))
+### 1. Elixir Client Wrapper Results (`mix run + priv/xitdb_nif.so -o:speed`, Commit `b9e57a998e69-dirty`, 5 samples across 1 run(s))
 
 #### 1.1 Sub-Microsecond Fast Path (`< 1 µs`, 5 tests)
 
 | # | Benchmark | Med (`ns`) | Mean ± σ | CV | Min `ops/s` | Max `ops/s` | IQR | `p95` | `p99` | Min | Max | Ops |
 | ---: | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| [#3](bench_elixir.exs#L219-L226) | [`Access: Sorted_Map B+Tree key lookup (sorted[key])`](slices/03_access_sorted_map_b_tree_key_lookup_sorted_key.md) | **626** | 629 ± 8.1 | 1.3% | 1.56M | 1.61M | 10 | 639 | 640 | 620 | 640 | 500 |
-| [#4](bench_elixir.exs#L227-L234) | [`Access: Array_List random index lookup (items[idx])`](slices/04_access_array_list_random_index_lookup_items_idx.md) | **376** | 375 ± 6.0 | 1.6% | 2.6M | 2.7M | 5 | 381 | 382 | 366 | 382 | 500 |
-| [#5](bench_elixir.exs#L235-L242) | [`Access: Linked_Array_List random index lookup (linked[idx])`](slices/05_access_linked_array_list_random_index_lookup_linked_idx.md) | **418** | 433 ± 35.6 | 8.2% | 2.0M | 2.4M | 2 | 482 | 494 | 414 | 497 | 500 |
-| [#6](bench_elixir.exs#L243-L250) | [`Enum: O(1) Enum.count/1 on Counted_Hash_Map (N=500)`](slices/06_enum_o_1_enum_count_1_on_counted_hash_map_n_500.md) | **165** | 175 ± 19.3 | 11.0% | 4.8M | 6.1M | 7 | 202 | 208 | 164 | 209 | 1K |
-| [#7](bench_elixir.exs#L251-L258) | [`Enum: O(1) Enum.member?/2 on Counted_Hash_Set (N=500)`](slices/07_enum_o_1_enum_member_2_on_counted_hash_set_n_500.md) | **808** | 813 ± 13.0 | 1.6% | 1.20M | 1.24M | 5 | 831 | 835 | 804 | 836 | 1K |
+| [#3](bench_elixir.exs#L219-L226) | [`Access: Sorted_Map B+Tree key lookup (sorted[key])`](slices/03_access_sorted_map_b_tree_key_lookup_sorted_key.md) | **638** | 657 ± 44.0 | 6.7% | 1.4M | 1.6M | 7 | 716 | 731 | 633 | 735 | 500 |
+| [#4](bench_elixir.exs#L227-L234) | [`Access: Array_List random index lookup (items[idx])`](slices/04_access_array_list_random_index_lookup_items_idx.md) | **471** | 471 ± 116 | 24.7% | 1.5M | 2.7M | 109 | 622 | 650 | 371 | 657 | 500 |
+| [#5](bench_elixir.exs#L235-L242) | [`Access: Linked_Array_List random index lookup (linked[idx])`](slices/05_access_linked_array_list_random_index_lookup_linked_idx.md) | **436** | 500 ± 113 | 22.7% | 1.6M | 2.6M | 172 | 633 | 639 | 389 | 640 | 500 |
+| [#6](bench_elixir.exs#L243-L250) | [`Enum: O(1) Enum.count/1 on Counted_Hash_Map (N=500)`](slices/06_enum_o_1_enum_count_1_on_counted_hash_map_n_500.md) | **200** | 206 ± 41.8 | 20.3% | 3.6M | 5.8M | 30 | 262 | 273 | 173 | 276 | 1K |
+| [#7](bench_elixir.exs#L251-L258) | [`Enum: O(1) Enum.member?/2 on Counted_Hash_Set (N=500)`](slices/07_enum_o_1_enum_member_2_on_counted_hash_set_n_500.md) | **846** | 836 ± 25.2 | 3.0% | 1.15M | 1.24M | 39 | 863 | 865 | 809 | 866 | 1K |
 
 
 #### 1.2 Multi-Microsecond Client Operations (`≥ 1 µs`, 21 tests)
 
 | # | Benchmark | Med (`µs`) | Mean ± σ | CV | Min `ops/s` | Max `ops/s` | IQR | `p95` | `p99` | Min | Max | Ops |
 | ---: | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| [#1](bench_elixir.exs#L203-L210) | [`Access: 3-hop lazy HAMT lookup (root[users][id][name])`](slices/01_access_3_hop_lazy_hamt_lookup_root_users_id_name.md) | **2.46** | 2.47 ± 0.01 | 0.5% | 403K | 407K | 0.02 | 2.48 | 2.48 | 2.46 | 2.48 | 500 |
-| [#2](bench_elixir.exs#L211-L218) | [`Access: Single-call selector select(.users.<id>.name)`](slices/02_access_single_call_selector_select_users_id_name.md) | **2.13** | 2.14 ± 0.04 | 1.8% | 456K | 476K | 0.05 | 2.19 | 2.19 | 2.10 | 2.19 | 500 |
-| [#8](bench_elixir.exs#L259-L266) | [`Enum: O(log N) Enum.slice/2 window (offset 200, len 20)`](slices/08_enum_o_log_n_enum_slice_2_window_offset_200_len_20.md) | **3.52** | 3.55 ± 0.07 | 1.9% | 275K | 287K | 0.09 | 3.63 | 3.64 | 3.48 | 3.64 | 200 |
-| [#9](bench_elixir.exs#L267-L274) | [`Stream: Lazy Stream.take(10) early-halt on Sorted_Map`](slices/09_stream_lazy_stream_take_10_early_halt_on_sorted_map.md) | **4.76** | 4.76 ± 0.05 | 1.0% | 208K | 213K | 0.05 | 4.81 | 4.82 | 4.70 | 4.82 | 200 |
-| [#10](bench_elixir.exs#L275-L282) | [`Enum: Full Enum.to_list/1 stream over Array_List (N=500)`](slices/10_enum_full_enum_to_list_1_stream_over_array_list_n_500.md) | **78.8** | 78.9 ± 0.44 | 0.6% | 12.6K | 12.8K | 0.60 | 79.3 | 79.3 | 78.3 | 79.4 | 50 |
-| [#11](bench_elixir.exs#L283-L290) | [`Materialize: Eager subtree materialize/1 (user profile)`](slices/11_materialize_eager_subtree_materialize_1_user_profile.md) | **6.09** | 6.16 ± 0.20 | 3.3% | 153K | 166K | 0.03 | 6.43 | 6.50 | 6.03 | 6.52 | 200 |
-| [#12](bench_elixir.exs#L291-L317) | [`Tx: Single nested entity transact commit (6 attributes)`](slices/12_tx_single_nested_entity_transact_commit_6_attributes.md) | **14.1** | 14.4 ± 0.58 | 4.0% | 66.2K | 72.0K | 1.00 | 15.1 | 15.1 | 13.9 | 15.1 | 100 |
-| [#13](bench_elixir.exs#L318-L333) | [`Tx: Bulk batch transact (100 entities in 1 commit)`](slices/13_tx_bulk_batch_transact_100_entities_in_1_commit.md) | **414.5** | 411.5 ± 11.6 | 2.8% | 2.4K | 2.5K | 18.2 | 423.8 | 424.8 | 398.4 | 425.0 | 1 |
-| [#14](bench_elixir.exs#L334-L348) | [`Tx: Incremental put_in nested attribute commit`](slices/14_tx_incremental_put_in_nested_attribute_commit.md) | **12.6** | 13.0 ± 0.93 | 7.1% | 68.3K | 80.1K | 0.17 | 14.3 | 14.6 | 12.5 | 14.6 | 100 |
-| [#15](bench_elixir.exs#L349-L369) | [`Tx: Linked_Array_List O(log N) mid-list insert + delete`](slices/15_tx_linked_array_list_o_log_n_mid_list_insert_delete.md) | **11.4** | 11.4 ± 0.13 | 1.2% | 86.4K | 88.6K | 0.24 | 11.6 | 11.6 | 11.3 | 11.6 | 50 |
-| [#16](bench_elixir.exs#L370-L387) | [`Tx: O(1) zero-copy subtree fork (500 entities)`](slices/16_tx_o_1_zero_copy_subtree_fork_500_entities.md) | **7.77** | 8.12 ± 0.84 | 10.3% | 104K | 130K | 0.05 | 9.25 | 9.55 | 7.72 | 9.62 | 100 |
-| [#17](bench_elixir.exs#L388-L396) | [`Time-Travel: Historical as_of(db, m) across 100 moments`](slices/17_time_travel_historical_as_of_db_m_across_100_moments.md) | **2.40** | 2.40 ± 0.04 | 1.5% | 407K | 423K | 0.03 | 2.45 | 2.46 | 2.36 | 2.46 | 100 |
-| [#18](bench_elixir.exs#L397-L404) | [`Time-Travel: history_of(db, selector) (100 moments)`](slices/18_time_travel_history_of_db_selector_100_moments.md) | **208.3** | 208.7 ± 3.34 | 1.6% | 4.7K | 4.9K | 6.15 | 212.3 | 212.4 | 205.3 | 212.5 | 50 |
-| [#19](bench_elixir.exs#L405-L412) | [`Time-Travel: diff_moments (1 of 200 entities mutated)`](slices/19_time_travel_diff_moments_1_of_200_entities_mutated.md) | **328.8** | 328.8 ± 0.48 | 0.1% | 3.03K | 3.05K | 0.43 | 329.4 | 329.5 | 328.2 | 329.5 | 50 |
-| [#20](bench_elixir.exs#L413-L424) | [`Lifecycle: compact/1 100-moment database deduplication`](slices/20_lifecycle_compact_1_100_moment_database_deduplication.md) | **25.2** | 25.1 ± 0.50 | 2.0% | 38.8K | 41.0K | 0.08 | 25.7 | 25.8 | 24.4 | 25.8 | 20 |
-| [#21](bench_elixir.exs#L425-L432) | [`Query: Datomic pull projection (4 attrs + nested slice)`](slices/21_query_datomic_pull_projection_4_attrs_nested_slice.md) | **6.33** | 6.34 ± 0.05 | 0.8% | 156K | 159K | 0.05 | 6.41 | 6.42 | 6.30 | 6.42 | 200 |
-| [#22](bench_elixir.exs#L433-L440) | [`Query: Datalog B+Tree index prefix + join (N=200)`](slices/22_query_datalog_b_tree_index_prefix_join_n_200.md) | **46.4** | 46.6 ± 0.59 | 1.3% | 21.0K | 21.6K | 0.21 | 47.4 | 47.6 | 46.2 | 47.6 | 50 |
-| [#23](bench_elixir.exs#L441-L448) | [`Query: Datalog grouped aggregation (count + sum, N=200)`](slices/23_query_datalog_grouped_aggregation_count_sum_n_200.md) | **557.1** | 556.9 ± 0.53 | 0.1% | 1.79K | 1.80K | 0.20 | 557.3 | 557.3 | 556.0 | 557.3 | 50 |
-| [#24](bench_elixir.exs#L449-L465) | [`Storage: Buffered_File transact + sync (50 commits)`](slices/24_storage_buffered_file_transact_sync_50_commits.md) | **59.5** | 59.5 ± 0.42 | 0.7% | 16.6K | 16.9K | 0.34 | 60.0 | 60.1 | 59.0 | 60.1 | 50 |
-| [#25](bench_elixir.exs#L466-L480) | [`Search: Sorted_Map B+Tree prefix seek (limit=16)`](slices/25_search_sorted_map_b_tree_prefix_seek_limit_16.md) | **4.66** | 4.65 ± 0.08 | 1.7% | 210K | 220K | 0.06 | 4.74 | 4.76 | 4.55 | 4.76 | 100 |
-| [#26](bench_elixir.exs#L481-L497) | [`Search: BM25 corpus search (N=200, 2-term prefix, limit=10)`](slices/26_search_bm25_corpus_search_n_200_2_term_prefix_limit_10.md) | **260.6** | 259.3 ± 2.80 | 1.1% | 3.8K | 3.9K | 3.73 | 261.6 | 261.6 | 255.2 | 261.6 | 50 |
+| [#1](bench_elixir.exs#L203-L210) | [`Access: 3-hop lazy HAMT lookup (root[users][id][name])`](slices/01_access_3_hop_lazy_hamt_lookup_root_users_id_name.md) | **2.43** | 2.59 ± 0.27 | 10.3% | 333K | 419K | 0.31 | 2.95 | 2.99 | 2.39 | 3.00 | 500 |
+| [#2](bench_elixir.exs#L211-L218) | [`Access: Single-call selector select(.users.<id>.name)`](slices/02_access_single_call_selector_select_users_id_name.md) | **2.49** | 2.50 ± 0.20 | 8.0% | 355K | 441K | 0.08 | 2.76 | 2.81 | 2.27 | 2.82 | 500 |
+| [#8](bench_elixir.exs#L259-L266) | [`Enum: O(log N) Enum.slice/2 window (offset 200, len 20)`](slices/08_enum_o_log_n_enum_slice_2_window_offset_200_len_20.md) | **3.32** | 3.38 ± 0.17 | 5.1% | 272K | 310K | 0.04 | 3.61 | 3.66 | 3.23 | 3.67 | 200 |
+| [#9](bench_elixir.exs#L267-L274) | [`Stream: Lazy Stream.take(10) early-halt on Sorted_Map`](slices/09_stream_lazy_stream_take_10_early_halt_on_sorted_map.md) | **4.58** | 4.62 ± 0.18 | 3.9% | 203K | 224K | 0.05 | 4.86 | 4.92 | 4.47 | 4.93 | 200 |
+| [#10](bench_elixir.exs#L275-L282) | [`Enum: Full Enum.to_list/1 stream over Array_List (N=500)`](slices/10_enum_full_enum_to_list_1_stream_over_array_list_n_500.md) | **82.1** | 81.9 ± 0.78 | 1.0% | 12.1K | 12.4K | 0.99 | 82.7 | 82.8 | 80.9 | 82.8 | 50 |
+| [#11](bench_elixir.exs#L283-L290) | [`Materialize: Eager subtree materialize/1 (user profile)`](slices/11_materialize_eager_subtree_materialize_1_user_profile.md) | **5.85** | 5.94 ± 0.18 | 3.1% | 160K | 173K | 0.15 | 6.19 | 6.23 | 5.78 | 6.24 | 200 |
+| [#12](bench_elixir.exs#L291-L317) | [`Tx: Single nested entity transact commit (6 attributes)`](slices/12_tx_single_nested_entity_transact_commit_6_attributes.md) | **13.3** | 13.5 ± 0.78 | 5.8% | 67.2K | 76.7K | 0.36 | 14.6 | 14.8 | 13.0 | 14.9 | 100 |
+| [#13](bench_elixir.exs#L318-L333) | [`Tx: Bulk batch transact (100 entities in 1 commit)`](slices/13_tx_bulk_batch_transact_100_entities_in_1_commit.md) | **436.8** | 435.1 ± 23.7 | 5.4% | 2.2K | 2.5K | 37.6 | 459.8 | 460.9 | 405.9 | 461.1 | 1 |
+| [#14](bench_elixir.exs#L334-L348) | [`Tx: Incremental put_in nested attribute commit`](slices/14_tx_incremental_put_in_nested_attribute_commit.md) | **11.9** | 12.0 ± 0.35 | 2.9% | 79.5K | 85.4K | 0.32 | 12.5 | 12.6 | 11.7 | 12.6 | 100 |
+| [#15](bench_elixir.exs#L349-L369) | [`Tx: Linked_Array_List O(log N) mid-list insert + delete`](slices/15_tx_linked_array_list_o_log_n_mid_list_insert_delete.md) | **9.01** | 9.59 ± 1.41 | 14.7% | 82.6K | 114K | 0.12 | 11.5 | 12.0 | 8.80 | 12.1 | 50 |
+| [#16](bench_elixir.exs#L370-L387) | [`Tx: O(1) zero-copy subtree fork (500 entities)`](slices/16_tx_o_1_zero_copy_subtree_fork_500_entities.md) | **7.53** | 8.37 ± 1.66 | 19.9% | 88.7K | 136K | 0.89 | 10.7 | 11.2 | 7.37 | 11.3 | 100 |
+| [#17](bench_elixir.exs#L388-L396) | [`Time-Travel: Historical as_of(db, m) across 100 moments`](slices/17_time_travel_historical_as_of_db_m_across_100_moments.md) | **2.40** | 2.45 ± 0.09 | 3.8% | 384K | 419K | 0.08 | 2.57 | 2.60 | 2.38 | 2.60 | 100 |
+| [#18](bench_elixir.exs#L397-L404) | [`Time-Travel: history_of(db, selector) (100 moments)`](slices/18_time_travel_history_of_db_selector_100_moments.md) | **47.1** | 48.8 ± 3.96 | 8.1% | 18.0K | 22.1K | 2.31 | 54.2 | 55.2 | 45.2 | 55.4 | 50 |
+| [#19](bench_elixir.exs#L405-L412) | [`Time-Travel: diff_moments (1 of 200 entities mutated)`](slices/19_time_travel_diff_moments_1_of_200_entities_mutated.md) | **344.4** | 348.5 ± 12.7 | 3.6% | 2.8K | 3.0K | 23.6 | 362.4 | 362.6 | 336.4 | 362.7 | 50 |
+| [#20](bench_elixir.exs#L413-L424) | [`Lifecycle: compact/1 100-moment database deduplication`](slices/20_lifecycle_compact_1_100_moment_database_deduplication.md) | **28.3** | 29.4 ± 4.48 | 15.3% | 27.0K | 39.4K | 1.42 | 35.4 | 36.7 | 25.4 | 37.0 | 20 |
+| [#21](bench_elixir.exs#L425-L432) | [`Query: Datomic pull projection (4 attrs + nested slice)`](slices/21_query_datomic_pull_projection_4_attrs_nested_slice.md) | **6.47** | 6.41 ± 0.10 | 1.6% | 154K | 160K | 0.13 | 6.49 | 6.49 | 6.26 | 6.49 | 200 |
+| [#22](bench_elixir.exs#L433-L440) | [`Query: Datalog B+Tree index prefix + join (N=200)`](slices/22_query_datalog_b_tree_index_prefix_join_n_200.md) | **47.8** | 48.7 ± 1.72 | 3.5% | 19.5K | 21.1K | 2.07 | 51.0 | 51.3 | 47.4 | 51.3 | 50 |
+| [#23](bench_elixir.exs#L441-L448) | [`Query: Datalog grouped aggregation (count + sum, N=200)`](slices/23_query_datalog_grouped_aggregation_count_sum_n_200.md) | **593.9** | 600.0 ± 25.1 | 4.2% | 1.6K | 1.7K | 34.0 | 632.0 | 635.7 | 576.9 | 636.7 | 50 |
+| [#24](bench_elixir.exs#L449-L465) | [`Storage: Buffered_File transact + sync (50 commits)`](slices/24_storage_buffered_file_transact_sync_50_commits.md) | **58.2** | 58.3 ± 0.36 | 0.6% | 17.0K | 17.3K | 0.47 | 58.7 | 58.7 | 57.8 | 58.7 | 50 |
+| [#25](bench_elixir.exs#L466-L480) | [`Search: Sorted_Map B+Tree prefix seek (limit=16)`](slices/25_search_sorted_map_b_tree_prefix_seek_limit_16.md) | **7.65** | 7.10 ± 1.19 | 16.7% | 128K | 200K | 0.30 | 7.80 | 7.83 | 5.00 | 7.84 | 100 |
+| [#26](bench_elixir.exs#L481-L497) | [`Search: BM25 corpus search (N=200, 2-term prefix, limit=10)`](slices/26_search_bm25_corpus_search_n_200_2_term_prefix_limit_10.md) | **254.0** | 253.7 ± 3.24 | 1.3% | 3.9K | 4.0K | 3.45 | 257.0 | 257.2 | 248.9 | 257.2 | 50 |
 
 
-### 2. Raw Odin Baseline Results (`odin run benchmarks -o:speed -microarch:native`, Commit `a6ad2e15d006`, 5 samples across 1 run(s))
+### 2. Raw Odin Baseline Results (`odin run benchmarks -o:speed -microarch:native`, Commit `b9e57a998e69-dirty`, 5 samples across 1 run(s))
 
 #### 2.1 Sub-Microsecond Fast Path (`< 1 µs`, 7 tests)
 
 | # | Benchmark | Med (`ns`) | Mean ± σ | CV | Min `ops/s` | Max `ops/s` | IQR | `p95` | `p99` | Min | Max | Ops |
 | ---: | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| [#1](bench_client.odin#L786-L805) | [`Access: 3-hop lazy HAMT lookup (root[users][id][name])`](slices/01_access_3_hop_lazy_hamt_lookup_root_users_id_name.md) | **606** | 638 ± 62.0 | 9.7% | 1.3M | 1.7M | 36 | 724 | 741 | 598 | 745 | 500 |
-| [#3](bench_client.odin#L823-L838) | [`Access: Sorted_Map B+Tree key lookup (sorted[key])`](slices/03_access_sorted_map_b_tree_key_lookup_sorted_key.md) | **380** | 388 ± 19.0 | 4.9% | 2.4M | 2.6M | 3 | 414 | 420 | 378 | 422 | 500 |
-| [#4](bench_client.odin#L840-L854) | [`Access: Array_List random index lookup (items[idx])`](slices/04_access_array_list_random_index_lookup_items_idx.md) | **106** | 112 ± 14.9 | 13.2% | 7.2M | 9.5M | 0 | 132 | 138 | 105 | 139 | 500 |
-| [#5](bench_client.odin#L856-L870) | [`Access: Linked_Array_List random index lookup (linked[idx])`](slices/05_access_linked_array_list_random_index_lookup_linked_idx.md) | **118** | 118 ± 1.3 | 1.1% | 8.3M | 8.5M | 2 | 120 | 120 | 117 | 120 | 500 |
-| [#6](bench_client.odin#L872-L884) | [`Enum: O(1) Enum.count/1 on Counted_Hash_Map (N=500)`](slices/06_enum_o_1_enum_count_1_on_counted_hash_map_n_500.md) | **6** | 6 ± 0.4 | 7.2% | 143M | 167M | 0 | 7 | 7 | 6 | 7 | 1K |
-| [#7](bench_client.odin#L886-L900) | [`Enum: O(1) Enum.member?/2 on Counted_Hash_Set (N=500)`](slices/07_enum_o_1_enum_member_2_on_counted_hash_set_n_500.md) | **262** | 268 ± 8.1 | 3.0% | 3.6M | 3.8M | 14 | 277 | 277 | 261 | 277 | 1K |
-| [#17](bench_client.odin#L1125-L1145) | [`Time-Travel: Historical as_of(db, m) across 100 moments`](slices/17_time_travel_historical_as_of_db_m_across_100_moments.md) | **543** | 545 ± 3.5 | 0.6% | 1.81M | 1.84M | 1 | 550 | 551 | 543 | 551 | 100 |
+| [#1](bench_client.odin#L786-L805) | [`Access: 3-hop lazy HAMT lookup (root[users][id][name])`](slices/01_access_3_hop_lazy_hamt_lookup_root_users_id_name.md) | **642** | 668 ± 50.6 | 7.6% | 1.3M | 1.6M | 33 | 738 | 752 | 634 | 755 | 500 |
+| [#3](bench_client.odin#L823-L838) | [`Access: Sorted_Map B+Tree key lookup (sorted[key])`](slices/03_access_sorted_map_b_tree_key_lookup_sorted_key.md) | **394** | 397 ± 8.0 | 2.0% | 2.4M | 2.6M | 0 | 408 | 410 | 391 | 411 | 500 |
+| [#4](bench_client.odin#L840-L854) | [`Access: Array_List random index lookup (items[idx])`](slices/04_access_array_list_random_index_lookup_items_idx.md) | **114** | 117 ± 8.2 | 7.0% | 7.9M | 9.2M | 14 | 126 | 127 | 109 | 127 | 500 |
+| [#5](bench_client.odin#L856-L870) | [`Access: Linked_Array_List random index lookup (linked[idx])`](slices/05_access_linked_array_list_random_index_lookup_linked_idx.md) | **121** | 123 ± 5.7 | 4.6% | 7.5M | 8.4M | 2 | 131 | 133 | 119 | 133 | 500 |
+| [#6](bench_client.odin#L872-L884) | [`Enum: O(1) Enum.count/1 on Counted_Hash_Map (N=500)`](slices/06_enum_o_1_enum_count_1_on_counted_hash_map_n_500.md) | **7** | 7 ± 0.0 | 0.0% | 143M | 143M | 0 | 7 | 7 | 7 | 7 | 1K |
+| [#7](bench_client.odin#L886-L900) | [`Enum: O(1) Enum.member?/2 on Counted_Hash_Set (N=500)`](slices/07_enum_o_1_enum_member_2_on_counted_hash_set_n_500.md) | **282** | 286 ± 16.9 | 5.9% | 3.2M | 3.7M | 26 | 307 | 309 | 270 | 309 | 1K |
+| [#17](bench_client.odin#L1125-L1145) | [`Time-Travel: Historical as_of(db, m) across 100 moments`](slices/17_time_travel_historical_as_of_db_m_across_100_moments.md) | **551** | 563 ± 35.7 | 6.3% | 1.6M | 1.9M | 9 | 611 | 623 | 540 | 626 | 100 |
 
 
 #### 2.2 Multi-Microsecond Client Operations (`≥ 1 µs`, 19 tests)
 
 | # | Benchmark | Med (`µs`) | Mean ± σ | CV | Min `ops/s` | Max `ops/s` | IQR | `p95` | `p99` | Min | Max | Ops |
 | ---: | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| [#2](bench_client.odin#L807-L821) | [`Access: Single-call selector select(.users.<id>.name)`](slices/02_access_single_call_selector_select_users_id_name.md) | **1.01** | 1.01 ± 0.01 | 1.1% | 974K | 998K | 0.02 | 1.03 | 1.03 | 1.00 | 1.03 | 500 |
-| [#8](bench_client.odin#L902-L921) | [`Enum: O(log N) Enum.slice/2 window (offset 200, len 20)`](slices/08_enum_o_log_n_enum_slice_2_window_offset_200_len_20.md) | **1.61** | 1.63 ± 0.03 | 1.8% | 600K | 623K | 0.05 | 1.67 | 1.67 | 1.61 | 1.67 | 200 |
-| [#9](bench_client.odin#L923-L946) | [`Stream: Lazy Stream.take(10) early-halt on Sorted_Map`](slices/09_stream_lazy_stream_take_10_early_halt_on_sorted_map.md) | **1.46** | 1.47 ± 0.03 | 2.0% | 661K | 692K | 0.05 | 1.51 | 1.51 | 1.45 | 1.51 | 200 |
-| [#10](bench_client.odin#L948-L969) | [`Enum: Full Enum.to_list/1 stream over Array_List (N=500)`](slices/10_enum_full_enum_to_list_1_stream_over_array_list_n_500.md) | **35.3** | 35.2 ± 0.16 | 0.5% | 28.3K | 28.6K | 0.15 | 35.3 | 35.3 | 34.9 | 35.3 | 50 |
-| [#11](bench_client.odin#L971-L986) | [`Materialize: Eager subtree materialize/1 (user profile)`](slices/11_materialize_eager_subtree_materialize_1_user_profile.md) | **2.64** | 2.67 ± 0.04 | 1.5% | 368K | 379K | 0.07 | 2.72 | 2.72 | 2.64 | 2.72 | 200 |
-| [#12](bench_client.odin#L988-L1005) | [`Tx: Single nested entity transact commit (6 attributes)`](slices/12_tx_single_nested_entity_transact_commit_6_attributes.md) | **6.29** | 6.31 ± 0.17 | 2.7% | 152K | 164K | 0.06 | 6.53 | 6.57 | 6.10 | 6.58 | 100 |
-| [#13](bench_client.odin#L1007-L1021) | [`Tx: Bulk batch transact (100 entities in 1 commit)`](slices/13_tx_bulk_batch_transact_100_entities_in_1_commit.md) | **182.0** | 183.3 ± 4.21 | 2.3% | 5.3K | 5.6K | 2.91 | 189.0 | 190.0 | 179.6 | 190.3 | 1 |
-| [#14](bench_client.odin#L1023-L1045) | [`Tx: Incremental put_in nested attribute commit`](slices/14_tx_incremental_put_in_nested_attribute_commit.md) | **3.71** | 3.74 ± 0.12 | 3.2% | 258K | 277K | 0.19 | 3.87 | 3.87 | 3.61 | 3.87 | 100 |
-| [#15](bench_client.odin#L1047-L1072) | [`Tx: Linked_Array_List O(log N) mid-list insert + delete`](slices/15_tx_linked_array_list_o_log_n_mid_list_insert_delete.md) | **5.27** | 5.31 ± 0.06 | 1.1% | 186K | 190K | 0.10 | 5.38 | 5.38 | 5.26 | 5.38 | 50 |
-| [#16](bench_client.odin#L1074-L1101) | [`Tx: O(1) zero-copy subtree fork (500 entities)`](slices/16_tx_o_1_zero_copy_subtree_fork_500_entities.md) | **3.74** | 3.76 ± 0.14 | 3.6% | 251K | 274K | 0.07 | 3.94 | 3.98 | 3.64 | 3.99 | 100 |
-| [#18](bench_client.odin#L1147-L1160) | [`Time-Travel: history_of(db, selector) (100 moments)`](slices/18_time_travel_history_of_db_selector_100_moments.md) | **69.9** | 69.9 ± 0.10 | 0.1% | 14.29K | 14.34K | 0.18 | 70.0 | 70.0 | 69.8 | 70.0 | 50 |
-| [#19](bench_client.odin#L1179-L1192) | [`Time-Travel: diff_moments (1 of 200 entities mutated)`](slices/19_time_travel_diff_moments_1_of_200_entities_mutated.md) | **177.4** | 177.5 ± 0.63 | 0.4% | 5.6K | 5.7K | 0.21 | 178.3 | 178.5 | 176.8 | 178.5 | 50 |
-| [#20](bench_client.odin#L1194-L1214) | [`Lifecycle: compact/1 100-moment database deduplication`](slices/20_lifecycle_compact_1_100_moment_database_deduplication.md) | **18.9** | 18.7 ± 0.32 | 1.7% | 52.8K | 55.0K | 0.29 | 19.0 | 19.0 | 18.2 | 19.0 | 20 |
-| [#21](bench_client.odin#L1216-L1231) | [`Query: Datomic pull projection (4 attrs + nested slice)`](slices/21_query_datomic_pull_projection_4_attrs_nested_slice.md) | **2.67** | 2.68 ± 0.02 | 0.6% | 371K | 376K | 0.03 | 2.69 | 2.70 | 2.66 | 2.70 | 200 |
-| [#22](bench_client.odin#L1233-L1254) | [`Query: Datalog B+Tree index prefix + join (N=200)`](slices/22_query_datalog_b_tree_index_prefix_join_n_200.md) | **25.0** | 25.4 ± 0.97 | 3.8% | 36.8K | 40.1K | 0.03 | 26.7 | 27.1 | 24.9 | 27.1 | 50 |
-| [#23](bench_client.odin#L1256-L1275) | [`Query: Datalog grouped aggregation (count + sum, N=200)`](slices/23_query_datalog_grouped_aggregation_count_sum_n_200.md) | **464.9** | 469.0 ± 18.9 | 4.0% | 2.0K | 2.2K | 21.3 | 493.6 | 497.1 | 451.1 | 497.9 | 50 |
-| [#24](bench_client.odin#L1277-L1296) | [`Storage: Buffered_File transact + sync (50 commits)`](slices/24_storage_buffered_file_transact_sync_50_commits.md) | **51.7** | 51.8 ± 0.46 | 0.9% | 19.0K | 19.5K | 0.09 | 52.4 | 52.5 | 51.3 | 52.5 | 50 |
-| [#25](bench_client.odin#L1298-L1334) | [`Search: Sorted_Map B+Tree prefix seek (limit=16)`](slices/25_search_sorted_map_b_tree_prefix_seek_limit_16.md) | **1.52** | 1.62 ± 0.23 | 14.3% | 491K | 660K | 0.00 | 1.93 | 2.01 | 1.52 | 2.04 | 100 |
-| [#26](bench_client.odin#L1336-L1364) | [`Search: BM25 corpus search (N=200, 2-term prefix, limit=10)`](slices/26_search_bm25_corpus_search_n_200_2_term_prefix_limit_10.md) | **154.3** | 161.4 ± 12.9 | 8.0% | 5.5K | 6.5K | 9.78 | 179.3 | 182.6 | 153.0 | 183.4 | 50 |
+| [#2](bench_client.odin#L807-L821) | [`Access: Single-call selector select(.users.<id>.name)`](slices/02_access_single_call_selector_select_users_id_name.md) | **1.02** | 1.02 ± 0.02 | 2.2% | 953K | 1.0M | 0.04 | 1.05 | 1.05 | 1.00 | 1.05 | 500 |
+| [#8](bench_client.odin#L902-L921) | [`Enum: O(log N) Enum.slice/2 window (offset 200, len 20)`](slices/08_enum_o_log_n_enum_slice_2_window_offset_200_len_20.md) | **1.64** | 1.67 ± 0.05 | 2.7% | 574K | 610K | 0.06 | 1.73 | 1.74 | 1.64 | 1.74 | 200 |
+| [#9](bench_client.odin#L923-L946) | [`Stream: Lazy Stream.take(10) early-halt on Sorted_Map`](slices/09_stream_lazy_stream_take_10_early_halt_on_sorted_map.md) | **1.46** | 1.50 ± 0.06 | 4.0% | 627K | 688K | 0.06 | 1.58 | 1.59 | 1.45 | 1.60 | 200 |
+| [#10](bench_client.odin#L948-L969) | [`Enum: Full Enum.to_list/1 stream over Array_List (N=500)`](slices/10_enum_full_enum_to_list_1_stream_over_array_list_n_500.md) | **35.4** | 35.4 ± 0.41 | 1.2% | 27.7K | 28.6K | 0.18 | 36.0 | 36.0 | 34.9 | 36.1 | 50 |
+| [#11](bench_client.odin#L971-L986) | [`Materialize: Eager subtree materialize/1 (user profile)`](slices/11_materialize_eager_subtree_materialize_1_user_profile.md) | **2.69** | 2.73 ± 0.11 | 4.2% | 346K | 386K | 0.09 | 2.87 | 2.89 | 2.59 | 2.89 | 200 |
+| [#12](bench_client.odin#L988-L1005) | [`Tx: Single nested entity transact commit (6 attributes)`](slices/12_tx_single_nested_entity_transact_commit_6_attributes.md) | **6.54** | 6.52 ± 0.33 | 5.1% | 146K | 164K | 0.51 | 6.86 | 6.87 | 6.08 | 6.87 | 100 |
+| [#13](bench_client.odin#L1007-L1021) | [`Tx: Bulk batch transact (100 entities in 1 commit)`](slices/13_tx_bulk_batch_transact_100_entities_in_1_commit.md) | **181.8** | 185.7 ± 11.6 | 6.2% | 5.0K | 5.8K | 12.4 | 199.6 | 200.9 | 171.5 | 201.2 | 1 |
+| [#14](bench_client.odin#L1023-L1045) | [`Tx: Incremental put_in nested attribute commit`](slices/14_tx_incremental_put_in_nested_attribute_commit.md) | **3.78** | 3.74 ± 0.15 | 3.9% | 254K | 279K | 0.18 | 3.91 | 3.94 | 3.59 | 3.94 | 100 |
+| [#15](bench_client.odin#L1047-L1072) | [`Tx: Linked_Array_List O(log N) mid-list insert + delete`](slices/15_tx_linked_array_list_o_log_n_mid_list_insert_delete.md) | **5.34** | 5.33 ± 0.23 | 4.2% | 178K | 196K | 0.35 | 5.60 | 5.62 | 5.11 | 5.63 | 50 |
+| [#16](bench_client.odin#L1074-L1101) | [`Tx: O(1) zero-copy subtree fork (500 entities)`](slices/16_tx_o_1_zero_copy_subtree_fork_500_entities.md) | **4.30** | 4.73 ± 1.07 | 22.5% | 154K | 253K | 0.96 | 6.19 | 6.44 | 3.96 | 6.50 | 100 |
+| [#18](bench_client.odin#L1147-L1160) | [`Time-Travel: history_of(db, selector) (100 moments)`](slices/18_time_travel_history_of_db_selector_100_moments.md) | **68.6** | 70.1 ± 2.73 | 3.9% | 13.5K | 14.8K | 3.27 | 73.7 | 74.1 | 67.8 | 74.2 | 50 |
+| [#19](bench_client.odin#L1179-L1192) | [`Time-Travel: diff_moments (1 of 200 entities mutated)`](slices/19_time_travel_diff_moments_1_of_200_entities_mutated.md) | **182.4** | 182.3 ± 0.17 | 0.1% | 5.48K | 5.49K | 0.29 | 182.5 | 182.5 | 182.1 | 182.5 | 50 |
+| [#20](bench_client.odin#L1194-L1214) | [`Lifecycle: compact/1 100-moment database deduplication`](slices/20_lifecycle_compact_1_100_moment_database_deduplication.md) | **19.2** | 19.5 ± 1.14 | 5.9% | 46.5K | 53.8K | 0.38 | 21.1 | 21.4 | 18.6 | 21.5 | 20 |
+| [#21](bench_client.odin#L1216-L1231) | [`Query: Datomic pull projection (4 attrs + nested slice)`](slices/21_query_datomic_pull_projection_4_attrs_nested_slice.md) | **2.69** | 2.68 ± 0.02 | 0.9% | 369K | 377K | 0.04 | 2.70 | 2.71 | 2.65 | 2.71 | 200 |
+| [#22](bench_client.odin#L1233-L1254) | [`Query: Datalog B+Tree index prefix + join (N=200)`](slices/22_query_datalog_b_tree_index_prefix_join_n_200.md) | **25.2** | 28.4 ± 5.15 | 18.1% | 27.3K | 40.1K | 5.27 | 35.4 | 36.4 | 24.9 | 36.7 | 50 |
+| [#23](bench_client.odin#L1256-L1275) | [`Query: Datalog grouped aggregation (count + sum, N=200)`](slices/23_query_datalog_grouped_aggregation_count_sum_n_200.md) | **500.9** | 499.0 ± 23.3 | 4.7% | 1.9K | 2.1K | 32.9 | 526.3 | 529.3 | 474.1 | 530.0 | 50 |
+| [#24](bench_client.odin#L1277-L1296) | [`Storage: Buffered_File transact + sync (50 commits)`](slices/24_storage_buffered_file_transact_sync_50_commits.md) | **52.5** | 55.9 ± 6.49 | 11.6% | 14.9K | 19.5K | 4.00 | 64.9 | 66.6 | 51.3 | 67.0 | 50 |
+| [#25](bench_client.odin#L1298-L1334) | [`Search: Sorted_Map B+Tree prefix seek (limit=16)`](slices/25_search_sorted_map_b_tree_prefix_seek_limit_16.md) | **1.57** | 1.65 ± 0.25 | 15.3% | 478K | 669K | 0.09 | 1.99 | 2.07 | 1.50 | 2.09 | 100 |
+| [#26](bench_client.odin#L1336-L1364) | [`Search: BM25 corpus search (N=200, 2-term prefix, limit=10)`](slices/26_search_bm25_corpus_search_n_200_2_term_prefix_limit_10.md) | **179.2** | 176.2 ± 10.8 | 6.2% | 5.3K | 6.3K | 8.18 | 186.3 | 187.2 | 159.0 | 187.5 | 50 |
 
-### 3. 1v1 Client Boundary Comparison (Elixir NIF Wrapper vs. Raw Odin, Commit `a6ad2e15d006`)
+### 3. 1v1 Client Boundary Comparison (Elixir NIF Wrapper vs. Raw Odin, Commit `b9e57a998e69-dirty`)
 
 #### 3.1 Sub-Microsecond Fast Path (Elixir `< 1 µs`, 5 tests)
 
 | # | Benchmark | NIF Ratio | Raw Odin Med (`ns`) | Elixir Med (`ns`) | Welch `z` | Odin Mean ± σ | Odin CV | Elixir Mean ± σ | Elixir CV |
 | ---: | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 3 | [`Access: Sorted_Map B+Tree key lookup (sorted[key])`](slices/03_access_sorted_map_b_tree_key_lookup_sorted_key.md) | **1.65x** | 380 | **626** | `26.1` ★ | 388 ± 19.0 | 4.9% | 629 ± 8.1 | 1.3% |
-| 4 | [`Access: Array_List random index lookup (items[idx])`](slices/04_access_array_list_random_index_lookup_items_idx.md) | **3.55x** | 106 | **376** | `36.6` ★ | 112 ± 14.9 | 13.2% | 375 ± 6.0 | 1.6% |
-| 5 | [`Access: Linked_Array_List random index lookup (linked[idx])`](slices/05_access_linked_array_list_random_index_lookup_linked_idx.md) | **3.54x** | 118 | **418** | `19.8` ★ | 118 ± 1.3 | 1.1% | 433 ± 35.6 | 8.2% |
-| 6 | [`Enum: O(1) Enum.count/1 on Counted_Hash_Map (N=500)`](slices/06_enum_o_1_enum_count_1_on_counted_hash_map_n_500.md) | **27.50x** | 6 | **165** | `19.6` ★ | 6 ± 0.4 | 7.2% | 175 ± 19.3 | 11.0% |
-| 7 | [`Enum: O(1) Enum.member?/2 on Counted_Hash_Set (N=500)`](slices/07_enum_o_1_enum_member_2_on_counted_hash_set_n_500.md) | **3.08x** | 262 | **808** | `79.8` ★ | 268 ± 8.1 | 3.0% | 813 ± 13.0 | 1.6% |
+| 3 | [`Access: Sorted_Map B+Tree key lookup (sorted[key])`](slices/03_access_sorted_map_b_tree_key_lookup_sorted_key.md) | **1.62x** | 394 | **638** | `13.0` ★ | 397 ± 8.0 | 2.0% | 657 ± 44.0 | 6.7% |
+| 4 | [`Access: Array_List random index lookup (items[idx])`](slices/04_access_array_list_random_index_lookup_items_idx.md) | **4.13x** | 114 | **471** | `6.8` ★ | 117 ± 8.2 | 7.0% | 471 ± 116 | 24.7% |
+| 5 | [`Access: Linked_Array_List random index lookup (linked[idx])`](slices/05_access_linked_array_list_random_index_lookup_linked_idx.md) | **3.60x** | 121 | **436** | `7.4` ★ | 123 ± 5.7 | 4.6% | 500 ± 113 | 22.7% |
+| 6 | [`Enum: O(1) Enum.count/1 on Counted_Hash_Map (N=500)`](slices/06_enum_o_1_enum_count_1_on_counted_hash_map_n_500.md) | **28.57x** | 7 | **200** | `10.6` ★ | 7 ± 0.0 | 0.0% | 206 ± 41.8 | 20.3% |
+| 7 | [`Enum: O(1) Enum.member?/2 on Counted_Hash_Set (N=500)`](slices/07_enum_o_1_enum_member_2_on_counted_hash_set_n_500.md) | **3.00x** | 282 | **846** | `40.5` ★ | 286 ± 16.9 | 5.9% | 836 ± 25.2 | 3.0% |
 
 
 #### 3.2 Multi-Microsecond Client Operations (Elixir `≥ 1 µs`, 21 tests)
 
 | # | Benchmark | NIF Ratio | Raw Odin Med (`µs`) | Elixir Med (`µs`) | Welch `z` | Odin Mean ± σ | Odin CV | Elixir Mean ± σ | Elixir CV |
 | ---: | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | [`Access: 3-hop lazy HAMT lookup (root[users][id][name])`](slices/01_access_3_hop_lazy_hamt_lookup_root_users_id_name.md) | **4.06x** | 0.61 | **2.46** | `64.8` ★ | 0.64 ± 0.06 | 9.7% | 2.47 ± 0.01 | 0.5% |
-| 2 | [`Access: Single-call selector select(.users.<id>.name)`](slices/02_access_single_call_selector_select_users_id_name.md) | **2.10x** | 1.01 | **2.13** | `63.5` ★ | 1.01 ± 0.01 | 1.1% | 2.14 ± 0.04 | 1.8% |
-| 8 | [`Enum: O(log N) Enum.slice/2 window (offset 200, len 20)`](slices/08_enum_o_log_n_enum_slice_2_window_offset_200_len_20.md) | **2.18x** | 1.61 | **3.52** | `58.0` ★ | 1.63 ± 0.03 | 1.8% | 3.55 ± 0.07 | 1.9% |
-| 9 | [`Stream: Lazy Stream.take(10) early-halt on Sorted_Map`](slices/09_stream_lazy_stream_take_10_early_halt_on_sorted_map.md) | **3.25x** | 1.46 | **4.76** | `134.6` ★ | 1.47 ± 0.03 | 2.0% | 4.76 ± 0.05 | 1.0% |
-| 10 | [`Enum: Full Enum.to_list/1 stream over Array_List (N=500)`](slices/10_enum_full_enum_to_list_1_stream_over_array_list_n_500.md) | **2.23x** | 35.3 | **78.8** | `207.6` ★ | 35.2 ± 0.16 | 0.5% | 78.9 ± 0.44 | 0.6% |
-| 11 | [`Materialize: Eager subtree materialize/1 (user profile)`](slices/11_materialize_eager_subtree_materialize_1_user_profile.md) | **2.30x** | 2.64 | **6.09** | `37.9` ★ | 2.67 ± 0.04 | 1.5% | 6.16 ± 0.20 | 3.3% |
-| 12 | [`Tx: Single nested entity transact commit (6 attributes)`](slices/12_tx_single_nested_entity_transact_commit_6_attributes.md) | **2.25x** | 6.29 | **14.1** | `30.1` ★ | 6.31 ± 0.17 | 2.7% | 14.4 ± 0.58 | 4.0% |
-| 13 | [`Tx: Bulk batch transact (100 entities in 1 commit)`](slices/13_tx_bulk_batch_transact_100_entities_in_1_commit.md) | **2.28x** | 182.0 | **414.5** | `41.5` ★ | 183.3 ± 4.21 | 2.3% | 411.5 ± 11.6 | 2.8% |
-| 14 | [`Tx: Incremental put_in nested attribute commit`](slices/14_tx_incremental_put_in_nested_attribute_commit.md) | **3.40x** | 3.71 | **12.6** | `22.1` ★ | 3.74 ± 0.12 | 3.2% | 13.0 ± 0.93 | 7.1% |
-| 15 | [`Tx: Linked_Array_List O(log N) mid-list insert + delete`](slices/15_tx_linked_array_list_o_log_n_mid_list_insert_delete.md) | **2.16x** | 5.27 | **11.4** | `93.1` ★ | 5.31 ± 0.06 | 1.1% | 11.4 ± 0.13 | 1.2% |
-| 16 | [`Tx: O(1) zero-copy subtree fork (500 entities)`](slices/16_tx_o_1_zero_copy_subtree_fork_500_entities.md) | **2.08x** | 3.74 | **7.77** | `11.5` ★ | 3.76 ± 0.14 | 3.6% | 8.12 ± 0.84 | 10.3% |
-| 17 | [`Time-Travel: Historical as_of(db, m) across 100 moments`](slices/17_time_travel_historical_as_of_db_m_across_100_moments.md) | **4.43x** | 0.54 | **2.40** | `115.2` ★ | 0.54 ± 0.00 | 0.6% | 2.40 ± 0.04 | 1.5% |
-| 18 | [`Time-Travel: history_of(db, selector) (100 moments)`](slices/18_time_travel_history_of_db_selector_100_moments.md) | **2.98x** | 69.9 | **208.3** | `92.8` ★ | 69.9 ± 0.10 | 0.1% | 208.7 ± 3.34 | 1.6% |
-| 19 | [`Time-Travel: diff_moments (1 of 200 entities mutated)`](slices/19_time_travel_diff_moments_1_of_200_entities_mutated.md) | **1.85x** | 177.4 | **328.8** | `426.0` ★ | 177.5 ± 0.63 | 0.4% | 328.8 ± 0.48 | 0.1% |
-| 20 | [`Lifecycle: compact/1 100-moment database deduplication`](slices/20_lifecycle_compact_1_100_moment_database_deduplication.md) | **1.33x** | 18.9 | **25.2** | `24.2` ★ | 18.7 ± 0.32 | 1.7% | 25.1 ± 0.50 | 2.0% |
-| 21 | [`Query: Datomic pull projection (4 attrs + nested slice)`](slices/21_query_datomic_pull_projection_4_attrs_nested_slice.md) | **2.37x** | 2.67 | **6.33** | `159.6` ★ | 2.68 ± 0.02 | 0.6% | 6.34 ± 0.05 | 0.8% |
-| 22 | [`Query: Datalog B+Tree index prefix + join (N=200)`](slices/22_query_datalog_b_tree_index_prefix_join_n_200.md) | **1.86x** | 25.0 | **46.4** | `41.8` ★ | 25.4 ± 0.97 | 3.8% | 46.6 ± 0.59 | 1.3% |
-| 23 | [`Query: Datalog grouped aggregation (count + sum, N=200)`](slices/23_query_datalog_grouped_aggregation_count_sum_n_200.md) | **1.20x** | 464.9 | **557.1** | `10.4` ★ | 469.0 ± 18.9 | 4.0% | 556.9 ± 0.53 | 0.1% |
-| 24 | [`Storage: Buffered_File transact + sync (50 commits)`](slices/24_storage_buffered_file_transact_sync_50_commits.md) | **1.15x** | 51.7 | **59.5** | `27.5` ★ | 51.8 ± 0.46 | 0.9% | 59.5 ± 0.42 | 0.7% |
-| 25 | [`Search: Sorted_Map B+Tree prefix seek (limit=16)`](slices/25_search_sorted_map_b_tree_prefix_seek_limit_16.md) | **3.07x** | 1.52 | **4.66** | `27.8` ★ | 1.62 ± 0.23 | 14.3% | 4.65 ± 0.08 | 1.7% |
-| 26 | [`Search: BM25 corpus search (N=200, 2-term prefix, limit=10)`](slices/26_search_bm25_corpus_search_n_200_2_term_prefix_limit_10.md) | **1.69x** | 154.3 | **260.6** | `16.5` ★ | 161.4 ± 12.9 | 8.0% | 259.3 ± 2.80 | 1.1% |
+| 1 | [`Access: 3-hop lazy HAMT lookup (root[users][id][name])`](slices/01_access_3_hop_lazy_hamt_lookup_root_users_id_name.md) | **3.79x** | 0.64 | **2.43** | `15.8` ★ | 0.67 ± 0.05 | 7.6% | 2.59 ± 0.27 | 10.3% |
+| 2 | [`Access: Single-call selector select(.users.<id>.name)`](slices/02_access_single_call_selector_select_users_id_name.md) | **2.44x** | 1.02 | **2.49** | `16.3` ★ | 1.02 ± 0.02 | 2.2% | 2.50 ± 0.20 | 8.0% |
+| 8 | [`Enum: O(log N) Enum.slice/2 window (offset 200, len 20)`](slices/08_enum_o_log_n_enum_slice_2_window_offset_200_len_20.md) | **2.02x** | 1.64 | **3.32** | `21.4` ★ | 1.67 ± 0.05 | 2.7% | 3.38 ± 0.17 | 5.1% |
+| 9 | [`Stream: Lazy Stream.take(10) early-halt on Sorted_Map`](slices/09_stream_lazy_stream_take_10_early_halt_on_sorted_map.md) | **3.13x** | 1.46 | **4.58** | `36.5` ★ | 1.50 ± 0.06 | 4.0% | 4.62 ± 0.18 | 3.9% |
+| 10 | [`Enum: Full Enum.to_list/1 stream over Array_List (N=500)`](slices/10_enum_full_enum_to_list_1_stream_over_array_list_n_500.md) | **2.32x** | 35.4 | **82.1** | `117.7` ★ | 35.4 ± 0.41 | 1.2% | 81.9 ± 0.78 | 1.0% |
+| 11 | [`Materialize: Eager subtree materialize/1 (user profile)`](slices/11_materialize_eager_subtree_materialize_1_user_profile.md) | **2.18x** | 2.69 | **5.85** | `33.3` ★ | 2.73 ± 0.11 | 4.2% | 5.94 ± 0.18 | 3.1% |
+| 12 | [`Tx: Single nested entity transact commit (6 attributes)`](slices/12_tx_single_nested_entity_transact_commit_6_attributes.md) | **2.03x** | 6.54 | **13.3** | `18.5` ★ | 6.52 ± 0.33 | 5.1% | 13.5 ± 0.78 | 5.8% |
+| 13 | [`Tx: Bulk batch transact (100 entities in 1 commit)`](slices/13_tx_bulk_batch_transact_100_entities_in_1_commit.md) | **2.40x** | 181.8 | **436.8** | `21.2` ★ | 185.7 ± 11.6 | 6.2% | 435.1 ± 23.7 | 5.4% |
+| 14 | [`Tx: Incremental put_in nested attribute commit`](slices/14_tx_incremental_put_in_nested_attribute_commit.md) | **3.15x** | 3.78 | **11.9** | `48.4` ★ | 3.74 ± 0.15 | 3.9% | 12.0 ± 0.35 | 2.9% |
+| 15 | [`Tx: Linked_Array_List O(log N) mid-list insert + delete`](slices/15_tx_linked_array_list_o_log_n_mid_list_insert_delete.md) | **1.69x** | 5.34 | **9.01** | `6.7` ★ | 5.33 ± 0.23 | 4.2% | 9.59 ± 1.41 | 14.7% |
+| 16 | [`Tx: O(1) zero-copy subtree fork (500 entities)`](slices/16_tx_o_1_zero_copy_subtree_fork_500_entities.md) | **1.75x** | 4.30 | **7.53** | `4.1` ★ | 4.73 ± 1.07 | 22.5% | 8.37 ± 1.66 | 19.9% |
+| 17 | [`Time-Travel: Historical as_of(db, m) across 100 moments`](slices/17_time_travel_historical_as_of_db_m_across_100_moments.md) | **4.35x** | 0.55 | **2.40** | `42.2` ★ | 0.56 ± 0.04 | 6.3% | 2.45 ± 0.09 | 3.8% |
+| 18 | [`Time-Travel: history_of(db, selector) (100 moments)`](slices/18_time_travel_history_of_db_selector_100_moments.md) | **0.69x** | 68.6 | **47.1** | `9.9` ★ | 70.1 ± 2.73 | 3.9% | 48.8 ± 3.96 | 8.1% |
+| 19 | [`Time-Travel: diff_moments (1 of 200 entities mutated)`](slices/19_time_travel_diff_moments_1_of_200_entities_mutated.md) | **1.89x** | 182.4 | **344.4** | `29.3` ★ | 182.3 ± 0.17 | 0.1% | 348.5 ± 12.7 | 3.6% |
+| 20 | [`Lifecycle: compact/1 100-moment database deduplication`](slices/20_lifecycle_compact_1_100_moment_database_deduplication.md) | **1.47x** | 19.2 | **28.3** | `4.7` ★ | 19.5 ± 1.14 | 5.9% | 29.4 ± 4.48 | 15.3% |
+| 21 | [`Query: Datomic pull projection (4 attrs + nested slice)`](slices/21_query_datomic_pull_projection_4_attrs_nested_slice.md) | **2.41x** | 2.69 | **6.47** | `79.6` ★ | 2.68 ± 0.02 | 0.9% | 6.41 ± 0.10 | 1.6% |
+| 22 | [`Query: Datalog B+Tree index prefix + join (N=200)`](slices/22_query_datalog_b_tree_index_prefix_join_n_200.md) | **1.90x** | 25.2 | **47.8** | `8.3` ★ | 28.4 ± 5.15 | 18.1% | 48.7 ± 1.72 | 3.5% |
+| 23 | [`Query: Datalog grouped aggregation (count + sum, N=200)`](slices/23_query_datalog_grouped_aggregation_count_sum_n_200.md) | **1.19x** | 500.9 | **593.9** | `6.6` ★ | 499.0 ± 23.3 | 4.7% | 600.0 ± 25.1 | 4.2% |
+| 24 | [`Storage: Buffered_File transact + sync (50 commits)`](slices/24_storage_buffered_file_transact_sync_50_commits.md) | **1.11x** | 52.5 | **58.2** | `0.8` ~ | 55.9 ± 6.49 | 11.6% | 58.3 ± 0.36 | 0.6% |
+| 25 | [`Search: Sorted_Map B+Tree prefix seek (limit=16)`](slices/25_search_sorted_map_b_tree_prefix_seek_limit_16.md) | **4.89x** | 1.57 | **7.65** | `10.0` ★ | 1.65 ± 0.25 | 15.3% | 7.10 ± 1.19 | 16.7% |
+| 26 | [`Search: BM25 corpus search (N=200, 2-term prefix, limit=10)`](slices/26_search_bm25_corpus_search_n_200_2_term_prefix_limit_10.md) | **1.42x** | 179.2 | **254.0** | `15.3` ★ | 176.2 ± 10.8 | 6.2% | 253.7 ± 3.24 | 1.3% |
 
 ### 4. Commit-vs-Commit Progression
 

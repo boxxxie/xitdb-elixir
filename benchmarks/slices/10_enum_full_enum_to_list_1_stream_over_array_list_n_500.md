@@ -8,9 +8,9 @@
 
 | Metric | Elixir NIF Wrapper | Raw Odin Baseline | Comparison |
 | :--- | ---: | ---: | ---: |
-| **Median (`ns/op`)** | 78.80 µs (78797.0 ns) | 35.26 µs (35262.0 ns) | **`2.23x`** NIF Ratio |
-| **Mean ± σ (CV)** | 78.85 µs ± 442.2 ns (0.6%) | 35.18 µs ± 160.1 ns (0.5%) | Welch `z` = `207.64` |
-| **p95 / Max (`ns/op`)** | 79.33 µs / 79.35 µs | 35.30 µs / 35.31 µs | `5` vs `5` pooled samples |
+| **Median (`ns/op`)** | 82.09 µs (82086.0 ns) | 35.38 µs (35378.0 ns) | **`2.32x`** NIF Ratio |
+| **Mean ± σ (CV)** | 81.88 µs ± 780.9 ns (1.0%) | 35.44 µs ± 410.1 ns (1.2%) | Welch `z` = `117.72` |
+| **p95 / Max (`ns/op`)** | 82.72 µs / 82.82 µs | 35.95 µs / 36.06 µs | `5` vs `5` pooled samples |
 
 ## Benchmark Harnesses (Elixir vs. Raw Odin)
 
@@ -57,7 +57,7 @@
 ## Elixir Wrapper & NIF Bridge
 
 <details>
-<summary>Elixir <code>reduce</code> — <a href="../../lib/xitdb/cursor.ex#L1131-L1160">lib/xitdb/cursor.ex#L1131-L1160</a></summary>
+<summary>Elixir <code>reduce</code> — <a href="../../lib/xitdb/cursor.ex#L1142-L1171">lib/xitdb/cursor.ex#L1142-L1171</a></summary>
 
 ```elixir
   def reduce(%Cursor{} = raw_cursor, acc, fun) do
@@ -95,7 +95,7 @@
 </details>
 
 <details>
-<summary>Elixir <code>do_reduce</code> — <a href="../../lib/xitdb/cursor.ex#L1162-L1203">lib/xitdb/cursor.ex#L1162-L1203</a></summary>
+<summary>Elixir <code>do_reduce</code> — <a href="../../lib/xitdb/cursor.ex#L1173-L1214">lib/xitdb/cursor.ex#L1173-L1214</a></summary>
 
 ```elixir
   defp do_reduce(_cursor, _offset, _buf, {:halt, acc}, _fun), do: {:halted, acc}
@@ -145,7 +145,7 @@
 </details>
 
 <details>
-<summary>NIF <code>odin_nif_slot_entries</code> — <a href="../../native/xitdb_nif.odin#L1311-L1461">native/xitdb_nif.odin#L1311-L1461</a></summary>
+<summary>NIF <code>odin_nif_slot_entries</code> — <a href="../../native/xitdb_nif.odin#L1361-L1503">native/xitdb_nif.odin#L1361-L1503</a></summary>
 
 ```odin
 odin_nif_slot_entries :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {
@@ -249,15 +249,11 @@ odin_nif_slot_entries :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF
 
 		case .Hash_Set, .Counted_Hash_Set, .Sorted_Set:
 			if seen >= offset {
-				kv, kv_err := xitdb.cursor_read_kv_pair(elem_cur, context.temp_allocator)
+				key_cur, _, kv_err := xitdb.cursor_read_kv_pair_slots(elem_cur)
 				if kv_err != nil {
 					return make_xitdb_err(env, kv_err)
 				}
-				ks, ks_err := xitdb.cursor_slot(kv.key_cursor)
-				if ks_err != nil {
-					return make_xitdb_err(env, ks_err)
-				}
-				t, t_err := slot_to_term(env, &handle.db, ks)
+				t, t_err := slot_to_term(env, &handle.db, key_cur.slot_ptr.slot)
 				if t_err != nil {
 					return make_xitdb_err(env, t_err)
 				}
@@ -267,11 +263,11 @@ odin_nif_slot_entries :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF
 			seen += 1
 
 		case .Hash_Map, .Counted_Hash_Map, .Sorted_Map:
-			kv, kv_err := xitdb.cursor_read_kv_pair(elem_cur, context.temp_allocator)
+			key_cur, val_cur, kv_err := xitdb.cursor_read_kv_pair_slots(elem_cur)
 			if kv_err != nil {
 				return make_xitdb_err(env, kv_err)
 			}
-			k_str, k_err := read_key_cursor_string(kv.key_cursor, sb_buf[:])
+			k_str, k_err := read_key_cursor_string(key_cur, sb_buf[:])
 			if k_err != nil {
 				return make_xitdb_err(env, k_err)
 			}
@@ -279,11 +275,7 @@ odin_nif_slot_entries :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF
 				continue
 			}
 			if seen >= offset {
-				vs, vs_err := xitdb.cursor_slot(kv.value_cursor)
-				if vs_err != nil {
-					return make_xitdb_err(env, vs_err)
-				}
-				vt, vt_err := slot_to_term(env, &handle.db, vs)
+				vt, vt_err := slot_to_term(env, &handle.db, val_cur.slot_ptr.slot)
 				if vt_err != nil {
 					return make_xitdb_err(env, vt_err)
 				}
@@ -304,7 +296,7 @@ odin_nif_slot_entries :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF
 </details>
 
 <details>
-<summary>NIF <code>slot_to_term</code> — <a href="../../native/xitdb_nif.odin#L293-L351">native/xitdb_nif.odin#L293-L351</a></summary>
+<summary>NIF <code>slot_to_term</code> — <a href="../../native/xitdb_nif.odin#L317-L375">native/xitdb_nif.odin#L317-L375</a></summary>
 
 ```odin
 slot_to_term :: proc(env: ErlNifEnv, db: ^xitdb.Database, slot: xitdb.Slot) -> (res: ERL_NIF_TERM, err: xitdb.Error) {
@@ -371,7 +363,7 @@ slot_to_term :: proc(env: ErlNifEnv, db: ^xitdb.Database, slot: xitdb.Slot) -> (
 </details>
 
 <details>
-<summary>NIF <code>read_key_cursor_string</code> — <a href="../../native/xitdb_nif.odin#L353-L359">native/xitdb_nif.odin#L353-L359</a></summary>
+<summary>NIF <code>read_key_cursor_string</code> — <a href="../../native/xitdb_nif.odin#L377-L383">native/xitdb_nif.odin#L377-L383</a></summary>
 
 ```odin
 read_key_cursor_string :: proc(cur: xitdb.Read_Cursor, sb_buf: []u8) -> (s: string, err: xitdb.Error) {
@@ -686,26 +678,30 @@ cursor_slot :: proc(c: Read_Cursor) -> (res: Slot, err: Error) {
 </details>
 
 <details>
-<summary><code>xitdb.cursor_read_kv_pair</code> — <a href="../../native/xitdb-odin/xitdb/cursor.odin#L361-L378">cursor.odin#L361-L378</a></summary>
+<summary><code>xitdb.cursor_read_kv_pair_slots</code> — <a href="../../native/xitdb-odin/xitdb/cursor.odin#L381-L402">cursor.odin#L381-L402</a></summary>
 
 ```odin
-cursor_read_kv_pair :: proc(c: Read_Cursor, allocator := context.temp_allocator) -> (res: Read_KV_Pair_Cursor, err: Error) {
+cursor_read_kv_pair_slots :: proc(c: Read_Cursor) -> (key_cursor: Read_Cursor, value_cursor: Read_Cursor, err: Error) {
 	slot_ptr := cursor_resolved(c) or_return
 	if is_key_only_entry(slot_ptr.slot) {
-		return Read_KV_Pair_Cursor{
-			value_cursor = Read_Cursor{slot_ptr = Slot_Pointer{position = nil, slot = Slot{}}, db = c.db, frozen_at = c.frozen_at},
-			key_cursor   = Read_Cursor{slot_ptr = Slot_Pointer{position = nil, slot = slot_ptr.slot}, db = c.db, frozen_at = c.frozen_at},
-			hash         = nil,
-		}, nil
+		return Read_Cursor{slot_ptr = Slot_Pointer{position = nil, slot = slot_ptr.slot}, db = c.db, frozen_at = c.frozen_at},
+			Read_Cursor{slot_ptr = Slot_Pointer{position = nil, slot = Slot{}}, db = c.db, frozen_at = c.frozen_at},
+			nil
 	}
-	kv_pair := decode_kv_pair_at(c.db.core, slot_ptr.slot.value, slot_ptr.slot.tag, int(c.db.header.hash_size), allocator) or_return
-	key_slot_pos := database_kv_key_position(c.db, slot_ptr.slot)
-	value_slot_pos := database_kv_value_position(c.db, slot_ptr.slot)
-	return Read_KV_Pair_Cursor{
-		value_cursor = Read_Cursor{slot_ptr = Slot_Pointer{position = value_slot_pos, slot = kv_pair.value_slot}, db = c.db, frozen_at = c.frozen_at},
-		key_cursor   = Read_Cursor{slot_ptr = Slot_Pointer{position = key_slot_pos, slot = kv_pair.key_slot}, db = c.db, frozen_at = c.frozen_at},
-		hash         = kv_pair.hash,
-	}, nil
+	if slot_ptr.slot.tag != .KV_Pair && slot_ptr.slot.tag != .Sorted_KV_Pair {
+		return {}, {}, .Unexpected_Tag
+	}
+	key_pos := slot_ptr.slot.value + database_kv_key_offset(c.db, slot_ptr.slot.tag)
+	val_pos := key_pos + SLOT_LENGTH
+	b: [SLOT_LENGTH * 2]u8 = ---
+	core_read_exact_at(c.db.core, key_pos, b[:]) or_return
+	key_slot := slot_from_slice_raw(b[0:SLOT_LENGTH])
+	tag_validate(key_slot.tag) or_return
+	val_slot := slot_from_slice_raw(b[SLOT_LENGTH : SLOT_LENGTH * 2])
+	tag_validate(val_slot.tag) or_return
+	return Read_Cursor{slot_ptr = Slot_Pointer{position = key_pos, slot = key_slot}, db = c.db, frozen_at = c.frozen_at},
+		Read_Cursor{slot_ptr = Slot_Pointer{position = val_pos, slot = val_slot}, db = c.db, frozen_at = c.frozen_at},
+		nil
 }
 ```
 

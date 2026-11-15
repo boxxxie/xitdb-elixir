@@ -8,9 +8,9 @@
 
 | Metric | Elixir NIF Wrapper | Raw Odin Baseline | Comparison |
 | :--- | ---: | ---: | ---: |
-| **Median (`ns/op`)** | 557.06 µs (557056.0 ns) | 464.86 µs (464856.0 ns) | **`1.20x`** NIF Ratio |
-| **Mean ± σ (CV)** | 556.85 µs ± 525.5 ns (0.1%) | 469.00 µs ± 18.88 µs (4.0%) | Welch `z` = `10.40` |
-| **p95 / Max (`ns/op`)** | 557.27 µs / 557.33 µs | 493.58 µs / 497.92 µs | `5` vs `5` pooled samples |
+| **Median (`ns/op`)** | 593.91 µs (593906.0 ns) | 500.87 µs (500870.0 ns) | **`1.19x`** NIF Ratio |
+| **Mean ± σ (CV)** | 599.99 µs ± 25.11 µs (4.2%) | 498.96 µs ± 23.25 µs (4.7%) | Welch `z` = `6.60` |
+| **p95 / Max (`ns/op`)** | 631.98 µs / 636.66 µs | 526.30 µs / 530.04 µs | `5` vs `5` pooled samples |
 
 ## Benchmark Harnesses (Elixir vs. Raw Odin)
 
@@ -55,7 +55,7 @@
 ## Elixir Wrapper & NIF Bridge
 
 <details>
-<summary>Elixir <code>query</code> — <a href="../../lib/xitdb.ex#L647-L662">lib/xitdb.ex#L647-L662</a></summary>
+<summary>Elixir <code>query</code> — <a href="../../lib/xitdb.ex#L716-L731">lib/xitdb.ex#L716-L731</a></summary>
 
 ```elixir
   def query(target, query_str, opts \\ [])
@@ -79,7 +79,7 @@
 </details>
 
 <details>
-<summary>Elixir <code>do_query</code> — <a href="../../lib/xitdb.ex#L664-L666">lib/xitdb.ex#L664-L666</a></summary>
+<summary>Elixir <code>do_query</code> — <a href="../../lib/xitdb.ex#L733-L735">lib/xitdb.ex#L733-L735</a></summary>
 
 ```elixir
   defp do_query(db_ref, moment, query_str) do
@@ -90,7 +90,7 @@
 </details>
 
 <details>
-<summary>NIF <code>odin_nif_query_datalog</code> — <a href="../../native/xitdb_nif.odin#L6312-L6388">native/xitdb_nif.odin#L6312-L6388</a></summary>
+<summary>NIF <code>odin_nif_query_datalog</code> — <a href="../../native/xitdb_nif.odin#L6722-L6798">native/xitdb_nif.odin#L6722-L6798</a></summary>
 
 ```odin
 odin_nif_query_datalog :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {
@@ -175,7 +175,7 @@ odin_nif_query_datalog :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NI
 </details>
 
 <details>
-<summary>NIF <code>nif_dl_parse_query</code> — <a href="../../native/xitdb_nif.odin#L5423-L5472">native/xitdb_nif.odin#L5423-L5472</a></summary>
+<summary>NIF <code>nif_dl_parse_query</code> — <a href="../../native/xitdb_nif.odin#L5833-L5882">native/xitdb_nif.odin#L5833-L5882</a></summary>
 
 ```odin
 nif_dl_parse_query :: proc(query_str: string, allocator: runtime.Allocator) -> (q: NIF_Datalog_Query, err_reason: string) {
@@ -233,7 +233,7 @@ nif_dl_parse_query :: proc(query_str: string, allocator: runtime.Allocator) -> (
 </details>
 
 <details>
-<summary>NIF <code>nif_dl_eval_clauses</code> — <a href="../../native/xitdb_nif.odin#L6136-L6195">native/xitdb_nif.odin#L6136-L6195</a></summary>
+<summary>NIF <code>nif_dl_eval_clauses</code> — <a href="../../native/xitdb_nif.odin#L6546-L6605">native/xitdb_nif.odin#L6546-L6605</a></summary>
 
 ```odin
 nif_dl_eval_clauses :: proc(
@@ -301,7 +301,7 @@ nif_dl_eval_clauses :: proc(
 </details>
 
 <details>
-<summary>NIF <code>nif_dl_compute_aggregations</code> — <a href="../../native/xitdb_nif.odin#L6197-L6309">native/xitdb_nif.odin#L6197-L6309</a></summary>
+<summary>NIF <code>nif_dl_compute_aggregations</code> — <a href="../../native/xitdb_nif.odin#L6607-L6719">native/xitdb_nif.odin#L6607-L6719</a></summary>
 
 ```odin
 nif_dl_compute_aggregations :: proc(q: ^NIF_Datalog_Query, envs: []NIF_Datalog_Env, allocator: runtime.Allocator) -> [][]xitdb.Pull_Value {
@@ -422,7 +422,7 @@ nif_dl_compute_aggregations :: proc(q: ^NIF_Datalog_Query, envs: []NIF_Datalog_E
 </details>
 
 <details>
-<summary>NIF <code>pull_value_to_term</code> — <a href="../../native/xitdb_nif.odin#L458-L506">native/xitdb_nif.odin#L458-L506</a></summary>
+<summary>NIF <code>pull_value_to_term</code> — <a href="../../native/xitdb_nif.odin#L517-L565">native/xitdb_nif.odin#L517-L565</a></summary>
 
 ```odin
 pull_value_to_term :: proc(env: ErlNifEnv, pv: xitdb.Pull_Value) -> ERL_NIF_TERM {
@@ -479,7 +479,7 @@ pull_value_to_term :: proc(env: ErlNifEnv, pv: xitdb.Pull_Value) -> ERL_NIF_TERM
 </details>
 
 <details>
-<summary>NIF <code>nif_dl_is_ws</code> — <a href="../../native/xitdb_nif.odin#L4650-L4652">native/xitdb_nif.odin#L4650-L4652</a></summary>
+<summary>NIF <code>nif_dl_is_ws</code> — <a href="../../native/xitdb_nif.odin#L5060-L5062">native/xitdb_nif.odin#L5060-L5062</a></summary>
 
 ```odin
 nif_dl_is_ws :: proc(ch: u8) -> bool {
@@ -490,7 +490,7 @@ nif_dl_is_ws :: proc(ch: u8) -> bool {
 </details>
 
 <details>
-<summary>NIF <code>nif_dl_find_where_keyword</code> — <a href="../../native/xitdb_nif.odin#L4654-L4687">native/xitdb_nif.odin#L4654-L4687</a></summary>
+<summary>NIF <code>nif_dl_find_where_keyword</code> — <a href="../../native/xitdb_nif.odin#L5064-L5097">native/xitdb_nif.odin#L5064-L5097</a></summary>
 
 ```odin
 nif_dl_find_where_keyword :: proc(s: string) -> int {
@@ -532,7 +532,7 @@ nif_dl_find_where_keyword :: proc(s: string) -> int {
 </details>
 
 <details>
-<summary>NIF <code>nif_dl_parse_find_item</code> — <a href="../../native/xitdb_nif.odin#L5386-L5421">native/xitdb_nif.odin#L5386-L5421</a></summary>
+<summary>NIF <code>nif_dl_parse_find_item</code> — <a href="../../native/xitdb_nif.odin#L5796-L5831">native/xitdb_nif.odin#L5796-L5831</a></summary>
 
 ```odin
 nif_dl_parse_find_item :: proc(q: ^NIF_Datalog_Query, token: string) -> (item: xitdb.Datalog_Find_Item, err_reason: string) {

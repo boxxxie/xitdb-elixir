@@ -8,9 +8,9 @@
 
 | Metric | Elixir NIF Wrapper | Raw Odin Baseline | Comparison |
 | :--- | ---: | ---: | ---: |
-| **Median (`ns/op`)** | 6.33 µs (6330.0 ns) | 2.67 µs (2671.0 ns) | **`2.37x`** NIF Ratio |
-| **Mean ± σ (CV)** | 6.34 µs ± 48.7 ns (0.8%) | 2.68 µs ± 16.4 ns (0.6%) | Welch `z` = `159.59` |
-| **p95 / Max (`ns/op`)** | 6.41 µs / 6.42 µs | 2.69 µs / 2.69 µs | `5` vs `5` pooled samples |
+| **Median (`ns/op`)** | 6.47 µs (6467.0 ns) | 2.69 µs (2687.0 ns) | **`2.41x`** NIF Ratio |
+| **Mean ± σ (CV)** | 6.41 µs ± 101.8 ns (1.6%) | 2.68 µs ± 24.8 ns (0.9%) | Welch `z` = `79.62` |
+| **p95 / Max (`ns/op`)** | 6.49 µs / 6.49 µs | 2.70 µs / 2.71 µs | `5` vs `5` pooled samples |
 
 ## Benchmark Harnesses (Elixir vs. Raw Odin)
 
@@ -51,7 +51,7 @@
 ## Elixir Wrapper & NIF Bridge
 
 <details>
-<summary>Elixir <code>pull</code> — <a href="../../lib/xitdb.ex#L577-L605">lib/xitdb.ex#L577-L605</a></summary>
+<summary>Elixir <code>pull</code> — <a href="../../lib/xitdb.ex#L645-L673">lib/xitdb.ex#L645-L673</a></summary>
 
 ```elixir
   def pull(%__MODULE__{db_ref: db_ref}, pattern) do
@@ -88,7 +88,7 @@
 </details>
 
 <details>
-<summary>Elixir <code>do_nif_pull</code> — <a href="../../lib/xitdb.ex#L607-L615">lib/xitdb.ex#L607-L615</a></summary>
+<summary>Elixir <code>do_nif_pull</code> — <a href="../../lib/xitdb.ex#L675-L683">lib/xitdb.ex#L675-L683</a></summary>
 
 ```elixir
   defp do_nif_pull(%Cursor{root: true, tag: tag, db_ref: db_ref, moment: moment}, pattern)
@@ -105,7 +105,7 @@
 </details>
 
 <details>
-<summary>NIF <code>odin_nif_pull</code> — <a href="../../native/xitdb_nif.odin#L4273-L4327">native/xitdb_nif.odin#L4273-L4327</a></summary>
+<summary>NIF <code>odin_nif_pull</code> — <a href="../../native/xitdb_nif.odin#L4609-L4663">native/xitdb_nif.odin#L4609-L4663</a></summary>
 
 ```odin
 odin_nif_pull :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {
@@ -168,7 +168,7 @@ odin_nif_pull :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -
 </details>
 
 <details>
-<summary>NIF <code>nif_pull_cursor</code> — <a href="../../native/xitdb_nif.odin#L4072-L4267">native/xitdb_nif.odin#L4072-L4267</a></summary>
+<summary>NIF <code>nif_pull_cursor</code> — <a href="../../native/xitdb_nif.odin#L4408-L4603">native/xitdb_nif.odin#L4408-L4603</a></summary>
 
 ```odin
 nif_pull_cursor :: proc(
@@ -212,12 +212,12 @@ nif_pull_cursor :: proc(
 					if !ok {
 						break
 					}
-					kv := xitdb.cursor_read_kv_pair(elem_cur, context.temp_allocator) or_return
-					k_str := xitdb.cursor_read_string(kv.key_cursor, 0, context.temp_allocator) or_return
+					key_cur, val_cur := xitdb.cursor_read_kv_pair_slots(elem_cur) or_return
+					k_str := xitdb.cursor_read_string(key_cur, 0, context.temp_allocator) or_return
 					if is_root && k_str == "__tx" {
 						continue
 					}
-					v, v_reason, v_err := nif_pull_wildcard(env, db, kv.value_cursor, false, visited)
+					v, v_reason, v_err := nif_pull_wildcard(env, db, val_cur, false, visited)
 					if v_err != nil {
 						return 0, "", v_err
 					}
@@ -372,7 +372,7 @@ nif_pull_cursor :: proc(
 </details>
 
 <details>
-<summary>NIF <code>nif_pull_wildcard</code> — <a href="../../native/xitdb_nif.odin#L3901-L3994">native/xitdb_nif.odin#L3901-L3994</a></summary>
+<summary>NIF <code>nif_pull_wildcard</code> — <a href="../../native/xitdb_nif.odin#L4238-L4330">native/xitdb_nif.odin#L4238-L4330</a></summary>
 
 ```odin
 nif_pull_wildcard :: proc(
@@ -430,9 +430,8 @@ nif_pull_wildcard :: proc(
 			if !ok {
 				break
 			}
-			kv := xitdb.cursor_read_kv_pair(elem_cur, context.temp_allocator) or_return
-			key_slot := xitdb.cursor_slot(kv.key_cursor) or_return
-			v := slot_to_term(env, db, key_slot) or_return
+			key_cur, _ := xitdb.cursor_read_kv_pair_slots(elem_cur) or_return
+			v := slot_to_term(env, db, key_cur.slot_ptr.slot) or_return
 			append(&items, v)
 		}
 		if len(items) == 0 {
@@ -450,12 +449,12 @@ nif_pull_wildcard :: proc(
 			if !ok {
 				break
 			}
-			kv := xitdb.cursor_read_kv_pair(elem_cur, context.temp_allocator) or_return
-			k_str := xitdb.cursor_read_string(kv.key_cursor, 0, context.temp_allocator) or_return
+			key_cur, val_cur := xitdb.cursor_read_kv_pair_slots(elem_cur) or_return
+			k_str := xitdb.cursor_read_string(key_cur, 0, context.temp_allocator) or_return
 			if is_root && k_str == "__tx" {
 				continue
 			}
-			v, v_reason, v_err := nif_pull_wildcard(env, db, kv.value_cursor, false, visited)
+			v, v_reason, v_err := nif_pull_wildcard(env, db, val_cur, false, visited)
 			if v_err != nil {
 				return 0, "", v_err
 			}
@@ -474,7 +473,7 @@ nif_pull_wildcard :: proc(
 </details>
 
 <details>
-<summary>NIF <code>split_top_level_pull_specs</code> — <a href="../../native/xitdb_nif.odin#L3789-L3831">native/xitdb_nif.odin#L3789-L3831</a></summary>
+<summary>NIF <code>split_top_level_pull_specs</code> — <a href="../../native/xitdb_nif.odin#L4126-L4168">native/xitdb_nif.odin#L4126-L4168</a></summary>
 
 ```odin
 split_top_level_pull_specs :: proc(inner: string, allocator: runtime.Allocator) -> []string {
@@ -525,7 +524,7 @@ split_top_level_pull_specs :: proc(inner: string, allocator: runtime.Allocator) 
 </details>
 
 <details>
-<summary>NIF <code>find_top_level_pull_brace</code> — <a href="../../native/xitdb_nif.odin#L3841-L3872">native/xitdb_nif.odin#L3841-L3872</a></summary>
+<summary>NIF <code>find_top_level_pull_brace</code> — <a href="../../native/xitdb_nif.odin#L4178-L4209">native/xitdb_nif.odin#L4178-L4209</a></summary>
 
 ```odin
 find_top_level_pull_brace :: proc(s: string) -> int {
@@ -565,7 +564,7 @@ find_top_level_pull_brace :: proc(s: string) -> int {
 </details>
 
 <details>
-<summary>NIF <code>find_last_unquoted_lbracket</code> — <a href="../../native/xitdb_nif.odin#L3874-L3897">native/xitdb_nif.odin#L3874-L3897</a></summary>
+<summary>NIF <code>find_last_unquoted_lbracket</code> — <a href="../../native/xitdb_nif.odin#L4211-L4234">native/xitdb_nif.odin#L4211-L4234</a></summary>
 
 ```odin
 find_last_unquoted_lbracket :: proc(s: string) -> int {
@@ -597,7 +596,7 @@ find_last_unquoted_lbracket :: proc(s: string) -> int {
 </details>
 
 <details>
-<summary>NIF <code>is_simple_hash_map_ident</code> — <a href="../../native/xitdb_nif.odin#L3996-L4010">native/xitdb_nif.odin#L3996-L4010</a></summary>
+<summary>NIF <code>is_simple_hash_map_ident</code> — <a href="../../native/xitdb_nif.odin#L4332-L4346">native/xitdb_nif.odin#L4332-L4346</a></summary>
 
 ```odin
 is_simple_hash_map_ident :: proc(s: string) -> (string, bool) {
@@ -620,131 +619,22 @@ is_simple_hash_map_ident :: proc(s: string) -> (string, bool) {
 </details>
 
 <details>
-<summary>NIF <code>parse_escaped_steps</code> — <a href="../../native/xitdb_nif.odin#L1619-L1740">native/xitdb_nif.odin#L1619-L1740</a></summary>
+<summary>NIF <code>parse_escaped_steps</code> — <a href="../../native/xitdb_nif.odin#L1822-L1834">native/xitdb_nif.odin#L1822-L1834</a></summary>
 
 ```odin
 parse_escaped_steps :: proc(path_str: string, allocator := context.temp_allocator) -> (res: []xitdb.Path_Step, err_reason: string) {
-	s := strings.trim_space(path_str)
-	if len(s) == 0 {
-		return nil, ""
+	stack_buf: [16]xitdb.Path_Step = ---
+	steps, er := parse_escaped_steps_buf(path_str, stack_buf[:], allocator)
+	if er != "" || len(steps) == 0 {
+		return steps, er
 	}
-	steps := make([dynamic]xitdb.Path_Step, 0, 8, allocator)
-	i := 0
-
-	for i < len(s) {
-		ch := s[i]
-		switch ch {
-		case '.':
-			i += 1
-			key, next_i, er := parse_escaped_ident_or_bracket(s, i, allocator)
-			if er != "" {
-				return nil, er
-			}
-			append(&steps, xitdb.Path_Step{kind = .Hash_Map_Key, key = key})
-			i = next_i
-
-		case '#':
-			i += 1
-			kind := xitdb.Step_Kind.Counted_Hash_Map_Key
-			if i < len(s) && s[i] == '%' {
-				kind = .Counted_Set_Member
-				i += 1
-			}
-			key, next_i, er := parse_escaped_ident_or_bracket(s, i, allocator)
-			if er != "" {
-				return nil, er
-			}
-			append(&steps, xitdb.Path_Step{kind = kind, key = key})
-			i = next_i
-
-		case '$':
-			i += 1
-			key, next_i, er := parse_escaped_ident_or_bracket(s, i, allocator)
-			if er != "" {
-				return nil, er
-			}
-			append(&steps, xitdb.Path_Step{kind = .Sorted_Map_Key, key = key})
-			i = next_i
-
-		case '%':
-			i += 1
-			key, next_i, er := parse_escaped_ident_or_bracket(s, i, allocator)
-			if er != "" {
-				return nil, er
-			}
-			append(&steps, xitdb.Path_Step{kind = .Hash_Set_Member, key = key})
-			i = next_i
-
-		case '^':
-			i += 1
-			key, next_i, er := parse_escaped_ident_or_bracket(s, i, allocator)
-			if er != "" {
-				return nil, er
-			}
-			append(&steps, xitdb.Path_Step{kind = .Sorted_Set_Member, key = key})
-			i = next_i
-
-		case '[':
-			if i + 1 < len(s) && s[i + 1] == '[' {
-				i += 2
-				start := i
-				for i < len(s) && s[i] != ']' {
-					i += 1
-				}
-				if i + 1 >= len(s) || s[i] != ']' || s[i + 1] != ']' {
-					return nil, "invalid_selector"
-				}
-				idx_str := strings.trim_space(s[start:i])
-				idx, ok := strconv.parse_i64(idx_str)
-				if !ok {
-					return nil, "invalid_selector"
-				}
-				append(&steps, xitdb.Path_Step{kind = .Linked_List_Idx, index = idx})
-				i += 2
-			} else if i + 1 < len(s) && (s[i + 1] == '"' || s[i + 1] == '\'') {
-				key, next_i, er := parse_escaped_bracketed_string(s, i, allocator)
-				if er != "" {
-					return nil, er
-				}
-				step_kind := xitdb.Step_Kind.Hash_Map_Key
-				if len(steps) == 1 {
-					if steps[0].kind == .Counted_Hash_Map_Key {
-						steps[0].kind = .Hash_Map_Key
-						step_kind = .Counted_Hash_Map_Key
-					} else if steps[0].kind == .Sorted_Map_Key {
-						steps[0].kind = .Hash_Map_Key
-						step_kind = .Sorted_Map_Key
-					}
-				}
-				append(&steps, xitdb.Path_Step{kind = step_kind, key = key})
-				i = next_i
-			} else {
-				i += 1
-				start := i
-				for i < len(s) && s[i] != ']' {
-					i += 1
-				}
-				if i >= len(s) || s[i] != ']' {
-					return nil, "invalid_selector"
-				}
-				idx_str := strings.trim_space(s[start:i])
-				idx, ok := strconv.parse_i64(idx_str)
-				if !ok {
-					return nil, "invalid_selector"
-				}
-				append(&steps, xitdb.Path_Step{kind = .Array_List_Idx, index = idx})
-				i += 1
-			}
-
-		case:
-			key, next_i, er := parse_escaped_ident_or_bracket(s, i, allocator)
-			if er != "" {
-				return nil, er
-			}
-			append(&steps, xitdb.Path_Step{kind = .Hash_Map_Key, key = key})
-			i = next_i
-		}
+	if raw_data(steps) == raw_data(stack_buf[:]) {
+		out := make([]xitdb.Path_Step, len(steps), allocator)
+		copy(out, steps)
+		return out, ""
 	}
+	return steps, ""
+}
 ```
 
 </details>
@@ -879,26 +769,30 @@ cursor_iterator_next :: proc(it: ^Cursor_Iterator) -> (res: Maybe(Read_Cursor), 
 </details>
 
 <details>
-<summary><code>xitdb.cursor_read_kv_pair</code> — <a href="../../native/xitdb-odin/xitdb/cursor.odin#L361-L378">cursor.odin#L361-L378</a></summary>
+<summary><code>xitdb.cursor_read_kv_pair_slots</code> — <a href="../../native/xitdb-odin/xitdb/cursor.odin#L381-L402">cursor.odin#L381-L402</a></summary>
 
 ```odin
-cursor_read_kv_pair :: proc(c: Read_Cursor, allocator := context.temp_allocator) -> (res: Read_KV_Pair_Cursor, err: Error) {
+cursor_read_kv_pair_slots :: proc(c: Read_Cursor) -> (key_cursor: Read_Cursor, value_cursor: Read_Cursor, err: Error) {
 	slot_ptr := cursor_resolved(c) or_return
 	if is_key_only_entry(slot_ptr.slot) {
-		return Read_KV_Pair_Cursor{
-			value_cursor = Read_Cursor{slot_ptr = Slot_Pointer{position = nil, slot = Slot{}}, db = c.db, frozen_at = c.frozen_at},
-			key_cursor   = Read_Cursor{slot_ptr = Slot_Pointer{position = nil, slot = slot_ptr.slot}, db = c.db, frozen_at = c.frozen_at},
-			hash         = nil,
-		}, nil
+		return Read_Cursor{slot_ptr = Slot_Pointer{position = nil, slot = slot_ptr.slot}, db = c.db, frozen_at = c.frozen_at},
+			Read_Cursor{slot_ptr = Slot_Pointer{position = nil, slot = Slot{}}, db = c.db, frozen_at = c.frozen_at},
+			nil
 	}
-	kv_pair := decode_kv_pair_at(c.db.core, slot_ptr.slot.value, slot_ptr.slot.tag, int(c.db.header.hash_size), allocator) or_return
-	key_slot_pos := database_kv_key_position(c.db, slot_ptr.slot)
-	value_slot_pos := database_kv_value_position(c.db, slot_ptr.slot)
-	return Read_KV_Pair_Cursor{
-		value_cursor = Read_Cursor{slot_ptr = Slot_Pointer{position = value_slot_pos, slot = kv_pair.value_slot}, db = c.db, frozen_at = c.frozen_at},
-		key_cursor   = Read_Cursor{slot_ptr = Slot_Pointer{position = key_slot_pos, slot = kv_pair.key_slot}, db = c.db, frozen_at = c.frozen_at},
-		hash         = kv_pair.hash,
-	}, nil
+	if slot_ptr.slot.tag != .KV_Pair && slot_ptr.slot.tag != .Sorted_KV_Pair {
+		return {}, {}, .Unexpected_Tag
+	}
+	key_pos := slot_ptr.slot.value + database_kv_key_offset(c.db, slot_ptr.slot.tag)
+	val_pos := key_pos + SLOT_LENGTH
+	b: [SLOT_LENGTH * 2]u8 = ---
+	core_read_exact_at(c.db.core, key_pos, b[:]) or_return
+	key_slot := slot_from_slice_raw(b[0:SLOT_LENGTH])
+	tag_validate(key_slot.tag) or_return
+	val_slot := slot_from_slice_raw(b[SLOT_LENGTH : SLOT_LENGTH * 2])
+	tag_validate(val_slot.tag) or_return
+	return Read_Cursor{slot_ptr = Slot_Pointer{position = key_pos, slot = key_slot}, db = c.db, frozen_at = c.frozen_at},
+		Read_Cursor{slot_ptr = Slot_Pointer{position = val_pos, slot = val_slot}, db = c.db, frozen_at = c.frozen_at},
+		nil
 }
 ```
 

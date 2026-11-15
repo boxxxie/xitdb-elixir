@@ -8,9 +8,9 @@
 
 | Metric | Elixir NIF Wrapper | Raw Odin Baseline | Comparison |
 | :--- | ---: | ---: | ---: |
-| **Median (`ns/op`)** | 165.0 ns (165.0 ns) | 6.0 ns (6.0 ns) | **`27.50x`** NIF Ratio |
-| **Mean ± σ (CV)** | 175.0 ns ± 19.3 ns (11.0%) | 6.2 ns ± 0.4 ns (7.2%) | Welch `z` = `19.58` |
-| **p95 / Max (`ns/op`)** | 201.6 ns / 209.0 ns | 6.8 ns / 7.0 ns | `5` vs `5` pooled samples |
+| **Median (`ns/op`)** | 200.0 ns (200.0 ns) | 7.0 ns (7.0 ns) | **`28.57x`** NIF Ratio |
+| **Mean ± σ (CV)** | 205.8 ns ± 41.8 ns (20.3%) | 7.0 ns ± 0.0 ns (0.0%) | Welch `z` = `10.64` |
+| **p95 / Max (`ns/op`)** | 261.8 ns / 276.0 ns | 7.0 ns / 7.0 ns | `5` vs `5` pooled samples |
 
 ## Benchmark Harnesses (Elixir vs. Raw Odin)
 
@@ -48,7 +48,7 @@
 ## Elixir Wrapper & NIF Bridge
 
 <details>
-<summary>Elixir <code>count</code> — <a href="../../lib/xitdb/cursor.ex#L1022-L1034">lib/xitdb/cursor.ex#L1022-L1034</a></summary>
+<summary>Elixir <code>count</code> — <a href="../../lib/xitdb/cursor.ex#L1033-L1045">lib/xitdb/cursor.ex#L1033-L1045</a></summary>
 
 ```elixir
   def count(%Cursor{} = cursor) do
@@ -69,7 +69,7 @@
 </details>
 
 <details>
-<summary>NIF <code>odin_nif_slot_count</code> — <a href="../../native/xitdb_nif.odin#L1038-L1082">native/xitdb_nif.odin#L1038-L1082</a></summary>
+<summary>NIF <code>odin_nif_slot_count</code> — <a href="../../native/xitdb_nif.odin#L1097-L1141">native/xitdb_nif.odin#L1097-L1141</a></summary>
 
 ```odin
 odin_nif_slot_count :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {

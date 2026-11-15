@@ -8,9 +8,9 @@
 
 | Metric | Elixir NIF Wrapper | Raw Odin Baseline | Comparison |
 | :--- | ---: | ---: | ---: |
-| **Median (`ns/op`)** | 418.0 ns (418.0 ns) | 118.0 ns (118.0 ns) | **`3.54x`** NIF Ratio |
-| **Mean ± σ (CV)** | 433.4 ns ± 35.6 ns (8.2%) | 118.2 ns ± 1.3 ns (1.1%) | Welch `z` = `19.77` |
-| **p95 / Max (`ns/op`)** | 481.6 ns / 497.0 ns | 119.8 ns / 120.0 ns | `5` vs `5` pooled samples |
+| **Median (`ns/op`)** | 436.0 ns (436.0 ns) | 121.0 ns (121.0 ns) | **`3.60x`** NIF Ratio |
+| **Mean ± σ (CV)** | 500.2 ns ± 113.4 ns (22.7%) | 123.0 ns ± 5.7 ns (4.6%) | Welch `z` = `7.43` |
+| **p95 / Max (`ns/op`)** | 632.8 ns / 640.0 ns | 130.8 ns / 133.0 ns | `5` vs `5` pooled samples |
 
 ## Benchmark Harnesses (Elixir vs. Raw Odin)
 
@@ -128,7 +128,7 @@
 </details>
 
 <details>
-<summary>NIF <code>odin_nif_slot_get_index</code> — <a href="../../native/xitdb_nif.odin#L948-L1035">native/xitdb_nif.odin#L948-L1035</a></summary>
+<summary>NIF <code>odin_nif_slot_get_index</code> — <a href="../../native/xitdb_nif.odin#L1007-L1094">native/xitdb_nif.odin#L1007-L1094</a></summary>
 
 ```odin
 odin_nif_slot_get_index :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {
@@ -224,7 +224,7 @@ odin_nif_slot_get_index :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_N
 </details>
 
 <details>
-<summary>NIF <code>slot_to_term</code> — <a href="../../native/xitdb_nif.odin#L293-L351">native/xitdb_nif.odin#L293-L351</a></summary>
+<summary>NIF <code>slot_to_term</code> — <a href="../../native/xitdb_nif.odin#L317-L375">native/xitdb_nif.odin#L317-L375</a></summary>
 
 ```odin
 slot_to_term :: proc(env: ErlNifEnv, db: ^xitdb.Database, slot: xitdb.Slot) -> (res: ERL_NIF_TERM, err: xitdb.Error) {

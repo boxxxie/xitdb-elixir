@@ -8,9 +8,9 @@
 
 | Metric | Elixir NIF Wrapper | Raw Odin Baseline | Comparison |
 | :--- | ---: | ---: | ---: |
-| **Median (`ns/op`)** | 59.51 µs (59507.0 ns) | 51.69 µs (51693.0 ns) | **`1.15x`** NIF Ratio |
-| **Mean ± σ (CV)** | 59.48 µs ± 423.3 ns (0.7%) | 51.79 µs ± 461.4 ns (0.9%) | Welch `z` = `27.46` |
-| **p95 / Max (`ns/op`)** | 60.01 µs / 60.13 µs | 52.39 µs / 52.54 µs | `5` vs `5` pooled samples |
+| **Median (`ns/op`)** | 58.23 µs (58235.0 ns) | 52.53 µs (52527.0 ns) | **`1.11x`** NIF Ratio |
+| **Mean ± σ (CV)** | 58.31 µs ± 363.1 ns (0.6%) | 55.93 µs ± 6.49 µs (11.6%) | Welch `z` = `0.82` |
+| **p95 / Max (`ns/op`)** | 58.72 µs / 58.74 µs | 64.88 µs / 67.00 µs | `5` vs `5` pooled samples |
 
 ## Benchmark Harnesses (Elixir vs. Raw Odin)
 
@@ -95,10 +95,16 @@
 </details>
 
 <details>
-<summary>Elixir <code>transact</code> — <a href="../../lib/xitdb.ex#L316-L362">lib/xitdb.ex#L316-L362</a></summary>
+<summary>Elixir <code>transact</code> — <a href="../../lib/xitdb.ex#L316-L339">lib/xitdb.ex#L316-L339</a></summary>
 
 ```elixir
   def transact(db, map_or_fun, opts \\ [])
+
+  def transact(%__MODULE__{db_ref: db_ref} = db, map, [])
+      when is_map(map) and not is_struct(map) do
+    ops = TxCompiler.compile_moment_map(map)
+    do_transact_ops_default(db, db_ref, ops)
+  end
 
   def transact(%__MODULE__{} = db, map, opts) when is_map(map) and not is_struct(map) do
     with {:ok, validated} <- validate_opts(opts, @transact_schema) do
@@ -107,42 +113,13 @@
     end
   end
 
+  def transact(%__MODULE__{db_ref: db_ref} = db, fun, []) when is_function(fun, 1) do
+    run_transact_fun(db, db_ref, fun, -1, :default)
+  end
+
   def transact(%__MODULE__{db_ref: db_ref} = db, fun, opts) when is_function(fun, 1) do
     with {:ok, validated} <- validate_opts(opts, @transact_schema) do
-      base_moment = validated[:base_moment]
-
-      root_cursor = %Cursor{
-        db_ref: db_ref,
-        tag: :hash_map,
-        tag_id: -1,
-        value: base_moment,
-        moment: base_moment,
-        root: true,
-        tx_mode: true
-      }
-
-      try do
-        case fun.(root_cursor) do
-          %Cursor{staged_ops: ops} ->
-            do_transact_ops(db, :lists.reverse(ops), validated)
-
-          {:abort, reason} ->
-            {:error, %Error{reason: reason}}
-
-          other when is_map(other) and not is_struct(other) ->
-            ops = TxCompiler.compile_moment_map(other)
-            do_transact_ops(db, ops, validated)
-
-          other ->
-            {:error, %Error{reason: :invalid_transaction_return, details: %{value: other}}}
-        end
-      rescue
-        e in Error ->
-          {:error, e}
-
-        e ->
-          {:error, %Error{reason: :transaction_exception, details: %{exception: e}}}
-      end
+      run_transact_fun(db, db_ref, fun, validated[:base_moment], validated)
     end
   end
 ```
@@ -172,7 +149,7 @@
 </details>
 
 <details>
-<summary>NIF <code>odin_nif_open</code> — <a href="../../native/xitdb_nif.odin#L568-L643">native/xitdb_nif.odin#L568-L643</a></summary>
+<summary>NIF <code>odin_nif_open</code> — <a href="../../native/xitdb_nif.odin#L627-L702">native/xitdb_nif.odin#L627-L702</a></summary>
 
 ```odin
 odin_nif_open :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {
@@ -256,7 +233,7 @@ odin_nif_open :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -
 </details>
 
 <details>
-<summary>NIF <code>odin_nif_transact</code> — <a href="../../native/xitdb_nif.odin#L3395-L3700">native/xitdb_nif.odin#L3395-L3700</a></summary>
+<summary>NIF <code>odin_nif_transact</code> — <a href="../../native/xitdb_nif.odin#L3744-L4042">native/xitdb_nif.odin#L3744-L4042</a></summary>
 
 ```odin
 odin_nif_transact :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {
@@ -315,11 +292,10 @@ odin_nif_transact :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TER
 			if arity != 3 {
 				return make_err(env, "invalid_put_op")
 			}
-			path_str, ok_p := get_string_from_binary(env, elems[1])
+			steps, s_err, ok_p := decode_steps_term(env, elems[1], tx.allocator)
 			if !ok_p {
 				return make_err(env, "invalid_put_op")
 			}
-			steps, s_err := parse_escaped_steps(path_str, tx.allocator)
 			if s_err != "" {
 				return make_err(env, s_err)
 			}
@@ -343,11 +319,10 @@ odin_nif_transact :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TER
 			if arity != 3 {
 				return make_err(env, "invalid_append_op")
 			}
-			path_str, ok_p := get_string_from_binary(env, elems[1])
+			steps, s_err, ok_p := decode_steps_term(env, elems[1], tx.allocator)
 			if !ok_p {
 				return make_err(env, "invalid_append_op")
 			}
-			steps, s_err := parse_escaped_steps(path_str, tx.allocator)
 			if s_err != "" {
 				return make_err(env, s_err)
 			}
@@ -368,13 +343,12 @@ odin_nif_transact :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TER
 			if arity != 4 {
 				return make_err(env, "invalid_insert_op")
 			}
-			path_str, ok_p := get_string_from_binary(env, elems[1])
 			idx_val: i64 = 0
 			ok_i := nif_get_int64(env, elems[2], &idx_val) != 0
+			steps, s_err, ok_p := decode_steps_term(env, elems[1], tx.allocator)
 			if !ok_p || !ok_i {
 				return make_err(env, "invalid_insert_op")
 			}
-			steps, s_err := parse_escaped_steps(path_str, tx.allocator)
 			if s_err != "" {
 				return make_err(env, s_err)
 			}
@@ -395,11 +369,10 @@ odin_nif_transact :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TER
 			if arity != 2 {
 				return make_err(env, "invalid_rm_op")
 			}
-			path_str, ok_p := get_string_from_binary(env, elems[1])
+			steps, s_err, ok_p := decode_steps_term(env, elems[1], tx.allocator)
 			if !ok_p {
 				return make_err(env, "invalid_rm_op")
 			}
-			steps, s_err := parse_escaped_steps(path_str, tx.allocator)
 			if s_err != "" {
 				return make_err(env, s_err)
 			}
@@ -409,11 +382,10 @@ odin_nif_transact :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TER
 			if arity != 2 {
 				return make_err(env, "invalid_rm_op")
 			}
-			path_str, ok_p := get_string_from_binary(env, elems[1])
+			steps, s_err, ok_p := decode_steps_term(env, elems[1], tx.allocator)
 			if !ok_p {
 				return make_err(env, "invalid_rm_op")
 			}
-			steps, s_err := parse_escaped_steps(path_str, tx.allocator)
 			if s_err != "" {
 				return make_err(env, s_err)
 			}
@@ -425,18 +397,17 @@ odin_nif_transact :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TER
 			if arity != 4 {
 				return make_err(env, "invalid_slice_op")
 			}
-			path_str, ok_p := get_string_from_binary(env, elems[1])
 			offset_val: i64 = 0
 			size_val: i64 = 0
 			ok_o := nif_get_int64(env, elems[2], &offset_val) != 0
 			ok_s := nif_get_int64(env, elems[3], &size_val) != 0
+			steps, s_err, ok_p := decode_steps_term(env, elems[1], tx.allocator)
 			if !ok_p || !ok_o || !ok_s {
 				return make_err(env, "invalid_slice_op")
 			}
 			if offset_val < 0 || size_val < 0 {
 				return make_xitdb_err(env, .Invalid_Range)
 			}
-			steps, s_err := parse_escaped_steps(path_str, tx.allocator)
 			if s_err != "" {
 				return make_err(env, s_err)
 			}
@@ -451,16 +422,14 @@ odin_nif_transact :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TER
 			if arity != 3 {
 				return make_err(env, "invalid_fork_op")
 			}
-			from_str, ok_f := get_string_from_binary(env, elems[1])
-			to_str, ok_t := get_string_from_binary(env, elems[2])
+			from_steps, f_err, ok_f := decode_steps_term(env, elems[1], tx.allocator)
+			to_steps, t_err, ok_t := decode_steps_term(env, elems[2], tx.allocator)
 			if !ok_f || !ok_t {
 				return make_err(env, "invalid_fork_op")
 			}
-			from_steps, f_err := parse_escaped_steps(from_str, tx.allocator)
 			if f_err != "" {
 				return make_err(env, f_err)
 			}
-			to_steps, t_err := parse_escaped_steps(to_str, tx.allocator)
 			if t_err != "" {
 				return make_err(env, t_err)
 			}
@@ -468,7 +437,9 @@ odin_nif_transact :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TER
 				return make_xitdb_err(env, .Invalid_Range)
 			}
 			append(&tx.ops, xitdb.Tx_Op{kind = .Fork, from_steps = from_steps, steps = to_steps})
-			xitdb.tx_savepoint(&tx)
+			if nif_is_empty_list(env, tail) == 0 {
+				xitdb.tx_savepoint(&tx)
+			}
 
 		case ATOM_INDEX_ON:
 			if arity != 4 {
@@ -524,12 +495,11 @@ odin_nif_transact :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TER
 			if arity != 3 {
 				return make_err(env, "invalid_init_col_op")
 			}
-			path_str, ok_p := get_string_from_binary(env, elems[1])
 			kind_str, ok_k := get_string_from_binary(env, elems[2])
+			steps, s_err, ok_p := decode_steps_term(env, elems[1], tx.allocator)
 			if !ok_p || !ok_k || !is_supported_col_kind(kind_str) {
 				return make_err(env, "invalid_init_col_op")
 			}
-			steps, s_err := parse_escaped_steps(path_str, tx.allocator)
 			if s_err != "" {
 				return make_err(env, s_err)
 			}
@@ -570,7 +540,7 @@ odin_nif_transact :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TER
 </details>
 
 <details>
-<summary>NIF <code>odin_nif_sync</code> — <a href="../../native/xitdb_nif.odin#L669-L686">native/xitdb_nif.odin#L669-L686</a></summary>
+<summary>NIF <code>odin_nif_sync</code> — <a href="../../native/xitdb_nif.odin#L728-L745">native/xitdb_nif.odin#L728-L745</a></summary>
 
 ```odin
 odin_nif_sync :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {
@@ -596,7 +566,7 @@ odin_nif_sync :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -
 </details>
 
 <details>
-<summary>NIF <code>odin_nif_info</code> — <a href="../../native/xitdb_nif.odin#L689-L724">native/xitdb_nif.odin#L689-L724</a></summary>
+<summary>NIF <code>odin_nif_info</code> — <a href="../../native/xitdb_nif.odin#L748-L783">native/xitdb_nif.odin#L748-L783</a></summary>
 
 ```odin
 odin_nif_info :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {
@@ -640,7 +610,7 @@ odin_nif_info :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -
 </details>
 
 <details>
-<summary>NIF <code>odin_nif_close</code> — <a href="../../native/xitdb_nif.odin#L646-L666">native/xitdb_nif.odin#L646-L666</a></summary>
+<summary>NIF <code>odin_nif_close</code> — <a href="../../native/xitdb_nif.odin#L705-L725">native/xitdb_nif.odin#L705-L725</a></summary>
 
 ```odin
 odin_nif_close :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {
@@ -669,137 +639,32 @@ odin_nif_close :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) 
 </details>
 
 <details>
-<summary>NIF <code>parse_escaped_steps</code> — <a href="../../native/xitdb_nif.odin#L1619-L1740">native/xitdb_nif.odin#L1619-L1740</a></summary>
+<summary>NIF <code>decode_steps_term</code> — <a href="../../native/xitdb_nif.odin#L2067-L2083">native/xitdb_nif.odin#L2067-L2083</a></summary>
 
 ```odin
-parse_escaped_steps :: proc(path_str: string, allocator := context.temp_allocator) -> (res: []xitdb.Path_Step, err_reason: string) {
-	s := strings.trim_space(path_str)
-	if len(s) == 0 {
-		return nil, ""
+decode_steps_term :: proc(
+	env: ErlNifEnv,
+	term: ERL_NIF_TERM,
+	allocator := context.temp_allocator,
+) -> (res: []xitdb.Path_Step, err_reason: string, term_ok: bool) {
+	stack_buf: [16]xitdb.Path_Step = ---
+	steps, er, ok_t := decode_steps_term_buf(env, term, stack_buf[:], allocator)
+	if !ok_t || er != "" || len(steps) == 0 {
+		return steps, er, ok_t
 	}
-	steps := make([dynamic]xitdb.Path_Step, 0, 8, allocator)
-	i := 0
-
-	for i < len(s) {
-		ch := s[i]
-		switch ch {
-		case '.':
-			i += 1
-			key, next_i, er := parse_escaped_ident_or_bracket(s, i, allocator)
-			if er != "" {
-				return nil, er
-			}
-			append(&steps, xitdb.Path_Step{kind = .Hash_Map_Key, key = key})
-			i = next_i
-
-		case '#':
-			i += 1
-			kind := xitdb.Step_Kind.Counted_Hash_Map_Key
-			if i < len(s) && s[i] == '%' {
-				kind = .Counted_Set_Member
-				i += 1
-			}
-			key, next_i, er := parse_escaped_ident_or_bracket(s, i, allocator)
-			if er != "" {
-				return nil, er
-			}
-			append(&steps, xitdb.Path_Step{kind = kind, key = key})
-			i = next_i
-
-		case '$':
-			i += 1
-			key, next_i, er := parse_escaped_ident_or_bracket(s, i, allocator)
-			if er != "" {
-				return nil, er
-			}
-			append(&steps, xitdb.Path_Step{kind = .Sorted_Map_Key, key = key})
-			i = next_i
-
-		case '%':
-			i += 1
-			key, next_i, er := parse_escaped_ident_or_bracket(s, i, allocator)
-			if er != "" {
-				return nil, er
-			}
-			append(&steps, xitdb.Path_Step{kind = .Hash_Set_Member, key = key})
-			i = next_i
-
-		case '^':
-			i += 1
-			key, next_i, er := parse_escaped_ident_or_bracket(s, i, allocator)
-			if er != "" {
-				return nil, er
-			}
-			append(&steps, xitdb.Path_Step{kind = .Sorted_Set_Member, key = key})
-			i = next_i
-
-		case '[':
-			if i + 1 < len(s) && s[i + 1] == '[' {
-				i += 2
-				start := i
-				for i < len(s) && s[i] != ']' {
-					i += 1
-				}
-				if i + 1 >= len(s) || s[i] != ']' || s[i + 1] != ']' {
-					return nil, "invalid_selector"
-				}
-				idx_str := strings.trim_space(s[start:i])
-				idx, ok := strconv.parse_i64(idx_str)
-				if !ok {
-					return nil, "invalid_selector"
-				}
-				append(&steps, xitdb.Path_Step{kind = .Linked_List_Idx, index = idx})
-				i += 2
-			} else if i + 1 < len(s) && (s[i + 1] == '"' || s[i + 1] == '\'') {
-				key, next_i, er := parse_escaped_bracketed_string(s, i, allocator)
-				if er != "" {
-					return nil, er
-				}
-				step_kind := xitdb.Step_Kind.Hash_Map_Key
-				if len(steps) == 1 {
-					if steps[0].kind == .Counted_Hash_Map_Key {
-						steps[0].kind = .Hash_Map_Key
-						step_kind = .Counted_Hash_Map_Key
-					} else if steps[0].kind == .Sorted_Map_Key {
-						steps[0].kind = .Hash_Map_Key
-						step_kind = .Sorted_Map_Key
-					}
-				}
-				append(&steps, xitdb.Path_Step{kind = step_kind, key = key})
-				i = next_i
-			} else {
-				i += 1
-				start := i
-				for i < len(s) && s[i] != ']' {
-					i += 1
-				}
-				if i >= len(s) || s[i] != ']' {
-					return nil, "invalid_selector"
-				}
-				idx_str := strings.trim_space(s[start:i])
-				idx, ok := strconv.parse_i64(idx_str)
-				if !ok {
-					return nil, "invalid_selector"
-				}
-				append(&steps, xitdb.Path_Step{kind = .Array_List_Idx, index = idx})
-				i += 1
-			}
-
-		case:
-			key, next_i, er := parse_escaped_ident_or_bracket(s, i, allocator)
-			if er != "" {
-				return nil, er
-			}
-			append(&steps, xitdb.Path_Step{kind = .Hash_Map_Key, key = key})
-			i = next_i
-		}
+	if raw_data(steps) == raw_data(stack_buf[:]) {
+		out := make([]xitdb.Path_Step, len(steps), allocator)
+		copy(out, steps)
+		return out, "", true
 	}
+	return steps, "", true
+}
 ```
 
 </details>
 
 <details>
-<summary>NIF <code>decode_writeable_value</code> — <a href="../../native/xitdb_nif.odin#L1827-L1877">native/xitdb_nif.odin#L1827-L1877</a></summary>
+<summary>NIF <code>decode_writeable_value</code> — <a href="../../native/xitdb_nif.odin#L2176-L2226">native/xitdb_nif.odin#L2176-L2226</a></summary>
 
 ```odin
 decode_writeable_value :: proc(env: ErlNifEnv, term: ERL_NIF_TERM) -> (xitdb.Writeable_Data, bool) {
@@ -858,7 +723,7 @@ decode_writeable_value :: proc(env: ErlNifEnv, term: ERL_NIF_TERM) -> (xitdb.Wri
 </details>
 
 <details>
-<summary>NIF <code>validate_write_term</code> — <a href="../../native/xitdb_nif.odin#L1924-L2005">native/xitdb_nif.odin#L1924-L2005</a></summary>
+<summary>NIF <code>validate_write_term</code> — <a href="../../native/xitdb_nif.odin#L2273-L2354">native/xitdb_nif.odin#L2273-L2354</a></summary>
 
 ```odin
 validate_write_term :: proc(env: ErlNifEnv, term: ERL_NIF_TERM) -> bool {
