@@ -12,7 +12,8 @@ import "core:time"
 import "core:unicode/utf8"
 import xitdb "xitdb:."
 
-MAX_RUNS :: 64
+MAX_RUNS        :: 64
+MAX_TOTAL_RANKS :: 32
 
 Bench_Record :: struct {
 	rank:       int,
@@ -23,13 +24,21 @@ Bench_Record :: struct {
 	runs:       int,
 }
 
-g_runs: int = 5
-g_warmup: int = 1
-g_commit_sha: string = "unknown"
-g_run_id: string = "run-0"
-g_jsonl_path: string = "benchmarks/odin.jsonl"
-g_history_path: string = "benchmarks/history.jsonl"
-g_records: [dynamic]Bench_Record
+g_runs:           int = 5
+g_warmup:         int = 1
+g_commit_sha:     string = "unknown"
+g_run_id:         string = "run-0"
+g_append_primary: bool = false
+g_save_history:   bool = true
+g_jsonl_path:     string = "benchmarks/odin.jsonl"
+g_history_path:   string = "benchmarks/history.jsonl"
+g_groups_filter:  string = ""
+g_name_filter:    string = ""
+g_records:        [dynamic]Bench_Record
+
+g_selective_run:  bool = false
+g_existing_lines: [MAX_TOTAL_RANKS]string
+g_updated_lines:  [MAX_TOTAL_RANKS]string
 
 resolve_git_commit :: proc(allocator := context.allocator) -> string {
 	head_bytes, err := os.read_entire_file(".git/HEAD", allocator)
@@ -47,12 +56,180 @@ resolve_git_commit :: proc(allocator := context.allocator) -> string {
 			}
 			return sha
 		}
+		if packed_bytes, p_err := os.read_entire_file(".git/packed-refs", allocator); p_err == nil {
+			lines := strings.split_lines(string(packed_bytes), allocator)
+			suffix := fmt.aprintf(" %s", ref_rel, allocator = allocator)
+			for line in lines {
+				trimmed := strings.trim_space(line)
+				if len(trimmed) == 0 || strings.has_prefix(trimmed, "#") || strings.has_prefix(trimmed, "^") {
+					continue
+				}
+				if strings.has_suffix(trimmed, suffix) && len(trimmed) >= 12 {
+					return trimmed[:12]
+				}
+			}
+		}
 		return "unknown"
 	}
 	if len(head_str) > 12 {
 		return head_str[:12]
 	}
 	return head_str
+}
+
+parse_cli_args :: proc() {
+	g_commit_sha = resolve_git_commit()
+	unix_sec := i64(time.to_unix_nanoseconds(time.now())) / 1_000_000_000
+	g_run_id = fmt.aprintf("run-%d", unix_sec)
+
+	args := os.args[1:]
+	i := 0
+	for i < len(args) {
+		arg := args[i]
+		if arg == "--append" || arg == "-append" {
+			g_append_primary = true
+		} else if arg == "--no-history" || arg == "-no-history" {
+			g_save_history = false
+		} else if (arg == "--runs" || arg == "-runs") && i + 1 < len(args) {
+			if v, ok := strconv.parse_int(args[i + 1]); ok && v > 0 {
+				g_runs = clamp(v, 1, MAX_RUNS)
+			}
+			i += 1
+		} else if strings.has_prefix(arg, "--runs=") || strings.has_prefix(arg, "-runs:") {
+			eq := strings.index_any(arg, "=:")
+			if v, ok := strconv.parse_int(arg[eq + 1:]); ok && v > 0 {
+				g_runs = clamp(v, 1, MAX_RUNS)
+			}
+		} else if (arg == "--warmup" || arg == "-warmup") && i + 1 < len(args) {
+			if v, ok := strconv.parse_int(args[i + 1]); ok && v >= 0 {
+				g_warmup = v
+			}
+			i += 1
+		} else if strings.has_prefix(arg, "--warmup=") || strings.has_prefix(arg, "-warmup:") {
+			eq := strings.index_any(arg, "=:")
+			if v, ok := strconv.parse_int(arg[eq + 1:]); ok && v >= 0 {
+				g_warmup = v
+			}
+		} else if (arg == "--commit" || arg == "-commit") && i + 1 < len(args) {
+			g_commit_sha = args[i + 1]
+			i += 1
+		} else if strings.has_prefix(arg, "--commit=") || strings.has_prefix(arg, "-commit:") {
+			eq := strings.index_any(arg, "=:")
+			g_commit_sha = arg[eq + 1:]
+		} else if (arg == "--run-id" || arg == "-run-id") && i + 1 < len(args) {
+			g_run_id = args[i + 1]
+			i += 1
+		} else if strings.has_prefix(arg, "--run-id=") || strings.has_prefix(arg, "-run-id:") {
+			eq := strings.index_any(arg, "=:")
+			g_run_id = arg[eq + 1:]
+		} else if (arg == "--output" || arg == "-output") && i + 1 < len(args) {
+			g_jsonl_path = args[i + 1]
+			i += 1
+		} else if strings.has_prefix(arg, "--output=") || strings.has_prefix(arg, "-output:") {
+			eq := strings.index_any(arg, "=:")
+			g_jsonl_path = arg[eq + 1:]
+		} else if (arg == "--history" || arg == "-history") && i + 1 < len(args) {
+			g_history_path = args[i + 1]
+			i += 1
+		} else if strings.has_prefix(arg, "--history=") || strings.has_prefix(arg, "-history:") {
+			eq := strings.index_any(arg, "=:")
+			g_history_path = arg[eq + 1:]
+		} else if (arg == "--groups" || arg == "-groups" || arg == "--group" || arg == "-group") && i + 1 < len(args) {
+			g_groups_filter = args[i + 1]
+			i += 1
+		} else if strings.has_prefix(arg, "--groups=") || strings.has_prefix(arg, "-groups:") || strings.has_prefix(arg, "--group=") || strings.has_prefix(arg, "-group:") {
+			eq := strings.index_any(arg, "=:")
+			g_groups_filter = arg[eq + 1:]
+		} else if (arg == "--filter" || arg == "-filter") && i + 1 < len(args) {
+			g_name_filter = args[i + 1]
+			i += 1
+		} else if strings.has_prefix(arg, "--filter=") || strings.has_prefix(arg, "-filter:") {
+			eq := strings.index_any(arg, "=:")
+			g_name_filter = arg[eq + 1:]
+		}
+		i += 1
+	}
+	g_selective_run = (len(g_groups_filter) > 0 && g_groups_filter != "all") || len(g_name_filter) > 0
+}
+
+rank_group :: proc(rank: int) -> string {
+	switch {
+	case rank >= 1 && rank <= 5:
+		return "access"
+	case rank >= 6 && rank <= 11:
+		return "enumerable"
+	case rank >= 12 && rank <= 16:
+		return "transactions"
+	case rank >= 17 && rank <= 20:
+		return "time_travel"
+	case rank >= 21 && rank <= 26:
+		return "queries"
+	case:
+		return "unknown"
+	}
+}
+
+should_run_group :: proc(group_name: string) -> bool {
+	if len(g_groups_filter) == 0 || g_groups_filter == "all" {
+		return true
+	}
+	parts := strings.split_multi(g_groups_filter, {",", "|"}, context.temp_allocator)
+	for raw_p in parts {
+		p := strings.to_lower(strings.trim_space(raw_p), context.temp_allocator)
+		if len(p) == 0 do continue
+		if p == "all" || p == group_name {
+			return true
+		}
+		if (p == "enum" || p == "stream" || p == "materialize") && group_name == "enumerable" {
+			return true
+		}
+		if (p == "tx" || p == "transaction") && group_name == "transactions" {
+			return true
+		}
+		if (p == "time-travel" || p == "timetravel" || p == "history" || p == "lifecycle" || p == "compact" || p == "compaction") && group_name == "time_travel" {
+			return true
+		}
+		if (p == "query" || p == "search" || p == "storage" || p == "datalog" || p == "pull" || p == "bm25") && group_name == "queries" {
+			return true
+		}
+	}
+	return false
+}
+
+matches_name_filter :: proc(bench_name: string) -> bool {
+	if len(g_name_filter) == 0 {
+		return true
+	}
+	lower_name := strings.to_lower(bench_name, context.temp_allocator)
+	parts := strings.split_multi(g_name_filter, {"|", ","}, context.temp_allocator)
+	for raw_p in parts {
+		p := strings.to_lower(strings.trim_space(raw_p), context.temp_allocator)
+		if len(p) > 0 && strings.contains(lower_name, p) {
+			return true
+		}
+	}
+	return false
+}
+
+should_run_bench :: proc(rank: int, bench_name: string) -> bool {
+	return should_run_group(rank_group(rank)) && matches_name_filter(bench_name)
+}
+
+load_existing_jsonl_ranks :: proc(path: string) {
+	data, err := os.read_entire_file(path, context.allocator)
+	if err != nil do return
+	lines := strings.split_lines(string(data), context.allocator)
+	prefix :: "{\"rank\":"
+	for raw_line in lines {
+		line := strings.trim_space(raw_line)
+		if !strings.has_prefix(line, prefix) do continue
+		rest := line[len(prefix):]
+		comma := strings.index_byte(rest, ',')
+		if comma <= 0 do continue
+		if r, ok := strconv.parse_int(rest[:comma]); ok && r >= 1 && r < MAX_TOTAL_RANKS {
+			g_existing_lines[r] = fmt.aprintf("%s\n", line)
+		}
+	}
 }
 
 calc_percentile :: proc(sorted: []f64, p: f64) -> f64 {
@@ -71,7 +248,11 @@ calc_percentile :: proc(sorted: []f64, p: f64) -> f64 {
 }
 
 emit_jsonl :: proc() {
-	sb := strings.builder_make(context.temp_allocator)
+	if len(g_records) == 0 {
+		return
+	}
+
+	new_sb := strings.builder_make(context.temp_allocator)
 	for rec in g_records {
 		samples := make([]f64, rec.runs, context.temp_allocator)
 		for i in 0 ..< rec.runs {
@@ -105,8 +286,9 @@ emit_jsonl :: proc() {
 		total_ms := (med_ns * f64(max(rec.ops, 1))) / 1e6
 		ops_per_sec := i64(math.round(1e9 / max(med_ns, 1.0)))
 
+		line_sb := strings.builder_make(context.temp_allocator)
 		fmt.sbprintf(
-			&sb,
+			&line_sb,
 			"{{\"rank\":%d,\"lang\":\"odin\",\"commit\":\"%s\",\"run_id\":\"%s\",\"name\":\"%s\",\"ops\":%d,\"runs\":%d,\"warmup\":%d,\"total_ms\":%.3f,\"ns_per_op\":%d,\"mean_ns\":%.2f,\"median_ns\":%.2f,\"stddev_ns\":%.2f,\"variance_ns2\":%.2f,\"cv_pct\":%.2f,\"min_ns\":%d,\"max_ns\":%d,\"iqr_ns\":%.2f,\"p95_ns\":%d,\"p99_ns\":%d,\"ops_per_sec\":%d,\"bytes_used\":%d,\"samples_ns\":[",
 			rec.rank,
 			g_commit_sha,
@@ -132,19 +314,47 @@ emit_jsonl :: proc() {
 		)
 		for i in 0 ..< rec.runs {
 			if i > 0 {
-				strings.write_byte(&sb, ',')
+				strings.write_byte(&line_sb, ',')
 			}
-			fmt.sbprintf(&sb, "%d", i64(math.round(rec.samples_ns[i])))
+			fmt.sbprintf(&line_sb, "%d", i64(math.round(rec.samples_ns[i])))
 		}
-		strings.write_string(&sb, "]}\n")
+		strings.write_string(&line_sb, "]}\n")
+
+		line_str := strings.to_string(line_sb)
+		strings.write_string(&new_sb, line_str)
+		if rec.rank >= 1 && rec.rank < MAX_TOTAL_RANKS {
+			g_updated_lines[rec.rank] = strings.clone(line_str, context.allocator)
+		}
 	}
 
-	payload := strings.to_string(sb)
-	_ = os.write_entire_file(g_jsonl_path, transmute([]u8)payload)
+	new_payload := strings.to_string(new_sb)
 
-	if hist_f, err := os.open(g_history_path, {.Write, .Create, .Append}, os.Permissions_Default_File); err == nil {
-		_, _ = os.write_string(hist_f, payload)
-		_ = os.close(hist_f)
+	if g_append_primary {
+		if f, err := os.open(g_jsonl_path, {.Write, .Create, .Append}, os.Permissions_Default_File); err == nil {
+			_, _ = os.write_string(f, new_payload)
+			_ = os.close(f)
+		}
+	} else if g_selective_run {
+		load_existing_jsonl_ranks(g_jsonl_path)
+		merged_sb := strings.builder_make(context.temp_allocator)
+		for r in 1 ..< MAX_TOTAL_RANKS {
+			if len(g_updated_lines[r]) > 0 {
+				strings.write_string(&merged_sb, g_updated_lines[r])
+			} else if len(g_existing_lines[r]) > 0 {
+				strings.write_string(&merged_sb, g_existing_lines[r])
+			}
+		}
+		merged_payload := strings.to_string(merged_sb)
+		_ = os.write_entire_file(g_jsonl_path, transmute([]u8)merged_payload)
+	} else {
+		_ = os.write_entire_file(g_jsonl_path, transmute([]u8)new_payload)
+	}
+
+	if g_save_history {
+		if hist_f, err := os.open(g_history_path, {.Write, .Create, .Append}, os.Permissions_Default_File); err == nil {
+			_, _ = os.write_string(hist_f, new_payload)
+			_ = os.close(hist_f)
+		}
 	}
 }
 
@@ -158,10 +368,19 @@ record_samples :: proc(rank: int, name: string, ops: int, samples: [MAX_RUNS]f64
 		runs       = g_runs,
 	}
 	append(&g_records, rec)
-	fmt.printf("  [Odin #%02d] %-56s %8.0f ns/op\n", rank, name, samples[0])
+	sorted := make([]f64, g_runs, context.temp_allocator)
+	for i in 0 ..< g_runs {
+		sorted[i] = samples[i]
+	}
+	slice.sort(sorted)
+	med := calc_percentile(sorted, 0.50)
+	fmt.printf("  [Odin #%02d] %-56s %8.0f ns/op\n", rank, name, med)
 }
 
 run_bench :: proc(rank: int, name: string, ops: int, fn: proc() -> (time.Duration, i64)) {
+	if !should_run_bench(rank, name) {
+		return
+	}
 	for _ in 0 ..< g_warmup {
 		_, _ = fn()
 		free_all(context.temp_allocator)
@@ -456,228 +675,277 @@ bench_raw_bm25_search :: proc(root_map: xitdb.Read_Hash_Map, collection: string,
 }
 
 main :: proc() {
-	g_commit_sha = resolve_git_commit()
-	unix_sec := i64(time.to_unix_nanoseconds(time.now())) / 1_000_000_000
-	g_run_id = fmt.aprintf("run-%d", unix_sec)
-
-	args := os.args[1:]
-	for i := 0; i < len(args); i += 1 {
-		if (args[i] == "--runs" || args[i] == "-runs") && i + 1 < len(args) {
-			if v, ok := strconv.parse_int(args[i + 1]); ok && v > 0 {
-				g_runs = clamp(v, 1, MAX_RUNS)
-			}
-			i += 1
-		}
-	}
-
+	parse_cli_args()
 	g_records = make([dynamic]Bench_Record, 0, 26)
 
+	r1 := should_run_bench(1, "Access: 3-hop lazy HAMT lookup (root[users][id][name])")
+	r2 := should_run_bench(2, "Access: Single-call selector select(.users.<id>.name)")
+	r3 := should_run_bench(3, "Access: Sorted_Map B+Tree key lookup (sorted[key])")
+	r4 := should_run_bench(4, "Access: Array_List random index lookup (items[idx])")
+	r5 := should_run_bench(5, "Access: Linked_Array_List random index lookup (linked[idx])")
+	r6 := should_run_bench(6, "Enum: O(1) Enum.count/1 on Counted_Hash_Map (N=500)")
+	r7 := should_run_bench(7, "Enum: O(1) Enum.member?/2 on Counted_Hash_Set (N=500)")
+	r8 := should_run_bench(8, "Enum: O(log N) Enum.slice/2 window (offset 200, len 20)")
+	r9 := should_run_bench(9, "Stream: Lazy Stream.take(10) early-halt on Sorted_Map")
+	r10 := should_run_bench(10, "Enum: Full Enum.to_list/1 stream over Array_List (N=500)")
+	r11 := should_run_bench(11, "Materialize: Eager subtree materialize/1 (user profile)")
+	r16 := should_run_bench(16, "Tx: O(1) zero-copy subtree fork (500 entities)")
+	r17 := should_run_bench(17, "Time-Travel: Historical as_of(db, m) across 100 moments")
+	r18 := should_run_bench(18, "Time-Travel: history_of(db, selector) (100 moments)")
+	r19 := should_run_bench(19, "Time-Travel: diff_moments (1 of 200 entities mutated)")
+	r20 := should_run_bench(20, "Lifecycle: compact/1 100-moment database deduplication")
+	r21 := should_run_bench(21, "Query: Datomic pull projection (4 attrs + nested slice)")
+	r22 := should_run_bench(22, "Query: Datalog B+Tree index prefix + join (N=200)")
+	r23 := should_run_bench(23, "Query: Datalog grouped aggregation (count + sum, N=200)")
+	r25 := should_run_bench(25, "Search: Sorted_Map B+Tree prefix seek (limit=16)")
+	r26 := should_run_bench(26, "Search: BM25 corpus search (N=200, 2-term prefix, limit=10)")
+
+	need_main_db := r1 || r2 || r3 || r4 || r5 || r6 || r7 || r8 || r9 || r10 || r11 || r21 || r25
+	need_hist_db := r17 || r18 || r20
+	need_diff_db := r19 || r22 || r23
+	need_search_db := r26
+
 	// Shared fixture DB for read/query benchmarks (N=500)
-	core := xitdb.core_memory_init()
-	defer xitdb.core_destroy(&core)
-	db, _ := xitdb.database_init(&core, xitdb.sha1_hasher())
-	seed_fixture_db(&core, &db, 500)
+	core: xitdb.Core
+	db: xitdb.Database
+	m0_map: xitdb.Read_Hash_Map
+	users_map: xitdb.Read_Hash_Map
+	sorted_map: xitdb.Read_Sorted_Map
+	items_al: xitdb.Read_Array_List
+	linked_ll: xitdb.Read_Linked_Array_List
+	cusers_chm: xitdb.Read_Counted_Hash_Map
+	cset_chs: xitdb.Read_Counted_Hash_Set
+	defer if need_main_db {
+		xitdb.core_destroy(&core)
+	}
+	if need_main_db {
+		core = xitdb.core_memory_init()
+		db, _ = xitdb.database_init(&core, xitdb.sha1_hasher())
+		seed_fixture_db(&core, &db, 500)
 
-	rc := xitdb.database_root_cursor(&db).read_cursor
-	hist, _ := xitdb.read_array_list_init(rc)
-	m0_cur_maybe, _ := xitdb.array_list_get_cursor(hist, 0)
-	m0_cur := m0_cur_maybe.?
-	m0_map, _ := xitdb.read_hash_map_init(m0_cur)
+		rc := xitdb.database_root_cursor(&db).read_cursor
+		hist, _ := xitdb.read_array_list_init(rc)
+		m0_cur_maybe, _ := xitdb.array_list_get_cursor(hist, 0)
+		m0_cur := m0_cur_maybe.?
+		m0_map, _ = xitdb.read_hash_map_init(m0_cur)
 
-	users_cur_maybe, _ := xitdb.hash_map_get_cursor(m0_map, "users")
-	users_map, _ := xitdb.read_hash_map_init(users_cur_maybe.?)
-	sorted_cur_maybe, _ := xitdb.hash_map_get_cursor(m0_map, "sorted_users")
-	sorted_map, _ := xitdb.read_sorted_map_init(sorted_cur_maybe.?)
-	items_cur_maybe, _ := xitdb.hash_map_get_cursor(m0_map, "items")
-	items_al, _ := xitdb.read_array_list_init(items_cur_maybe.?)
-	linked_cur_maybe, _ := xitdb.hash_map_get_cursor(m0_map, "linked")
-	linked_ll, _ := xitdb.read_linked_array_list_init(linked_cur_maybe.?)
-	cusers_cur_maybe, _ := xitdb.hash_map_get_cursor(m0_map, "counted_users")
-	cusers_chm, _ := xitdb.read_counted_hash_map_init(cusers_cur_maybe.?)
-	cset_cur_maybe, _ := xitdb.hash_map_get_cursor(m0_map, "counted_set")
-	cset_chs, _ := xitdb.read_counted_hash_set_init(cset_cur_maybe.?)
+		users_cur_maybe, _ := xitdb.hash_map_get_cursor(m0_map, "users")
+		users_map, _ = xitdb.read_hash_map_init(users_cur_maybe.?)
+		sorted_cur_maybe, _ := xitdb.hash_map_get_cursor(m0_map, "sorted_users")
+		sorted_map, _ = xitdb.read_sorted_map_init(sorted_cur_maybe.?)
+		items_cur_maybe, _ := xitdb.hash_map_get_cursor(m0_map, "items")
+		items_al, _ = xitdb.read_array_list_init(items_cur_maybe.?)
+		linked_cur_maybe, _ := xitdb.hash_map_get_cursor(m0_map, "linked")
+		linked_ll, _ = xitdb.read_linked_array_list_init(linked_cur_maybe.?)
+		cusers_cur_maybe, _ := xitdb.hash_map_get_cursor(m0_map, "counted_users")
+		cusers_chm, _ = xitdb.read_counted_hash_map_init(cusers_cur_maybe.?)
+		cset_cur_maybe, _ := xitdb.hash_map_get_cursor(m0_map, "counted_set")
+		cset_chs, _ = xitdb.read_counted_hash_set_init(cset_cur_maybe.?)
+	}
 
 	samples: [MAX_RUNS]f64
 
 	// #1: 3-hop lazy HAMT lookup
-	for r in 0 ..< (g_warmup + g_runs) {
-		t0 := time.now()
-		for i in 0 ..< 500 {
-			uid := fmt.tprintf("u%d", i)
-			u_cur, _ := xitdb.hash_map_get_cursor(m0_map, "users")
-			um, _ := xitdb.read_hash_map_init(u_cur.?)
-			id_cur, _ := xitdb.hash_map_get_cursor(um, uid)
-			idm, _ := xitdb.read_hash_map_init(id_cur.?)
-			n_cur, _ := xitdb.hash_map_get_cursor(idm, "name")
-			_, _ = xitdb.cursor_read_string(n_cur.?, 0, context.temp_allocator)
+	if r1 {
+		for r in 0 ..< (g_warmup + g_runs) {
+			t0 := time.now()
+			for i in 0 ..< 500 {
+				uid := fmt.tprintf("u%d", i)
+				u_cur, _ := xitdb.hash_map_get_cursor(m0_map, "users")
+				um, _ := xitdb.read_hash_map_init(u_cur.?)
+				id_cur, _ := xitdb.hash_map_get_cursor(um, uid)
+				idm, _ := xitdb.read_hash_map_init(id_cur.?)
+				n_cur, _ := xitdb.hash_map_get_cursor(idm, "name")
+				_, _ = xitdb.cursor_read_string(n_cur.?, 0, context.temp_allocator)
+			}
+			if r >= g_warmup {
+				samples[r - g_warmup] = f64(time.duration_nanoseconds(time.since(t0))) / 500.0
+			}
+			free_all(context.temp_allocator)
 		}
-		if r >= g_warmup {
-			samples[r - g_warmup] = f64(time.duration_nanoseconds(time.since(t0))) / 500.0
-		}
-		free_all(context.temp_allocator)
+		record_samples(1, "Access: 3-hop lazy HAMT lookup (root[users][id][name])", 500, samples)
 	}
-	record_samples(1, "Access: 3-hop lazy HAMT lookup (root[users][id][name])", 500, samples)
 
 	// #2: Single-call selector
-	for r in 0 ..< (g_warmup + g_runs) {
-		t0 := time.now()
-		for i in 0 ..< 500 {
-			sel := fmt.tprintf("@-1.users.u%d.name", i)
-			_, _ = xitdb.get_string(&db, sel, context.temp_allocator)
+	if r2 {
+		for r in 0 ..< (g_warmup + g_runs) {
+			t0 := time.now()
+			for i in 0 ..< 500 {
+				sel := fmt.tprintf("@-1.users.u%d.name", i)
+				_, _ = xitdb.get_string(&db, sel, context.temp_allocator)
+			}
+			if r >= g_warmup {
+				samples[r - g_warmup] = f64(time.duration_nanoseconds(time.since(t0))) / 500.0
+			}
+			free_all(context.temp_allocator)
 		}
-		if r >= g_warmup {
-			samples[r - g_warmup] = f64(time.duration_nanoseconds(time.since(t0))) / 500.0
-		}
-		free_all(context.temp_allocator)
+		record_samples(2, "Access: Single-call selector select(.users.<id>.name)", 500, samples)
 	}
-	record_samples(2, "Access: Single-call selector select(.users.<id>.name)", 500, samples)
 
 	// #3: Sorted_Map B+Tree key lookup
-	for r in 0 ..< (g_warmup + g_runs) {
-		t0 := time.now()
-		for i in 0 ..< 500 {
-			uid := fmt.tprintf("u%d", i)
-			vc, _ := xitdb.sorted_map_get_cursor(sorted_map, uid)
-			_, _ = xitdb.cursor_read_string(vc.?, 0, context.temp_allocator)
+	if r3 {
+		for r in 0 ..< (g_warmup + g_runs) {
+			t0 := time.now()
+			for i in 0 ..< 500 {
+				uid := fmt.tprintf("u%d", i)
+				vc, _ := xitdb.sorted_map_get_cursor(sorted_map, uid)
+				_, _ = xitdb.cursor_read_string(vc.?, 0, context.temp_allocator)
+			}
+			if r >= g_warmup {
+				samples[r - g_warmup] = f64(time.duration_nanoseconds(time.since(t0))) / 500.0
+			}
+			free_all(context.temp_allocator)
 		}
-		if r >= g_warmup {
-			samples[r - g_warmup] = f64(time.duration_nanoseconds(time.since(t0))) / 500.0
-		}
-		free_all(context.temp_allocator)
+		record_samples(3, "Access: Sorted_Map B+Tree key lookup (sorted[key])", 500, samples)
 	}
-	record_samples(3, "Access: Sorted_Map B+Tree key lookup (sorted[key])", 500, samples)
 
 	// #4: Array_List random index lookup
-	for r in 0 ..< (g_warmup + g_runs) {
-		t0 := time.now()
-		for i in 0 ..< 500 {
-			ec, _ := xitdb.array_list_get_cursor(items_al, i64((i * 37) % 500))
-			_, _ = xitdb.cursor_read_string(ec.?, 0, context.temp_allocator)
+	if r4 {
+		for r in 0 ..< (g_warmup + g_runs) {
+			t0 := time.now()
+			for i in 0 ..< 500 {
+				ec, _ := xitdb.array_list_get_cursor(items_al, i64((i * 37) % 500))
+				_, _ = xitdb.cursor_read_string(ec.?, 0, context.temp_allocator)
+			}
+			if r >= g_warmup {
+				samples[r - g_warmup] = f64(time.duration_nanoseconds(time.since(t0))) / 500.0
+			}
+			free_all(context.temp_allocator)
 		}
-		if r >= g_warmup {
-			samples[r - g_warmup] = f64(time.duration_nanoseconds(time.since(t0))) / 500.0
-		}
-		free_all(context.temp_allocator)
+		record_samples(4, "Access: Array_List random index lookup (items[idx])", 500, samples)
 	}
-	record_samples(4, "Access: Array_List random index lookup (items[idx])", 500, samples)
 
 	// #5: Linked_Array_List random index lookup
-	for r in 0 ..< (g_warmup + g_runs) {
-		t0 := time.now()
-		for i in 0 ..< 500 {
-			ec, _ := xitdb.linked_array_list_get_cursor(linked_ll, i64((i * 37) % 500))
-			_, _ = xitdb.cursor_read_string(ec.?, 0, context.temp_allocator)
+	if r5 {
+		for r in 0 ..< (g_warmup + g_runs) {
+			t0 := time.now()
+			for i in 0 ..< 500 {
+				ec, _ := xitdb.linked_array_list_get_cursor(linked_ll, i64((i * 37) % 500))
+				_, _ = xitdb.cursor_read_string(ec.?, 0, context.temp_allocator)
+			}
+			if r >= g_warmup {
+				samples[r - g_warmup] = f64(time.duration_nanoseconds(time.since(t0))) / 500.0
+			}
+			free_all(context.temp_allocator)
 		}
-		if r >= g_warmup {
-			samples[r - g_warmup] = f64(time.duration_nanoseconds(time.since(t0))) / 500.0
-		}
-		free_all(context.temp_allocator)
+		record_samples(5, "Access: Linked_Array_List random index lookup (linked[idx])", 500, samples)
 	}
-	record_samples(5, "Access: Linked_Array_List random index lookup (linked[idx])", 500, samples)
 
 	// #6: O(1) Counted_Hash_Map count
-	for r in 0 ..< (g_warmup + g_runs) {
-		t0 := time.now()
-		for _ in 0 ..< 1000 {
-			_, _ = xitdb.counted_hash_map_count(cusers_chm)
+	if r6 {
+		for r in 0 ..< (g_warmup + g_runs) {
+			t0 := time.now()
+			for _ in 0 ..< 1000 {
+				_, _ = xitdb.counted_hash_map_count(cusers_chm)
+			}
+			if r >= g_warmup {
+				samples[r - g_warmup] = f64(time.duration_nanoseconds(time.since(t0))) / 1000.0
+			}
 		}
-		if r >= g_warmup {
-			samples[r - g_warmup] = f64(time.duration_nanoseconds(time.since(t0))) / 1000.0
-		}
+		record_samples(6, "Enum: O(1) Enum.count/1 on Counted_Hash_Map (N=500)", 1000, samples)
 	}
-	record_samples(6, "Enum: O(1) Enum.count/1 on Counted_Hash_Map (N=500)", 1000, samples)
 
 	// #7: O(1) Counted_Hash_Set membership check
-	for r in 0 ..< (g_warmup + g_runs) {
-		t0 := time.now()
-		for i in 0 ..< 1000 {
-			uid := fmt.tprintf("u%d", i % 500)
-			_, _ = xitdb.hash_set_get_slot(cset_chs.read_hash_set, uid)
+	if r7 {
+		for r in 0 ..< (g_warmup + g_runs) {
+			t0 := time.now()
+			for i in 0 ..< 1000 {
+				uid := fmt.tprintf("u%d", i % 500)
+				_, _ = xitdb.hash_set_get_slot(cset_chs.read_hash_set, uid)
+			}
+			if r >= g_warmup {
+				samples[r - g_warmup] = f64(time.duration_nanoseconds(time.since(t0))) / 1000.0
+			}
+			free_all(context.temp_allocator)
 		}
-		if r >= g_warmup {
-			samples[r - g_warmup] = f64(time.duration_nanoseconds(time.since(t0))) / 1000.0
-		}
-		free_all(context.temp_allocator)
+		record_samples(7, "Enum: O(1) Enum.member?/2 on Counted_Hash_Set (N=500)", 1000, samples)
 	}
-	record_samples(7, "Enum: O(1) Enum.member?/2 on Counted_Hash_Set (N=500)", 1000, samples)
 
 	// #8: O(log N) Enum.slice window
-	for r in 0 ..< (g_warmup + g_runs) {
-		t0 := time.now()
-		for _ in 0 ..< 200 {
-			it, _ := xitdb.cursor_iterator_array_list_from_index(items_al.cursor, 200)
-			for _ in 0 ..< 20 {
-				nm, _ := xitdb.cursor_iterator_next(&it)
-				if ec, ok := nm.?; ok {
+	if r8 {
+		for r in 0 ..< (g_warmup + g_runs) {
+			t0 := time.now()
+			for _ in 0 ..< 200 {
+				it, _ := xitdb.cursor_iterator_array_list_from_index(items_al.cursor, 200)
+				for _ in 0 ..< 20 {
+					nm, _ := xitdb.cursor_iterator_next(&it)
+					if ec, ok := nm.?; ok {
+						_, _ = xitdb.cursor_read_string(ec, 0, context.temp_allocator)
+					}
+				}
+			}
+			if r >= g_warmup {
+				samples[r - g_warmup] = f64(time.duration_nanoseconds(time.since(t0))) / 200.0
+			}
+			free_all(context.temp_allocator)
+		}
+		record_samples(8, "Enum: O(log N) Enum.slice/2 window (offset 200, len 20)", 200, samples)
+	}
+
+	// #9: Lazy Stream.take(10) early-halt on Sorted_Map (N=500)
+	if r9 {
+		for r in 0 ..< (g_warmup + g_runs) {
+			t0 := time.now()
+			for _ in 0 ..< 200 {
+				it, _ := xitdb.sorted_map_iterator(sorted_map)
+				for _ in 0 ..< 10 {
+					nm, _ := xitdb.cursor_iterator_next(&it)
+					kv_cur, ok := nm.?
+					if !ok {
+						break
+					}
+					kv, _ := xitdb.cursor_read_kv_pair(kv_cur, context.temp_allocator)
+					_, _ = xitdb.cursor_read_string(kv.key_cursor, 0, context.temp_allocator)
+					_, _ = xitdb.cursor_read_string(kv.value_cursor, 0, context.temp_allocator)
+				}
+			}
+			if r >= g_warmup {
+				samples[r - g_warmup] = f64(time.duration_nanoseconds(time.since(t0))) / 200.0
+			}
+			free_all(context.temp_allocator)
+		}
+		record_samples(9, "Stream: Lazy Stream.take(10) early-halt on Sorted_Map", 200, samples)
+	}
+
+	// #10: Full Enum.to_list stream over Array_List (N=500)
+	if r10 {
+		for r in 0 ..< (g_warmup + g_runs) {
+			t0 := time.now()
+			for _ in 0 ..< 50 {
+				it, _ := xitdb.array_list_iterator(items_al)
+				for {
+					nm, _ := xitdb.cursor_iterator_next(&it)
+					ec, ok := nm.?
+					if !ok {
+						break
+					}
 					_, _ = xitdb.cursor_read_string(ec, 0, context.temp_allocator)
 				}
 			}
-		}
-		if r >= g_warmup {
-			samples[r - g_warmup] = f64(time.duration_nanoseconds(time.since(t0))) / 200.0
-		}
-		free_all(context.temp_allocator)
-	}
-	record_samples(8, "Enum: O(log N) Enum.slice/2 window (offset 200, len 20)", 200, samples)
-
-	// #9: Lazy Stream.take(10) early-halt on Sorted_Map (N=500)
-	for r in 0 ..< (g_warmup + g_runs) {
-		t0 := time.now()
-		for _ in 0 ..< 200 {
-			it, _ := xitdb.sorted_map_iterator(sorted_map)
-			for _ in 0 ..< 10 {
-				nm, _ := xitdb.cursor_iterator_next(&it)
-				kv_cur, ok := nm.?
-				if !ok {
-					break
-				}
-				kv, _ := xitdb.cursor_read_kv_pair(kv_cur, context.temp_allocator)
-				_, _ = xitdb.cursor_read_string(kv.key_cursor, 0, context.temp_allocator)
-				_, _ = xitdb.cursor_read_string(kv.value_cursor, 0, context.temp_allocator)
+			if r >= g_warmup {
+				samples[r - g_warmup] = f64(time.duration_nanoseconds(time.since(t0))) / 50.0
 			}
+			free_all(context.temp_allocator)
 		}
-		if r >= g_warmup {
-			samples[r - g_warmup] = f64(time.duration_nanoseconds(time.since(t0))) / 200.0
-		}
-		free_all(context.temp_allocator)
+		record_samples(10, "Enum: Full Enum.to_list/1 stream over Array_List (N=500)", 50, samples)
 	}
-	record_samples(9, "Stream: Lazy Stream.take(10) early-halt on Sorted_Map", 200, samples)
-
-	// #10: Full Enum.to_list stream over Array_List (N=500)
-	for r in 0 ..< (g_warmup + g_runs) {
-		t0 := time.now()
-		for _ in 0 ..< 50 {
-			it, _ := xitdb.array_list_iterator(items_al)
-			for {
-				nm, _ := xitdb.cursor_iterator_next(&it)
-				ec, ok := nm.?
-				if !ok {
-					break
-				}
-				_, _ = xitdb.cursor_read_string(ec, 0, context.temp_allocator)
-			}
-		}
-		if r >= g_warmup {
-			samples[r - g_warmup] = f64(time.duration_nanoseconds(time.since(t0))) / 50.0
-		}
-		free_all(context.temp_allocator)
-	}
-	record_samples(10, "Enum: Full Enum.to_list/1 stream over Array_List (N=500)", 50, samples)
 
 	// #11: Subtree materialize (nested user profile)
-	u0_cur_maybe, _ := xitdb.hash_map_get_cursor(users_map, "u0")
-	u0_cur := u0_cur_maybe.?
-	for r in 0 ..< (g_warmup + g_runs) {
-		t0 := time.now()
-		for _ in 0 ..< 200 {
-			_, _ = xitdb.pull(u0_cur, "*", context.temp_allocator)
+	if r11 {
+		u0_cur_maybe, _ := xitdb.hash_map_get_cursor(users_map, "u0")
+		u0_cur := u0_cur_maybe.?
+		for r in 0 ..< (g_warmup + g_runs) {
+			t0 := time.now()
+			for _ in 0 ..< 200 {
+				_, _ = xitdb.pull(u0_cur, "*", context.temp_allocator)
+			}
+			if r >= g_warmup {
+				samples[r - g_warmup] = f64(time.duration_nanoseconds(time.since(t0))) / 200.0
+			}
+			free_all(context.temp_allocator)
 		}
-		if r >= g_warmup {
-			samples[r - g_warmup] = f64(time.duration_nanoseconds(time.since(t0))) / 200.0
-		}
-		free_all(context.temp_allocator)
+		record_samples(11, "Materialize: Eager subtree materialize/1 (user profile)", 200, samples)
 	}
-	record_samples(11, "Materialize: Eager subtree materialize/1 (user profile)", 200, samples)
 
 	// #12: Single nested entity transact commit
 	run_bench(12, "Tx: Single nested entity transact commit (6 attributes)", 100, proc() -> (time.Duration, i64) {
@@ -776,177 +1044,207 @@ main :: proc() {
 	})
 
 	// #16: O(1) zero-copy subtree fork (500 entities)
-	max_fork_bytes: i64 = 0
-	for r in 0 ..< (g_warmup + g_runs) {
-		c := xitdb.core_memory_init()
-		d, _ := xitdb.database_init(&c, xitdb.sha1_hasher())
-		seed_fixture_db(&c, &d, 500)
-		t0 := time.now()
+	if r16 {
+		max_fork_bytes: i64 = 0
+		for r in 0 ..< (g_warmup + g_runs) {
+			c := xitdb.core_memory_init()
+			d, _ := xitdb.database_init(&c, xitdb.sha1_hasher())
+			seed_fixture_db(&c, &d, 500)
+			t0 := time.now()
+			for i in 0 ..< 100 {
+				tx := xitdb.tx_init(&d, base_moment = -1, track_changes = false, allocator = context.temp_allocator)
+				_ = xitdb.tx_fork(&tx, ".users", fmt.tprintf(".users_clone_%d", i))
+				rep, _ := xitdb.tx_commit(&tx)
+				xitdb.tx_report_destroy(&rep, context.temp_allocator)
+				xitdb.tx_destroy(&tx)
+			}
+			dur := time.since(t0)
+			sz, _ := xitdb.core_length(&c)
+			if r >= g_warmup {
+				samples[r - g_warmup] = f64(time.duration_nanoseconds(dur)) / 100.0
+				if sz > max_fork_bytes {
+					max_fork_bytes = sz
+				}
+			}
+			xitdb.core_destroy(&c)
+			free_all(context.temp_allocator)
+		}
+		record_samples(16, "Tx: O(1) zero-copy subtree fork (500 entities)", 100, samples, max_fork_bytes)
+	}
+
+	// Shared 100-moment history DB for #17 (as_of across 100 moments), #18 (history_of), and #20 (compact)
+	hist_core: xitdb.Core
+	hist_db: xitdb.Database
+	hist_al: xitdb.Read_Array_List
+	defer if need_hist_db {
+		xitdb.core_destroy(&hist_core)
+	}
+	if need_hist_db {
+		hist_core = xitdb.core_memory_init()
+		hist_db, _ = xitdb.database_init(&hist_core, xitdb.sha1_hasher())
 		for i in 0 ..< 100 {
-			tx := xitdb.tx_init(&d, base_moment = -1, track_changes = false, allocator = context.temp_allocator)
-			_ = xitdb.tx_fork(&tx, ".users", fmt.tprintf(".users_clone_%d", i))
+			tx := xitdb.tx_init(&hist_db, base_moment = -1, track_changes = false, allocator = context.temp_allocator)
+			_ = xitdb.tx_put(&tx, ".users.alice.score", u64(i))
+			_ = xitdb.tx_put(&tx, ".users.bob.score", u64(1000))
 			rep, _ := xitdb.tx_commit(&tx)
 			xitdb.tx_report_destroy(&rep, context.temp_allocator)
 			xitdb.tx_destroy(&tx)
 		}
-		dur := time.since(t0)
-		sz, _ := xitdb.core_length(&c)
-		if r >= g_warmup {
-			samples[r - g_warmup] = f64(time.duration_nanoseconds(dur)) / 100.0
-			if sz > max_fork_bytes {
-				max_fork_bytes = sz
-			}
-		}
-		xitdb.core_destroy(&c)
-		free_all(context.temp_allocator)
+		hist_rc := xitdb.database_root_cursor(&hist_db).read_cursor
+		hist_al, _ = xitdb.read_array_list_init(hist_rc)
 	}
-	record_samples(16, "Tx: O(1) zero-copy subtree fork (500 entities)", 100, samples, max_fork_bytes)
-
-	// Shared 100-moment history DB for #17 (as_of across 100 moments), #18 (history_of), and #20 (compact)
-	hist_core := xitdb.core_memory_init()
-	defer xitdb.core_destroy(&hist_core)
-	hist_db, _ := xitdb.database_init(&hist_core, xitdb.sha1_hasher())
-	for i in 0 ..< 100 {
-		tx := xitdb.tx_init(&hist_db, base_moment = -1, track_changes = false, allocator = context.temp_allocator)
-		_ = xitdb.tx_put(&tx, ".users.alice.score", u64(i))
-		_ = xitdb.tx_put(&tx, ".users.bob.score", u64(1000))
-		rep, _ := xitdb.tx_commit(&tx)
-		xitdb.tx_report_destroy(&rep, context.temp_allocator)
-		xitdb.tx_destroy(&tx)
-	}
-	hist_rc := xitdb.database_root_cursor(&hist_db).read_cursor
-	hist_al, _ := xitdb.read_array_list_init(hist_rc)
 
 	// #17: Time-Travel as_of(db, moment) across 100 distinct historical moments
-	for r in 0 ..< (g_warmup + g_runs) {
-		t0 := time.now()
-		for m in 0 ..< 100 {
-			mc, _ := xitdb.array_list_get_cursor(hist_al, i64(m))
-			mm, _ := xitdb.read_hash_map_init(mc.?)
-			uc, _ := xitdb.hash_map_get_cursor(mm, "users")
-			um, _ := xitdb.read_hash_map_init(uc.?)
-			ac, _ := xitdb.hash_map_get_cursor(um, "alice")
-			am, _ := xitdb.read_hash_map_init(ac.?)
-			sc, _ := xitdb.hash_map_get_cursor(am, "score")
-			_, _ = xitdb.cursor_read_uint(sc.?)
+	if r17 {
+		for r in 0 ..< (g_warmup + g_runs) {
+			t0 := time.now()
+			for m in 0 ..< 100 {
+				mc, _ := xitdb.array_list_get_cursor(hist_al, i64(m))
+				mm, _ := xitdb.read_hash_map_init(mc.?)
+				uc, _ := xitdb.hash_map_get_cursor(mm, "users")
+				um, _ := xitdb.read_hash_map_init(uc.?)
+				ac, _ := xitdb.hash_map_get_cursor(um, "alice")
+				am, _ := xitdb.read_hash_map_init(ac.?)
+				sc, _ := xitdb.hash_map_get_cursor(am, "score")
+				_, _ = xitdb.cursor_read_uint(sc.?)
+			}
+			if r >= g_warmup {
+				samples[r - g_warmup] = f64(time.duration_nanoseconds(time.since(t0))) / 100.0
+			}
+			free_all(context.temp_allocator)
 		}
-		if r >= g_warmup {
-			samples[r - g_warmup] = f64(time.duration_nanoseconds(time.since(t0))) / 100.0
-		}
-		free_all(context.temp_allocator)
+		record_samples(17, "Time-Travel: Historical as_of(db, m) across 100 moments", 100, samples)
 	}
-	record_samples(17, "Time-Travel: Historical as_of(db, m) across 100 moments", 100, samples)
 
 	// #18: Time-Travel history_of(db, selector) lineage across 100 moments
-	for r in 0 ..< (g_warmup + g_runs) {
-		t0 := time.now()
-		for _ in 0 ..< 50 {
-			_, _ = xitdb.history_of(&hist_db, ".users.alice.score", context.temp_allocator)
+	if r18 {
+		for r in 0 ..< (g_warmup + g_runs) {
+			t0 := time.now()
+			for _ in 0 ..< 50 {
+				_, _ = xitdb.history_of(&hist_db, ".users.alice.score", context.temp_allocator)
+			}
+			if r >= g_warmup {
+				samples[r - g_warmup] = f64(time.duration_nanoseconds(time.since(t0))) / 50.0
+			}
+			free_all(context.temp_allocator)
 		}
-		if r >= g_warmup {
-			samples[r - g_warmup] = f64(time.duration_nanoseconds(time.since(t0))) / 50.0
-		}
-		free_all(context.temp_allocator)
+		record_samples(18, "Time-Travel: history_of(db, selector) (100 moments)", 50, samples)
 	}
-	record_samples(18, "Time-Travel: history_of(db, selector) (100 moments)", 50, samples)
+
+	// Shared 200-entity diff DB for #19 (diff_moments), #22 (Datalog prefix), #23 (Datalog agg)
+	diff_core: xitdb.Core
+	diff_db: xitdb.Database
+	defer if need_diff_db {
+		xitdb.core_destroy(&diff_core)
+	}
+	if need_diff_db {
+		diff_core = xitdb.core_memory_init()
+		diff_db, _ = xitdb.database_init(&diff_core, xitdb.sha1_hasher())
+		seed_fixture_db(&diff_core, &diff_db, 200)
+		tx_mut := xitdb.tx_init(&diff_db, base_moment = -1, track_changes = false, allocator = context.temp_allocator)
+		_ = xitdb.tx_put(&tx_mut, ".users.u42.age", u64(99))
+		rep_mut, _ := xitdb.tx_commit(&tx_mut)
+		xitdb.tx_report_destroy(&rep_mut, context.temp_allocator)
+		xitdb.tx_destroy(&tx_mut)
+	}
 
 	// #19: diff_moments (1 of 200 entities mutated)
-	diff_core := xitdb.core_memory_init()
-	defer xitdb.core_destroy(&diff_core)
-	diff_db, _ := xitdb.database_init(&diff_core, xitdb.sha1_hasher())
-	seed_fixture_db(&diff_core, &diff_db, 200)
-	tx_mut := xitdb.tx_init(&diff_db, base_moment = -1, track_changes = false, allocator = context.temp_allocator)
-	_ = xitdb.tx_put(&tx_mut, ".users.u42.age", u64(99))
-	rep_mut, _ := xitdb.tx_commit(&tx_mut)
-	xitdb.tx_report_destroy(&rep_mut, context.temp_allocator)
-	xitdb.tx_destroy(&tx_mut)
-
-	for r in 0 ..< (g_warmup + g_runs) {
-		t0 := time.now()
-		for _ in 0 ..< 50 {
-			_, _ = xitdb.diff_moments(&diff_db, 0, 1, false, context.temp_allocator)
+	if r19 {
+		for r in 0 ..< (g_warmup + g_runs) {
+			t0 := time.now()
+			for _ in 0 ..< 50 {
+				_, _ = xitdb.diff_moments(&diff_db, 0, 1, false, context.temp_allocator)
+			}
+			if r >= g_warmup {
+				samples[r - g_warmup] = f64(time.duration_nanoseconds(time.since(t0))) / 50.0
+			}
+			free_all(context.temp_allocator)
 		}
-		if r >= g_warmup {
-			samples[r - g_warmup] = f64(time.duration_nanoseconds(time.since(t0))) / 50.0
-		}
-		free_all(context.temp_allocator)
+		record_samples(19, "Time-Travel: diff_moments (1 of 200 entities mutated)", 50, samples)
 	}
-	record_samples(19, "Time-Travel: diff_moments (1 of 200 entities mutated)", 50, samples)
 
 	// #20: compact/1 100-moment database deduplication
-	compact_bytes: i64 = 0
-	for r in 0 ..< (g_warmup + g_runs) {
-		t0 := time.now()
-		for _ in 0 ..< 20 {
-			target_core := xitdb.core_memory_init()
-			_, _ = xitdb.database_compact(&hist_db, &target_core)
-			sz, _ := xitdb.core_length(&target_core)
-			if sz > compact_bytes {
-				compact_bytes = sz
+	if r20 {
+		compact_bytes: i64 = 0
+		for r in 0 ..< (g_warmup + g_runs) {
+			t0 := time.now()
+			for _ in 0 ..< 20 {
+				target_core := xitdb.core_memory_init()
+				_, _ = xitdb.database_compact(&hist_db, &target_core)
+				sz, _ := xitdb.core_length(&target_core)
+				if sz > compact_bytes {
+					compact_bytes = sz
+				}
+				xitdb.core_destroy(&target_core)
 			}
-			xitdb.core_destroy(&target_core)
+			if r >= g_warmup {
+				samples[r - g_warmup] = f64(time.duration_nanoseconds(time.since(t0))) / 20.0
+			}
+			free_all(context.temp_allocator)
 		}
-		if r >= g_warmup {
-			samples[r - g_warmup] = f64(time.duration_nanoseconds(time.since(t0))) / 20.0
-		}
-		free_all(context.temp_allocator)
+		record_samples(20, "Lifecycle: compact/1 100-moment database deduplication", 20, samples, compact_bytes)
 	}
-	record_samples(20, "Lifecycle: compact/1 100-moment database deduplication", 20, samples, compact_bytes)
 
 	// #21: Datomic pull projection
-	for r in 0 ..< (g_warmup + g_runs) {
-		t0 := time.now()
-		for i in 0 ..< 200 {
-			uid := fmt.tprintf("u%d", i)
-			uc, _ := xitdb.hash_map_get_cursor(users_map, uid)
-			_, _ = xitdb.pull(uc.?, "{name, age, roles[0..2], profile{city}}", context.temp_allocator)
+	if r21 {
+		for r in 0 ..< (g_warmup + g_runs) {
+			t0 := time.now()
+			for i in 0 ..< 200 {
+				uid := fmt.tprintf("u%d", i)
+				uc, _ := xitdb.hash_map_get_cursor(users_map, uid)
+				_, _ = xitdb.pull(uc.?, "{name, age, roles[0..2], profile{city}}", context.temp_allocator)
+			}
+			if r >= g_warmup {
+				samples[r - g_warmup] = f64(time.duration_nanoseconds(time.since(t0))) / 200.0
+			}
+			free_all(context.temp_allocator)
 		}
-		if r >= g_warmup {
-			samples[r - g_warmup] = f64(time.duration_nanoseconds(time.since(t0))) / 200.0
-		}
-		free_all(context.temp_allocator)
+		record_samples(21, "Query: Datomic pull projection (4 attrs + nested slice)", 200, samples)
 	}
-	record_samples(21, "Query: Datomic pull projection (4 attrs + nested slice)", 200, samples)
 
 	// #22: Datalog B+Tree index prefix + join
-	q_prefix := `
-		find ?name, ?age
-		where
-			$username->id[?name] = ?id
-			starts_with(?name, "user_001")
-			.users[?id].age = ?age
-			.users[?id].dept = "eng"
-	`
-	for r in 0 ..< (g_warmup + g_runs) {
-		t0 := time.now()
-		for _ in 0 ..< 50 {
-			_, _ = xitdb.query_datalog(&diff_db, q_prefix, -1, context.temp_allocator)
+	if r22 {
+		q_prefix := `
+			find ?name, ?age
+			where
+				$username->id[?name] = ?id
+				starts_with(?name, "user_001")
+				.users[?id].age = ?age
+				.users[?id].dept = "eng"
+		`
+		for r in 0 ..< (g_warmup + g_runs) {
+			t0 := time.now()
+			for _ in 0 ..< 50 {
+				_, _ = xitdb.query_datalog(&diff_db, q_prefix, -1, context.temp_allocator)
+			}
+			if r >= g_warmup {
+				samples[r - g_warmup] = f64(time.duration_nanoseconds(time.since(t0))) / 50.0
+			}
+			free_all(context.temp_allocator)
 		}
-		if r >= g_warmup {
-			samples[r - g_warmup] = f64(time.duration_nanoseconds(time.since(t0))) / 50.0
-		}
-		free_all(context.temp_allocator)
+		record_samples(22, "Query: Datalog B+Tree index prefix + join (N=200)", 50, samples)
 	}
-	record_samples(22, "Query: Datalog B+Tree index prefix + join (N=200)", 50, samples)
 
 	// #23: Datalog grouped aggregation (count + sum, N=200)
-	q_agg := `
-		find ?dept, count(?id), sum(?age)
-		where
-			.users[?id].dept = ?dept
-			.users[?id].age = ?age
-	`
-	for r in 0 ..< (g_warmup + g_runs) {
-		t0 := time.now()
-		for _ in 0 ..< 50 {
-			_, _ = xitdb.query_datalog(&diff_db, q_agg, -1, context.temp_allocator)
+	if r23 {
+		q_agg := `
+			find ?dept, count(?id), sum(?age)
+			where
+				.users[?id].dept = ?dept
+				.users[?id].age = ?age
+		`
+		for r in 0 ..< (g_warmup + g_runs) {
+			t0 := time.now()
+			for _ in 0 ..< 50 {
+				_, _ = xitdb.query_datalog(&diff_db, q_agg, -1, context.temp_allocator)
+			}
+			if r >= g_warmup {
+				samples[r - g_warmup] = f64(time.duration_nanoseconds(time.since(t0))) / 50.0
+			}
+			free_all(context.temp_allocator)
 		}
-		if r >= g_warmup {
-			samples[r - g_warmup] = f64(time.duration_nanoseconds(time.since(t0))) / 50.0
-		}
-		free_all(context.temp_allocator)
+		record_samples(23, "Query: Datalog grouped aggregation (count + sum, N=200)", 50, samples)
 	}
-	record_samples(23, "Query: Datalog grouped aggregation (count + sum, N=200)", 50, samples)
 
 	// #24: Storage: Buffered_File transact + sync (50 commits)
 	run_bench(24, "Storage: Buffered_File transact + sync (50 commits)", 50, proc() -> (time.Duration, i64) {
@@ -970,62 +1268,72 @@ main :: proc() {
 	})
 
 	// #25: Search: Sorted_Map B+Tree prefix seek (limit=16)
-	sb_seek: [8]u8 = ---
-	for r in 0 ..< (g_warmup + g_runs) {
-		t0 := time.now()
-		for _ in 0 ..< 100 {
-			it, _ := xitdb.sorted_map_iterator_from_string(sorted_map, "u4")
-			cnt := 0
-			for cnt < 16 {
-				nm, _ := xitdb.cursor_iterator_next(&it)
-				ec, hn := nm.?
-				if !hn {
-					break
+	if r25 {
+		sb_seek: [8]u8 = ---
+		for r in 0 ..< (g_warmup + g_runs) {
+			t0 := time.now()
+			for _ in 0 ..< 100 {
+				it, _ := xitdb.sorted_map_iterator_from_string(sorted_map, "u4")
+				cnt := 0
+				for cnt < 16 {
+					nm, _ := xitdb.cursor_iterator_next(&it)
+					ec, hn := nm.?
+					if !hn {
+						break
+					}
+					kv, _ := xitdb.cursor_read_kv_pair(ec, context.temp_allocator)
+					sp, _ := xitdb.cursor_resolved(kv.key_cursor)
+					ks: string
+					if sp.slot.tag == .Short_Bytes && !sp.slot.full {
+						bo, _ := xitdb.cursor_read_bytes_buf(kv.key_cursor, sb_seek[:])
+						ks = string(bo.value)
+					} else {
+						ks, _ = xitdb.cursor_read_string(kv.key_cursor, 0, context.temp_allocator)
+					}
+					if !strings.has_prefix(ks, "u4") {
+						break
+					}
+					_, _ = xitdb.cursor_slot(kv.value_cursor)
+					cnt += 1
 				}
-				kv, _ := xitdb.cursor_read_kv_pair(ec, context.temp_allocator)
-				sp, _ := xitdb.cursor_resolved(kv.key_cursor)
-				ks: string
-				if sp.slot.tag == .Short_Bytes && !sp.slot.full {
-					bo, _ := xitdb.cursor_read_bytes_buf(kv.key_cursor, sb_seek[:])
-					ks = string(bo.value)
-				} else {
-					ks, _ = xitdb.cursor_read_string(kv.key_cursor, 0, context.temp_allocator)
-				}
-				if !strings.has_prefix(ks, "u4") {
-					break
-				}
-				_, _ = xitdb.cursor_slot(kv.value_cursor)
-				cnt += 1
 			}
+			if r >= g_warmup {
+				samples[r - g_warmup] = f64(time.duration_nanoseconds(time.since(t0))) / 100.0
+			}
+			free_all(context.temp_allocator)
 		}
-		if r >= g_warmup {
-			samples[r - g_warmup] = f64(time.duration_nanoseconds(time.since(t0))) / 100.0
-		}
-		free_all(context.temp_allocator)
+		record_samples(25, "Search: Sorted_Map B+Tree prefix seek (limit=16)", 100, samples)
 	}
-	record_samples(25, "Search: Sorted_Map B+Tree prefix seek (limit=16)", 100, samples)
 
 	// #26: Search: BM25 corpus search (N=200, 2-term prefix, limit=10)
-	search_core := xitdb.core_memory_init()
-	defer xitdb.core_destroy(&search_core)
-	search_db, _ := xitdb.database_init(&search_core, xitdb.sha1_hasher())
-	seed_bm25_fixture_db(&search_db, 200)
-	s_rc := xitdb.database_root_cursor(&search_db).read_cursor
-	s_hist, _ := xitdb.read_array_list_init(s_rc)
-	s_m0_cur, _ := xitdb.array_list_get_cursor(s_hist, 0)
-	s_m0_map, _ := xitdb.read_hash_map_init(s_m0_cur.?)
-	bm25_q := [2]string{"nord", "cap"}
-	for r in 0 ..< (g_warmup + g_runs) {
-		t0 := time.now()
-		for _ in 0 ..< 50 {
-			_ = bench_raw_bm25_search(s_m0_map, "articles", bm25_q[:], 10)
-		}
-		if r >= g_warmup {
-			samples[r - g_warmup] = f64(time.duration_nanoseconds(time.since(t0))) / 50.0
-		}
-		free_all(context.temp_allocator)
+	search_core: xitdb.Core
+	search_db: xitdb.Database
+	defer if need_search_db {
+		xitdb.core_destroy(&search_core)
 	}
-	record_samples(26, "Search: BM25 corpus search (N=200, 2-term prefix, limit=10)", 50, samples)
+	if need_search_db {
+		search_core = xitdb.core_memory_init()
+		search_db, _ = xitdb.database_init(&search_core, xitdb.sha1_hasher())
+		seed_bm25_fixture_db(&search_db, 200)
+	}
+	if r26 {
+		s_rc := xitdb.database_root_cursor(&search_db).read_cursor
+		s_hist, _ := xitdb.read_array_list_init(s_rc)
+		s_m0_cur, _ := xitdb.array_list_get_cursor(s_hist, 0)
+		s_m0_map, _ := xitdb.read_hash_map_init(s_m0_cur.?)
+		bm25_q := [2]string{"nord", "cap"}
+		for r in 0 ..< (g_warmup + g_runs) {
+			t0 := time.now()
+			for _ in 0 ..< 50 {
+				_ = bench_raw_bm25_search(s_m0_map, "articles", bm25_q[:], 10)
+			}
+			if r >= g_warmup {
+				samples[r - g_warmup] = f64(time.duration_nanoseconds(time.since(t0))) / 50.0
+			}
+			free_all(context.temp_allocator)
+		}
+		record_samples(26, "Search: BM25 corpus search (N=200, 2-term prefix, limit=10)", 50, samples)
+	}
 
 	emit_jsonl()
 }

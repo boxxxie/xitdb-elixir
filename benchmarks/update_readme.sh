@@ -24,7 +24,11 @@ if [[ -f "${HISTORY_JSONL}" ]]; then
 fi
 INPUT_FILES+=("${ODIN_JSONL}" "${ELIXIR_JSONL}")
 
-TABLES=$(jq -rn --arg target_commit "${TARGET_COMMIT}" '
+"${SCRIPT_DIR}/compare_1v1.py" --generate-slices >/dev/null
+CODE_MAP_JSON=$("${SCRIPT_DIR}/compare_1v1.py" --code-map-json 2>/dev/null || echo "{}")
+PLAN_JSON=$("${SCRIPT_DIR}/compare_1v1.py" --plan-json 2>/dev/null || echo "{}")
+
+TABLES=$(jq -rn --arg target_commit "${TARGET_COMMIT}" --argjson code_map "${CODE_MAP_JSON}" --argjson plan "${PLAN_JSON}" '
 def commify:
   tostring |
   if test("^-?[0-9]+$") then
@@ -183,10 +187,10 @@ def latest_snapshot_for_lang($all; $lang):
     ($lang_recs
      | map(select((.commit // "unknown") == $target_commit))
      | group_by(.name)
-     | map(pool_records(.))
+     | map(pool_records(.) | . + {commit: $target_commit, baseline_commit: $target_commit})
      | sort_by(.rank))
   else
-    (($lang_recs | map(select((.commit // "unknown") != "unknown"))) as $known |
+    (($lang_recs | map(select((.commit // "unknown") != "unknown" and (.commit // "") != ""))) as $known |
      (if ($known | length) > 0 then $known else $lang_recs end) as $scoped |
      ($scoped | last.commit // "unknown") as $overall_lc |
      (reduce $scoped[] as $r ({order: [], counts: {}};
@@ -199,6 +203,7 @@ def latest_snapshot_for_lang($all; $lang):
      ([ $by_commit.order[] | {c: ., n: ($by_commit.counts[.] | keys | length)} ]) as $commit_sizes |
      ([$commit_sizes[].n] | max) as $max_n |
      ([$commit_sizes | to_entries[] | select(.value.n == $max_n) | .key] | last) as $full_idx |
+     ($commit_sizes[$full_idx].c // $overall_lc) as $baseline_sha |
      ([$commit_sizes[$full_idx:][].c]) as $active_commits |
      ($active_commits | map($by_commit.counts[.] | keys[]) | unique) as $active_names |
      ($active_names | map({key: ., value: true}) | from_entries) as $active_set |
@@ -209,38 +214,80 @@ def latest_snapshot_for_lang($all; $lang):
          (last.commit // "unknown") as $name_lc |
          map(select((.commit // "unknown") == $name_lc))
          | pool_records(.)
-         | .commit = $overall_lc
+         | . + {commit: $name_lc, baseline_commit: $baseline_sha, latest_commit: $overall_lc}
        )
      | sort_by(.rank))
   end;
 
-def tier_table_ns($list):
+def distinct_commits($all; $lang):
+  ($all
+   | map(select(.lang == $lang and (.commit // "unknown") != "unknown" and (.commit // "") != ""))
+   | reduce .[] as $r ([]; if index($r.commit) then . else . + [$r.commit] end));
+
+def pool_commit_snapshot($all; $lang; $sha):
+  ($all
+   | map(select(.lang == $lang and (.commit // "unknown") == $sha))
+   | group_by(.name)
+   | map(pool_records(.) | .commit = $sha)
+   | sort_by(.rank));
+
+def bench_link($name):
+  ($code_map[$name].slice_doc // "") as $sdoc |
+  if $sdoc != "" then
+    "[`\($name | nbsp)`](\($sdoc))"
+  else
+    "`\($name | nbsp)`"
+  end;
+
+def rank_cell($row; $mode):
+  (if $mode == "odin" then ($code_map[$row.name].odin_bench // "")
+   elif $mode == "elixir" then ($code_map[$row.name].elixir_bench // "")
+   else ($code_map[$row.name].slice_doc // "")
+   end) as $href |
+  (if $href != "" then "[#\($row.rank)](\($href))" else "#\($row.rank)" end) as $base |
+  if ($row.commit // "") != ($row.baseline_commit // $row.commit // "") then
+    "\($base)\u00a0↻"
+  else
+    $base
+  end;
+
+def fmt_duration_cell($ns):
+  if $ns < 1000 then "\($ns | round | commify)\u00a0ns"
+  elif $ns < 1000000 then "\(fmt_us($ns))\u00a0µs"
+  else "\(fmt_dec2($ns / 1000000.0))\u00a0ms"
+  end;
+
+def tier_table_ns($list; $mode):
   "| # | Benchmark | Med\u00a0(`ns`) | Mean\u00a0±\u00a0σ | CV | Min\u00a0`ops/s` | Max\u00a0`ops/s` | IQR | `p95` | `p99` | Min | Max | Ops |",
   "| ---: | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
   ($list[] |
     fmt_ops_bounds(.min_ns; .max_ns) as $ops_b |
-    "| \(.rank) | `\(.name | nbsp)` | **\(.ns_per_op | commify)** | \(.mean_ns | round | commify)\u00a0±\u00a0\(fmt_sigma(.stddev_ns)) | \(fmt_dec1(.cv_pct))% | \($ops_b[0]) | \($ops_b[1]) | \(.iqr_ns | round | commify) | \(.p95_ns | commify) | \(.p99_ns | commify) | \(.min_ns | commify) | \(.max_ns | commify) | \(fmt_ops_count(.ops)) |"
+    "| \(rank_cell(.; $mode)) | \(bench_link(.name)) | **\(.ns_per_op | commify)** | \(.mean_ns | round | commify)\u00a0±\u00a0\(fmt_sigma(.stddev_ns)) | \(fmt_dec1(.cv_pct))% | \($ops_b[0]) | \($ops_b[1]) | \(.iqr_ns | round | commify) | \(.p95_ns | commify) | \(.p99_ns | commify) | \(.min_ns | commify) | \(.max_ns | commify) | \(fmt_ops_count(.ops)) |"
   );
 
-def tier_table_us($list):
+def tier_table_us($list; $mode):
   "| # | Benchmark | Med\u00a0(`µs`) | Mean\u00a0±\u00a0σ | CV | Min\u00a0`ops/s` | Max\u00a0`ops/s` | IQR | `p95` | `p99` | Min | Max | Ops |",
   "| ---: | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
   ($list[] |
     fmt_ops_bounds(.min_ns; .max_ns) as $ops_b |
-    "| \(.rank) | `\(.name | nbsp)` | **\(fmt_us(.median_ns))** | \(fmt_us(.mean_ns))\u00a0±\u00a0\(fmt_us(.stddev_ns)) | \(fmt_dec1(.cv_pct))% | \($ops_b[0]) | \($ops_b[1]) | \(fmt_us(.iqr_ns)) | \(fmt_us(.p95_ns)) | \(fmt_us(.p99_ns)) | \(fmt_us(.min_ns)) | \(fmt_us(.max_ns)) | \(fmt_ops_count(.ops)) |"
+    "| \(rank_cell(.; $mode)) | \(bench_link(.name)) | **\(fmt_us(.median_ns))** | \(fmt_us(.mean_ns))\u00a0±\u00a0\(fmt_us(.stddev_ns)) | \(fmt_dec1(.cv_pct))% | \($ops_b[0]) | \($ops_b[1]) | \(fmt_us(.iqr_ns)) | \(fmt_us(.p95_ns)) | \(fmt_us(.p99_ns)) | \(fmt_us(.min_ns)) | \(fmt_us(.max_ns)) | \(fmt_ops_count(.ops)) |"
   );
 
-def single_lang_section($sec_num; $lang_label; $flags; $sha; $list):
+def single_lang_section($sec_num; $lang_label; $mode; $flags; $sha; $list):
   ($list | map(select(.ns_per_op < 1000))) as $sub_us |
   ($list | map(select(.ns_per_op >= 1000))) as $multi_us |
+  ($list | map(select(.commit != (.baseline_commit // .commit))) | length) as $selective_cnt |
   "### \($sec_num). \($lang_label) Results (`\($flags)`, Commit `\($sha)`, \($list[0].runs) samples across \($list[0].invocations) run(s))\n",
+  (if $selective_cnt > 0 then
+    "\n> _Note: `\($selective_cnt)` row(s) marked `↻` reflect selective/affected updates on a newer commit atop baseline `\($list[0].baseline_commit)`._\n"
+   else empty end),
   (if ($sub_us | length) > 0 then
     "#### \($sec_num).1 Sub-Microsecond Fast Path (`< 1 µs`, \($sub_us | length) tests)\n",
-    tier_table_ns($sub_us),
+    tier_table_ns($sub_us; $mode),
     "\n"
    else empty end),
   "#### \($sec_num).2 Multi-Microsecond Client Operations (`≥ 1 µs`, \($multi_us | length) tests)\n",
-  tier_table_us($multi_us);
+  tier_table_us($multi_us; $mode);
 
 def compare_1v1_table($list; $ex_map; $unit):
   "| # | Benchmark | NIF\u00a0Ratio | Raw\u00a0Odin\u00a0Med\u00a0(`\($unit)`) | Elixir\u00a0Med\u00a0(`\($unit)`) | Welch\u00a0`z` | Odin\u00a0Mean\u00a0±\u00a0σ | Odin\u00a0CV | Elixir\u00a0Mean\u00a0±\u00a0σ | Elixir\u00a0CV |",
@@ -248,39 +295,76 @@ def compare_1v1_table($list; $ex_map; $unit):
   ($list[] | . as $o | $ex_map[$o.name] as $e | select($e != null) |
     welch_z($o; $e) as $wz |
     (if $wz >= 1.96 then "`\(fmt_dec1($wz))`\u00a0★" else "`\(fmt_dec1($wz))`\u00a0~" end) as $sig_col |
+    (if ($o.commit != ($o.baseline_commit // $o.commit) or $e.commit != ($e.baseline_commit // $e.commit)) then "\u00a0↻" else "" end) as $sel_mark |
     (if $unit == "µs" then
-      "| \($o.rank) | `\($o.name | nbsp)` | **\(fmt_ratio($o.median_ns; $e.median_ns))** | \(fmt_us($o.median_ns)) | **\(fmt_us($e.median_ns))** | \($sig_col) | \(fmt_us($o.mean_ns))\u00a0±\u00a0\(fmt_us($o.stddev_ns)) | \(fmt_dec1($o.cv_pct))% | \(fmt_us($e.mean_ns))\u00a0±\u00a0\(fmt_us($e.stddev_ns)) | \(fmt_dec1($e.cv_pct))% |"
+      "| \($o.rank)\($sel_mark) | \(bench_link($o.name)) | **\(fmt_ratio($o.median_ns; $e.median_ns))** | \(fmt_us($o.median_ns)) | **\(fmt_us($e.median_ns))** | \($sig_col) | \(fmt_us($o.mean_ns))\u00a0±\u00a0\(fmt_us($o.stddev_ns)) | \(fmt_dec1($o.cv_pct))% | \(fmt_us($e.mean_ns))\u00a0±\u00a0\(fmt_us($e.stddev_ns)) | \(fmt_dec1($e.cv_pct))% |"
      else
-      "| \($o.rank) | `\($o.name | nbsp)` | **\(fmt_ratio($o.ns_per_op; $e.ns_per_op))** | \($o.ns_per_op | commify) | **\($e.ns_per_op | commify)** | \($sig_col) | \($o.mean_ns | round | commify)\u00a0±\u00a0\(fmt_sigma($o.stddev_ns)) | \(fmt_dec1($o.cv_pct))% | \($e.mean_ns | round | commify)\u00a0±\u00a0\(fmt_sigma($e.stddev_ns)) | \(fmt_dec1($e.cv_pct))% |"
+      "| \($o.rank)\($sel_mark) | \(bench_link($o.name)) | **\(fmt_ratio($o.ns_per_op; $e.ns_per_op))** | \($o.ns_per_op | commify) | **\($e.ns_per_op | commify)** | \($sig_col) | \($o.mean_ns | round | commify)\u00a0±\u00a0\(fmt_sigma($o.stddev_ns)) | \(fmt_dec1($o.cv_pct))% | \($e.mean_ns | round | commify)\u00a0±\u00a0\(fmt_sigma($e.stddev_ns)) | \(fmt_dec1($e.cv_pct))% |"
      end)
+  );
+
+def compare_commits_table($prev_sha; $curr_sha; $prev_list; $curr_list):
+  (reduce $curr_list[] as $c ({}; .[$c.name] = $c)) as $curr_map |
+  "| # | Benchmark | `\($prev_sha)`\u00a0Med | `\($curr_sha)`\u00a0Med | Δ% | Speedup | Welch\u00a0`z` | `\($prev_sha)`\u00a0Mean\u00a0±\u00a0σ | `\($curr_sha)`\u00a0Mean\u00a0±\u00a0σ |",
+  "| ---: | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+  ($prev_list[] | . as $a | $curr_map[$a.name] as $b | select($b != null) |
+    (if $a.median_ns > 0 then (($b.median_ns - $a.median_ns) / $a.median_ns * 100.0) else 0.0 end) as $pct |
+    (if $pct >= 0 then "+\(fmt_dec1($pct))%" else "\(fmt_dec1($pct))%" end) as $delta_col |
+    (if $b.median_ns > 0 then ($a.median_ns / $b.median_ns) else 1.0 end) as $sp |
+    welch_z($a; $b) as $wz |
+    (if $wz >= 1.96 then "`\(fmt_dec1($wz))`\u00a0★" else "`\(fmt_dec1($wz))`\u00a0~" end) as $sig_col |
+    "| \($b.rank) | \(bench_link($b.name)) | \(fmt_duration_cell($a.median_ns)) | **\(fmt_duration_cell($b.median_ns))** | \($delta_col) | **\(fmt_dec2($sp))x** | \($sig_col) | \(fmt_duration_cell($a.mean_ns))\u00a0±\u00a0\(fmt_duration_cell($a.stddev_ns)) | \(fmt_duration_cell($b.mean_ns))\u00a0±\u00a0\(fmt_duration_cell($b.stddev_ns)) |"
   );
 
 [inputs] as $all |
 latest_snapshot_for_lang($all; "odin") as $odin_list |
 latest_snapshot_for_lang($all; "elixir") as $ex_list |
 (reduce $ex_list[] as $e ({}; .[$e.name] = $e)) as $ex_map |
-($odin_list[0].commit // "unknown") as $odin_sha |
-($ex_list[0].commit // "unknown") as $ex_sha |
+($odin_list[0].latest_commit // $odin_list[0].commit // "unknown") as $odin_sha |
+($ex_list[0].latest_commit // $ex_list[0].commit // "unknown") as $ex_sha |
 ($odin_list | map(select($ex_map[.name] != null))) as $paired_list |
 ($paired_list | map(select($ex_map[.name].ns_per_op < 1000))) as $paired_sub_us |
 ($paired_list | map(select($ex_map[.name].ns_per_op >= 1000))) as $paired_multi_us |
+distinct_commits($all; "elixir") as $ex_commits |
+distinct_commits($all; "odin") as $odin_commits |
 
-single_lang_section("1"; "Elixir Client Wrapper"; "mix run + priv/xitdb_nif.so -o:speed"; $ex_sha; $ex_list),
+single_lang_section("1"; "Elixir Client Wrapper"; "elixir"; "mix run + priv/xitdb_nif.so -o:speed"; $ex_sha; $ex_list),
 "\n",
-single_lang_section("2"; "Raw Odin Baseline"; "odin run benchmarks -o:speed -microarch:native"; $odin_sha; $odin_list),
+single_lang_section("2"; "Raw Odin Baseline"; "odin"; "odin run benchmarks -o:speed -microarch:native"; $odin_sha; $odin_list),
 "\n### 3. 1v1 Client Boundary Comparison (Elixir NIF Wrapper vs. Raw Odin, Commit `\($ex_sha)`)\n",
 (if ($paired_sub_us | length) > 0 then
-  "#### 3.1 Sub-Microsecond Fast Path (`ns`, \($paired_sub_us | length) tests)\n",
+  "#### 3.1 Sub-Microsecond Fast Path (Elixir `< 1 µs`, \($paired_sub_us | length) tests)\n",
   compare_1v1_table($paired_sub_us; $ex_map; "ns"),
   "\n"
  else empty end),
-"#### 3.2 Multi-Microsecond Client Operations (`µs`, \($paired_multi_us | length) tests)\n",
+"#### 3.2 Multi-Microsecond Client Operations (Elixir `≥ 1 µs`, \($paired_multi_us | length) tests)\n",
 compare_1v1_table($paired_multi_us; $ex_map; "µs"),
-"\n### 4. Database Storage Footprint (`bytes_used > 0`)\n",
+"\n### 4. Commit-vs-Commit Progression\n",
+(if ($ex_commits | length) >= 2 then
+  ($ex_commits[-2]) as $prev_sha |
+  ($ex_commits[-1]) as $curr_sha |
+  pool_commit_snapshot($all; "elixir"; $prev_sha) as $ex_prev |
+  pool_commit_snapshot($all; "elixir"; $curr_sha) as $ex_curr |
+  "\n#### 4.1 Elixir Client Wrapper (`\($prev_sha)` → `\($curr_sha)`)\n",
+  compare_commits_table($prev_sha; $curr_sha; $ex_prev; $ex_curr),
+  "\n"
+ else
+  "\n_Only one Elixir commit recorded so far; run on another commit to populate commit-vs-commit progression._\n"
+ end),
+(if ($odin_commits | length) >= 2 then
+  ($odin_commits[-2]) as $o_prev_sha |
+  ($odin_commits[-1]) as $o_curr_sha |
+  pool_commit_snapshot($all; "odin"; $o_prev_sha) as $od_prev |
+  pool_commit_snapshot($all; "odin"; $o_curr_sha) as $od_curr |
+  "\n#### 4.2 Raw Odin Baseline (`\($o_prev_sha)` → `\($o_curr_sha)`)\n",
+  compare_commits_table($o_prev_sha; $o_curr_sha; $od_prev; $od_curr),
+  "\n"
+ else empty end),
+"\n### 5. Database Storage Footprint (`bytes_used > 0`)\n",
 "| # | Benchmark | Ops | Raw\u00a0Odin\u00a0Size | Elixir\u00a0Wrapper\u00a0Size |",
 "| ---: | :--- | ---: | ---: | ---: |",
 ($odin_list[] | select(.bytes_used > 0) | . as $o | ($ex_map[$o.name] // null) as $e |
-  "| \($o.rank) | `\($o.name | nbsp)` | \(fmt_ops_count($o.ops)) | \(fmt_kb($o.bytes_used)) | \(if $e != null and $e.bytes_used > 0 then fmt_kb($e.bytes_used) else "—" end) |"
+  "| \($o.rank) | \(bench_link($o.name)) | \(fmt_ops_count($o.ops)) | \(fmt_kb($o.bytes_used)) | \(if $e != null and $e.bytes_used > 0 then fmt_kb($e.bytes_used) else "—" end) |"
 )
 ' "${INPUT_FILES[@]}")
 

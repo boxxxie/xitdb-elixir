@@ -1,0 +1,8 @@
+{
+  "track_id": "benchmark_suite_adoption_20261115",
+  "type": "chore",
+  "status": "completed",
+  "created_at": "2026-11-15T10:59:30Z",
+  "updated_at": "2026-11-15T11:46:30Z",
+  "description": "Adopt the odin-xitdb benchmark infrastructure (CLI flag & selective JSONL merge parity, git-diff --affected/--plan analyzer, automated per-benchmark code slices in benchmarks/slices/, and enhanced update_readme.sh progression tables) for the 26 1v1 Elixir vs. Raw Odin client benchmarks."
+}

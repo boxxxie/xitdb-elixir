@@ -4,46 +4,162 @@
 defmodule Xitdb.ClientBench do
   alias Xitdb
 
+  @bench_meta [
+    {1, :access, "Access: 3-hop lazy HAMT lookup (root[users][id][name])"},
+    {2, :access, "Access: Single-call selector select(.users.<id>.name)"},
+    {3, :access, "Access: Sorted_Map B+Tree key lookup (sorted[key])"},
+    {4, :access, "Access: Array_List random index lookup (items[idx])"},
+    {5, :access, "Access: Linked_Array_List random index lookup (linked[idx])"},
+    {6, :enumerable, "Enum: O(1) Enum.count/1 on Counted_Hash_Map (N=500)"},
+    {7, :enumerable, "Enum: O(1) Enum.member?/2 on Counted_Hash_Set (N=500)"},
+    {8, :enumerable, "Enum: O(log N) Enum.slice/2 window (offset 200, len 20)"},
+    {9, :enumerable, "Stream: Lazy Stream.take(10) early-halt on Sorted_Map"},
+    {10, :enumerable, "Enum: Full Enum.to_list/1 stream over Array_List (N=500)"},
+    {11, :enumerable, "Materialize: Eager subtree materialize/1 (user profile)"},
+    {12, :transactions, "Tx: Single nested entity transact commit (6 attributes)"},
+    {13, :transactions, "Tx: Bulk batch transact (100 entities in 1 commit)"},
+    {14, :transactions, "Tx: Incremental put_in nested attribute commit"},
+    {15, :transactions, "Tx: Linked_Array_List O(log N) mid-list insert + delete"},
+    {16, :transactions, "Tx: O(1) zero-copy subtree fork (500 entities)"},
+    {17, :time_travel, "Time-Travel: Historical as_of(db, m) across 100 moments"},
+    {18, :time_travel, "Time-Travel: history_of(db, selector) (100 moments)"},
+    {19, :time_travel, "Time-Travel: diff_moments (1 of 200 entities mutated)"},
+    {20, :time_travel, "Lifecycle: compact/1 100-moment database deduplication"},
+    {21, :queries, "Query: Datomic pull projection (4 attrs + nested slice)"},
+    {22, :queries, "Query: Datalog B+Tree index prefix + join (N=200)"},
+    {23, :queries, "Query: Datalog grouped aggregation (count + sum, N=200)"},
+    {24, :queries, "Storage: Buffered_File transact + sync (50 commits)"},
+    {25, :queries, "Search: Sorted_Map B+Tree prefix seek (limit=16)"},
+    {26, :queries, "Search: BM25 corpus search (N=200, 2-term prefix, limit=10)"}
+  ]
+
+  @value_flags %{
+    "--runs" => :runs,
+    "--warmup" => :warmup,
+    "--commit" => :commit,
+    "--run-id" => :run_id,
+    "--groups" => :groups,
+    "--group" => :groups,
+    "--filter" => :filter,
+    "--output" => :output,
+    "--history" => :history
+  }
+
+  def parse_argv(argv) do
+    do_parse_argv(argv, [])
+  end
+
+  defp do_parse_argv([], acc), do: Enum.reverse(acc)
+  defp do_parse_argv(["--" | rest], acc), do: do_parse_argv(rest, acc)
+  defp do_parse_argv(["--append" | rest], acc), do: do_parse_argv(rest, [{:append, true} | acc])
+
+  defp do_parse_argv(["--no-history" | rest], acc),
+    do: do_parse_argv(rest, [{:no_history, true} | acc])
+
+  defp do_parse_argv([arg | rest], acc) do
+    case String.split(arg, "=", parts: 2) do
+      [flag, value] ->
+        case Map.get(@value_flags, flag) do
+          nil -> do_parse_argv(rest, acc)
+          key -> do_parse_argv(rest, [{key, coerce_flag(key, value)} | acc])
+        end
+
+      [flag] ->
+        case {Map.get(@value_flags, flag), rest} do
+          {key, [value | tail]} when not is_nil(key) ->
+            do_parse_argv(tail, [{key, coerce_flag(key, value)} | acc])
+
+          _ ->
+            do_parse_argv(rest, acc)
+        end
+    end
+  end
+
+  defp coerce_flag(:runs, v), do: max(String.to_integer(v), 1)
+  defp coerce_flag(:warmup, v), do: max(String.to_integer(v), 0)
+  defp coerce_flag(_key, v), do: v
+
   def run(opts \\ []) do
     runs = Keyword.get(opts, :runs, 5)
     warmup = Keyword.get(opts, :warmup, 1)
-    commit_sha = resolve_git_commit()
-    run_id = "run-#{System.os_time(:second)}"
+    commit_sha = Keyword.get(opts, :commit) || resolve_git_commit()
+    run_id = Keyword.get(opts, :run_id) || "run-#{System.os_time(:second)}"
+    append? = Keyword.get(opts, :append, false)
+    no_history? = Keyword.get(opts, :no_history, false)
+    groups_filter = Keyword.get(opts, :groups, "") || ""
+    name_filter = Keyword.get(opts, :filter, "") || ""
+    output_path = Keyword.get(opts, :output, "benchmarks/elixir.jsonl")
+    history_path = Keyword.get(opts, :history, "benchmarks/history.jsonl")
 
-    {:ok, db} = Xitdb.open(backend: :memory)
-    db = seed_fixture_db(db, 500)
+    selective_run? =
+      (groups_filter != "" and String.downcase(groups_filter) != "all") or name_filter != ""
 
-    root = Xitdb.db(db)
-    users_cur = root["users"]
-    sorted_cur = root["sorted_users"]
-    items_cur = root["items"]
-    linked_cur = root["linked"]
-    cusers_cur = root["counted_users"]
-    cset_cur = root["counted_set"]
-    u0_cur = users_cur["u0"]
+    active_ranks =
+      @bench_meta
+      |> Enum.filter(fn {_rank, group, name} ->
+        should_run_bench?(group, name, groups_filter, name_filter)
+      end)
+      |> MapSet.new(fn {rank, _group, _name} -> rank end)
 
-    {:ok, hist_db} = Xitdb.open(backend: :memory)
+    need_main_db? =
+      Enum.any?([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 21, 25], &MapSet.member?(active_ranks, &1))
+
+    need_hist_db? = Enum.any?([17, 18, 20], &MapSet.member?(active_ranks, &1))
+    need_diff_db? = Enum.any?([19, 22, 23], &MapSet.member?(active_ranks, &1))
+    need_search_db? = MapSet.member?(active_ranks, 26)
+
+    {db, root, users_cur, sorted_cur, items_cur, linked_cur, cusers_cur, cset_cur, u0_cur} =
+      if need_main_db? do
+        {:ok, d} = Xitdb.open(backend: :memory)
+        d = seed_fixture_db(d, 500)
+        r = Xitdb.db(d)
+        uc = r["users"]
+
+        {d, r, uc, r["sorted_users"], r["items"], r["linked"], r["counted_users"],
+         r["counted_set"], uc["u0"]}
+      else
+        {nil, nil, nil, nil, nil, nil, nil, nil, nil}
+      end
+
+    _ = root
 
     hist_db =
-      Enum.reduce(0..99, hist_db, fn i, acc ->
-        {:ok, acc} =
-          Xitdb.transact(acc, %{
-            "users" => %{
-              "alice" => %{"score" => i},
-              "bob" => %{"score" => 1000}
-            }
-          })
+      if need_hist_db? do
+        {:ok, hd} = Xitdb.open(backend: :memory)
 
-        acc
-      end)
+        Enum.reduce(0..99, hd, fn i, acc ->
+          {:ok, acc} =
+            Xitdb.transact(acc, %{
+              "users" => %{
+                "alice" => %{"score" => i},
+                "bob" => %{"score" => 1000}
+              }
+            })
 
-    {:ok, diff_db} = Xitdb.open(backend: :memory)
-    diff_db = seed_fixture_db(diff_db, 200)
-    {:ok, diff_db} = Xitdb.transact(diff_db, fn r -> put_in(r["users"]["u42"]["age"], 99) end)
+          acc
+        end)
+      else
+        nil
+      end
 
-    {:ok, search_db} = Xitdb.open(backend: :memory)
-    search_db = seed_bm25_fixture_db(search_db, 200)
-    search_root = Xitdb.db(search_db)
+    diff_db =
+      if need_diff_db? do
+        {:ok, dd} = Xitdb.open(backend: :memory)
+        dd = seed_fixture_db(dd, 200)
+        {:ok, dd} = Xitdb.transact(dd, fn r -> put_in(r["users"]["u42"]["age"], 99) end)
+        dd
+      else
+        nil
+      end
+
+    {search_db, search_root} =
+      if need_search_db? do
+        {:ok, sd} = Xitdb.open(backend: :memory)
+        sd = seed_bm25_fixture_db(sd, 200)
+        {sd, Xitdb.db(sd)}
+      else
+        {nil, nil}
+      end
 
     bm25_opts = %{
       match: :all,
@@ -372,8 +488,12 @@ defmodule Xitdb.ClientBench do
     ]
 
     records =
-      Enum.map(benches, fn {rank, name, ops, fun} ->
-        for _ <- 1..warmup, do: fun.()
+      benches
+      |> Enum.filter(fn {rank, _name, _ops, _fun} -> MapSet.member?(active_ranks, rank) end)
+      |> Enum.map(fn {rank, name, ops, fun} ->
+        if warmup > 0 do
+          for _ <- 1..warmup, do: fun.()
+        end
 
         {samples_ns, max_bytes} =
           Enum.reduce(1..runs, {[], 0}, fn _, {acc, max_b} ->
@@ -400,15 +520,98 @@ defmodule Xitdb.ClientBench do
         rec
       end)
 
-    Xitdb.close(db)
-    Xitdb.close(hist_db)
-    Xitdb.close(diff_db)
-    Xitdb.close(search_db)
+    if db, do: Xitdb.close(db)
+    if hist_db, do: Xitdb.close(hist_db)
+    if diff_db, do: Xitdb.close(diff_db)
+    if search_db, do: Xitdb.close(search_db)
 
-    jsonl = Enum.map_join(records, "\n", &encode_json_line/1) <> "\n"
-    File.write!("benchmarks/elixir.jsonl", jsonl)
-    File.write!("benchmarks/history.jsonl", jsonl, [:append])
+    if records != [] do
+      new_lines_by_rank = Map.new(records, fn r -> {r.rank, encode_json_line(r)} end)
+      new_jsonl = Enum.map_join(records, "\n", &Map.fetch!(new_lines_by_rank, &1.rank)) <> "\n"
+
+      cond do
+        append? ->
+          File.write!(output_path, new_jsonl, [:append])
+
+        selective_run? ->
+          existing_by_rank =
+            if File.exists?(output_path) do
+              output_path
+              |> File.read!()
+              |> String.split("\n", trim: true)
+              |> Enum.reduce(%{}, fn line, acc ->
+                case Regex.run(~r/"rank"\s*:\s*(\d+)/, line) do
+                  [_, r_str] -> Map.put(acc, String.to_integer(r_str), line)
+                  _ -> acc
+                end
+              end)
+            else
+              %{}
+            end
+
+          merged_jsonl =
+            existing_by_rank
+            |> Map.merge(new_lines_by_rank)
+            |> Enum.sort_by(fn {rank, _line} -> rank end)
+            |> Enum.map_join("\n", fn {_rank, line} -> line end)
+            |> Kernel.<>("\n")
+
+          File.write!(output_path, merged_jsonl)
+
+        true ->
+          File.write!(output_path, new_jsonl)
+      end
+
+      unless no_history? do
+        File.write!(history_path, new_jsonl, [:append])
+      end
+    end
   end
+
+  defp should_run_bench?(group, name, groups_filter, name_filter) do
+    group_ok =
+      if groups_filter == "" or String.downcase(groups_filter) == "all" do
+        true
+      else
+        tokens =
+          groups_filter
+          |> String.split([",", "|"], trim: true)
+          |> Enum.map(&(&1 |> String.trim() |> String.downcase()))
+
+        Enum.any?(tokens, fn tok ->
+          tok == "all" or tok == Atom.to_string(group) or group_alias_match?(tok, group)
+        end)
+      end
+
+    name_ok =
+      if name_filter == "" do
+        true
+      else
+        lower = String.downcase(name)
+
+        name_filter
+        |> String.split(["|", ","], trim: true)
+        |> Enum.map(&(&1 |> String.trim() |> String.downcase()))
+        |> Enum.any?(fn pat -> pat != "" and String.contains?(lower, pat) end)
+      end
+
+    group_ok and name_ok
+  end
+
+  defp group_alias_match?(tok, :enumerable) when tok in ["enum", "stream", "materialize"],
+    do: true
+
+  defp group_alias_match?(tok, :transactions) when tok in ["tx", "transaction"], do: true
+
+  defp group_alias_match?(tok, :time_travel)
+       when tok in ["time-travel", "timetravel", "history", "lifecycle", "compact", "compaction"],
+       do: true
+
+  defp group_alias_match?(tok, :queries)
+       when tok in ["query", "search", "storage", "datalog", "pull", "bm25"],
+       do: true
+
+  defp group_alias_match?(_, _), do: false
 
   defp seed_fixture_db(db, n) do
     users =
@@ -605,4 +808,4 @@ defmodule Xitdb.ClientBench do
   end
 end
 
-Xitdb.ClientBench.run()
+Xitdb.ClientBench.run(Xitdb.ClientBench.parse_argv(System.argv()))
