@@ -36,9 +36,10 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     @spec swap_compacted_base(module(), term(), integer()) :: :ok
     def swap_compacted_base(store, compacted_db, moment)
         when is_atom(store) and is_integer(moment) and moment >= @uncommitted_moment do
-      {_old_db, atomics, reverse_fks} = fetch_slot!(store)
-      :ok = :atomics.put(atomics, 1, moment)
-      :persistent_term.put(pt_key(store), {compacted_db, atomics, reverse_fks})
+      {_old_db, _old_atomics, reverse_fks} = fetch_slot!(store)
+      new_atomics = :atomics.new(1, signed: true)
+      :ok = :atomics.put(new_atomics, 1, moment)
+      :persistent_term.put(pt_key(store), {compacted_db, new_atomics, reverse_fks})
     end
 
     @doc """
@@ -99,12 +100,18 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     """
     @spec as_of(module(), integer()) :: Xitdb.Cursor.t()
     def as_of(store, moment) when is_atom(store) and is_integer(moment) do
-      {%Xitdb{} = slot_base_db, _atomics, _reverse_fks} = fetch_slot!(store)
+      tx_key = {:xitdb_tx_db, store}
+      callers = Process.get(:"$callers")
+
+      active_handle =
+        Process.get(tx_key) ||
+          caller_dict_lookup(callers, tx_key, tx_key) ||
+          sandbox_or_committed_db(store)
 
       base_db =
-        case Process.get({:xitdb_tx_db, store}) || sandbox_or_committed_db(store) do
+        case active_handle do
           %Xitdb{} = db -> db
-          %Xitdb.Cursor{db_ref: db_ref} -> %{slot_base_db | db_ref: db_ref}
+          %Xitdb.Cursor{db_ref: db_ref} -> struct(Xitdb, db_ref: db_ref)
           {%Xitdb{} = db, _moment} -> db
         end
 
@@ -129,8 +136,15 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     end
 
     defp caller_dict_lookup(callers, as_of_key, tx_key) when is_list(callers) do
-      Enum.find_value(callers, fn
-        pid when is_pid(pid) ->
+      Enum.find_value(callers, fn entry ->
+        pid =
+          cond do
+            is_pid(entry) -> entry
+            is_atom(entry) and entry != nil -> Process.whereis(entry)
+            true -> nil
+          end
+
+        if is_pid(pid) do
           case :erlang.process_info(pid, {:dictionary, as_of_key}) do
             {{:dictionary, ^as_of_key}, val} when val != :undefined and val != nil ->
               val
@@ -141,9 +155,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
                 _ -> nil
               end
           end
-
-        _ ->
-          nil
+        end
       end)
     end
 

@@ -24,6 +24,12 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         index :status
         index [:status, :inserted_at], name: :idx_status_recent
         search_field :title, boost: 2.5
+
+        search_field :title_tag,
+          boost: 1.5,
+          resolver: fn event, _db ->
+            ["tag:" <> (event.title || "")]
+          end
       end
 
       attributes do
@@ -163,7 +169,14 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       assert Info.collection!(Event) == :events
       assert Info.counted_set_fields(Event) == [:tags]
       assert Info.index_relationships?(Event) == true
-      assert [%SearchField{field: :title, boost: 2.5}] = Info.search_fields(Event)
+
+      assert [
+               %SearchField{field: :title, boost: 2.5, resolver: nil},
+               %SearchField{field: :title_tag, boost: 1.5, resolver: resolver}
+             ] = Info.search_fields(Event)
+
+      assert is_function(resolver, 2)
+      assert resolver.(%{title: "Summit"}, nil) == ["tag:Summit"]
 
       assert [
                %Index{fields: [:status], name: nil},
@@ -361,17 +374,32 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       end
     end
 
-    # Spark runs `Spark.Dsl.Verifier`s inside `@after_verify`, where errors surface as compiler
-    # diagnostics instead of raised `DslError`s, so verifier tests assert on diagnostics and call
-    # `verify/1` directly. Transformer (`BuildIndexPlan`) tests keep using `assert_raise`.
+    # Spark runs `Spark.Dsl.Verifier`s inside `@after_verify` via `Module.ParallelChecker`
+    # unless `{Spark.Dsl, :test_collector}` is set before compilation; setting it captures
+    # verifier errors cleanly under `async: true` without printing warnings to `:stderr`.
     defp assert_verifier_error(code_str, mod_name, verifier_mod, expected_regex) do
-      {compiled, diagnostics} =
-        Code.with_diagnostics(fn ->
-          Code.compile_string(code_str)
-        end)
+      previous = Process.put({Spark.Dsl, :test_collector}, self())
 
-      assert Enum.any?(diagnostics, &(&1.message =~ expected_regex))
+      {compiled, collected_errors} =
+        try do
+          compiled = Code.compile_string(code_str)
+          {compiled, Spark.Test.__drain_errors__([])}
+        after
+          case previous do
+            nil -> Process.delete({Spark.Dsl, :test_collector})
+            prev -> Process.put({Spark.Dsl, :test_collector}, prev)
+          end
+
+          Spark.Test.__drain_errors__([])
+          Spark.Test.__drain_warnings__([])
+        end
+
       assert Enum.any?(compiled, fn {mod, _bin} -> mod == mod_name end)
+
+      assert Enum.any?(collected_errors, fn
+               {^mod_name, errs} -> Enum.any?(errs, &(Exception.message(&1) =~ expected_regex))
+               _ -> false
+             end)
 
       assert {:error, %DslError{message: msg}} =
                verifier_mod.verify(mod_name.spark_dsl_config())

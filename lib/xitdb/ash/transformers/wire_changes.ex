@@ -13,6 +13,7 @@ if Code.ensure_loaded?(Spark.Dsl.Transformer) and Code.ensure_loaded?(Ash.Resour
 
     @impl true
     def after?(Ash.Resource.Transformers.SetTypes), do: true
+    def after?(Xitdb.Ash.Transformers.BuildIndexPlan), do: true
     def after?(_), do: false
 
     @impl true
@@ -68,6 +69,9 @@ if Code.ensure_loaded?(Spark.Dsl.Transformer) and Code.ensure_loaded?(Ash.Resour
       lock_change = Transformer.get_persisted(dsl_state, :xitdb_lock_change)
       normalized_indexes = Transformer.get_persisted(dsl_state, :xitdb_normalized_indexes)
 
+      uses_default_store? =
+        Transformer.get_option(dsl_state, [:xitdb], :store) == nil and store != nil
+
       Transformer.eval(
         dsl_state,
         [
@@ -78,32 +82,53 @@ if Code.ensure_loaded?(Spark.Dsl.Transformer) and Code.ensure_loaded?(Ash.Resour
           pull_pattern: pull_pattern,
           store: store,
           lock_change: lock_change,
-          normalized_indexes: normalized_indexes
+          normalized_indexes: normalized_indexes,
+          uses_default_store?: uses_default_store?
         ],
         quote do
-          @doc false
-          def __xitdb_collection__, do: unquote(Macro.escape(collection))
+          if unquote(uses_default_store?) do
+            _ = Application.compile_env(:xitdb, :default_store)
+          end
 
-          @doc false
-          def __xitdb_nested_in__, do: unquote(Macro.escape(nested_in))
+          unless Module.defines?(__MODULE__, {:__xitdb_collection__, 0}, :def) do
+            @doc false
+            def __xitdb_collection__, do: unquote(Macro.escape(collection))
+          end
 
-          @doc false
-          def __xitdb_indexes__, do: unquote(Macro.escape(normalized_indexes))
+          unless Module.defines?(__MODULE__, {:__xitdb_nested_in__, 0}, :def) do
+            @doc false
+            def __xitdb_nested_in__, do: unquote(Macro.escape(nested_in))
+          end
 
-          @doc false
-          def __xitdb_editable_field_strings__, do: unquote(Macro.escape(editable_strings))
+          unless Module.defines?(__MODULE__, {:__xitdb_indexes__, 0}, :def) do
+            @doc false
+            def __xitdb_indexes__, do: unquote(Macro.escape(normalized_indexes))
+          end
 
-          @doc false
-          def __xitdb_pull_fields__, do: unquote(Macro.escape(pull_fields))
+          unless Module.defines?(__MODULE__, {:__xitdb_editable_field_strings__, 0}, :def) do
+            @doc false
+            def __xitdb_editable_field_strings__, do: unquote(Macro.escape(editable_strings))
+          end
 
-          @doc false
-          def __xitdb_pull_pattern__, do: unquote(Macro.escape(pull_pattern))
+          unless Module.defines?(__MODULE__, {:__xitdb_pull_fields__, 0}, :def) do
+            @doc false
+            def __xitdb_pull_fields__, do: unquote(Macro.escape(pull_fields))
+          end
 
-          @doc false
-          def __xitdb_store__, do: unquote(Macro.escape(store))
+          unless Module.defines?(__MODULE__, {:__xitdb_pull_pattern__, 0}, :def) do
+            @doc false
+            def __xitdb_pull_pattern__, do: unquote(Macro.escape(pull_pattern))
+          end
 
-          @doc false
-          def __xitdb_lock_change__, do: unquote(Macro.escape(lock_change))
+          unless Module.defines?(__MODULE__, {:__xitdb_store__, 0}, :def) do
+            @doc false
+            def __xitdb_store__, do: unquote(Macro.escape(store))
+          end
+
+          unless Module.defines?(__MODULE__, {:__xitdb_lock_change__, 0}, :def) do
+            @doc false
+            def __xitdb_lock_change__, do: unquote(Macro.escape(lock_change))
+          end
         end
       )
     end
@@ -112,7 +137,7 @@ if Code.ensure_loaded?(Spark.Dsl.Transformer) and Code.ensure_loaded?(Ash.Resour
       collection =
         case XitdbInfo.xitdb_collection(dsl_state) do
           {:ok, col} -> col
-          _ -> nil
+          _ -> Transformer.get_persisted(dsl_state, :xitdb_collection)
         end
 
       nested_in = XitdbInfo.compute_nested_mappings(dsl_state)
@@ -122,8 +147,8 @@ if Code.ensure_loaded?(Spark.Dsl.Transformer) and Code.ensure_loaded?(Ash.Resour
 
       store =
         case XitdbInfo.xitdb_store(dsl_state) do
-          {:ok, s} -> s
-          _ -> nil
+          {:ok, s} when not is_nil(s) -> s
+          _ -> Transformer.get_persisted(dsl_state, :xitdb_store) || XitdbInfo.store(dsl_state)
         end
 
       lock_change =
@@ -132,13 +157,32 @@ if Code.ensure_loaded?(Spark.Dsl.Transformer) and Code.ensure_loaded?(Ash.Resour
           _ -> nil
         end
 
+      existing_normalized = Transformer.get_persisted(dsl_state, :xitdb_normalized_indexes, [])
+      aliases = XitdbInfo.xitdb_field_aliases!(dsl_state)
+
       normalized_indexes =
         if is_nil(collection) do
-          []
+          existing_normalized
         else
-          for {field, idx_name} <- XitdbInfo.xitdb_indexes!(dsl_state) do
-            {collection, field, idx_name}
-          end
+          opt_indexes =
+            for {field, idx_name} <- XitdbInfo.xitdb_indexes!(dsl_state) do
+              {collection, Keyword.get(aliases, field, field), idx_name}
+            end
+
+          entity_indexes =
+            for %Xitdb.Ash.Index{fields: [single], name: name} <-
+                  Spark.Dsl.Extension.get_entities(dsl_state, [:xitdb]) do
+              slot_name =
+                case name do
+                  n when is_atom(n) and not is_nil(n) -> Atom.to_string(n)
+                  n when is_binary(n) -> n
+                  nil -> "attr_#{single}"
+                end
+
+              {collection, Keyword.get(aliases, single, single), slot_name}
+            end
+
+          Enum.uniq(existing_normalized ++ opt_indexes ++ entity_indexes)
         end
 
       dsl_state

@@ -199,7 +199,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
                 GenServer.call(
                   coord_pid,
                   {:commit, store, lease_ref, final_snapshot},
-                  call_timeout
+                  :infinity
                 )
               end
 
@@ -269,6 +269,13 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     end
 
     defp find_chain_owner(_store, []), do: :none
+
+    defp find_chain_owner(store, [name | rest]) when is_atom(name) and name != nil do
+      case Process.whereis(name) do
+        pid when is_pid(pid) -> find_chain_owner(store, [pid | rest])
+        nil -> find_chain_owner(store, rest)
+      end
+    end
 
     defp find_chain_owner(store, [pid | rest]) when is_pid(pid) do
       cond do
@@ -414,6 +421,13 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
       {closing, remaining_snapshots} = Map.split(state.snapshots, stores)
 
+      Enum.each(stores, fn store ->
+        case Map.fetch(state.queues, store) do
+          {:ok, queue} -> LeaseQueue.cancel_all(queue, {:error, :sandbox_checked_in})
+          :error -> :ok
+        end
+      end)
+
       Enum.each(closing, fn {_store, {db, _moment}} ->
         Backend.close_db(db)
       end)
@@ -429,16 +443,28 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     end
 
     def handle_call({:acquire, store, req_ref, call_timeout}, from, %__MODULE__{} = state) do
-      queue = Map.fetch!(state.queues, store)
-      snapshot = Map.fetch!(state.snapshots, store)
-      lease_timeout = Store.min_timeout(state.lease_timeout, call_timeout)
+      case {Map.fetch(state.queues, store), Map.fetch(state.snapshots, store)} do
+        {{:ok, queue}, {:ok, snapshot}} ->
+          lease_timeout = Store.min_timeout(state.lease_timeout, call_timeout)
 
-      case LeaseQueue.acquire(queue, store, req_ref, from, lease_timeout, call_timeout, snapshot) do
-        {:granted, lease_ref, next_queue} ->
-          {:reply, {:ok, lease_ref, snapshot}, put_queue(state, store, next_queue)}
+          case LeaseQueue.acquire(
+                 queue,
+                 store,
+                 req_ref,
+                 from,
+                 lease_timeout,
+                 call_timeout,
+                 snapshot
+               ) do
+            {:granted, lease_ref, next_queue} ->
+              {:reply, {:ok, lease_ref, snapshot}, put_queue(state, store, next_queue)}
 
-        {:queued, next_queue} ->
-          {:noreply, put_queue(state, store, next_queue)}
+            {:queued, next_queue} ->
+              {:noreply, put_queue(state, store, next_queue)}
+          end
+
+        _ ->
+          {:reply, {:error, :sandbox_checked_in}, state}
       end
     end
 
@@ -447,39 +473,43 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           {caller_pid, _},
           %__MODULE__{} = state
         ) do
-      queue = Map.fetch!(state.queues, store)
+      case Map.fetch(state.queues, store) do
+        :error ->
+          {:reply, {:error, :lease_expired}, state}
 
-      case LeaseQueue.verify_holder(queue, lease_ref, caller_pid) do
-        :ok ->
-          {committed_db, committed_moment} = Backend.reconcile_tip(new_db, new_moment)
-          next_snapshot = {committed_db, committed_moment}
+        {:ok, queue} ->
+          case LeaseQueue.verify_holder(queue, lease_ref, caller_pid) do
+            :ok ->
+              {committed_db, committed_moment} = Backend.reconcile_tip(new_db, new_moment)
+              next_snapshot = {committed_db, committed_moment}
 
-          :ets.insert(
-            state.table,
-            {{:db, store, state.owner}, Xitdb.as_of(committed_db, committed_moment)}
-          )
+              :ets.insert(
+                state.table,
+                {{:db, store, state.owner}, Xitdb.as_of(committed_db, committed_moment)}
+              )
 
-          next_queue = LeaseQueue.release_and_grant_next(queue, store, next_snapshot)
+              next_queue = LeaseQueue.release_and_grant_next(queue, store, next_snapshot)
 
-          next_state = %__MODULE__{
-            state
-            | snapshots: Map.put(state.snapshots, store, next_snapshot),
-              queues: Map.put(state.queues, store, next_queue)
-          }
+              next_state = %__MODULE__{
+                state
+                | snapshots: Map.put(state.snapshots, store, next_snapshot),
+                  queues: Map.put(state.queues, store, next_queue)
+              }
 
-          {:reply, :ok, next_state}
+              {:reply, :ok, next_state}
 
-        {:error, :lease_expired} = err ->
-          next_state =
-            if is_nil(queue.active) do
-              {db, moment} = Map.fetch!(state.snapshots, store)
-              restored_snap = Backend.reconcile_tip(db, moment)
-              %__MODULE__{state | snapshots: Map.put(state.snapshots, store, restored_snap)}
-            else
-              state
-            end
+            {:error, :lease_expired} = err ->
+              next_state =
+                if is_nil(queue.active) do
+                  {db, moment} = Map.fetch!(state.snapshots, store)
+                  restored_snap = Backend.reconcile_tip(db, moment)
+                  %__MODULE__{state | snapshots: Map.put(state.snapshots, store, restored_snap)}
+                else
+                  state
+                end
 
-          {:reply, err, next_state}
+              {:reply, err, next_state}
+          end
       end
     end
 
@@ -493,10 +523,14 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     end
 
     def handle_cast({:cancel_waiter, store, req_ref}, %__MODULE__{} = state) do
-      queue = Map.fetch!(state.queues, store)
-      snapshot = Map.fetch!(state.snapshots, store)
-      next_queue = LeaseQueue.cancel_waiter(queue, req_ref, store, snapshot)
-      {:noreply, put_queue(state, store, next_queue)}
+      case {Map.fetch(state.queues, store), Map.fetch(state.snapshots, store)} do
+        {{:ok, queue}, {:ok, snapshot}} ->
+          next_queue = LeaseQueue.cancel_waiter(queue, req_ref, store, snapshot)
+          {:noreply, put_queue(state, store, next_queue)}
+
+        _ ->
+          {:noreply, state}
+      end
     end
 
     @impl GenServer
@@ -563,23 +597,27 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     end
 
     defp release_aborted_sandbox_lease(%__MODULE__{} = state, store, lease_ref, caller_pid) do
-      queue = Map.fetch!(state.queues, store)
-
-      case LeaseQueue.verify_holder(queue, lease_ref, caller_pid) do
-        :ok ->
-          {db, moment} = Map.fetch!(state.snapshots, store)
-          {restored_db, restored_moment} = Backend.reconcile_tip(db, moment)
-          restored_snap = {restored_db, restored_moment}
-          next_queue = LeaseQueue.release_and_grant_next(queue, store, restored_snap)
-
-          %__MODULE__{
-            state
-            | snapshots: Map.put(state.snapshots, store, restored_snap),
-              queues: Map.put(state.queues, store, next_queue)
-          }
-
-        {:error, :lease_expired} ->
+      case Map.fetch(state.queues, store) do
+        :error ->
           state
+
+        {:ok, queue} ->
+          case LeaseQueue.verify_holder(queue, lease_ref, caller_pid) do
+            :ok ->
+              {db, moment} = Map.fetch!(state.snapshots, store)
+              {restored_db, restored_moment} = Backend.reconcile_tip(db, moment)
+              restored_snap = {restored_db, restored_moment}
+              next_queue = LeaseQueue.release_and_grant_next(queue, store, restored_snap)
+
+              %__MODULE__{
+                state
+                | snapshots: Map.put(state.snapshots, store, restored_snap),
+                  queues: Map.put(state.queues, store, next_queue)
+              }
+
+            {:error, :lease_expired} ->
+              state
+          end
       end
     end
 

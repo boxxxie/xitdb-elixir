@@ -172,6 +172,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
       attribute(:compensation_band, :string, public?: true)
       attribute(:view_count, :integer, default: 0, allow_nil?: false, public?: true)
+      attribute(:local_overrides, :map, default: %{}, allow_nil?: false, public?: true)
     end
 
     identities do
@@ -256,12 +257,13 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           :role,
           :visibility,
           :compensation_band,
+          :local_overrides,
           :organization_id
         ])
 
         upsert?(true)
         upsert_identity(:unique_email)
-        upsert_fields([:full_name, :headline, :visibility, :organization_id])
+        upsert_fields([:full_name, :headline, :visibility, :local_overrides, :organization_id])
       end
 
       create :submit_application do
@@ -271,12 +273,13 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           :headline,
           :visibility,
           :compensation_band,
+          :local_overrides,
           :organization_id
         ])
       end
 
       update :edit_profile do
-        accept([:headline, :visibility, :compensation_band])
+        accept([:headline, :visibility, :compensation_band, :local_overrides])
       end
 
       update :change_email do
@@ -466,6 +469,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       attribute(:recipient_id, :integer, allow_nil?: false, public?: true)
       attribute(:body, :string, allow_nil?: false, public?: true)
       attribute(:archived?, :boolean, default: false, allow_nil?: false, public?: true)
+      attribute(:context_metadata, :map, default: %{}, allow_nil?: false, public?: true)
     end
 
     relationships do
@@ -481,7 +485,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       defaults([:read, :destroy])
 
       create :send_message do
-        accept([:sender_id, :recipient_id, :body])
+        accept([:sender_id, :recipient_id, :body, :context_metadata])
       end
 
       update :archive do

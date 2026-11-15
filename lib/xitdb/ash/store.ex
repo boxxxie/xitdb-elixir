@@ -447,8 +447,18 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
     @impl GenServer
     def terminate(_reason, %State{} = state) do
+      final_db =
+        case state.db do
+          %Xitdb{} = db when is_integer(state.moment) and state.moment >= 0 ->
+            {reconciled_db, _restored_moment} = Backend.reconcile_tip(db, state.moment)
+            reconciled_db
+
+          other ->
+            other
+        end
+
       Snapshot.erase(state.name)
-      Backend.close_db(state.db)
+      Backend.close_db(final_db)
       :ok
     end
 
@@ -479,29 +489,37 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     def run_with_working_db(store, initial_snapshot, fun, commit_fn, abort_fn) do
       put_working_snapshot(store, initial_snapshot)
 
-      try do
-        value = fun.()
-        final_snapshot = Process.get(tx_state_key(store))
-        delete_working_snapshot(store)
+      result =
+        try do
+          {:ok, fun.()}
+        catch
+          :throw, {:xitdb_ash_rollback, ^store, reason} ->
+            delete_working_snapshot(store)
+            abort_fn.()
+            {:error, reason}
 
-        case commit_fn.(final_snapshot) do
-          :ok ->
-            {:ok, value}
-
-          {:error, :lease_expired} ->
-            {:error, %LeaseError{store: store, reason: :lease_expired}}
+          kind, payload ->
+            stacktrace = __STACKTRACE__
+            delete_working_snapshot(store)
+            abort_fn.()
+            :erlang.raise(kind, payload, stacktrace)
         end
-      catch
-        :throw, {:xitdb_ash_rollback, ^store, reason} ->
-          delete_working_snapshot(store)
-          abort_fn.()
-          {:error, reason}
 
-        kind, payload ->
-          stacktrace = __STACKTRACE__
+      case result do
+        {:ok, value} ->
+          final_snapshot = Process.get(tx_state_key(store))
           delete_working_snapshot(store)
-          abort_fn.()
-          :erlang.raise(kind, payload, stacktrace)
+
+          case commit_fn.(final_snapshot) do
+            :ok ->
+              {:ok, value}
+
+            {:error, :lease_expired} ->
+              {:error, %LeaseError{store: store, reason: :lease_expired}}
+          end
+
+        {:error, _reason} = err ->
+          err
       end
     end
 
@@ -528,7 +546,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       case acquire_store_lease(store, req_ref, call_timeout) do
         {:ok, lease_ref, initial_snapshot} ->
           commit_fn = fn final_snapshot ->
-            GenServer.call(store, {:commit_lease, lease_ref, final_snapshot}, call_timeout)
+            GenServer.call(store, {:commit_lease, lease_ref, final_snapshot}, :infinity)
           end
 
           abort_fn = fn ->
@@ -586,7 +604,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         end)
 
       local_set = MapSet.new(local_resources)
-      by_collection = Map.new(local_resources, fn res -> {resolve_collection(res), res} end)
+      by_collection = Enum.group_by(local_resources, &resolve_collection/1)
 
       explicit_pairs =
         for child <- local_resources,
@@ -650,23 +668,27 @@ if Code.ensure_loaded?(Ash.DataLayer) do
            %{parent_collection: parent_col, foreign_key: fk_attr},
            by_collection
          ) do
-      case resolve_parent_resource(child, fk_attr, parent_col, by_collection) do
-        nil -> []
-        parent -> [{parent, fk_attr}]
-      end
+      child
+      |> resolve_parent_resources(fk_attr, parent_col, by_collection)
+      |> Enum.map(&{&1, fk_attr})
     end
 
     defp normalize_nested_parent(_child, _other, _by_collection), do: []
 
-    defp resolve_parent_resource(source_resource, fk_attr, parent_col, by_collection) do
+    defp resolve_parent_resources(source_resource, fk_attr, parent_col, by_collection) do
       rel_match =
         source_resource
         |> Ash.Resource.Info.relationships()
         |> Enum.find(fn rel -> rel.type == :belongs_to and rel.source_attribute == fk_attr end)
 
       case rel_match do
-        %{destination: dest} -> dest
-        nil -> Map.get(by_collection, parent_col)
+        %{destination: dest} ->
+          [dest]
+
+        nil ->
+          candidates = Map.get(by_collection, parent_col, [])
+          top_level = Enum.reject(candidates, &resource_nested?/1)
+          if top_level != [], do: top_level, else: candidates
       end
     end
 
@@ -755,8 +777,10 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       def ensure_seeded!(%Xitdb{} = db) do
         case Xitdb.moment_count(db) do
           0 ->
-            {:ok, seeded_db} = Xitdb.transact_ops(db, [{:init_col, ".meta", "hash_map"}])
-            {seeded_db, Xitdb.moment_count(seeded_db) - 1}
+            {:ok, seeded_db, moment} =
+              Xitdb.transact_ops_with_moment(db, [{:init_col, ".meta", "hash_map"}])
+
+            {seeded_db, moment}
 
           count when count > 0 ->
             {db, count - 1}
@@ -771,14 +795,14 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         tail_moment = latest_moment(db)
 
         if tail_moment > target_moment do
-          {:ok, restored_db} =
-            Xitdb.transact_ops(
+          {:ok, restored_db, restored_moment} =
+            Xitdb.transact_ops_with_moment(
               db,
               [{:meta, "restored_moment", target_moment}],
               base_moment: target_moment
             )
 
-          {restored_db, latest_moment(restored_db)}
+          {restored_db, restored_moment}
         else
           {db, target_moment}
         end

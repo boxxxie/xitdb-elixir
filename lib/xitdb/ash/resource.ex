@@ -56,11 +56,6 @@ if Code.ensure_loaded?(Spark.Dsl.Extension) and Code.ensure_loaded?(Ash.Resource
       :status
     ]
 
-    @doc false
-    def validate_resolver(fun) when is_function(fun, 2), do: {:ok, fun}
-    def validate_resolver(nil), do: {:ok, nil}
-    def validate_resolver(_), do: {:error, "must be a 2-arity function (record, db) or nil"}
-
     @search_field %Spark.Dsl.Entity{
       name: :search_field,
       describe: "Declares a field to be indexed in the transactional BM25 search index.",
@@ -83,7 +78,7 @@ if Code.ensure_loaded?(Spark.Dsl.Extension) and Code.ensure_loaded?(Ash.Resource
           doc: "BM25 field weight multiplier."
         ],
         resolver: [
-          type: {:custom, __MODULE__, :validate_resolver, []},
+          type: {:or, [{:fun, 2}, {:in, [nil]}]},
           doc: "Custom 2-arity resolver fn(record, db) -> string or enumerable of strings."
         ]
       ]

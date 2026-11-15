@@ -184,4 +184,10 @@ defmodule Xitdb.Ash.SearchTest do
     assert [{expr_calc, :asc}] = sorted_query.sort
     assert is_struct(expr_calc)
   end
+
+  test "query rejects negative as_of moment indexes", %{db: db} do
+    assert_raise NimbleOptions.ValidationError, ~r/as_of/, fn ->
+      Search.query(SearchProfile, "alice", db: db, as_of: -1)
+    end
+  end
 end

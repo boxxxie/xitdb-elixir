@@ -47,6 +47,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           %SearchField{s | __identifier__: nil, __spark_metadata__: nil}
         end
 
+      uses_default_store? = is_nil(Transformer.get_option(dsl_state, [:xitdb], :store))
+
       with {:ok, store} <- validate_store(module, dsl_state),
            {:ok, collection} <- validate_collection(module, dsl_state),
            :ok <- validate_primary_key(module, pk_fields),
@@ -54,10 +56,9 @@ if Code.ensure_loaded?(Ash.DataLayer) do
            :ok <- validate_explicit_indexes(module, explicit_indexes, attr_names),
            :ok <- validate_counted_set_fields(module, dsl_state, attrs_by_name),
            :ok <- validate_projected_fields(module, dsl_state, attr_names),
-           :ok <- validate_search_fields(module, search_fields, attr_names) do
-        all_indexes =
-          maybe_append_relationship_indexes(dsl_state, explicit_indexes, pk_fields)
-
+           :ok <- validate_search_fields(module, search_fields, attr_names),
+           all_indexes = maybe_append_relationship_indexes(dsl_state, explicit_indexes, pk_fields),
+           :ok <- validate_all_index_slots(module, all_indexes) do
         normalized_indexes = build_tx_for_indexes(collection, all_indexes)
 
         updated_state =
@@ -69,7 +70,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           |> Transformer.persist(:xitdb_search_fields, search_fields)
           |> Transformer.persist(:xitdb_references, references)
           |> Transformer.persist(:xitdb_normalized_indexes, normalized_indexes)
-          |> define_direct_callbacks(store, collection, normalized_indexes)
+          |> define_direct_callbacks(store, collection, normalized_indexes, uses_default_store?)
 
         {:ok, updated_state}
       end
@@ -151,6 +152,15 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         slot_name = canonical_index_slot_name(idx)
 
         cond do
+          blank_index_name?(name) ->
+            {:halt,
+             {:error,
+              DslError.exception(
+                module: module,
+                path: [:xitdb, :index, name || fields],
+                message: "index `name` cannot be blank"
+              )}}
+
           fields == [] ->
             {:halt,
              {:error,
@@ -198,6 +208,35 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       |> case do
         {:error, _} = err -> err
         {_seen_fields, _seen_names} -> :ok
+      end
+    end
+
+    defp blank_index_name?(name) when is_binary(name), do: String.trim(name) == ""
+    defp blank_index_name?(:""), do: true
+    defp blank_index_name?(_), do: false
+
+    defp validate_all_index_slots(module, all_indexes) do
+      all_indexes
+      |> Enum.reduce_while(MapSet.new(), fn %Index{fields: fields, name: name} = idx,
+                                            seen_slots ->
+        slot_name = canonical_index_slot_name(idx)
+
+        if MapSet.member?(seen_slots, slot_name) do
+          {:halt,
+           {:error,
+            DslError.exception(
+              module: module,
+              path: [:xitdb, :index, name || fields],
+              message:
+                "colliding index slot name #{inspect(slot_name)} in `xitdb.index` on #{inspect(module)}"
+            )}}
+        else
+          {:cont, MapSet.put(seen_slots, slot_name)}
+        end
+      end)
+      |> case do
+        {:error, _} = err -> err
+        _seen_slots -> :ok
       end
     end
 
@@ -321,19 +360,40 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       end
     end
 
-    defp define_direct_callbacks(dsl_state, store, collection, normalized_indexes) do
+    defp define_direct_callbacks(
+           dsl_state,
+           store,
+           collection,
+           normalized_indexes,
+           uses_default_store?
+         ) do
       Transformer.eval(
         dsl_state,
-        [store: store, collection: collection, normalized_indexes: normalized_indexes],
+        [
+          store: store,
+          collection: collection,
+          normalized_indexes: normalized_indexes,
+          uses_default_store?: uses_default_store?
+        ],
         quote do
-          @doc false
-          def __xitdb_store__, do: unquote(Macro.escape(store))
+          if unquote(uses_default_store?) do
+            _ = Application.compile_env(:xitdb, :default_store)
+          end
 
-          @doc false
-          def __xitdb_collection__, do: unquote(Macro.escape(collection))
+          unless Module.defines?(__MODULE__, {:__xitdb_store__, 0}, :def) do
+            @doc false
+            def __xitdb_store__, do: unquote(Macro.escape(store))
+          end
 
-          @doc false
-          def __xitdb_indexes__, do: unquote(Macro.escape(normalized_indexes))
+          unless Module.defines?(__MODULE__, {:__xitdb_collection__, 0}, :def) do
+            @doc false
+            def __xitdb_collection__, do: unquote(Macro.escape(collection))
+          end
+
+          unless Module.defines?(__MODULE__, {:__xitdb_indexes__, 0}, :def) do
+            @doc false
+            def __xitdb_indexes__, do: unquote(Macro.escape(normalized_indexes))
+          end
         end
       )
     end

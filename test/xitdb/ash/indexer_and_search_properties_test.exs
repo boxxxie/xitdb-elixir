@@ -3,7 +3,6 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     use Xitdb.AshCase
     use ExUnitProperties
 
-    alias Spark.Error.DslError
     alias Xitdb.Ash.{Indexer, Search, Store}
     alias Xitdb.Ash.Search.Storage, as: SearchStorage
     alias Xitdb.TestSupport.{AgendaSession, MdmDomain, MdmStore, Organization}
@@ -90,114 +89,6 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       # Destroying `event` releases the `on_delete: :restrict` constraint on `other_org`
       assert :ok = MdmDomain.destroy_organization!(other_org)
       assert :ok = MdmDomain.destroy_organization!(org)
-    end
-
-    test "VerifyNoSqlFragments rejects SQL fragment(...) calculations at compile time" do
-      uid = System.unique_integer([:positive])
-      res_mod = Module.concat(Xitdb.TestSupport, "InvalidFragmentResource#{uid}")
-
-      # Spark runs verifiers in `@after_verify`, so errors surface as compiler diagnostics.
-      {compiled, diagnostics} =
-        Code.with_diagnostics(fn ->
-          Code.compile_string("""
-          defmodule Xitdb.TestSupport.InvalidFragmentDomain#{uid} do
-            use Ash.Domain, validate_config_inclusion?: false
-
-            resources do
-              resource Xitdb.TestSupport.InvalidFragmentResource#{uid}
-            end
-          end
-
-          defmodule Xitdb.TestSupport.InvalidFragmentResource#{uid} do
-            use Ash.Resource,
-              domain: Xitdb.TestSupport.InvalidFragmentDomain#{uid},
-              data_layer: Xitdb.Ash.DataLayer
-
-            xitdb do
-              store Xitdb.TestSupport.MdmStore
-              collection :invalid_fragments
-            end
-
-            attributes do
-              integer_primary_key :id
-              attribute :city, :string
-            end
-
-            calculations do
-              calculate :bad_loc, :string, expr(fragment("COALESCE(?, 'N/A')", city))
-            end
-          end
-          """)
-        end)
-
-      assert Enum.any?(
-               diagnostics,
-               &(&1.message =~ ~r/SQL `fragment\(\.\.\.\)` .*is not supported/)
-             )
-
-      assert Enum.any?(compiled, fn {m, _} -> m == res_mod end)
-
-      assert {:error, %DslError{message: msg}} =
-               Xitdb.Ash.Verifiers.VerifyNoSqlFragments.verify(res_mod.spark_dsl_config())
-
-      assert msg =~ ~r/SQL `fragment\(\.\.\.\)` .*is not supported/
-    end
-
-    test "VerifyCrossStoreReferences rejects on_delete cascades across distinct .xit stores" do
-      uid = System.unique_integer([:positive])
-      res_mod = Module.concat(Xitdb.TestSupport, "InvalidCrossStoreRef#{uid}")
-
-      # Spark runs verifiers in `@after_verify`, so errors surface as compiler diagnostics.
-      {compiled, diagnostics} =
-        Code.with_diagnostics(fn ->
-          Code.compile_string("""
-          defmodule Xitdb.TestSupport.InvalidCrossStoreDomain#{uid} do
-            use Ash.Domain, validate_config_inclusion?: false
-
-            resources do
-              resource Xitdb.TestSupport.InvalidCrossStoreRef#{uid}
-            end
-          end
-
-          defmodule Xitdb.TestSupport.InvalidCrossStoreRef#{uid} do
-            use Ash.Resource,
-              domain: Xitdb.TestSupport.InvalidCrossStoreDomain#{uid},
-              data_layer: Xitdb.Ash.DataLayer
-
-            xitdb do
-              store Xitdb.TestSupport.AppStore
-              collection :invalid_cross_refs
-
-              references do
-                reference :sender, on_delete: :delete
-              end
-            end
-
-            attributes do
-              integer_primary_key :id
-            end
-
-            relationships do
-              belongs_to :sender, Xitdb.TestSupport.MemberProfile do
-                domain Xitdb.TestSupport.MdmDomain
-                attribute_type :integer
-              end
-            end
-          end
-          """)
-        end)
-
-      assert Enum.any?(
-               diagnostics,
-               &(&1.message =~ ~r/[Cc]ross-store .*`?on_delete: :delete`?/)
-             )
-
-      assert Enum.any?(compiled, fn {m, _} -> m == res_mod end)
-
-      assert {:error, %DslError{message: msg}} =
-               Xitdb.Ash.Verifiers.VerifyCrossStoreReferences.verify(res_mod.spark_dsl_config())
-
-      assert msg =~ ~r/[Cc]ross-store .*`?on_delete: :delete`?/
     end
 
     defp apply_search_ops(ops, state) do

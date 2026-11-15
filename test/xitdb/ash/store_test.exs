@@ -91,7 +91,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     end
 
     test "serializes concurrent transactions in FIFO order and preserves caller context" do
-      {store, _pid} = start_ephemeral_store()
+      {store, store_pid} = start_ephemeral_store()
       Process.put(:caller_marker, :preserved)
 
       t1_started = self()
@@ -138,8 +138,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           end)
         end)
 
-      # Give t2 a brief moment to enqueue behind t1 before releasing t1
-      Process.sleep(30)
+      wait_until(fn -> :queue.len(:sys.get_state(store_pid).queue.waiters) == 1 end)
       send(t1.pid, :release_t1)
 
       assert {:ok, :t1_done} = Task.await(t1)
@@ -157,42 +156,54 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
       parent = self()
 
-      # Waiter timeout cancellation race: hold lease for 60ms while caller wait timeout is 20ms
+      # Waiter timeout cancellation race: hold lease deterministically while caller wait times out
       holder =
         Task.async(fn ->
           Store.transact(
             store,
             fn ->
               send(parent, :holder_ready)
-              Process.sleep(60)
-              :holder_done
+              receive do: (:release_holder -> :holder_done)
             end,
-            timeout: 500
+            timeout: 1_000
           )
         end)
 
       assert_receive :holder_ready, 1_000
 
       assert {:error, %LeaseError{store: ^store, reason: :lease_timeout}} =
-               Store.transact(store, fn -> :never_runs end, timeout: 20)
+               Store.transact(store, fn -> :never_runs end, timeout: 15)
 
+      send(holder.pid, :release_holder)
       assert {:ok, :holder_done} = Task.await(holder, 1_000)
 
       # Next transaction can still acquire and commit cleanly
       assert {:ok, :recovered} = Store.transact(store, fn -> :recovered end, timeout: 500)
 
-      # Zombie commit rejection: exceed store lease_timeout (40ms) inside closure
-      {short_store, _short_pid} = start_ephemeral_store(lease_timeout: 40)
+      # Zombie commit rejection: wait deterministically for short_store lease expiration
+      {short_store, short_pid} = start_ephemeral_store(lease_timeout: 25)
 
       assert {:error, %LeaseError{store: ^short_store, reason: :lease_expired}} =
                Store.transact(
                  short_store,
                  fn ->
-                   Process.sleep(80)
+                   wait_until(fn -> :sys.get_state(short_pid).queue.active == nil end)
                    :stale_result
                  end,
                  timeout: 500
                )
+    end
+
+    defp wait_until(pred, attempts \\ 200)
+    defp wait_until(_pred, 0), do: flunk("Condition not satisfied before deadline")
+
+    defp wait_until(pred, attempts) do
+      if pred.() do
+        :ok
+      else
+        Process.sleep(1)
+        wait_until(pred, attempts - 1)
+      end
     end
 
     test "reclaims lease on holder crash (:DOWN) and restores file-backed .xit tip on rollback" do

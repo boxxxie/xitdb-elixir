@@ -78,6 +78,15 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       MdmDomain.edit_profile(target_profile, attrs, actor: actor)
     end
 
+    def get_member_profile(profile_id, actor, opts \\ []) do
+      run = fn -> MdmDomain.get_profile!(profile_id, actor: actor) end
+
+      case Keyword.get(opts, :checkpoint) do
+        nil -> run.()
+        cp -> with_checkpoint(cp, run)
+      end
+    end
+
     def change_member_email(target_profile, new_email, actor) do
       MdmDomain.change_email(target_profile, new_email, actor: actor)
     end
@@ -86,12 +95,35 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       MdmDomain.record_profile_view(target_profile, actor: actor)
     end
 
-    def send_direct_message(sender_id, recipient_id, body) do
-      AppDomain.send_message!(%{
+    def send_direct_message(sender_id, recipient_id, body, opts \\ []) do
+      attrs = %{
         sender_id: sender_id,
         recipient_id: recipient_id,
         body: body
-      })
+      }
+
+      attrs =
+        if Keyword.has_key?(opts, :context_metadata) do
+          Map.put(attrs, :context_metadata, Keyword.fetch!(opts, :context_metadata))
+        else
+          attrs
+        end
+
+      AppDomain.send_message!(attrs)
+    end
+
+    def list_inbox_messages(recipient_id, opts \\ []) do
+      run = fn ->
+        DirectMessage
+        |> Ash.Query.filter(recipient_id == ^recipient_id)
+        |> Ash.Query.sort(id: :asc)
+        |> Ash.read!(domain: AppDomain)
+      end
+
+      case Keyword.get(opts, :checkpoint) do
+        nil -> run.()
+        cp -> with_checkpoint(cp, run)
+      end
     end
 
     def bulk_archive_and_prune_messages(recipient_id) do

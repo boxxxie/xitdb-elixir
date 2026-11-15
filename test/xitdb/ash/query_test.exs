@@ -1,6 +1,7 @@
 if Code.ensure_loaded?(Ash.DataLayer) do
   defmodule Xitdb.Ash.QueryTest do
     use ExUnit.Case, async: true
+    use ExUnitProperties
 
     require Ash.Query
 
@@ -878,6 +879,393 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
         # TrackingCalc was only invoked on the 1 post-limit record, NOT on Delta or Charlie
         assert_received {:tracking_calc_batch, 1, ["Bravo"]}
+      end
+    end
+
+    describe "Query engine edge-case regressions and indexed-vs-unindexed oracle" do
+      defmodule QueryRegressionsDomain do
+        use Ash.Domain, validate_config_inclusion?: false
+
+        resources do
+          allow_unregistered?(true)
+        end
+      end
+
+      defmodule CiJoinChild do
+        use Ash.Resource,
+          domain: QueryRegressionsDomain,
+          data_layer: Xitdb.Ash.DataLayer
+
+        xitdb do
+          store(PrimaryStore)
+          collection(:q_ci_join_children)
+        end
+
+        attributes do
+          integer_primary_key(:id, writable?: true)
+          attribute(:parent_slug, :string, allow_nil?: false, public?: true)
+          attribute(:label, :string, allow_nil?: false, public?: true)
+          attribute(:priority, :integer, default: 0, allow_nil?: false, public?: true)
+          attribute(:min_score, :integer, default: 0, allow_nil?: false, public?: true)
+        end
+
+        actions do
+          defaults([:read, :destroy])
+
+          create :create do
+            primary?(true)
+            accept([:id, :parent_slug, :label, :priority, :min_score])
+          end
+
+          update :update do
+            primary?(true)
+            accept([:label, :priority, :min_score])
+          end
+        end
+      end
+
+      defmodule CiJoinParent do
+        use Ash.Resource,
+          domain: QueryRegressionsDomain,
+          data_layer: Xitdb.Ash.DataLayer
+
+        xitdb do
+          store(PrimaryStore)
+          collection(:q_ci_join_parents)
+          index([:score])
+        end
+
+        attributes do
+          integer_primary_key(:id, writable?: true)
+          attribute(:slug, :ci_string, allow_nil?: false, public?: true)
+          attribute(:score, :integer, default: 0, allow_nil?: false, public?: true)
+        end
+
+        relationships do
+          has_many :children, CiJoinChild do
+            source_attribute(:slug)
+            destination_attribute(:parent_slug)
+            validate_destination_attribute?(false)
+            public?(true)
+          end
+        end
+
+        aggregates do
+          count(:child_count, :children)
+
+          first :top_child_label, :children, :label do
+            sort(priority: :desc)
+          end
+
+          count :eligible_child_count, :children do
+            filter(expr(min_score <= parent(score)))
+          end
+        end
+
+        calculations do
+          calculate(:has_v1_child, :boolean, expr(exists(children, label == "v1")))
+        end
+
+        actions do
+          defaults([:read, :destroy])
+
+          create :create do
+            primary?(true)
+            accept([:id, :slug, :score])
+          end
+        end
+      end
+
+      defmodule IndexedOracleItem do
+        use Ash.Resource,
+          domain: QueryRegressionsDomain,
+          data_layer: Xitdb.Ash.DataLayer
+
+        xitdb do
+          store(PrimaryStore)
+          collection(:q_oracle_indexed)
+          index([:tag])
+          index([:score])
+          index([:tag, :score])
+          index([:name])
+        end
+
+        attributes do
+          integer_primary_key(:id, writable?: true)
+          attribute(:tag, :string, public?: true)
+          attribute(:score, :integer, public?: true)
+          attribute(:name, :string, public?: true)
+        end
+
+        actions do
+          defaults([:read, :destroy])
+
+          create :create do
+            primary?(true)
+            accept([:id, :tag, :score, :name])
+          end
+        end
+      end
+
+      defmodule UnindexedOracleItem do
+        use Ash.Resource,
+          domain: QueryRegressionsDomain,
+          data_layer: Xitdb.Ash.DataLayer
+
+        xitdb do
+          store(PrimaryStore)
+          collection(:q_oracle_unindexed)
+        end
+
+        attributes do
+          integer_primary_key(:id, writable?: true)
+          attribute(:tag, :string, public?: true)
+          attribute(:score, :integer, public?: true)
+          attribute(:name, :string, public?: true)
+        end
+
+        actions do
+          defaults([:read, :destroy])
+
+          create :create do
+            primary?(true)
+            accept([:id, :tag, :score, :name])
+          end
+        end
+      end
+
+      test "handles :ci_string <-> :string joins, rel.sort/parent filter aggregates, select + sum, agg sort + limit, and cross-type numeric filters" do
+        p1 =
+          Ash.create!(CiJoinParent, %{id: 1, slug: "Polar.CA", score: 10},
+            domain: QueryRegressionsDomain
+          )
+
+        p2 =
+          Ash.create!(CiJoinParent, %{id: 2, slug: "Nordic.NO", score: 25},
+            domain: QueryRegressionsDomain
+          )
+
+        c1 =
+          Ash.create!(
+            CiJoinChild,
+            %{id: 101, parent_slug: "polar.ca", label: "v1", priority: 5, min_score: 5},
+            domain: QueryRegressionsDomain
+          )
+
+        _c2 =
+          Ash.create!(
+            CiJoinChild,
+            %{id: 102, parent_slug: "POLAR.ca", label: "top-polar", priority: 20, min_score: 50},
+            domain: QueryRegressionsDomain
+          )
+
+        _c3 =
+          Ash.create!(
+            CiJoinChild,
+            %{id: 103, parent_slug: "nordic.no", label: "solo", priority: 1, min_score: 10},
+            domain: QueryRegressionsDomain
+          )
+
+        loaded =
+          CiJoinParent
+          |> Ash.Query.load([:child_count, :top_child_label, :eligible_child_count])
+          |> Ash.Query.sort(id: :asc)
+          |> Ash.read!(domain: QueryRegressionsDomain)
+
+        assert Enum.map(
+                 loaded,
+                 &{&1.id, &1.child_count, &1.top_child_label, &1.eligible_child_count}
+               ) ==
+                 [
+                   {1, 2, "top-polar", 1},
+                   {2, 1, "solo", 1}
+                 ]
+
+        # Sort referencing aggregate + limit(1)
+        assert [%{id: 1, child_count: 2}] =
+                 CiJoinParent
+                 |> Ash.Query.load(:child_count)
+                 |> Ash.Query.sort(child_count: :desc)
+                 |> Ash.Query.limit(1)
+                 |> Ash.read!(domain: QueryRegressionsDomain)
+
+        # Cross-type float literal vs integer attribute filter
+        assert [%{id: 2}] =
+                 CiJoinParent
+                 |> Ash.Query.filter(score > 10.5)
+                 |> Ash.read!(domain: QueryRegressionsDomain)
+
+        assert [%{id: 1}] =
+                 CiJoinParent
+                 |> Ash.Query.filter(score < 10.5)
+                 |> Ash.read!(domain: QueryRegressionsDomain)
+
+        assert [] ==
+                 CiJoinParent
+                 |> Ash.Query.filter(score == 10.5)
+                 |> Ash.read!(domain: QueryRegressionsDomain)
+
+        assert [%{id: 1}] =
+                 CiJoinParent
+                 |> Ash.Query.filter(score == 10.0)
+                 |> Ash.read!(domain: QueryRegressionsDomain)
+
+        # Ash.Query.select([:id]) + Ash.sum!(query, :score)
+        sum_q = Ash.Query.select(CiJoinParent, [:id])
+        assert Ash.sum!(sum_q, :score, domain: QueryRegressionsDomain) == 35
+
+        # Historical xitdb_moment in exists(...) filter and Ash.calculate!/3
+        m1 = Store.root(PrimaryStore).moment
+        _c1_updated = Ash.update!(c1, %{label: "v2"}, domain: QueryRegressionsDomain)
+
+        assert [] ==
+                 CiJoinParent
+                 |> Ash.Query.filter(exists(children, label == "v1"))
+                 |> Ash.read!(domain: QueryRegressionsDomain)
+
+        assert [%{id: 1}] =
+                 CiJoinParent
+                 |> Ash.Query.set_context(%{xitdb_moment: m1})
+                 |> Ash.Query.filter(exists(children, label == "v1"))
+                 |> Ash.read!(domain: QueryRegressionsDomain)
+
+        assert Ash.calculate!(p1, :has_v1_child,
+                 domain: QueryRegressionsDomain,
+                 context: %{xitdb_moment: m1}
+               ) == true
+
+        assert Ash.calculate!(p1, :has_v1_child, domain: QueryRegressionsDomain) == false
+
+        assert Ash.calculate!(p2, :has_v1_child,
+                 context: %{xitdb_moment: m1},
+                 domain: QueryRegressionsDomain
+               ) == false
+      end
+
+      test "scopes unrelated exists(ContextTenantNote, ...) to the active query tenant" do
+        seed!(PrimaryStore, ContextTenantNote, [id: 1, code: "target", body: "T1"], "tenant_a")
+        seed!(PrimaryStore, ContextTenantNote, [id: 2, code: "other", body: "T2"], "tenant_b")
+
+        seed!(PrimaryStore, ContextTenantNote, [id: 10, code: "probe", body: "P1"], "tenant_a")
+        seed!(PrimaryStore, ContextTenantNote, [id: 20, code: "probe", body: "P2"], "tenant_b")
+
+        assert [%{id: 10}] =
+                 ContextTenantNote
+                 |> Ash.Query.set_tenant("tenant_a")
+                 |> Ash.Query.filter(
+                   code == "probe" and exists(ContextTenantNote, code == "target")
+                 )
+                 |> Ash.read!(domain: Domain)
+
+        assert [] ==
+                 ContextTenantNote
+                 |> Ash.Query.set_tenant("tenant_b")
+                 |> Ash.Query.filter(
+                   code == "probe" and exists(ContextTenantNote, code == "target")
+                 )
+                 |> Ash.read!(domain: Domain)
+      end
+
+      property "indexed queries return identical IDs to unindexed full scans across filters, sorts, limits, and offsets" do
+        row_gen =
+          uniq_list_of(integer(1..50), min_length: 1, max_length: 8)
+          |> bind(fn ids ->
+            tuple_gens =
+              Enum.map(ids, fn id ->
+                gen all(
+                      tag <- member_of(["alpha", "beta", "gamma", nil]),
+                      score <- one_of([constant(nil), integer(-20..20)]),
+                      name <- one_of([constant(nil), member_of(["a", "b", "c", "d"])])
+                    ) do
+                  %{id: id, tag: tag, score: score, name: name}
+                end
+              end)
+
+            fixed_list(tuple_gens)
+          end)
+
+        op_gen =
+          one_of([
+            tuple({constant(:tag_eq), member_of(["alpha", "beta", "missing"])}),
+            tuple(
+              {constant(:tag_in),
+               list_of(member_of(["alpha", "beta", "gamma"]), min_length: 1, max_length: 2)}
+            ),
+            tuple({constant(:tag_is_nil), boolean()}),
+            tuple(
+              {constant(:score_cmp), member_of([:lt, :lte, :gt, :gte, :eq]), integer(-20..20)}
+            ),
+            tuple({constant(:score_is_nil), boolean()}),
+            tuple({constant(:combo), member_of(["alpha", "beta"]), integer(-10..10)})
+          ])
+
+        check all(
+                rows <- row_gen,
+                filter_spec <- op_gen,
+                sort_dir <- member_of([:asc, :desc]),
+                offset <- integer(0..3),
+                limit <- integer(1..5),
+                max_runs: 25
+              ) do
+          Ash.bulk_destroy!(IndexedOracleItem, :destroy, %{}, domain: QueryRegressionsDomain)
+          Ash.bulk_destroy!(UnindexedOracleItem, :destroy, %{}, domain: QueryRegressionsDomain)
+
+          for row <- rows do
+            Ash.create!(IndexedOracleItem, row, domain: QueryRegressionsDomain)
+            Ash.create!(UnindexedOracleItem, row, domain: QueryRegressionsDomain)
+          end
+
+          apply_oracle_query = fn resource ->
+            q =
+              case filter_spec do
+                {:tag_eq, v} ->
+                  Ash.Query.filter(resource, tag == ^v)
+
+                {:tag_in, vs} ->
+                  Ash.Query.filter(resource, tag in ^vs)
+
+                {:tag_is_nil, true} ->
+                  Ash.Query.filter(resource, is_nil(tag))
+
+                {:tag_is_nil, false} ->
+                  Ash.Query.filter(resource, not is_nil(tag))
+
+                {:score_cmp, :lt, v} ->
+                  Ash.Query.filter(resource, score < ^v)
+
+                {:score_cmp, :lte, v} ->
+                  Ash.Query.filter(resource, score <= ^v)
+
+                {:score_cmp, :gt, v} ->
+                  Ash.Query.filter(resource, score > ^v)
+
+                {:score_cmp, :gte, v} ->
+                  Ash.Query.filter(resource, score >= ^v)
+
+                {:score_cmp, :eq, v} ->
+                  Ash.Query.filter(resource, score == ^v)
+
+                {:score_is_nil, true} ->
+                  Ash.Query.filter(resource, is_nil(score))
+
+                {:score_is_nil, false} ->
+                  Ash.Query.filter(resource, not is_nil(score))
+
+                {:combo, t, s} ->
+                  Ash.Query.filter(resource, tag == ^t and score >= ^s)
+              end
+
+            q
+            |> Ash.Query.sort([{:score, sort_dir}, {:id, :asc}])
+            |> Ash.Query.offset(offset)
+            |> Ash.Query.limit(limit)
+            |> Ash.read!(domain: QueryRegressionsDomain)
+            |> Enum.map(& &1.id)
+          end
+
+          assert apply_oracle_query.(IndexedOracleItem) ==
+                   apply_oracle_query.(UnindexedOracleItem)
+        end
       end
     end
   end

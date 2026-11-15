@@ -633,5 +633,190 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         assert loaded.timestamps == [ts]
       end
     end
+
+    describe "binary, map serialization, microsecond/timezone fidelity, and integer overflow" do
+      defmodule ExtendedCodecRecord do
+        use Ash.Resource,
+          domain: nil,
+          validate_domain_inclusion?: false,
+          extensions: [Xitdb.Ash.Dsl]
+
+        xitdb do
+          store DummyStore
+          collection :extended_codec_records
+        end
+
+        attributes do
+          integer_primary_key(:id)
+          attribute(:raw_bytes, :binary, public?: true)
+          attribute(:meta, :map, default: %{}, allow_nil?: false, public?: true)
+          attribute(:local_overrides, :map, default: %{}, allow_nil?: false, public?: true)
+
+          attribute(:event_at_usec, :utc_datetime_usec, public?: true)
+
+          attribute(:alarm_usec, :time,
+            constraints: [precision: :microsecond],
+            public?: true
+          )
+
+          attribute(:zoned_at, :datetime,
+            constraints: [precision: :microsecond],
+            public?: true
+          )
+
+          attribute(:count, :integer, public?: true)
+        end
+      end
+
+      test "binary round-trips raw NUL/0xFF/non-UTF8 bytes and encode_scalar_key preserves unsigned byte order" do
+        bin_attr = Ash.Resource.Info.attribute(ExtendedCodecRecord, :raw_bytes)
+        ordered = [<<>>, <<0>>, <<0, 255>>, <<1>>, <<128, 0, 255>>, <<255, 0>>]
+
+        for [a, b] <- Enum.chunk_every(ordered, 2, 1, :discard) do
+          assert Codec.encode_scalar_key(bin_attr, a) < Codec.encode_scalar_key(bin_attr, b)
+        end
+
+        raw_payload = <<0, 255, 128, 0, "abc", 254, 0>>
+
+        {:ok, dumped} =
+          Codec.to_cursor_map(ExtendedCodecRecord, %ExtendedCodecRecord{
+            id: 1,
+            raw_bytes: raw_payload,
+            meta: %{},
+            local_overrides: %{}
+          })
+
+        {:ok, db} = Xitdb.open(backend: :memory)
+        on_exit(fn -> Xitdb.close(db) end)
+
+        {:ok, db} = Xitdb.transact(db, fn root -> put_in(root["ext"]["1"], dumped) end)
+        assert {:ok, loaded} = Codec.from_cursor(ExtendedCodecRecord, Xitdb.db(db)["ext"]["1"])
+        assert loaded.raw_bytes === raw_payload
+      end
+
+      test "empty :map cursors deserialize as %{} (not []), and nil/sentinel entries round-trip losslessly" do
+        {:ok, db} = Xitdb.open(backend: :memory)
+        on_exit(fn -> Xitdb.close(db) end)
+
+        # 1. Empty :map default (%{}) must come back as %{}, never []
+        {:ok, empty_dumped} =
+          Codec.to_cursor_map(ExtendedCodecRecord, %ExtendedCodecRecord{
+            id: 10,
+            meta: %{},
+            local_overrides: %{}
+          })
+
+        {:ok, db} = Xitdb.transact(db, fn root -> put_in(root["ext"]["10"], empty_dumped) end)
+
+        assert {:ok, loaded_empty} =
+                 Codec.from_cursor(ExtendedCodecRecord, Xitdb.db(db)["ext"]["10"])
+
+        assert loaded_empty.meta === %{}
+        assert loaded_empty.local_overrides === %{}
+
+        # 2. Explicitly nil-valued map keys write without Key_Not_Found and preserve Map.has_key?
+        meta_with_nil = %{"blocker_id" => 1, "blocked_id" => 2, "reason" => nil}
+
+        overrides_with_nil = %{
+          "bio" => nil,
+          "nested" => %{"empty" => %{}, "cleared" => nil},
+          "items" => ["keep", nil, <<0, "__xitdb_nil__">>],
+          "sentinel" => <<0, "__xitdb_nil__">>,
+          "escaped" => <<0, "__xitdb_esc__val">>
+        }
+
+        {:ok, nil_dumped} =
+          Codec.to_cursor_map(ExtendedCodecRecord, %ExtendedCodecRecord{
+            id: 11,
+            meta: meta_with_nil,
+            local_overrides: overrides_with_nil
+          })
+
+        {:ok, db} = Xitdb.transact(db, fn root -> put_in(root["ext"]["11"], nil_dumped) end)
+
+        assert {:ok, loaded_nil} =
+                 Codec.from_cursor(ExtendedCodecRecord, Xitdb.db(db)["ext"]["11"])
+
+        assert loaded_nil.meta === meta_with_nil
+        assert Map.has_key?(loaded_nil.meta, "reason")
+        assert loaded_nil.meta["reason"] === nil
+
+        assert loaded_nil.local_overrides === overrides_with_nil
+        assert Map.has_key?(loaded_nil.local_overrides, "bio")
+        assert loaded_nil.local_overrides["bio"] === nil
+        assert loaded_nil.local_overrides["nested"] === %{"empty" => %{}, "cleared" => nil}
+
+        # 3. Resetting back to %{} overwrites nested nil/sentinel keys cleanly
+        {:ok, cleared_dumped} =
+          Codec.to_cursor_map(ExtendedCodecRecord, %ExtendedCodecRecord{
+            id: 11,
+            meta: %{},
+            local_overrides: %{}
+          })
+
+        {:ok, db} = Xitdb.transact(db, fn root -> put_in(root["ext"]["11"], cleared_dumped) end)
+        assert {:ok, reloaded} = Codec.from_cursor(ExtendedCodecRecord, Xitdb.db(db)["ext"]["11"])
+        assert reloaded.meta === %{}
+        assert reloaded.local_overrides === %{}
+      end
+
+      test "preserves :microsecond precision for :utc_datetime/:time, non-UTC :datetime timezone, and rejects >64-bit integer" do
+        dt_u1 = ~U[2026-06-15 12:30:45.123456Z]
+        dt_u2 = ~U[2026-06-15 12:30:45.123457Z]
+        t_u1 = ~T[09:15:30.000123]
+        t_u2 = ~T[09:15:30.000124]
+
+        zoned_dt = %DateTime{
+          year: 2026,
+          month: 6,
+          day: 15,
+          hour: 12,
+          minute: 30,
+          second: 45,
+          microsecond: {654_321, 6},
+          time_zone: "America/Toronto",
+          zone_abbr: "EDT",
+          utc_offset: -18_000,
+          std_offset: 3_600
+        }
+
+        dt_attr = Ash.Resource.Info.attribute(ExtendedCodecRecord, :event_at_usec)
+        t_attr = Ash.Resource.Info.attribute(ExtendedCodecRecord, :alarm_usec)
+        assert Codec.encode_scalar_key(dt_attr, dt_u1) < Codec.encode_scalar_key(dt_attr, dt_u2)
+        assert Codec.encode_scalar_key(t_attr, t_u1) < Codec.encode_scalar_key(t_attr, t_u2)
+
+        {:ok, dumped} =
+          Codec.to_cursor_map(ExtendedCodecRecord, %ExtendedCodecRecord{
+            id: 20,
+            event_at_usec: dt_u1,
+            alarm_usec: t_u1,
+            zoned_at: zoned_dt,
+            meta: %{},
+            local_overrides: %{}
+          })
+
+        {:ok, db} = Xitdb.open(backend: :memory)
+        on_exit(fn -> Xitdb.close(db) end)
+
+        {:ok, db} = Xitdb.transact(db, fn root -> put_in(root["ext"]["20"], dumped) end)
+        assert {:ok, loaded} = Codec.from_cursor(ExtendedCodecRecord, Xitdb.db(db)["ext"]["20"])
+        assert loaded.event_at_usec == dt_u1
+        assert loaded.alarm_usec == t_u1
+        assert loaded.zoned_at == zoned_dt
+        assert loaded.zoned_at.time_zone == "America/Toronto"
+        assert loaded.zoned_at.utc_offset == -18_000
+        assert loaded.zoned_at.std_offset == 3_600
+
+        overflow_val = Bitwise.bsl(1, 64)
+
+        assert {:error, {:integer_out_of_i64_range, :count}} =
+                 Codec.to_cursor_map(ExtendedCodecRecord, %ExtendedCodecRecord{
+                   id: 21,
+                   count: overflow_val,
+                   meta: %{},
+                   local_overrides: %{}
+                 })
+      end
+    end
   end
 end

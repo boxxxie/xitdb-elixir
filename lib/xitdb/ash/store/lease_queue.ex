@@ -118,6 +118,19 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
     def handle_expired(%__MODULE__{}, _ref, _owner_key, _latest_snapshot), do: :unmatched
 
+    @spec cancel_all(t(), term()) :: t()
+    def cancel_all(%__MODULE__{} = queue, waiter_reply \\ {:error, :sandbox_checked_in}) do
+      cleanup_active(queue.active)
+
+      queue.waiters
+      |> :queue.to_list()
+      |> Enum.each(fn waiter ->
+        GenServer.reply(waiter.from, waiter_reply)
+      end)
+
+      %__MODULE__{active: nil, waiters: :queue.new()}
+    end
+
     defp grant_next_waiter(%__MODULE__{} = queue, owner_key, latest_snapshot) do
       now_ms = System.monotonic_time(:millisecond)
 

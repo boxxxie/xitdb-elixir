@@ -257,83 +257,161 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
     @impl Ash.DataLayer
     def calculate(resource, expressions, context) when is_list(expressions) and is_map(context) do
-      calc_ctx = Map.get(context, :calculation_context)
+      with_context_db(context, resource, fn db ->
+        calc_ctx = Map.get(context, :calculation_context)
 
-      actor = if calc_ctx, do: calc_ctx.actor, else: Map.get(context, :actor)
-      tenant = if calc_ctx, do: calc_ctx.tenant, else: Map.get(context, :tenant)
-      domain = if calc_ctx, do: calc_ctx.domain, else: Ash.Resource.Info.domain(resource)
+        actor = if calc_ctx, do: calc_ctx.actor, else: Map.get(context, :actor)
+        tenant = if calc_ctx, do: calc_ctx.tenant, else: Map.get(context, :tenant)
+        domain = if calc_ctx, do: calc_ctx.domain, else: Ash.Resource.Info.domain(resource)
 
-      plain_ctx =
-        cond do
-          match?(%Ash.Resource.Calculation.Context{}, context) ->
-            context.source_context || %{}
+        plain_ctx =
+          cond do
+            match?(%Ash.Resource.Calculation.Context{}, context) ->
+              context.source_context || %{}
 
-          is_struct(context) ->
-            Map.from_struct(context)
+            is_struct(context) ->
+              Map.from_struct(context)
 
-          true ->
-            context
-        end
+            true ->
+              context
+          end
 
-      eval_opts = [
-        resource: resource,
-        domain: domain,
-        actor: actor,
-        tenant: tenant,
-        context: plain_ctx
-      ]
+        source_ctx =
+          cond do
+            match?(%Ash.Resource.Calculation.Context{}, calc_ctx) and
+                is_map(calc_ctx.source_context) ->
+              calc_ctx.source_context
 
-      expressions
-      |> Enum.reduce_while({:ok, []}, fn expr, {:ok, acc} ->
-        case Ash.Expr.eval(expr, eval_opts) do
-          {:ok, value} ->
-            {:cont, {:ok, [value | acc]}}
+            is_map(Map.get(plain_ctx, :source_context)) ->
+              Map.get(plain_ctx, :source_context)
 
-          :unknown ->
-            case Ash.Filter.hydrate_refs(expr, %{resource: resource, public?: false}) do
-              {:ok, hydrated} ->
-                case Ash.Expr.eval_hydrated(hydrated, eval_opts) do
-                  {:ok, val} ->
-                    {:cont, {:ok, [val | acc]}}
+            true ->
+              plain_ctx
+          end
 
-                  :unknown ->
-                    record = Map.get(context, :record) || Map.get(plain_ctx, :record)
+        record =
+          Map.get(context, :record) ||
+            Map.get(plain_ctx, :record) ||
+            Map.get(source_ctx, :record)
 
-                    case eval_relational_fallback(hydrated, record, domain, actor, tenant) do
-                      {:ok, val} -> {:cont, {:ok, [val | acc]}}
-                      :unknown -> {:cont, {:ok, [nil | acc]}}
-                      {:error, _} = err -> {:halt, err}
-                    end
+        base_eval_opts =
+          [
+            resource: resource,
+            domain: domain,
+            actor: actor,
+            tenant: tenant,
+            context: source_ctx
+          ]
+          |> then(fn opts ->
+            if is_nil(record), do: opts, else: Keyword.put(opts, :record, record)
+          end)
 
-                  {:error, _} = err ->
-                    {:halt, err}
-                end
+        expressions
+        |> Enum.reduce_while({:ok, []}, fn raw_expr, {:ok, acc} ->
+          expr = Query.preresolve_unrelated_exists(db, resource, raw_expr, tenant, domain)
 
-              {:error, _} = err ->
-                {:halt, err}
-            end
+          case Ash.Expr.eval(expr, base_eval_opts) do
+            {:ok, value} ->
+              {:cont, {:ok, [value | acc]}}
 
-          {:error, _} = err ->
-            {:halt, err}
+            :unknown ->
+              case Ash.Filter.hydrate_refs(expr, %{resource: resource, public?: false}) do
+                {:ok, hydrated} ->
+                  case Ash.Expr.eval_hydrated(hydrated, base_eval_opts) do
+                    {:ok, val} ->
+                      {:cont, {:ok, [val | acc]}}
+
+                    :unknown ->
+                      case eval_relational_fallback(
+                             hydrated,
+                             record,
+                             base_eval_opts,
+                             domain,
+                             actor,
+                             tenant
+                           ) do
+                        {:ok, val} -> {:cont, {:ok, [val | acc]}}
+                        :unknown -> {:cont, {:ok, [nil | acc]}}
+                        {:error, _} = err -> {:halt, err}
+                      end
+
+                    {:error, _} = err ->
+                      {:halt, err}
+                  end
+
+                {:error, _} = err ->
+                  {:halt, err}
+              end
+
+            {:error, _} = err ->
+              {:halt, err}
+          end
+        end)
+        |> case do
+          {:ok, rev} -> {:ok, Enum.reverse(rev)}
+          {:error, _} = err -> err
         end
       end)
-      |> case do
-        {:ok, rev} -> {:ok, Enum.reverse(rev)}
-        {:error, _} = err -> err
+    end
+
+    defp with_context_db(context, resource, fun) do
+      calc_ctx = Map.get(context, :calculation_context)
+
+      source_ctx =
+        if match?(%Ash.Resource.Calculation.Context{}, calc_ctx),
+          do: calc_ctx.source_context,
+          else: nil
+
+      override =
+        case extract_db_override(context) do
+          {:override, _} = found ->
+            found
+
+          :none ->
+            if is_map(source_ctx), do: extract_db_override(source_ctx), else: :none
+        end
+
+      case {Info.fetch_store(resource), override} do
+        {{:ok, store}, {:override, moment_or_db}} ->
+          Store.with_as_of(store, moment_or_db, fn ->
+            fun.(safe_current_db(store))
+          end)
+
+        {{:ok, store}, :none} ->
+          fun.(safe_current_db(store))
+
+        {:error, _} ->
+          fun.(nil)
       end
     end
 
-    defp eval_relational_fallback(_expr, nil, _domain, _actor, _tenant), do: :unknown
+    defp safe_current_db(store) do
+      Store.current_db(store)
+    rescue
+      _ -> nil
+    end
 
-    defp eval_relational_fallback(expr, record, domain, actor, tenant) when is_map(record) do
-      case Ash.Filter.Runtime.filter_matches(domain, [record], expr,
-             actor: actor,
-             tenant: tenant,
-             authorize?: false
-           ) do
-        {:ok, [_ | _]} -> {:ok, true}
-        {:ok, []} -> {:ok, false}
-        {:error, _} = err -> err
+    defp eval_relational_fallback(_expr, nil, _eval_opts, _domain, _actor, _tenant), do: :unknown
+
+    defp eval_relational_fallback(expr, record, eval_opts, domain, actor, tenant)
+         when is_map(record) do
+      case Ash.Expr.eval_hydrated(expr, Keyword.put(eval_opts, :record, record)) do
+        {:ok, val} ->
+          {:ok, val}
+
+        {:error, _} = err ->
+          err
+
+        :unknown ->
+          case Ash.Filter.Runtime.filter_matches(domain, [record], expr,
+                 actor: actor,
+                 tenant: tenant,
+                 authorize?: false
+               ) do
+            {:ok, [_ | _]} -> {:ok, true}
+            {:ok, []} -> {:ok, false}
+            {:error, _} = err -> err
+          end
       end
     rescue
       _ -> :unknown

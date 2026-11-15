@@ -1411,5 +1411,635 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         assert upserted.headline == "Updated Via Upsert"
       end
     end
+
+    describe "Mutator FK cascades, diamond priority, upserts, nested_in :one, and i64 bounds" do
+      defmodule FkRegressionsStore do
+        use Xitdb.Ash.Store
+      end
+
+      defmodule MaxScoreValidation do
+        use Ash.Resource.Validation
+        import Ash.Expr
+
+        @impl true
+        def atomic(_changeset, _opts, _context) do
+          {:atomic, [:score], expr(^atomic_ref(:score) > 150),
+           expr(
+             error(Ash.Error.Changes.InvalidAttribute,
+               field: :score,
+               message: "score cannot exceed 150"
+             )
+           )}
+        end
+      end
+
+      defmodule RegUser do
+        use Ash.Resource,
+          domain: Xitdb.Ash.MutatorTest.FkRegressionsDomain,
+          data_layer: Xitdb.Ash.DataLayer
+
+        xitdb do
+          store(FkRegressionsStore)
+          collection(:reg_users)
+        end
+
+        attributes do
+          integer_primary_key(:id)
+          attribute(:email, :string, allow_nil?: false, public?: true)
+          attribute(:version, :integer, default: 1, allow_nil?: false, public?: true)
+          attribute(:score, :integer, default: 0, allow_nil?: false, public?: true)
+          attribute(:bio, :string, public?: true)
+        end
+
+        identities do
+          identity(:unique_email, [:email])
+        end
+
+        actions do
+          defaults([:read, :destroy])
+
+          create :create do
+            primary?(true)
+            accept([:email, :version, :score, :bio])
+            validate(CorporateEmailValidation)
+          end
+
+          create :upsert_version do
+            accept([:email, :version, :score, :bio])
+            upsert?(true)
+            upsert_identity(:unique_email)
+            upsert_condition(expr(version < 2))
+            change(atomic_update(:score, expr(score + 10)))
+            validate(CorporateEmailValidation)
+          end
+
+          create :upsert_atomic_score do
+            accept([:email, :version, :bio])
+            upsert?(true)
+            upsert_identity(:unique_email)
+            change(atomic_update(:score, expr(score + 100)))
+
+            change(fn cs, _ ->
+              import Ash.Expr
+
+              %{
+                cs
+                | atomic_validations: [
+                    {expr(^atomic_ref(:score) > 150),
+                     expr(
+                       error(Ash.Error.Changes.InvalidAttribute,
+                         field: :score,
+                         message: "score cannot exceed 150"
+                       )
+                     )}
+                    | cs.atomic_validations
+                  ]
+              }
+            end)
+          end
+
+          update :add_score do
+            accept([])
+            change(atomic_update(:score, expr(score + 100)))
+            validate(MaxScoreValidation)
+          end
+        end
+      end
+
+      defmodule RegMessage do
+        use Ash.Resource,
+          domain: Xitdb.Ash.MutatorTest.FkRegressionsDomain,
+          data_layer: Xitdb.Ash.DataLayer
+
+        xitdb do
+          store(FkRegressionsStore)
+          collection(:reg_messages)
+
+          references do
+            reference(:sender, on_delete: :nilify)
+            reference(:recipient, on_delete: :nilify)
+          end
+        end
+
+        attributes do
+          integer_primary_key(:id)
+          attribute(:body, :string, allow_nil?: false, public?: true)
+        end
+
+        relationships do
+          belongs_to(:sender, RegUser, attribute_type: :integer, allow_nil?: true, public?: true)
+
+          belongs_to(:recipient, RegUser,
+            attribute_type: :integer,
+            allow_nil?: true,
+            public?: true
+          )
+        end
+
+        actions do
+          defaults([:read, :destroy])
+
+          create :create do
+            primary?(true)
+            accept([:body, :sender_id, :recipient_id])
+          end
+        end
+      end
+
+      defmodule SelfNode do
+        use Ash.Resource,
+          domain: Xitdb.Ash.MutatorTest.FkRegressionsDomain,
+          data_layer: Xitdb.Ash.DataLayer
+
+        xitdb do
+          store(FkRegressionsStore)
+          collection(:reg_self_nodes)
+          index([:parent_id])
+
+          references do
+            reference(:parent, on_delete: :nilify)
+          end
+        end
+
+        attributes do
+          integer_primary_key(:id)
+          attribute(:name, :string, allow_nil?: false, public?: true)
+        end
+
+        relationships do
+          belongs_to :parent, Xitdb.Ash.MutatorTest.SelfNode do
+            attribute_type(:integer)
+            allow_nil?(true)
+            public?(true)
+          end
+        end
+
+        actions do
+          defaults([:read, :destroy])
+
+          create :create do
+            primary?(true)
+            accept([:name, :parent_id])
+          end
+        end
+      end
+
+      defmodule DiamondRoot do
+        use Ash.Resource,
+          domain: Xitdb.Ash.MutatorTest.FkRegressionsDomain,
+          data_layer: Xitdb.Ash.DataLayer
+
+        xitdb do
+          store(FkRegressionsStore)
+          collection(:reg_diamond_roots)
+        end
+
+        attributes do
+          integer_primary_key(:id)
+          attribute(:name, :string, allow_nil?: false, public?: true)
+        end
+
+        actions do
+          defaults([:read, :destroy])
+
+          create :create do
+            primary?(true)
+            accept([:name])
+          end
+        end
+      end
+
+      defmodule DiamondMid do
+        use Ash.Resource,
+          domain: Xitdb.Ash.MutatorTest.FkRegressionsDomain,
+          data_layer: Xitdb.Ash.DataLayer
+
+        xitdb do
+          store(FkRegressionsStore)
+          collection(:reg_diamond_mids)
+
+          references do
+            reference(:root, on_delete: :delete)
+          end
+        end
+
+        attributes do
+          integer_primary_key(:id)
+          attribute(:label, :string, public?: true)
+        end
+
+        relationships do
+          belongs_to(:root, DiamondRoot,
+            attribute_type: :integer,
+            allow_nil?: false,
+            public?: true
+          )
+        end
+
+        actions do
+          defaults([:read, :destroy])
+
+          create :create do
+            primary?(true)
+            accept([:label, :root_id])
+          end
+        end
+      end
+
+      defmodule DiamondLeaf do
+        use Ash.Resource,
+          domain: Xitdb.Ash.MutatorTest.FkRegressionsDomain,
+          data_layer: Xitdb.Ash.DataLayer
+
+        xitdb do
+          store(FkRegressionsStore)
+          collection(:reg_diamond_leaves)
+
+          references do
+            reference(:mid, on_delete: :delete)
+            reference(:root, on_delete: :restrict)
+          end
+        end
+
+        attributes do
+          integer_primary_key(:id)
+          attribute(:label, :string, public?: true)
+        end
+
+        relationships do
+          belongs_to(:mid, DiamondMid, attribute_type: :integer, allow_nil?: true, public?: true)
+
+          belongs_to(:root, DiamondRoot,
+            attribute_type: :integer,
+            allow_nil?: false,
+            public?: true
+          )
+        end
+
+        actions do
+          defaults([:read, :destroy])
+
+          create :create do
+            primary?(true)
+            accept([:label, :mid_id, :root_id])
+          end
+        end
+      end
+
+      defmodule TenantGlobalSlug do
+        use Ash.Resource,
+          domain: Xitdb.Ash.MutatorTest.FkRegressionsDomain,
+          data_layer: Xitdb.Ash.DataLayer
+
+        xitdb do
+          store(FkRegressionsStore)
+          collection(:reg_tenant_global_slugs)
+        end
+
+        multitenancy do
+          strategy(:context)
+        end
+
+        attributes do
+          integer_primary_key(:id)
+          attribute(:slug, :string, allow_nil?: false, public?: true)
+        end
+
+        identities do
+          identity(:unique_global_slug, [:slug], all_tenants?: true)
+        end
+
+        actions do
+          defaults([:read, :destroy])
+
+          create :create do
+            primary?(true)
+            accept([:slug])
+          end
+        end
+      end
+
+      defmodule NestedParent do
+        use Ash.Resource,
+          domain: Xitdb.Ash.MutatorTest.FkRegressionsDomain,
+          data_layer: Xitdb.Ash.DataLayer
+
+        xitdb do
+          store(FkRegressionsStore)
+          collection(:reg_nested_parents)
+        end
+
+        attributes do
+          integer_primary_key(:id)
+          attribute(:name, :string, allow_nil?: false, public?: true)
+        end
+
+        actions do
+          defaults([:read, :destroy])
+
+          create :create do
+            primary?(true)
+            accept([:name])
+          end
+        end
+      end
+
+      defmodule NestedOneConfig do
+        use Ash.Resource,
+          domain: Xitdb.Ash.MutatorTest.FkRegressionsDomain,
+          data_layer: Xitdb.Ash.DataLayer
+
+        xitdb do
+          store(FkRegressionsStore)
+          collection(:reg_nested_configs)
+
+          nested_in(:reg_nested_parents,
+            foreign_key: :parent_id,
+            path: :config,
+            cardinality: :one
+          )
+
+          references do
+            reference(:parent, on_delete: :delete)
+          end
+        end
+
+        attributes do
+          integer_primary_key(:id)
+          attribute(:theme, :string, allow_nil?: false, public?: true)
+        end
+
+        relationships do
+          belongs_to(:parent, NestedParent,
+            attribute_type: :integer,
+            allow_nil?: false,
+            public?: true
+          )
+        end
+
+        actions do
+          defaults([:read, :destroy])
+
+          create :create do
+            primary?(true)
+            accept([:theme, :parent_id])
+          end
+
+          update :update do
+            primary?(true)
+            accept([:theme])
+          end
+        end
+      end
+
+      defmodule ExplicitPkItem do
+        use Ash.Resource,
+          domain: Xitdb.Ash.MutatorTest.FkRegressionsDomain,
+          data_layer: Xitdb.Ash.DataLayer
+
+        xitdb do
+          store(FkRegressionsStore)
+          collection(:reg_explicit_pks)
+        end
+
+        attributes do
+          attribute(:id, :integer,
+            primary_key?: true,
+            generated?: false,
+            allow_nil?: false,
+            writable?: true,
+            public?: true
+          )
+
+          attribute(:big_num, :integer, public?: true)
+        end
+
+        actions do
+          defaults([:read, :destroy])
+
+          create :create do
+            primary?(true)
+            accept([:id, :big_num])
+          end
+        end
+      end
+
+      defmodule FkRegressionsDomain do
+        use Ash.Domain, validate_config_inclusion?: false
+
+        resources do
+          resource(RegUser)
+          resource(RegMessage)
+          resource(SelfNode)
+          resource(DiamondRoot)
+          resource(DiamondMid)
+          resource(DiamondLeaf)
+          resource(TenantGlobalSlug)
+          resource(NestedParent)
+          resource(NestedOneConfig)
+          resource(ExplicitPkItem)
+        end
+      end
+
+      setup do
+        {:ok, fk_pid} =
+          Store.start_link(
+            name: FkRegressionsStore,
+            path: :memory,
+            domains: [FkRegressionsDomain]
+          )
+
+        on_exit(fn ->
+          if Process.alive?(fk_pid) do
+            try do
+              GenServer.stop(fk_pid, :normal, 1_000)
+            catch
+              :exit, _ -> :ok
+            end
+          end
+        end)
+
+        :ok
+      end
+
+      test "create and bulk_create enforce atomic validations; upsert honors omitted upsert_fields, upsert_condition, and post-atomic validation" do
+        assert {:error, _} =
+                 Ash.create(RegUser, %{email: "bad@gmail.com"}, domain: FkRegressionsDomain)
+
+        bulk_res =
+          Ash.bulk_create([%{email: "bad@gmail.com"}], RegUser, :create,
+            domain: FkRegressionsDomain,
+            return_errors?: true
+          )
+
+        assert bulk_res.status == :error
+
+        u1 =
+          Ash.create!(RegUser, %{email: "ok@corp.ca", version: 1, score: 5, bio: "v1"},
+            domain: FkRegressionsDomain
+          )
+
+        # Upsert with upsert_fields omitted + atomic_update(:score, score + 10)
+        u2 =
+          Ash.create!(RegUser, %{email: "ok@corp.ca", version: 2, bio: "v2"},
+            action: :upsert_version,
+            domain: FkRegressionsDomain
+          )
+
+        assert u2.id == u1.id
+        assert u2.bio == "v2"
+        assert u2.score == 15
+        assert u2.version == 2
+
+        # version is now 2, so upsert_condition expr(version < 2) skips the upsert
+        skipped =
+          Ash.create!(
+            RegUser,
+            %{email: "ok@corp.ca", version: 3, bio: "ignored"},
+            action: :upsert_version,
+            return_skipped_upsert?: true,
+            domain: FkRegressionsDomain
+          )
+
+        assert Ash.Resource.get_metadata(skipped, :upsert_skipped) == true
+        assert Ash.get!(RegUser, u1.id, domain: FkRegressionsDomain).bio == "v2"
+
+        # Atomic validation after atomic_update: first +100 -> 115 succeeds, second +100 -> 215 fails MaxScoreValidation (> 150)
+        u3 =
+          Ash.create!(RegUser, %{email: "ok@corp.ca", version: 2, bio: "v2"},
+            action: :upsert_atomic_score,
+            domain: FkRegressionsDomain
+          )
+
+        assert u3.score == 115
+
+        assert {:error, _} =
+                 Ash.create(RegUser, %{email: "ok@corp.ca", version: 2, bio: "v2"},
+                   action: :upsert_atomic_score,
+                   domain: FkRegressionsDomain
+                 )
+
+        assert {:error, _} =
+                 Ash.update(u3, %{},
+                   action: :add_score,
+                   domain: FkRegressionsDomain
+                 )
+
+        assert Ash.get!(RegUser, u1.id, domain: FkRegressionsDomain).score == 115
+      end
+
+      test "multi-FK :nilify clears both sender_id and recipient_id on the same child in one destroy" do
+        u = Ash.create!(RegUser, %{email: "self@corp.ca"}, domain: FkRegressionsDomain)
+
+        msg =
+          Ash.create!(RegMessage, %{body: "note to self", sender_id: u.id, recipient_id: u.id},
+            domain: FkRegressionsDomain
+          )
+
+        :ok = Ash.destroy!(u, domain: FkRegressionsDomain)
+
+        reloaded = Ash.get!(RegMessage, msg.id, domain: FkRegressionsDomain)
+        assert reloaded.sender_id == nil
+        assert reloaded.recipient_id == nil
+      end
+
+      test "self-referential bulk_destroy cleans parent_id nil index entries without leaving ghosts" do
+        root = Ash.create!(SelfNode, %{name: "root"}, domain: FkRegressionsDomain)
+
+        child =
+          Ash.create!(SelfNode, %{name: "child", parent_id: root.id}, domain: FkRegressionsDomain)
+
+        _leaf =
+          Ash.create!(SelfNode, %{name: "leaf", parent_id: child.id}, domain: FkRegressionsDomain)
+
+        %Ash.BulkResult{status: :success} =
+          Ash.bulk_destroy!(SelfNode, :destroy, %{}, domain: FkRegressionsDomain)
+
+        assert Ash.read!(SelfNode, domain: FkRegressionsDomain) == []
+
+        assert Indexer.count_by_attribute(
+                 Store.root(FkRegressionsStore),
+                 SelfNode,
+                 :parent_id,
+                 nil
+               ) == 0
+      end
+
+      test "diamond FK priority runs :delete before :restrict and still blocks when independent :restrict child survives" do
+        r1 = Ash.create!(DiamondRoot, %{name: "r1"}, domain: FkRegressionsDomain)
+        m1 = Ash.create!(DiamondMid, %{label: "m1", root_id: r1.id}, domain: FkRegressionsDomain)
+
+        _l1 =
+          Ash.create!(
+            DiamondLeaf,
+            %{label: "cascade-clears-restrict", mid_id: m1.id, root_id: r1.id},
+            domain: FkRegressionsDomain
+          )
+
+        # m1 cascades delete to l1 before r1's :restrict check against l1 runs
+        :ok = Ash.destroy!(r1, domain: FkRegressionsDomain)
+        assert Ash.read!(DiamondLeaf, domain: FkRegressionsDomain) == []
+
+        r2 = Ash.create!(DiamondRoot, %{name: "r2"}, domain: FkRegressionsDomain)
+
+        _independent_guard =
+          Ash.create!(DiamondLeaf, %{label: "blocks-delete", mid_id: nil, root_id: r2.id},
+            domain: FkRegressionsDomain
+          )
+
+        assert {:error, _} = Ash.destroy(r2, domain: FkRegressionsDomain)
+        assert Ash.get!(DiamondRoot, r2.id, domain: FkRegressionsDomain).name == "r2"
+      end
+
+      test "enforces all_tenants?: true across :context tenants, overwrites nested_in :one cleanly, and rejects missing explicit PK or >64-bit integer" do
+        _t1 =
+          Ash.create!(TenantGlobalSlug, %{slug: "shared"},
+            tenant: "tenant_a",
+            domain: FkRegressionsDomain
+          )
+
+        assert {:error, _} =
+                 Ash.create(TenantGlobalSlug, %{slug: "shared"},
+                   tenant: "tenant_b",
+                   domain: FkRegressionsDomain
+                 )
+
+        parent = Ash.create!(NestedParent, %{name: "P1"}, domain: FkRegressionsDomain)
+
+        cfg1 =
+          Ash.create!(NestedOneConfig, %{theme: "light", parent_id: parent.id},
+            domain: FkRegressionsDomain
+          )
+
+        assert Store.root(FkRegressionsStore)["reg_nested_parents"][Integer.to_string(parent.id)][
+                 "config"
+               ]["theme"] == "light"
+
+        cfg2 =
+          Ash.create!(NestedOneConfig, %{theme: "dark", parent_id: parent.id},
+            domain: FkRegressionsDomain
+          )
+
+        assert cfg2.theme == "dark"
+
+        assert Store.root(FkRegressionsStore)["reg_nested_parents"][Integer.to_string(parent.id)][
+                 "config"
+               ]["theme"] == "dark"
+
+        updated_cfg = Ash.update!(cfg2, %{theme: "solarized"}, domain: FkRegressionsDomain)
+        assert updated_cfg.theme == "solarized"
+        assert cfg1.id != cfg2.id
+
+        # Non-generated explicit PK rejects missing id instead of sequence allocation
+        assert {:error, _} =
+                 Ash.create(ExplicitPkItem, %{big_num: 1}, domain: FkRegressionsDomain)
+
+        # >64-bit signed integer returns structured Ash.Error.Invalid instead of NIF crash
+        assert {:error, %Ash.Error.Invalid{}} =
+                 Ash.create(ExplicitPkItem, %{id: 1, big_num: Bitwise.bsl(1, 64)},
+                   domain: FkRegressionsDomain
+                 )
+      end
+    end
   end
 end

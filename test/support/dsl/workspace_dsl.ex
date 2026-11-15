@@ -65,16 +65,24 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
       raw_email = Keyword.get(opts, :email, "#{slugify(label)}@allocator.ca")
 
-      profile =
-        WorkspaceDriver.enrol_member(%{
-          email: unique_email(ctx, raw_email),
-          full_name: label,
-          headline: Keyword.get(opts, :headline, "Allocator"),
-          role: Keyword.get(opts, :role, :member),
-          visibility: Keyword.get(opts, :visibility, :public),
-          compensation_band: Keyword.get(opts, :compensation_band),
-          organization_id: firm_id
-        })
+      attrs = %{
+        email: unique_email(ctx, raw_email),
+        full_name: label,
+        headline: Keyword.get(opts, :headline, "Allocator"),
+        role: Keyword.get(opts, :role, :member),
+        visibility: Keyword.get(opts, :visibility, :public),
+        compensation_band: Keyword.get(opts, :compensation_band),
+        organization_id: firm_id
+      }
+
+      attrs =
+        if Keyword.has_key?(opts, :local_overrides) do
+          Map.put(attrs, :local_overrides, Keyword.fetch!(opts, :local_overrides))
+        else
+          attrs
+        end
+
+      profile = WorkspaceDriver.enrol_member(attrs)
 
       %World{ctx | members: Map.put(ctx.members, label, profile)}
     end
@@ -83,7 +91,15 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       sender = Map.fetch!(ctx.members, Keyword.fetch!(opts, :from))
       recipient = Map.fetch!(ctx.members, Keyword.fetch!(opts, :to))
       body = Keyword.fetch!(opts, :body)
-      _ = WorkspaceDriver.send_direct_message(sender.id, recipient.id, body)
+
+      msg_opts =
+        if Keyword.has_key?(opts, :context_metadata) do
+          [context_metadata: Keyword.fetch!(opts, :context_metadata)]
+        else
+          []
+        end
+
+      _ = WorkspaceDriver.send_direct_message(sender.id, recipient.id, body, msg_opts)
       ctx
     end
 
@@ -246,6 +262,22 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       %World{ctx | bulk_stats: stats}
     end
 
+    def updating_local_overrides(%World{} = ctx, target_label, opts) do
+      target = Map.fetch!(ctx.members, target_label)
+      actor = Map.fetch!(ctx.members, Keyword.fetch!(opts, :as))
+      overrides = Keyword.fetch!(opts, :to)
+
+      result = WorkspaceDriver.edit_profile(target, %{local_overrides: overrides}, actor)
+
+      members =
+        case result do
+          {:ok, updated} -> Map.put(ctx.members, target_label, updated)
+          {:error, _} -> ctx.members
+        end
+
+      %World{ctx | members: members, last_result: result}
+    end
+
     def submitting_membership_form(%World{} = ctx, params) do
       raw_email = Map.fetch!(params, :email)
       scoped_params = Map.put(params, :email, unique_email(ctx, raw_email))
@@ -329,6 +361,13 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         member = Map.fetch!(ctx.members, unquote(member_label))
         opts = unquote(opts)
 
+        unknown = Keyword.keys(opts) -- [:badge, :sent_messages, :views, :at_checkpoint]
+
+        if unknown != [] do
+          raise ArgumentError,
+                "unknown options in profile_summary_matches: #{inspect(unknown)}"
+        end
+
         driver_opts =
           [load: [:display_badge, :sent_message_count]] ++
             Xitdb.TestDSL.WorkspaceDSL.checkpoint_opts(ctx, opts)
@@ -337,9 +376,12 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           WorkspaceDriver.list_visible_profiles(member, driver_opts)
           |> Enum.filter(&(&1.id == member.id))
 
-        if badge = opts[:badge], do: assert(loaded.display_badge == badge)
-        if sent = opts[:sent_messages], do: assert(loaded.sent_message_count == sent)
-        if views = opts[:views], do: assert(loaded.view_count == views)
+        if Keyword.has_key?(opts, :badge), do: assert(loaded.display_badge == opts[:badge])
+
+        if Keyword.has_key?(opts, :sent_messages),
+          do: assert(loaded.sent_message_count == opts[:sent_messages])
+
+        if Keyword.has_key?(opts, :views), do: assert(loaded.view_count == opts[:views])
         ctx
       end
     end
@@ -370,6 +412,49 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
         assert WorkspaceDriver.confirmed_seat_numbers(session.id, driver_opts) ==
                  unquote(expected_seat_numbers)
+
+        ctx
+      end
+    end
+
+    defmacro member_local_overrides_equal(ctx_ast, member_label, expected_map, opts \\ []) do
+      quote line: __CALLER__.line do
+        %World{} = ctx = unquote(ctx_ast)
+        member = Map.fetch!(ctx.members, unquote(member_label))
+        driver_opts = Xitdb.TestDSL.WorkspaceDSL.checkpoint_opts(ctx, unquote(opts))
+        loaded = WorkspaceDriver.get_member_profile(member.id, member, driver_opts)
+        expected = unquote(expected_map)
+
+        assert is_map(loaded.local_overrides)
+        assert loaded.local_overrides === expected
+
+        for {k, v} <- expected do
+          assert Map.has_key?(loaded.local_overrides, k)
+          assert Map.fetch!(loaded.local_overrides, k) === v
+        end
+
+        ctx
+      end
+    end
+
+    defmacro inbox_messages_metadata_are(ctx_ast, recipient_label, expected_pairs, opts \\ []) do
+      quote line: __CALLER__.line do
+        %World{} = ctx = unquote(ctx_ast)
+        recipient = Map.fetch!(ctx.members, unquote(recipient_label))
+        driver_opts = Xitdb.TestDSL.WorkspaceDSL.checkpoint_opts(ctx, unquote(opts))
+        msgs = WorkspaceDriver.list_inbox_messages(recipient.id, driver_opts)
+        expected = unquote(expected_pairs)
+
+        assert Enum.map(msgs, &{&1.body, &1.context_metadata}) === expected
+
+        for {msg, {_body, exp_meta}} <- Enum.zip(msgs, expected) do
+          assert is_map(msg.context_metadata)
+
+          for {k, v} <- exp_meta do
+            assert Map.has_key?(msg.context_metadata, k)
+            assert Map.fetch!(msg.context_metadata, k) === v
+          end
+        end
 
         ctx
       end

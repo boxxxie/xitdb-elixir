@@ -68,7 +68,12 @@ if Code.ensure_loaded?(Spark.Dsl.Verifier) and Code.ensure_loaded?(Ash.Resource)
             "#{inspect(module)} declares both `collection` and `nested_in`; choose one storage location."
           )
 
-        mappings != [] and XitdbInfo.xitdb_indexes!(dsl_state) != [] ->
+        mappings != [] and
+            (XitdbInfo.xitdb_indexes!(dsl_state) != [] or
+               Enum.any?(
+                 Spark.Dsl.Extension.get_entities(dsl_state, [:xitdb]),
+                 &match?(%Xitdb.Ash.Index{}, &1)
+               )) ->
           dsl_error(
             module,
             [:xitdb, :indexes],
@@ -106,6 +111,14 @@ if Code.ensure_loaded?(Spark.Dsl.Verifier) and Code.ensure_loaded?(Ash.Resource)
             module,
             [:xitdb, :nested_in],
             "`key` #{inspect(mapping.key)} does not exist as an attribute or computed_xitdb_field on #{inspect(module)}."
+          )
+
+        is_atom(mapping.parent) and Code.ensure_loaded?(mapping.parent) and
+            XitdbInfo.nested?(mapping.parent) ->
+          dsl_error(
+            module,
+            [:xitdb, :nested_in],
+            "multi-level `nested_in` is not supported: parent #{inspect(mapping.parent)} is itself nested."
           )
 
         true ->
@@ -171,21 +184,91 @@ if Code.ensure_loaded?(Spark.Dsl.Verifier) and Code.ensure_loaded?(Ash.Resource)
         |> Enum.concat(computed)
         |> MapSet.new()
 
-      dsl_state
-      |> XitdbInfo.xitdb_indexes!()
-      |> Keyword.keys()
-      |> Enum.reduce_while(:ok, fn idx_field, :ok ->
-        if MapSet.member?(valid_xitdb_keys, idx_field) do
-          {:cont, :ok}
-        else
-          {:halt,
-           {:error,
-            DslError.exception(
-              module: module,
-              path: [:xitdb, :indexes],
-              message:
-                "Indexed field #{inspect(idx_field)} is not in editable_fields, passthru_fields, or computed_xitdb_fields."
-            )}}
+      entities = Spark.Dsl.Extension.get_entities(dsl_state, [:xitdb])
+
+      with :ok <-
+             dsl_state
+             |> XitdbInfo.xitdb_indexes!()
+             |> Keyword.keys()
+             |> Enum.reduce_while(:ok, fn idx_field, :ok ->
+               if MapSet.member?(valid_xitdb_keys, idx_field) do
+                 {:cont, :ok}
+               else
+                 {:halt,
+                  {:error,
+                   DslError.exception(
+                     module: module,
+                     path: [:xitdb, :indexes],
+                     message:
+                       "Indexed field #{inspect(idx_field)} is not in editable_fields, passthru_fields, or computed_xitdb_fields."
+                   )}}
+               end
+             end),
+           :ok <-
+             verify_index_entities_covered(dsl_state, module, entities, valid_xitdb_keys, aliases) do
+        verify_search_entities_covered(dsl_state, module, entities)
+      end
+    end
+
+    defp verify_index_entities_covered(dsl_state, module, entities, valid_xitdb_keys, aliases) do
+      entities
+      |> Enum.filter(&match?(%Xitdb.Ash.Index{}, &1))
+      |> Enum.reduce_while(:ok, fn %Xitdb.Ash.Index{fields: fields}, :ok ->
+        cond do
+          fields == [] ->
+            {:halt, dsl_error(module, [:xitdb, :index], "index `fields` cannot be empty.")}
+
+          true ->
+            missing =
+              Enum.reject(fields, fn f ->
+                aliased = Keyword.get(aliases, f, f)
+
+                MapSet.member?(valid_xitdb_keys, aliased) or
+                  not is_nil(ResourceInfo.attribute(dsl_state, f))
+              end)
+
+            if missing == [] do
+              {:cont, :ok}
+            else
+              {:halt,
+               dsl_error(
+                 module,
+                 [:xitdb, :index, fields],
+                 "Indexed field(s) #{inspect(missing)} must exist on #{inspect(module)} or in editable/passthru/computed fields."
+               )}
+            end
+        end
+      end)
+    end
+
+    defp verify_search_entities_covered(dsl_state, module, entities) do
+      entities
+      |> Enum.filter(&match?(%Xitdb.Ash.SearchField{}, &1))
+      |> Enum.reduce_while(:ok, fn %Xitdb.Ash.SearchField{
+                                     field: field,
+                                     boost: boost,
+                                     resolver: resolver
+                                   },
+                                   :ok ->
+        cond do
+          boost <= 0.0 ->
+            {:halt,
+             dsl_error(
+               module,
+               [:xitdb, :search_field, field],
+               "`search_field` boost must be > 0.0, got: #{inspect(boost)}"
+             )}
+
+          is_nil(resolver) and is_nil(ResourceInfo.attribute(dsl_state, field)) ->
+            {:halt,
+             dsl_error(
+               module,
+               [:xitdb, :search_field, field],
+               "SearchField #{inspect(field)} must match an attribute on #{inspect(module)} or supply a `resolver: fun/2`."
+             )}
+
+          true ->
+            {:cont, :ok}
         end
       end)
     end

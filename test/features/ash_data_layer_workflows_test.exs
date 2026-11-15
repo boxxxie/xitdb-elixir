@@ -232,5 +232,48 @@ if Code.ensure_loaded?(Ash.DataLayer) do
             )
       @then search_results_ordered(["Claire Tremblay", "Victor Leung"])
     end
+
+    scenario "empty :map defaults and nil-valued map overrides round-trip losslessly across updates and time-travel checkpoints" do
+      @given member("Claire Tremblay", headline: "Managing Director")
+      @given member("Victor Leung", headline: "Partner")
+      @given direct_message(
+               from: "Claire Tremblay",
+               to: "Victor Leung",
+               body: "Default empty metadata"
+             )
+
+      @then member_local_overrides_equal("Claire Tremblay", %{})
+      @then inbox_messages_metadata_are("Victor Leung", [{"Default empty metadata", %{}}])
+
+      @upon direct_message(
+              from: "Claire Tremblay",
+              to: "Victor Leung",
+              body: "Moderation audit",
+              context_metadata: %{"blocker_id" => 1, "blocked_id" => 2, "reason" => nil}
+            )
+      @upon updating_local_overrides("Claire Tremblay",
+              as: "Claire Tremblay",
+              to: %{"bio" => nil, "nested" => %{"empty" => %{}, "cleared" => nil}}
+            )
+      @given checkpoint(:with_nil_overrides)
+
+      @then member_local_overrides_equal("Claire Tremblay", %{
+              "bio" => nil,
+              "nested" => %{"empty" => %{}, "cleared" => nil}
+            })
+      @then inbox_messages_metadata_are("Victor Leung", [
+              {"Default empty metadata", %{}},
+              {"Moderation audit", %{"blocker_id" => 1, "blocked_id" => 2, "reason" => nil}}
+            ])
+
+      @upon updating_local_overrides("Claire Tremblay", as: "Claire Tremblay", to: %{})
+
+      @then member_local_overrides_equal("Claire Tremblay", %{})
+      @then member_local_overrides_equal(
+              "Claire Tremblay",
+              %{"bio" => nil, "nested" => %{"empty" => %{}, "cleared" => nil}},
+              at_checkpoint: :with_nil_overrides
+            )
+    end
   end
 end

@@ -67,7 +67,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
                         "Explicit `%Xitdb{}` handle; defaults to `Xitdb.Ash.Store.current_db/1`."
                     ],
                     as_of: [
-                      type: {:or, [:integer, {:in, [nil]}]},
+                      type: {:or, [:non_neg_integer, {:in, [nil]}]},
                       default: nil,
                       doc:
                         "Optional historical moment index (`Xitdb.as_of/2`); ignored when `:db` is set."
@@ -136,26 +136,44 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     def sort_by_rank(%Ash.Query{resource: resource} = ash_query, ranked_ids)
         when is_list(ranked_ids) do
       [pk_field | _] = Ash.Resource.Info.primary_key(resource)
-      max_rank = length(ranked_ids)
+      unique_ids = Enum.uniq(ranked_ids)
+      max_rank = length(unique_ids)
 
       rank_expr =
-        Enum.reduce(Enum.with_index(ranked_ids), Ash.Expr.expr(^max_rank), fn {id, rank}, acc ->
+        Enum.reduce(Enum.with_index(unique_ids), Ash.Expr.expr(^max_rank), fn {id, rank}, acc ->
           Ash.Expr.expr(if(^Ash.Expr.ref(pk_field) == ^id, ^rank, ^acc))
         end)
 
-      Ash.Query.sort(ash_query, [{Ash.Sort.expr_sort(^rank_expr), :asc}])
+      Ash.Query.sort(ash_query, [{Ash.Sort.expr_sort(^rank_expr), :asc}], prepend?: true)
     end
 
     @doc """
     Reads a raw attribute from another collection on the same working `%Xitdb{}` handle
     for cross-entity `search_field` `resolver:` callbacks (e.g., `Profile` -> `Organization`).
     """
-    @spec lookup_field(term(), atom(), term(), String.t() | atom()) :: term()
-    def lookup_field(_db, _collection, nil, _attr_key), do: nil
+    @spec lookup_field(term(), atom(), term(), String.t() | atom(), term()) :: term()
+    def lookup_field(db, collection, id, attr_key, tenant \\ nil)
+    def lookup_field(_db, _collection, nil, _attr_key, _tenant), do: nil
 
-    def lookup_field(db, collection, id, attr_key)
+    def lookup_field(db, collection, id, attr_key, tenant)
         when is_atom(collection) and (is_binary(attr_key) or is_atom(attr_key)) do
-      Storage.read_entity_field(db, Atom.to_string(collection), encode_doc_key(id), attr_key)
+      {col_str, doc_key} =
+        if Ash.Resource.Info.resource?(collection) do
+          [pk_name | _] = Ash.Resource.Info.primary_key(collection)
+          pk_attr = Ash.Resource.Info.attribute(collection, pk_name)
+          {Codec.scoped_collection(collection, tenant), Codec.encode_pk_doc_id(pk_attr, id)}
+        else
+          scoped =
+            if is_nil(tenant) do
+              Atom.to_string(collection)
+            else
+              "t:" <> Codec.encode_doc_id(tenant) <> ":" <> Atom.to_string(collection)
+            end
+
+          {scoped, Codec.encode_doc_id(id)}
+        end
+
+      Storage.read_entity_field(db, col_str, doc_key, attr_key)
     end
 
     @doc """
@@ -168,6 +186,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
     def tokenize(text) when is_binary(text) do
       text
+      |> :unicode.characters_to_nfc_binary()
       |> String.downcase()
       |> String.split(~r/[^\p{L}\p{N}]+/u, trim: true)
       |> Enum.map(&:binary.copy/1)
@@ -266,10 +285,51 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     end
 
     defp score_collection(db, collection, tokens, opts, resource) do
-      case resolve_backend(opts[:backend], db) do
-        :nif -> score_collection_nif(db, collection, tokens, opts, resource)
-        :elixir -> score_collection_elixir(db, collection, tokens, opts, resource)
+      case Storage.root_cursor(db) do
+        %Xitdb.Cursor{tag: :none} ->
+          []
+
+        nil ->
+          []
+
+        _root ->
+          filter_tenant? = attribute_tenant_filter_needed?(resource, opts[:tenant])
+
+          effective_opts =
+            if filter_tenant? do
+              %{doc_count: doc_count} = Storage.read_corpus_stats(db, collection)
+              Keyword.put(opts, :limit, max(opts[:limit], doc_count))
+            else
+              opts
+            end
+
+          hits =
+            case resolve_backend(effective_opts[:backend], db) do
+              :nif -> score_collection_nif(db, collection, tokens, effective_opts, resource)
+              :elixir -> score_collection_elixir(db, collection, tokens, effective_opts, resource)
+            end
+
+          if filter_tenant? do
+            hits
+            |> Enum.filter(fn {pk_val, _score} ->
+              with {:ok, cur} <-
+                     Xitdb.Ash.Indexer.fetch_cursor(db, resource, pk_val, opts[:tenant]),
+                   {:ok, record} <- Codec.from_cursor(resource, cur, opts[:tenant]) do
+                Codec.matches_tenant?(resource, record, opts[:tenant])
+              else
+                _ -> false
+              end
+            end)
+            |> Enum.take(opts[:limit])
+          else
+            hits
+          end
       end
+    end
+
+    defp attribute_tenant_filter_needed?(resource, tenant) do
+      Ash.Resource.Info.multitenancy_strategy(resource) == :attribute and
+        not (is_nil(tenant) and Ash.Resource.Info.multitenancy_global?(resource))
     end
 
     defp resolve_backend(:elixir, _db), do: :elixir
@@ -287,6 +347,9 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
     defp score_collection_nif(db, collection, tokens, opts, resource) do
       case Storage.root_cursor(db) do
+        %Xitdb.Cursor{tag: :none} ->
+          []
+
         %Xitdb.Cursor{tx_mode: false, db_ref: db_ref, tag_id: root_tag_id, value: root_val_int} ->
           nif_opts = %{
             match: opts[:match],
@@ -312,6 +375,9 @@ if Code.ensure_loaded?(Ash.DataLayer) do
               Enum.map(raw_hits, fn {doc_key, score} ->
                 {decode_doc_key(resource, doc_key), score}
               end)
+
+            {:error, :invalid_moment} ->
+              []
 
             {:error, reason} ->
               raise Xitdb.Error, reason: reason, details: %{collection: collection}
@@ -353,7 +419,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       prefix_weight = opts[:prefix_weight]
 
       prefix_postings =
-        if opts[:prefix?] and String.length(token) >= opts[:min_prefix_length] do
+        if opts[:prefix?] and length(String.to_charlist(token)) >= opts[:min_prefix_length] do
           Storage.scan_prefix(
             db,
             collection,
@@ -529,10 +595,6 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       end)
     end
 
-    defp encode_doc_key(id) when is_integer(id), do: Integer.to_string(id)
-    defp encode_doc_key(id) when is_binary(id), do: id
-    defp encode_doc_key(id), do: to_string(id)
-
     defp decode_doc_key(resource, key) do
       case Codec.decode_doc_id(resource, key) do
         {:ok, pk_val} -> pk_val
@@ -555,8 +617,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       attr_str = to_string(attr_key)
 
       with root when not is_nil(root) <- root_cursor(db),
-           col when not is_nil(col) <- root[collection],
-           entity when not is_nil(entity) <- col[doc_key] do
+           entity when not is_nil(entity) <-
+             read_path(root, [{:hash_map, collection}, {:hash_map, doc_key}]) do
         entity[attr_str] || entity[attr_key]
       else
         _ -> nil
@@ -579,14 +641,31 @@ if Code.ensure_loaded?(Ash.DataLayer) do
             terms: %{optional(String.t()) => pos_integer()}
           }
     def read_doc(db, collection, doc_key) do
-      with docs when not is_nil(docs) <- get_in_search(db, collection, "docs"),
-           doc when not is_nil(doc) <- docs[doc_key] do
+      with root when not is_nil(root) <- root_cursor(db),
+           doc when not is_nil(doc) <-
+             read_path(root, [
+               {:hash_map, "idx"},
+               {:hash_map, "search"},
+               {:hash_map, collection},
+               {:hash_map, "docs"},
+               {:hash_map, doc_key}
+             ]) do
         terms =
           case doc["terms"] do
-            nil -> %{}
-            raw_terms when is_map(raw_terms) and not is_struct(raw_terms) -> raw_terms
-            %Xitdb.Cursor{} = terms_cur -> Map.new(terms_cur)
-            _ -> %{}
+            nil ->
+              %{}
+
+            %Xitdb.Collection{data: data} ->
+              Map.new(data, fn {k, v} -> {to_string(k), v} end)
+
+            raw_terms when is_map(raw_terms) and not is_struct(raw_terms) ->
+              raw_terms
+
+            %Xitdb.Cursor{} = terms_cur ->
+              Map.new(terms_cur)
+
+            _ ->
+              %{}
           end
 
         %{len: doc["len"] || 0, terms: terms}
@@ -597,8 +676,15 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
     @spec read_doc_len(term(), String.t(), String.t()) :: non_neg_integer()
     def read_doc_len(db, collection, doc_key) do
-      with docs when not is_nil(docs) <- get_in_search(db, collection, "docs"),
-           doc when not is_nil(doc) <- docs[doc_key] do
+      with root when not is_nil(root) <- root_cursor(db),
+           doc when not is_nil(doc) <-
+             read_path(root, [
+               {:hash_map, "idx"},
+               {:hash_map, "search"},
+               {:hash_map, collection},
+               {:hash_map, "docs"},
+               {:hash_map, doc_key}
+             ]) do
         doc["len"] || 0
       else
         _ -> 0
@@ -607,8 +693,15 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
     @spec lookup_term(term(), String.t(), String.t()) :: [{String.t(), pos_integer()}]
     def lookup_term(db, collection, term) do
-      with terms when not is_nil(terms) <- get_in_search(db, collection, "terms"),
-           postings when not is_nil(postings) <- terms[term] do
+      with root when not is_nil(root) <- root_cursor(db),
+           postings when not is_nil(postings) <-
+             read_path(root, [
+               {:hash_map, "idx"},
+               {:hash_map, "search"},
+               {:hash_map, collection},
+               {:hash_map, "terms"},
+               {:sorted_map, term}
+             ]) do
         Enum.to_list(postings)
       else
         _ -> []
@@ -619,7 +712,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
             {[{String.t(), Xitdb.Cursor.t()}], String.t() | nil}
     def scan_prefix_cursors(db, collection, prefix, limit) do
       case get_in_search(db, collection, "terms") do
-        %Xitdb.Cursor{db_ref: db_ref, tag_id: tag_id, value: val, moment: moment} ->
+        %Xitdb.Cursor{db_ref: db_ref, tag_id: tag_id, value: val, moment: moment}
+        when tag_id > 0 ->
           case Xitdb.NIF.nif_sorted_map_seek(db_ref, tag_id, val, prefix, limit) do
             {:ok, entries, next_cursor} ->
               cursors =
@@ -644,32 +738,67 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     def scan_prefix(db, collection, prefix, limit, backend \\ :auto)
 
     def scan_prefix(db, collection, prefix, limit, :elixir) do
-      scan_prefix_via_slot_entries(db, collection, prefix, limit)
-    end
+      case get_in_search(db, collection, "terms") do
+        %Xitdb.Cursor{tx_mode: false} = terms ->
+          scan_prefix_via_slot_entries_cursor(terms, prefix, limit)
 
-    def scan_prefix(db, collection, prefix, limit, _backend) do
-      if function_exported?(Xitdb.NIF, :nif_sorted_map_seek, 5) do
-        {cursor_entries, _next} = scan_prefix_cursors(db, collection, prefix, limit)
-        Enum.map(cursor_entries, fn {term, cur} -> {term, Enum.to_list(cur)} end)
-      else
-        scan_prefix_via_slot_entries(db, collection, prefix, limit)
+        other ->
+          scan_prefix_from_map_or_cursor(other, prefix, limit)
       end
     end
 
-    defp scan_prefix_via_slot_entries(db, collection, prefix, limit) do
+    def scan_prefix(db, collection, prefix, limit, _backend) do
       case get_in_search(db, collection, "terms") do
-        nil ->
-          []
-
-        %Xitdb.Cursor{} = terms ->
-          case Xitdb.NIF.nif_slot_count(terms.db_ref, terms.tag_id, terms.value) do
-            {:ok, total_count} when total_count > 0 ->
-              start_idx = find_prefix_start_index(terms, prefix, 0, total_count)
-              stream_prefix_from(terms, prefix, start_idx, limit)
-
-            _ ->
-              []
+        %Xitdb.Cursor{tx_mode: false} = terms ->
+          if function_exported?(Xitdb.NIF, :nif_sorted_map_seek, 5) do
+            {cursor_entries, _next} = scan_prefix_cursors(db, collection, prefix, limit)
+            Enum.map(cursor_entries, fn {term, cur} -> {term, Enum.to_list(cur)} end)
+          else
+            scan_prefix_via_slot_entries_cursor(terms, prefix, limit)
           end
+
+        other ->
+          scan_prefix_from_map_or_cursor(other, prefix, limit)
+      end
+    end
+
+    defp scan_prefix_from_map_or_cursor(nil, _prefix, _limit), do: []
+
+    defp scan_prefix_from_map_or_cursor(%Xitdb.Collection{data: data}, prefix, limit) do
+      data
+      |> Enum.map(fn {k, v} -> {to_string(k), v} end)
+      |> scan_prefix_from_entries(prefix, limit)
+    end
+
+    defp scan_prefix_from_map_or_cursor(terms, prefix, limit) when is_map(terms) do
+      terms
+      |> Enum.to_list()
+      |> scan_prefix_from_entries(prefix, limit)
+    end
+
+    defp scan_prefix_from_entries(entries, prefix, limit) do
+      entries
+      |> Enum.filter(fn {term, _postings} -> String.starts_with?(term, prefix) end)
+      |> Enum.sort_by(&elem(&1, 0))
+      |> Enum.take(limit)
+      |> Enum.map(fn {term, raw_postings} ->
+        {term, materialize_postings_list(raw_postings)}
+      end)
+    end
+
+    defp materialize_postings_list(%Xitdb.Collection{data: data}), do: Enum.to_list(data)
+    defp materialize_postings_list(postings) when is_map(postings), do: Enum.to_list(postings)
+    defp materialize_postings_list(postings) when is_list(postings), do: postings
+    defp materialize_postings_list(_), do: []
+
+    defp scan_prefix_via_slot_entries_cursor(%Xitdb.Cursor{} = terms, prefix, limit) do
+      case Xitdb.NIF.nif_slot_count(terms.db_ref, terms.tag_id, terms.value) do
+        {:ok, total_count} when total_count > 0 ->
+          start_idx = find_prefix_start_index(terms, prefix, 0, total_count)
+          stream_prefix_from(terms, prefix, start_idx, limit)
+
+        _ ->
+          []
       end
     end
 
@@ -794,8 +923,26 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
       case db do
         {%Xitdb{} = raw_db, moment} when is_integer(moment) ->
-          {:ok, new_db} = Xitdb.transact_ops(raw_db, ops, base_moment: moment)
-          {new_db, Xitdb.moment_count(new_db) - 1}
+          {:ok, new_db, next_moment} =
+            Xitdb.transact_ops_with_moment(raw_db, ops, base_moment: moment)
+
+          {new_db, next_moment}
+
+        %Xitdb.Cursor{db_ref: db_ref, moment: moment, tx_mode: false} ->
+          raw_db = %Xitdb{db_ref: db_ref, backend: :memory}
+
+          opts =
+            if is_integer(moment) and moment >= 0 do
+              [base_moment: moment]
+            else
+              []
+            end
+
+          {:ok, new_db, next_moment} = Xitdb.transact_ops_with_moment(raw_db, ops, opts)
+          Xitdb.as_of(new_db, next_moment)
+
+        %Xitdb.Cursor{tx_mode: true} = cursor ->
+          stage_search_ops(cursor, ops)
 
         %Xitdb{} = raw_db ->
           {:ok, new_db} = Xitdb.transact_ops(raw_db, ops)
@@ -810,14 +957,231 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     def root_cursor(_), do: nil
 
     defp get_in_search(db, collection, slot) do
-      with %Xitdb.Cursor{} = root <- root_cursor(db),
-           %Xitdb.Cursor{} = idx <- root["idx"],
-           %Xitdb.Cursor{} = search <- idx["search"],
-           %Xitdb.Cursor{} = col <- search[collection] do
-        col[slot]
-      else
-        _ -> nil
+      case root_cursor(db) do
+        %Xitdb.Cursor{} = root ->
+          read_path(root, [
+            {:hash_map, "idx"},
+            {:hash_map, "search"},
+            {:hash_map, collection},
+            {:hash_map, slot}
+          ])
+
+        _ ->
+          nil
       end
+    end
+
+    defp read_path(%Xitdb.Cursor{tx_mode: false} = root, steps) do
+      Enum.reduce_while(steps, root, fn
+        {_kind, key}, %Xitdb.Cursor{} = cur ->
+          case cur[key] do
+            nil -> {:halt, nil}
+            next -> {:cont, next}
+          end
+
+        _, _ ->
+          {:halt, nil}
+      end)
+    end
+
+    defp read_path(%Xitdb.Cursor{tx_mode: true} = root, steps) do
+      if map_size(root.staged_overrides) == 0 and MapSet.size(root.deleted_paths) == 0 do
+        read_path(%{root | tx_mode: false}, steps)
+      else
+        read_staged_path(root, steps)
+      end
+    end
+
+    defp read_staged_path(root, steps) do
+      full_steps = :lists.reverse(steps, root.path_steps)
+      sel = Xitdb.Cursor.steps_to_selector(full_steps)
+
+      cond do
+        path_or_ancestor_deleted?(root.deleted_paths, full_steps) ->
+          nil
+
+        Map.has_key?(root.staged_overrides, sel) ->
+          unwrap_staged(Map.fetch!(root.staged_overrides, sel))
+
+        true ->
+          case find_ancestor_override(root.staged_overrides, full_steps) do
+            {:ok, anc_val, rem_steps} ->
+              walk_overlay_steps(unwrap_staged(anc_val), rem_steps)
+
+            :none ->
+              base = read_path(%{root | tx_mode: false}, steps)
+              overlay_descendants_if_needed(root, full_steps, sel, base)
+          end
+      end
+    end
+
+    defp overlay_descendants_if_needed(%Xitdb.Cursor{} = root, full_steps, sel, base) do
+      has_desc? =
+        Enum.any?(root.staged_overrides, fn {k, _} -> selector_descendant?(k, sel) end) or
+          Enum.any?(root.deleted_paths, fn k -> selector_descendant?(k, sel) end)
+
+      cond do
+        not has_desc? ->
+          base
+
+        match?(%Xitdb.Cursor{}, base) ->
+          %Xitdb.Cursor{} = base_cur = base
+
+          staged_cur = %Xitdb.Cursor{
+            base_cur
+            | tx_mode: true,
+              staged_ops: root.staged_ops,
+              staged_overrides: root.staged_overrides,
+              deleted_paths: root.deleted_paths
+          }
+
+          case base_cur.tag do
+            tag when tag in [:hash_map, :counted_hash_map, :sorted_map] ->
+              Xitdb.Cursor.apply_staged_overlay(staged_cur, Xitdb.materialize(base_cur))
+
+            _ ->
+              base
+          end
+
+        is_nil(base) ->
+          synthetic = %Xitdb.Cursor{
+            root
+            | tag: :hash_map,
+              tag_id: Xitdb.Cursor.tag_id_for(:hash_map),
+              value: 0,
+              path_steps: full_steps
+          }
+
+          case Xitdb.Cursor.apply_staged_overlay(synthetic, %{}) do
+            empty when empty == %{} -> nil
+            non_empty -> non_empty
+          end
+
+        true ->
+          base
+      end
+    end
+
+    defp path_or_ancestor_deleted?(deleted_paths, rev_steps) do
+      MapSet.size(deleted_paths) > 0 and
+        Stream.iterate(rev_steps, &tl/1)
+        |> Stream.take_while(&(&1 != []))
+        |> Enum.any?(fn prefix_steps ->
+          MapSet.member?(deleted_paths, Xitdb.Cursor.steps_to_selector(prefix_steps))
+        end)
+    end
+
+    defp find_ancestor_override(staged_overrides, rev_steps) do
+      do_find_ancestor_override(staged_overrides, tl_or_empty(rev_steps), [hd(rev_steps)])
+    end
+
+    defp tl_or_empty([]), do: []
+    defp tl_or_empty([_ | rest]), do: rest
+
+    defp do_find_ancestor_override(_overrides, [], _rem), do: :none
+
+    defp do_find_ancestor_override(overrides, anc_rev_steps, rem_fwd) do
+      sel = Xitdb.Cursor.steps_to_selector(anc_rev_steps)
+
+      case Map.fetch(overrides, sel) do
+        {:ok, val} ->
+          {:ok, val, rem_fwd}
+
+        :error ->
+          do_find_ancestor_override(overrides, tl(anc_rev_steps), [hd(anc_rev_steps) | rem_fwd])
+      end
+    end
+
+    defp walk_overlay_steps(val, []), do: val
+    defp walk_overlay_steps(nil, _), do: nil
+
+    defp walk_overlay_steps(%Xitdb.Collection{data: data}, [{_kind, key} | rest])
+         when is_map(data) do
+      next_val =
+        case Map.fetch(data, key) do
+          {:ok, v} -> v
+          :error -> Map.get(data, to_string(key))
+        end
+
+      walk_overlay_steps(next_val, rest)
+    end
+
+    defp walk_overlay_steps(map, [{_kind, key} | rest]) when is_map(map) and not is_struct(map) do
+      next_val =
+        case Map.fetch(map, key) do
+          {:ok, v} -> v
+          :error -> Map.get(map, to_string(key))
+        end
+
+      walk_overlay_steps(next_val, rest)
+    end
+
+    defp walk_overlay_steps(_val, _steps), do: nil
+
+    defp unwrap_staged(%Xitdb.Collection{kind: kind, data: data})
+         when kind in [:hash_map, :counted_hash_map, :sorted_map] do
+      Map.new(data, fn {k, v} -> {to_string(k), unwrap_staged(v)} end)
+    end
+
+    defp unwrap_staged(other), do: other
+
+    defp selector_descendant?(sel, ""), do: is_binary(sel) and sel != ""
+
+    defp selector_descendant?(sel, prefix) do
+      plen = byte_size(prefix)
+
+      byte_size(sel) > plen and binary_part(sel, 0, plen) == prefix and
+        :binary.at(sel, plen) in [?., ?#, ?$, ?[, ?%, ?^]
+    end
+
+    defp stage_search_ops(%Xitdb.Cursor{tx_mode: true} = cursor, ops) do
+      {next_overrides, next_deleted} =
+        Enum.reduce(ops, {cursor.staged_overrides, cursor.deleted_paths}, fn
+          {:put, path, val}, {ov, del} ->
+            {Map.put(ov, path, val), MapSet.delete(del, path)}
+
+          {:reset_col, path, kind}, {ov, del} ->
+            col_val =
+              case kind do
+                "sorted_map" -> Xitdb.sorted_map(%{})
+                "counted_hash_map" -> Xitdb.counted_map(%{})
+                _ -> %{}
+              end
+
+            next_ov =
+              ov
+              |> Enum.reject(fn {k, _v} -> k == path or selector_descendant?(k, path) end)
+              |> Map.new()
+              |> Map.put(path, col_val)
+
+            next_del =
+              del
+              |> Enum.reject(fn k -> k == path or selector_descendant?(k, path) end)
+              |> MapSet.new()
+
+            {next_ov, next_del}
+
+          {:rm, path}, {ov, del} ->
+            next_ov =
+              ov
+              |> Enum.reject(fn {k, _v} -> k == path or selector_descendant?(k, path) end)
+              |> Map.new()
+
+            next_del =
+              del
+              |> Enum.reject(fn k -> selector_descendant?(k, path) end)
+              |> MapSet.new()
+              |> MapSet.put(path)
+
+            {next_ov, next_del}
+        end)
+
+      %Xitdb.Cursor{
+        cursor
+        | staged_ops: :lists.reverse(ops, cursor.staged_ops),
+          staged_overrides: next_overrides,
+          deleted_paths: next_deleted
+      }
     end
   end
 end

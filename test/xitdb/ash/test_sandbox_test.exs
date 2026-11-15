@@ -190,5 +190,138 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       # Stale commit was not published to ETS checkout snapshot
       assert Store.root(store)["entries"]["zombie"] == nil
     end
+
+    test "partial checkin checks in only the targeted store while keeping other checkouts isolated" do
+      store_a = start_sandboxed_store()
+      store_b = start_sandboxed_store()
+      :ok = TestSandbox.checkout([store_a, store_b])
+
+      assert {:ok, _} =
+               Store.mutate(store_a, fn {db, moment} ->
+                 {:ok, db2} =
+                   Xitdb.transact_ops(
+                     db,
+                     [{:put, "entries[\"only_a\"]", "v_a"}],
+                     base_moment: moment
+                   )
+
+                 {:ok, {db2, Xitdb.moment_count(db2) - 1}, :ok}
+               end)
+
+      assert {:ok, _} =
+               Store.mutate(store_b, fn {db, moment} ->
+                 {:ok, db2} =
+                   Xitdb.transact_ops(
+                     db,
+                     [{:put, "entries[\"only_b\"]", "v_b"}],
+                     base_moment: moment
+                   )
+
+                 {:ok, {db2, Xitdb.moment_count(db2) - 1}, :ok}
+               end)
+
+      assert Store.root(store_a)["entries"]["only_a"] == "v_a"
+      assert Store.root(store_b)["entries"]["only_b"] == "v_b"
+
+      :ok = TestSandbox.checkin([store_a])
+
+      # store_b keeps its checked-out sandbox snapshot
+      assert Store.root(store_b)["entries"]["only_b"] == "v_b"
+
+      # Re-checking out store_a starts fresh from template without leaked sandbox writes
+      :ok = TestSandbox.checkout([store_a])
+      assert Store.root(store_a)["entries"]["seed"] == "from_template"
+      assert Store.root(store_a)["entries"]["only_a"] == nil
+    end
+
+    test "file-backed store reopen after rolled-back or lease-expired write never resurrects uncommitted tail" do
+      tmp_dir =
+        Path.join(System.tmp_dir!(), "xitdb_store_reopen_#{System.unique_integer([:positive])}")
+
+      File.mkdir_p!(tmp_dir)
+      db_path = Path.join(tmp_dir, "reopen.xit")
+      store_name = :"XitdbFileReopen_#{System.unique_integer([:positive])}"
+
+      on_exit(fn ->
+        if pid = Process.whereis(store_name) do
+          if Process.alive?(pid) do
+            try do
+              GenServer.stop(pid, :normal, 1_000)
+            catch
+              :exit, _ -> :ok
+            end
+          end
+        end
+
+        File.rm_rf!(tmp_dir)
+      end)
+
+      {:ok, pid1} = Store.start_link(name: store_name, path: db_path, lease_timeout: 40)
+
+      assert {:ok, {:ok, :committed}} =
+               Store.transact(store_name, fn ->
+                 Store.mutate(store_name, fn {db, moment} ->
+                   {:ok, db2} =
+                     Xitdb.transact_ops(
+                       db,
+                       [
+                         {:init_col, "entries", "hash_map"},
+                         {:put, "entries[\"kept\"]", "initial"}
+                       ],
+                       base_moment: moment
+                     )
+
+                   {:ok, {db2, Xitdb.moment_count(db2) - 1}, :committed}
+                 end)
+               end)
+
+      # Explicit rollback after staging an uncommitted moment in the .xit file
+      assert {:error, :aborted} =
+               Store.transact(store_name, fn ->
+                 {:ok, _} =
+                   Store.mutate(store_name, fn {db, moment} ->
+                     {:ok, db2} =
+                       Xitdb.transact_ops(
+                         db,
+                         [{:put, "entries[\"ghost_abort\"]", "should_vanish"}],
+                         base_moment: moment
+                       )
+
+                     {:ok, {db2, Xitdb.moment_count(db2) - 1}, :staged}
+                   end)
+
+                 Store.rollback(store_name, :aborted)
+               end)
+
+      # Lease-expired mutation in the .xit file
+      assert {:error, %LeaseError{store: ^store_name, reason: :lease_expired}} =
+               Store.transact(store_name, fn ->
+                 {:ok, _} =
+                   Store.mutate(store_name, fn {db, moment} ->
+                     {:ok, db2} =
+                       Xitdb.transact_ops(
+                         db,
+                         [{:put, "entries[\"ghost_lease\"]", "should_vanish"}],
+                         base_moment: moment
+                       )
+
+                     {:ok, {db2, Xitdb.moment_count(db2) - 1}, :staged}
+                   end)
+
+                 Process.sleep(80)
+                 :stale
+               end)
+
+      assert Store.root(store_name)["entries"]["kept"] == "initial"
+      assert Store.root(store_name)["entries"]["ghost_abort"] == nil
+      assert Store.root(store_name)["entries"]["ghost_lease"] == nil
+
+      :ok = GenServer.stop(pid1, :normal, 1_000)
+
+      {:ok, _pid2} = Store.start_link(name: store_name, path: db_path)
+      assert Store.root(store_name)["entries"]["kept"] == "initial"
+      assert Store.root(store_name)["entries"]["ghost_abort"] == nil
+      assert Store.root(store_name)["entries"]["ghost_lease"] == nil
+    end
   end
 end

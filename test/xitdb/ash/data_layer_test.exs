@@ -1602,48 +1602,6 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
         assert results == [created.id, created.id, created.id, created.id]
       end
-
-      test "rejects SQL fragment(...) calculations via VerifyNoSqlFragments with Spark.Error.DslError" do
-        uid = System.unique_integer([:positive])
-        res_mod = Module.concat(Xitdb.Ash, "InvalidFragmentResource#{uid}")
-
-        {result, diagnostics} =
-          Code.with_diagnostics(fn ->
-            Code.compile_string("""
-            defmodule Xitdb.Ash.InvalidFragmentResource#{uid} do
-              use Ash.Resource,
-                domain: nil,
-                validate_domain_inclusion?: false,
-                data_layer: Xitdb.Ash.DataLayer
-
-              xitdb do
-                store Xitdb.Ash.DataLayerTest.TestMdmStore
-                collection :invalid_fragments
-              end
-
-              attributes do
-                integer_primary_key :id
-                attribute :start_time, :utc_datetime, public?: true
-              end
-
-              calculations do
-                calculate :bad_date, :date, expr(fragment("?::date", start_time))
-              end
-            end
-            """)
-          end)
-
-        assert Enum.any?(diagnostics, fn d ->
-                 d.message =~ "SQL `fragment(...)` is not supported"
-               end)
-
-        {compiled_mod, _bytecode} = Enum.find(result, fn {mod, _} -> mod == res_mod end)
-
-        assert {:error, %Spark.Error.DslError{message: msg}} =
-                 Xitdb.Ash.Verifiers.VerifyNoSqlFragments.verify(compiled_mod.spark_dsl_config())
-
-        assert msg =~ "SQL `fragment(...)` is not supported"
-      end
     end
 
     describe "time-travel as_of & xitdb_db queries" do

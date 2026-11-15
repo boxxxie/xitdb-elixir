@@ -6,11 +6,6 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
     alias Xitdb.Ash.{Index, NestedIn, Reference, SearchField}
 
-    @doc false
-    def validate_resolver(fun) when is_function(fun, 2), do: {:ok, fun}
-    def validate_resolver(nil), do: {:ok, nil}
-    def validate_resolver(_), do: {:error, "must be a 2-arity function (record, db) or nil"}
-
     @index %Spark.Dsl.Entity{
       name: :index,
       describe: "Declares a single-attribute or composite `:sorted_map` B+Tree secondary index.",
@@ -90,7 +85,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           doc: "Positive BM25 field weight multiplier."
         ],
         resolver: [
-          type: {:custom, __MODULE__, :validate_resolver, []},
+          type: {:or, [{:fun, 2}, {:in, [nil]}]},
           doc: "Optional `(record, db) -> term()` callback for cross-collection fields."
         ]
       ]

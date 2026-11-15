@@ -45,7 +45,11 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       dsl_state
       |> Ash.Resource.Info.aggregates()
       |> Enum.reduce_while(:ok, fn agg, :ok ->
-        agg_terms = [Map.get(agg, :filter), Map.get(agg, :join_filters)]
+        agg_terms = [
+          Map.get(agg, :filter),
+          Map.get(agg, :join_filters),
+          Map.get(agg, :sort)
+        ]
 
         if contains_sql_fragment?(agg_terms) do
           {:halt,
@@ -64,12 +68,14 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       dsl_state
       |> Ash.Resource.Info.relationships()
       |> Enum.reduce_while(:ok, fn rel, :ok ->
-        if contains_sql_fragment?(Map.get(rel, :filter)) do
+        rel_terms = [Map.get(rel, :filter), Map.get(rel, :sort)]
+
+        if contains_sql_fragment?(rel_terms) do
           {:halt,
            fragment_error(
              module,
              [:relationships, rel.name],
-             "relationship #{inspect(rel.name)} `filter`"
+             "relationship #{inspect(rel.name)}"
            )}
         else
           {:cont, :ok}
@@ -122,7 +128,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           Map.get(action, :filter),
           Map.get(action, :changes),
           Map.get(action, :validations),
-          Map.get(action, :preparations)
+          Map.get(action, :preparations),
+          Map.get(action, :upsert_condition)
         ]
 
         if contains_sql_fragment?(action_terms) do

@@ -191,7 +191,10 @@ if Code.ensure_loaded?(Ash.DataLayer) do
            :ok <- verify_pk_unused(cursor_root, resource, record_with_pk, tenant, MapSet.new()),
            record <- finalize_loaded_record(resource, record_with_pk, tenant),
            :ok <- verify_atomic_validations(record, record, resource, changeset),
-           {:ok, index_ops} <- Indexer.plan_put_ops(cursor_root, resource, nil, record, tenant),
+           :ok <- verify_create_filter(record, resource, changeset),
+           {:ok, index_ops} <-
+             Indexer.plan_put_ops(cursor_root, resource, nil, record, tenant)
+             |> normalize_plan_error(),
            {:ok, next_snapshot} <- commit_ops({db, moment}, seq_ops ++ index_ops) do
         {:ok, next_snapshot, record}
       end
@@ -223,6 +226,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
                  :ok <- verify_pk_unused(cursor_root, resource, record_with_pk, tenant, seen_pks),
                  record <- finalize_loaded_record(resource, record_with_pk, tenant),
                  :ok <- verify_atomic_validations(record, record, resource, cs),
+                 :ok <- verify_create_filter(record, resource, cs),
                  {:ok, next_seen_identities} <-
                    track_batch_identities(resource, record, tenant, seen_identities),
                  {:ok, index_ops, next_idx_batch_state} <-
@@ -233,7 +237,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
                      record,
                      tenant,
                      idx_batch_state
-                   ) do
+                   )
+                   |> normalize_plan_error() do
               [pk_name | _] = Ash.Resource.Info.primary_key(resource)
               pk_attr = Ash.Resource.Info.attribute(resource, pk_name)
               doc_id = Codec.encode_pk_doc_id(pk_attr, Map.fetch!(record, pk_name))
@@ -326,7 +331,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
                        current_record,
                        synced_with_seq,
                        tenant
-                     ),
+                     )
+                     |> normalize_plan_error(),
                    {:ok, next_snapshot} <- commit_ops({db, moment}, seq_ops ++ index_ops) do
                 {:ok, next_snapshot, synced_with_seq}
               end
@@ -384,7 +390,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
                          existing_record,
                          final_record,
                          tenant
-                       ),
+                       )
+                       |> normalize_plan_error(),
                      {:ok, next_snapshot} <- commit_ops(snapshot, index_ops) do
                   {:ok, next_snapshot, final_record}
                 end
@@ -455,7 +462,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
                    final_record,
                    tenant,
                    batch_state
-                 ) do
+                 )
+                 |> normalize_plan_error() do
               {:ok, index_ops, next_batch} ->
                 tagged =
                   Ash.Actions.Helpers.Bulk.put_metadata(
@@ -500,19 +508,20 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
       candidates
       |> Enum.reduce_while(
-        {:ok, [], MapSet.new(), %{}, []},
-        fn current_record, {:ok, ops_chunks, visited, batch_state, acc_records} ->
+        {:ok, [], MapSet.new(), %{}, %{}, []},
+        fn current_record, {:ok, ops_chunks, visited, batch_state, staged_records, acc_records} ->
           with :ok <- verify_changeset_filter(current_record, changeset, nil),
                :ok <-
                  verify_atomic_validations(current_record, current_record, resource, changeset),
-               {:ok, del_ops, next_visited, next_batch} <-
+               {:ok, del_ops, next_visited, next_batch, next_staged} <-
                  stage_cascade_delete(
                    cursor_root,
                    resource,
                    current_record,
                    tenant,
                    visited,
-                   batch_state
+                   batch_state,
+                   staged_records
                  ) do
             tagged =
               Ash.Actions.Helpers.Bulk.put_metadata(
@@ -521,10 +530,11 @@ if Code.ensure_loaded?(Ash.DataLayer) do
               )
 
             {:cont,
-             {:ok, [del_ops | ops_chunks], next_visited, next_batch, [tagged | acc_records]}}
+             {:ok, [del_ops | ops_chunks], next_visited, next_batch, next_staged,
+              [tagged | acc_records]}}
           else
             :filtered_out ->
-              {:cont, {:ok, ops_chunks, visited, batch_state, acc_records}}
+              {:cont, {:ok, ops_chunks, visited, batch_state, staged_records, acc_records}}
 
             {:error, _} = err ->
               {:halt, err}
@@ -532,7 +542,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         end
       )
       |> case do
-        {:ok, ops_chunks, _visited, _batch_state, rev_records} ->
+        {:ok, ops_chunks, _visited, _batch_state, _staged_records, rev_records} ->
           all_ops = ops_chunks |> Enum.reverse() |> List.flatten()
 
           with {:ok, final_snap} <- commit_ops(initial_snapshot, all_ops) do
@@ -550,25 +560,84 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       {allowed_attrs, allowed_atomic_set, conflicting_upsert_values} =
         prepare_update_inputs(current_record, resource, changeset, mode)
 
-      with :ok <- verify_changeset_filter(current_record, changeset, conflicting_upsert_values),
-           {:ok, evaluated_atomics} <-
-             evaluate_update_atomics(
-               current_record,
-               allowed_attrs,
-               allowed_atomic_set,
-               resource,
-               changeset,
-               conflicting_upsert_values
-             ) do
-        post_record =
-          current_record
-          |> Map.merge(allowed_attrs)
-          |> Map.merge(evaluated_atomics)
+      current_struct = ensure_resource_struct(resource, current_record)
 
-        case verify_atomic_validations(current_record, post_record, resource, changeset) do
-          :ok -> {:ok, post_record}
-          {:error, _} = err -> err
-        end
+      case mode do
+        {:upsert, _, _} ->
+          {post_filters, pre_filters} = split_upsert_filters(changeset.filter)
+
+          with :ok <-
+                 verify_filter_list(
+                   pre_filters,
+                   current_struct,
+                   current_struct,
+                   changeset,
+                   conflicting_upsert_values
+                 ),
+               {:ok, evaluated_atomics} <-
+                 evaluate_update_atomics(
+                   current_record,
+                   allowed_attrs,
+                   allowed_atomic_set,
+                   resource,
+                   changeset,
+                   conflicting_upsert_values
+                 ) do
+            post_record =
+              current_record
+              |> Map.merge(allowed_attrs)
+              |> Map.merge(evaluated_atomics)
+
+            post_struct = ensure_resource_struct(resource, post_record)
+
+            with :ok <-
+                   verify_filter_list(
+                     post_filters,
+                     post_struct,
+                     current_struct,
+                     changeset,
+                     conflicting_upsert_values
+                   ),
+                 :ok <-
+                   verify_atomic_validations(
+                     current_record,
+                     post_record,
+                     resource,
+                     changeset,
+                     conflicting_upsert_values
+                   ) do
+              {:ok, post_record}
+            end
+          end
+
+        :all_non_upsert ->
+          with :ok <-
+                 verify_changeset_filter(current_record, changeset, conflicting_upsert_values),
+               {:ok, evaluated_atomics} <-
+                 evaluate_update_atomics(
+                   current_record,
+                   allowed_attrs,
+                   allowed_atomic_set,
+                   resource,
+                   changeset,
+                   conflicting_upsert_values
+                 ) do
+            post_record =
+              current_record
+              |> Map.merge(allowed_attrs)
+              |> Map.merge(evaluated_atomics)
+
+            case verify_atomic_validations(
+                   current_record,
+                   post_record,
+                   resource,
+                   changeset,
+                   conflicting_upsert_values
+                 ) do
+              :ok -> {:ok, post_record}
+              {:error, _} = err -> err
+            end
+          end
       end
     end
 
@@ -648,6 +717,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
             # (minus create defaults unless part of `keys`) plus `update_default` attributes.
             defaults = Map.get(changeset, :defaults, []) -- keys
             explicit = Map.keys(changeset.attributes) -- defaults
+            atomic_keys = Keyword.keys(Map.get(changeset, :atomics, []))
 
             update_defaults =
               resource
@@ -655,7 +725,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
               |> Enum.filter(&(&1.update_default != nil))
               |> Enum.map(& &1.name)
 
-            Enum.uniq(explicit ++ update_defaults)
+            Enum.uniq(explicit ++ atomic_keys ++ update_defaults)
 
           :replace_all ->
             Ash.Changeset.expand_upsert_fields(:replace_all, resource)
@@ -673,6 +743,115 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       Enum.reject(candidate_fields, &MapSet.member?(pk_set, &1))
     end
 
+    defp normalize_plan_error({:error, {:integer_out_of_i64_range, field}}) do
+      {:error,
+       InvalidAttribute.exception(
+         field: field,
+         message: "must fit within a signed 64-bit integer (-2^63..2^63-1)"
+       )}
+    end
+
+    defp normalize_plan_error(other), do: other
+
+    defp verify_create_filter(_record, _resource, %Ash.Changeset{filter: nil}), do: :ok
+
+    defp verify_create_filter(
+           _record,
+           _resource,
+           %Ash.Changeset{filter: %Ash.Filter{expression: expr}}
+         )
+         when expr in [nil, true],
+         do: :ok
+
+    defp verify_create_filter(record, resource, %Ash.Changeset{} = changeset) do
+      record_struct = ensure_resource_struct(resource, record)
+
+      case verify_filter_list([changeset.filter], record_struct, record_struct, changeset, nil) do
+        :ok ->
+          :ok
+
+        :filtered_out ->
+          {:error, StaleRecord.exception(resource: resource, filter: changeset.filter)}
+
+        {:error, _} = err ->
+          err
+      end
+    end
+
+    defp split_upsert_filters(nil), do: {[], []}
+
+    defp split_upsert_filters(%Ash.Filter{expression: expr}) when expr in [nil, true],
+      do: {[], []}
+
+    defp split_upsert_filters(%Ash.Filter{expression: expr} = filter) do
+      conjuncts = flatten_and_conjuncts(expr)
+      {post_exprs, pre_exprs} = Enum.split_with(conjuncts, &expr_is_post_atomic_validation?/1)
+
+      pre_filters =
+        case pre_exprs do
+          [] -> []
+          list -> [%Ash.Filter{filter | expression: combine_and_conjuncts(list)}]
+        end
+
+      post_filters =
+        Enum.map(post_exprs, fn e -> %Ash.Filter{filter | expression: e} end)
+
+      {post_filters, pre_filters}
+    end
+
+    defp flatten_and_conjuncts(%Ash.Query.BooleanExpression{op: :and, left: l, right: r}) do
+      flatten_and_conjuncts(l) ++ flatten_and_conjuncts(r)
+    end
+
+    defp flatten_and_conjuncts(other), do: [other]
+
+    defp combine_and_conjuncts([single]), do: single
+
+    defp combine_and_conjuncts([first | rest]) do
+      Enum.reduce(rest, first, fn item, acc ->
+        %Ash.Query.BooleanExpression{op: :and, left: acc, right: item}
+      end)
+    end
+
+    defp expr_is_post_atomic_validation?(expr) do
+      not is_nil(
+        Ash.Filter.find(expr, fn
+          {:_atomic_ref, _} -> true
+          %Ash.Query.Call{name: :atomic_ref} -> true
+          %Ash.Query.Function.Error{} -> true
+          _ -> false
+        end)
+      )
+    end
+
+    defp verify_filter_list(
+           filters,
+           sub_struct,
+           match_struct,
+           %Ash.Changeset{} = changeset,
+           conflicting_upsert_values
+         ) do
+      actor = get_in(changeset.context, [:private, :actor])
+
+      Enum.reduce_while(filters, :ok, fn filter_item, :ok ->
+        resolved = substitute_atomic_refs(filter_item, sub_struct)
+
+        case Ash.Filter.Runtime.filter_matches(
+               changeset.domain,
+               [match_struct],
+               resolved,
+               actor: actor,
+               tenant: changeset.tenant,
+               authorize?: false,
+               conflicting_upsert_values: conflicting_upsert_values
+             ) do
+          {:ok, [_matched]} -> {:cont, :ok}
+          {:ok, []} -> {:halt, :filtered_out}
+          {:error, _} = err -> {:halt, err}
+        end
+      end)
+    end
+
     defp verify_changeset_filter(_record, %Ash.Changeset{filter: nil}, _conflicting), do: :ok
 
     defp verify_changeset_filter(
@@ -684,22 +863,15 @@ if Code.ensure_loaded?(Ash.DataLayer) do
          do: :ok
 
     defp verify_changeset_filter(record, %Ash.Changeset{} = changeset, conflicting_upsert_values) do
-      actor = get_in(changeset.context, [:private, :actor])
       record_struct = ensure_resource_struct(changeset.resource, record)
 
-      case Ash.Filter.Runtime.filter_matches(
-             changeset.domain,
-             [record_struct],
-             changeset.filter,
-             actor: actor,
-             tenant: changeset.tenant,
-             authorize?: false,
-             conflicting_upsert_values: conflicting_upsert_values
-           ) do
-        {:ok, [_matched]} -> :ok
-        {:ok, []} -> :filtered_out
-        {:error, _} = err -> err
-      end
+      verify_filter_list(
+        [changeset.filter],
+        record_struct,
+        record_struct,
+        changeset,
+        conflicting_upsert_values
+      )
     end
 
     defp apply_create_record(_resource, %Ash.Changeset{create_atomics: []} = changeset) do
@@ -823,7 +995,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
            pre_record,
            post_record,
            resource,
-           %Ash.Changeset{} = changeset
+           %Ash.Changeset{} = changeset,
+           conflicting_upsert_values \\ nil
          ) do
       validations = Map.get(changeset, :atomic_validations, [])
       actor = get_in(changeset.context, [:private, :actor])
@@ -841,7 +1014,14 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         # `%Ash.Query.Ref{}` nodes inspect `pre_struct` (for updates/destroys) or `post_struct` (for creates).
         resolved_cond = substitute_atomic_refs(failure_expr, post_struct)
 
-        case eval_boolean_condition(resolved_cond, pre_struct, resource, changeset, actor) do
+        case eval_boolean_condition(
+               resolved_cond,
+               pre_struct,
+               resource,
+               changeset,
+               actor,
+               conflicting_upsert_values
+             ) do
           {:ok, true} ->
             resolved_err = substitute_atomic_refs(error_expr, post_struct)
 
@@ -863,7 +1043,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
            record_struct,
            resource,
            %Ash.Changeset{} = changeset,
-           actor
+           actor,
+           conflicting_upsert_values
          ) do
       eval_opts = [
         record: record_struct,
@@ -891,7 +1072,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
                  expr,
                  actor: actor,
                  tenant: changeset.tenant,
-                 authorize?: false
+                 authorize?: false,
+                 conflicting_upsert_values: conflicting_upsert_values
                ) do
             {:ok, [_matched]} -> {:ok, true}
             {:ok, []} -> {:ok, false}
@@ -1030,6 +1212,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
     defp track_batch_identities(resource, record, tenant, seen_identities) do
       scoped_col = Codec.scoped_collection(resource, tenant)
+      base_col = Atom.to_string(Info.collection!(resource))
 
       resource
       |> Ash.Resource.Info.identities()
@@ -1047,7 +1230,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
               {:cont, {:ok, acc_seen}}
 
             {:ok, encoded_key} ->
-              batch_token = {scoped_col, identity.name, encoded_key}
+              id_col = if Map.get(identity, :all_tenants?, false), do: base_col, else: scoped_col
+              batch_token = {id_col, identity.name, encoded_key}
 
               if MapSet.member?(acc_seen, batch_token) do
                 {:halt,
@@ -1176,62 +1360,107 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     defp cascade_and_delete({db, moment} = snapshot, resource, record, tenant, visited) do
       cursor_root = Xitdb.as_of(db, moment)
 
-      with {:ok, ops, _next_visited, _next_batch} <-
-             stage_cascade_delete(cursor_root, resource, record, tenant, visited, %{}) do
+      with {:ok, ops, _next_visited, _next_batch, _next_staged} <-
+             stage_cascade_delete(cursor_root, resource, record, tenant, visited, %{}, %{}) do
         commit_ops(snapshot, ops)
       end
     end
 
-    defp stage_cascade_delete(cursor_root, resource, record, tenant, visited, batch_state) do
+    defp record_stage_key(resource, record, tenant) do
       [pk_name | _] = Ash.Resource.Info.primary_key(resource)
       pk_attr = Ash.Resource.Info.attribute(resource, pk_name)
-      pk_val = Map.fetch!(record, pk_name)
-      visit_key = {resource, Codec.encode_pk_doc_id(pk_attr, pk_val)}
+      doc_id = Codec.encode_pk_doc_id(pk_attr, Map.fetch!(record, pk_name))
+      {resource, Codec.scoped_collection(resource, tenant), doc_id}
+    end
 
-      if MapSet.member?(visited, visit_key) do
-        {:ok, [], visited, batch_state}
+    defp fk_rule_priority(%{on_delete: :delete}), do: 0
+    defp fk_rule_priority(%{on_delete: :nilify}), do: 1
+    defp fk_rule_priority(%{on_delete: :restrict}), do: 2
+    defp fk_rule_priority(_rule), do: 3
+
+    defp stage_cascade_delete(
+           cursor_root,
+           resource,
+           record,
+           tenant,
+           visited,
+           batch_state,
+           staged_records
+         ) do
+      stage_key = record_stage_key(resource, record, tenant)
+
+      if MapSet.member?(visited, stage_key) or Map.get(staged_records, stage_key) == :deleted do
+        {:ok, [], visited, batch_state, staged_records}
       else
-        next_visited = MapSet.put(visited, visit_key)
+        effective_record =
+          case Map.get(staged_records, stage_key) do
+            %_{} = staged -> staged
+            _ -> record
+          end
+
+        next_visited = MapSet.put(visited, stage_key)
+        staged_with_self = Map.put(staged_records, stage_key, :deleted)
         store = Info.store!(resource)
         rules = Store.reverse_fks(store, resource)
 
-        with {:ok, fk_ops, visited_after_fks, batch_after_fks} <-
+        with {:ok, fk_ops, visited_after_fks, batch_after_fks, staged_after_fks} <-
                stage_reverse_fk_rules(
                  cursor_root,
                  rules,
-                 record,
+                 effective_record,
                  tenant,
                  next_visited,
-                 batch_state
+                 batch_state,
+                 staged_with_self
                ),
              {:ok, del_ops, final_batch} <-
                Indexer.plan_delete_ops_batched(
                  cursor_root,
                  resource,
-                 record,
+                 effective_record,
                  tenant,
                  batch_after_fks
                ) do
-          {:ok, fk_ops ++ del_ops, visited_after_fks, final_batch}
+          {:ok, fk_ops ++ del_ops, visited_after_fks, final_batch, staged_after_fks}
         end
       end
     end
 
-    defp stage_reverse_fk_rules(_cursor_root, [], _record, _tenant, visited, batch_state) do
-      {:ok, [], visited, batch_state}
+    defp stage_reverse_fk_rules(
+           _cursor_root,
+           [],
+           _record,
+           _tenant,
+           visited,
+           batch_state,
+           staged_records
+         ) do
+      {:ok, [], visited, batch_state, staged_records}
     end
 
-    defp stage_reverse_fk_rules(cursor_root, rules, parent_record, tenant, visited, batch_state) do
-      Enum.reduce_while(rules, {:ok, [], visited, batch_state}, fn rule,
-                                                                   {:ok, ops_acc, vis_acc, b_acc} ->
+    defp stage_reverse_fk_rules(
+           cursor_root,
+           rules,
+           parent_record,
+           tenant,
+           visited,
+           batch_state,
+           staged_records
+         ) do
+      rules
+      |> Enum.sort_by(&fk_rule_priority/1)
+      |> Enum.reduce_while({:ok, [], visited, batch_state, staged_records}, fn rule,
+                                                                               {:ok, ops_acc,
+                                                                                vis_acc, b_acc,
+                                                                                s_acc} ->
         dest_val = Map.get(parent_record, rule.destination_attribute)
 
         if is_nil(dest_val) do
-          {:cont, {:ok, ops_acc, vis_acc, b_acc}}
+          {:cont, {:ok, ops_acc, vis_acc, b_acc, s_acc}}
         else
-          case stage_single_fk_rule(cursor_root, rule, dest_val, tenant, vis_acc, b_acc) do
-            {:ok, rule_ops, next_vis, next_b} ->
-              {:cont, {:ok, [rule_ops | ops_acc], next_vis, next_b}}
+          case stage_single_fk_rule(cursor_root, rule, dest_val, tenant, vis_acc, b_acc, s_acc) do
+            {:ok, rule_ops, next_vis, next_b, next_s} ->
+              {:cont, {:ok, [rule_ops | ops_acc], next_vis, next_b, next_s}}
 
             {:error, _} = err ->
               {:halt, err}
@@ -1239,8 +1468,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         end
       end)
       |> case do
-        {:ok, ops_chunks, final_vis, final_b} ->
-          {:ok, ops_chunks |> Enum.reverse() |> List.flatten(), final_vis, final_b}
+        {:ok, ops_chunks, final_vis, final_b, final_s} ->
+          {:ok, ops_chunks |> Enum.reverse() |> List.flatten(), final_vis, final_b, final_s}
 
         {:error, _} = err ->
           err
@@ -1253,9 +1482,10 @@ if Code.ensure_loaded?(Ash.DataLayer) do
            _dest_val,
            _tenant,
            visited,
-           batch_state
+           batch_state,
+           staged_records
          ) do
-      {:ok, [], visited, batch_state}
+      {:ok, [], visited, batch_state, staged_records}
     end
 
     defp stage_single_fk_rule(
@@ -1264,9 +1494,11 @@ if Code.ensure_loaded?(Ash.DataLayer) do
            dest_val,
            tenant,
            visited,
-           batch_state
+           batch_state,
+           staged_records
          ) do
-      child_count = count_referencing_children(cursor_root, rule, dest_val, tenant)
+      child_count =
+        count_referencing_children(cursor_root, rule, dest_val, tenant, staged_records)
 
       if child_count > 0 do
         {:error,
@@ -1275,7 +1507,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
            message: "cannot be destroyed while referenced by #{inspect(rule.source_collection)}"
          )}
       else
-        {:ok, [], visited, batch_state}
+        {:ok, [], visited, batch_state, staged_records}
       end
     end
 
@@ -1285,11 +1517,14 @@ if Code.ensure_loaded?(Ash.DataLayer) do
            dest_val,
            tenant,
            visited,
-           batch_state
+           batch_state,
+           staged_records
          ) do
-      children = load_referencing_children(cursor_root, rule, dest_val, tenant)
+      children = load_referencing_children(cursor_root, rule, dest_val, tenant, staged_records)
 
-      Enum.reduce_while(children, {:ok, [], batch_state}, fn child, {:ok, ops_acc, b_acc} ->
+      Enum.reduce_while(children, {:ok, [], batch_state, staged_records}, fn child,
+                                                                             {:ok, ops_acc, b_acc,
+                                                                              s_acc} ->
         nilified = Map.put(child, rule.source_attribute, nil)
 
         case Indexer.plan_put_ops_batched(
@@ -1299,17 +1534,21 @@ if Code.ensure_loaded?(Ash.DataLayer) do
                nilified,
                tenant,
                b_acc
-             ) do
+             )
+             |> normalize_plan_error() do
           {:ok, ops, next_b} ->
-            {:cont, {:ok, [ops | ops_acc], next_b}}
+            next_s =
+              Map.put(s_acc, record_stage_key(rule.source_resource, child, tenant), nilified)
+
+            {:cont, {:ok, [ops | ops_acc], next_b, next_s}}
 
           {:error, _} = err ->
             {:halt, err}
         end
       end)
       |> case do
-        {:ok, ops_chunks, final_b} ->
-          {:ok, ops_chunks |> Enum.reverse() |> List.flatten(), visited, final_b}
+        {:ok, ops_chunks, final_b, final_s} ->
+          {:ok, ops_chunks |> Enum.reverse() |> List.flatten(), visited, final_b, final_s}
 
         {:error, _} = err ->
           err
@@ -1322,31 +1561,36 @@ if Code.ensure_loaded?(Ash.DataLayer) do
            dest_val,
            tenant,
            visited,
-           batch_state
+           batch_state,
+           staged_records
          ) do
-      children = load_referencing_children(cursor_root, rule, dest_val, tenant)
+      children = load_referencing_children(cursor_root, rule, dest_val, tenant, staged_records)
 
-      Enum.reduce_while(children, {:ok, [], visited, batch_state}, fn child,
-                                                                      {:ok, ops_acc, vis_acc,
-                                                                       b_acc} ->
+      Enum.reduce_while(children, {:ok, [], visited, batch_state, staged_records}, fn child,
+                                                                                      {:ok,
+                                                                                       ops_acc,
+                                                                                       vis_acc,
+                                                                                       b_acc,
+                                                                                       s_acc} ->
         case stage_cascade_delete(
                cursor_root,
                rule.source_resource,
                child,
                tenant,
                vis_acc,
-               b_acc
+               b_acc,
+               s_acc
              ) do
-          {:ok, ops, next_vis, next_b} ->
-            {:cont, {:ok, [ops | ops_acc], next_vis, next_b}}
+          {:ok, ops, next_vis, next_b, next_s} ->
+            {:cont, {:ok, [ops | ops_acc], next_vis, next_b, next_s}}
 
           {:error, _} = err ->
             {:halt, err}
         end
       end)
       |> case do
-        {:ok, ops_chunks, final_vis, final_b} ->
-          {:ok, ops_chunks |> Enum.reverse() |> List.flatten(), final_vis, final_b}
+        {:ok, ops_chunks, final_vis, final_b, final_s} ->
+          {:ok, ops_chunks |> Enum.reverse() |> List.flatten(), final_vis, final_b, final_s}
 
         {:error, _} = err ->
           err
@@ -1357,24 +1601,34 @@ if Code.ensure_loaded?(Ash.DataLayer) do
            cursor_root,
            %{source_resource: res, source_attribute: fk} = rule,
            dest_val,
-           tenant
+           tenant,
+           staged_records
          ) do
-      nested_cursors =
-        if Map.get(rule, :nested?, false) do
-          Indexer.nested_cursors_for_parent(cursor_root, res, dest_val, tenant)
-        else
-          []
+      staged_for_resource? =
+        Enum.any?(staged_records, fn {{staged_res, _col, _doc_id}, _state} ->
+          staged_res == res
+        end)
+
+      if staged_for_resource? do
+        length(load_referencing_children(cursor_root, rule, dest_val, tenant, staged_records))
+      else
+        nested_cursors =
+          if Map.get(rule, :nested?, false) do
+            Indexer.nested_cursors_for_parent(cursor_root, res, dest_val, tenant)
+          else
+            []
+          end
+
+        cond do
+          nested_cursors != [] ->
+            length(nested_cursors)
+
+          Enum.any?(Info.indexes_for_field(res, fk), &(&1.fields == [fk])) ->
+            Indexer.count_by_attribute(cursor_root, res, fk, dest_val, tenant)
+
+          true ->
+            length(load_referencing_children(cursor_root, rule, dest_val, tenant, staged_records))
         end
-
-      cond do
-        nested_cursors != [] ->
-          length(nested_cursors)
-
-        Enum.any?(Info.indexes_for_field(res, fk), &(&1.fields == [fk])) ->
-          Indexer.count_by_attribute(cursor_root, res, fk, dest_val, tenant)
-
-        true ->
-          length(load_referencing_children(cursor_root, rule, dest_val, tenant))
       end
     end
 
@@ -1382,7 +1636,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
            cursor_root,
            %{source_resource: res, source_attribute: fk} = rule,
            dest_val,
-           tenant
+           tenant,
+           staged_records
          ) do
       nested_cursors =
         if Map.get(rule, :nested?, false) do
@@ -1395,8 +1650,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         if nested_cursors != [] do
           nested_cursors
         else
-          case Info.indexes_for_field(res, fk) do
-            [%{fields: [^fk]} = idx | _] ->
+          case Enum.find(Info.indexes_for_field(res, fk), &(&1.fields == [fk])) do
+            %{} = idx ->
               cursor_root
               |> Indexer.lookup_secondary_eq(res, idx, [dest_val], tenant)
               |> Enum.flat_map(fn doc_id ->
@@ -1408,21 +1663,33 @@ if Code.ensure_loaded?(Ash.DataLayer) do
                 end
               end)
 
-            _ ->
+            nil ->
               Indexer.all_cursors(cursor_root, res, tenant)
           end
         end
 
       attr = Ash.Resource.Info.attribute(res, fk)
+      scoped_col = Codec.scoped_collection(res, tenant)
 
       cursors
-      |> Enum.flat_map(fn {_doc_id, cursor} ->
-        case Codec.from_cursor(res, cursor, tenant) do
-          {:ok, child} ->
-            if values_equal?(attr, Map.get(child, fk), dest_val), do: [child], else: []
-
-          {:error, _} ->
+      |> Enum.flat_map(fn {doc_id, cursor} ->
+        case Map.get(staged_records, {res, scoped_col, doc_id}) do
+          :deleted ->
             []
+
+          %_{} = staged_child ->
+            if values_equal?(attr, Map.get(staged_child, fk), dest_val),
+              do: [staged_child],
+              else: []
+
+          nil ->
+            case Codec.from_cursor(res, cursor, tenant) do
+              {:ok, child} ->
+                if values_equal?(attr, Map.get(child, fk), dest_val), do: [child], else: []
+
+              {:error, _} ->
+                []
+            end
         end
       end)
     end
@@ -1438,8 +1705,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     defp commit_ops({db, moment}, []), do: {:ok, {db, moment}}
 
     defp commit_ops({db, moment}, ops) when is_list(ops) do
-      case Xitdb.transact_ops(db, ops, base_moment: moment) do
-        {:ok, next_db} -> {:ok, {next_db, Xitdb.moment_count(next_db) - 1}}
+      case Xitdb.transact_ops_with_moment(db, ops, base_moment: moment) do
+        {:ok, next_db, next_moment} -> {:ok, {next_db, next_moment}}
         {:error, _} = err -> err
       end
     end
@@ -1593,7 +1860,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     end
 
     defp generated_int_pk?(%Ash.Resource.Attribute{} = attr) do
-      Map.get(attr, :generated?, false) or attr.allow_nil? == false
+      Map.get(attr, :generated?, false) == true
     end
 
     defp integer_attribute?(%Ash.Resource.Attribute{type: type, constraints: constraints}) do

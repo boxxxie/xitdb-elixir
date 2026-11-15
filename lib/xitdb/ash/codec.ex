@@ -107,13 +107,40 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     def encode_doc_id(id), do: to_string(id)
 
     @doc """
-    Encodes a primary key value using its attribute definition (normalizing `:ci_string` strings).
+    Encodes a primary key value using its attribute definition (normalizing `:ci_string`,
+    `:uuid`, `:decimal`, and temporal types).
     """
     @spec encode_pk_doc_id(Attribute.t(), term()) :: String.t()
     def encode_pk_doc_id(%Attribute{} = attr, value) do
       case unwrap_type(attr.type, attr.constraints) do
-        {:ci_string, _} when is_binary(value) -> value |> String.downcase() |> :binary.copy()
-        _ -> encode_doc_id(value)
+        {:ci_string, _} when is_binary(value) ->
+          value |> String.downcase() |> :binary.copy()
+
+        {:uuid, _} when is_binary(value) ->
+          value |> String.downcase() |> :binary.copy()
+
+        {:decimal, _} ->
+          value |> coerce_decimal() |> Decimal.to_string(:normal)
+
+        {kind, _}
+        when kind in [
+               :utc_datetime,
+               :utc_datetime_usec,
+               :datetime,
+               :naive_datetime,
+               :date,
+               :time,
+               :time_usec
+             ] ->
+          coerced = coerce_pk_temporal(kind, value)
+
+          case dump_attribute_value(attr, coerced) do
+            {:ok, dumped} -> encode_doc_id(dumped)
+            {:error, _} -> encode_doc_id(value)
+          end
+
+        _ ->
+          encode_doc_id(value)
       end
     end
 
@@ -131,6 +158,15 @@ if Code.ensure_loaded?(Ash.DataLayer) do
             {int, ""} -> {:ok, int}
             _ -> {:error, {:invalid_integer_pk, doc_id}}
           end
+
+        {kind, _} when kind in [:utc_datetime, :utc_datetime_usec, :datetime, :naive_datetime] ->
+          raw =
+            case Integer.parse(doc_id) do
+              {int, ""} -> int
+              _ -> doc_id
+            end
+
+          load_attribute(attr, raw)
 
         _other ->
           load_attribute(attr, doc_id)
@@ -315,28 +351,48 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
     # -- Attribute Dump / Load Internals --
 
+    @min_i64 -9_223_372_036_854_775_808
+    @max_i64 9_223_372_036_854_775_807
+    @nil_sentinel <<0, "__xitdb_nil__">>
+    @nil_escape_prefix <<0, "__xitdb_esc__">>
+
     defp dump_attribute_or_set(_attr, nil, _as_counted_set?), do: {:ok, nil}
 
     defp dump_attribute_or_set(%Attribute{} = attr, values, true) when is_list(values) do
-      case dump_attribute(attr, values) do
+      case dump_attribute_value(attr, values) do
         {:ok, dumped_list} when is_list(dumped_list) -> {:ok, Xitdb.counted_set(dumped_list)}
         {:ok, other} -> {:ok, other}
         {:error, _} = err -> err
       end
     end
 
-    defp dump_attribute_or_set(attr, value, _as_counted_set?), do: dump_attribute(attr, value)
+    defp dump_attribute_or_set(attr, value, _as_counted_set?) do
+      with {:ok, dumped} <- dump_attribute_value(attr, value) do
+        if is_map(dumped) or is_list(dumped) do
+          {:ok, encode_complex_nils(dumped)}
+        else
+          {:ok, dumped}
+        end
+      end
+    end
 
-    defp dump_attribute(_attr, nil), do: {:ok, nil}
+    defp dump_attribute_value(_attr, nil), do: {:ok, nil}
 
-    defp dump_attribute(%Attribute{} = attr, value) do
+    defp dump_attribute_value(%Attribute{} = attr, value) do
       {kind, constraints} = unwrap_type(attr.type, attr.constraints)
 
       case kind do
         :integer when is_integer(value) ->
-          {:ok, value}
+          if value >= @min_i64 and value <= @max_i64 do
+            {:ok, value}
+          else
+            {:error, {:integer_out_of_i64_range, attr.name}}
+          end
 
         :string when is_binary(value) ->
+          {:ok, :binary.copy(value)}
+
+        :binary when is_binary(value) ->
           {:ok, :binary.copy(value)}
 
         :ci_string ->
@@ -366,11 +422,25 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
         :utc_datetime ->
           %DateTime{} = dt = value
-          {:ok, dt |> DateTime.truncate(:second) |> DateTime.to_unix(:microsecond)}
+          precision = Keyword.get(constraints || [], :precision, :second)
+          truncated = truncate_datetime(dt, precision)
+          {:ok, DateTime.to_unix(truncated, :microsecond)}
 
-        kind when kind in [:utc_datetime_usec, :datetime] ->
+        :utc_datetime_usec ->
           %DateTime{} = dt = value
           {:ok, DateTime.to_unix(dt, :microsecond)}
+
+        :datetime ->
+          %DateTime{} = dt = value
+          precision = Keyword.get(constraints || [], :precision, :second)
+          dt = truncate_datetime(dt, precision)
+
+          if dt.time_zone == "Etc/UTC" do
+            {:ok, DateTime.to_unix(dt, :microsecond)}
+          else
+            {:ok,
+             "#{DateTime.to_iso8601(dt)}|#{dt.time_zone}|#{dt.zone_abbr}|#{dt.utc_offset}|#{dt.std_offset}"}
+          end
 
         :naive_datetime ->
           %NaiveDateTime{} = ndt = value
@@ -382,7 +452,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
         :time ->
           %Time{} = t = value
-          {:ok, t |> Time.truncate(:second) |> Time.to_iso8601()}
+          precision = Keyword.get(constraints || [], :precision, :second)
+          {:ok, t |> truncate_time(precision) |> Time.to_iso8601()}
 
         :time_usec ->
           %Time{} = t = value
@@ -397,7 +468,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
           value
           |> Enum.reduce_while({:ok, []}, fn item, {:ok, acc} ->
-            case dump_attribute(elem_attr, item) do
+            case dump_attribute_value(elem_attr, item) do
               {:ok, dumped_item} -> {:cont, {:ok, [dumped_item | acc]}}
               {:error, _} = err -> {:halt, err}
             end
@@ -416,6 +487,103 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       end
     end
 
+    defp encode_complex_nils(nil), do: @nil_sentinel
+
+    defp encode_complex_nils(bin) when is_binary(bin) do
+      if String.starts_with?(bin, @nil_sentinel) or String.starts_with?(bin, @nil_escape_prefix) do
+        @nil_escape_prefix <> bin
+      else
+        bin
+      end
+    end
+
+    defp encode_complex_nils(list) when is_list(list),
+      do: Enum.map(list, &encode_complex_nils/1)
+
+    defp encode_complex_nils(map) when is_map(map) and not is_struct(map),
+      do: Map.new(map, fn {k, v} -> {k, encode_complex_nils(v)} end)
+
+    defp encode_complex_nils(other), do: other
+
+    defp decode_complex_nils(@nil_sentinel), do: nil
+
+    defp decode_complex_nils(<<0, "__xitdb_esc__", orig::binary>>), do: :binary.copy(orig)
+
+    defp decode_complex_nils(list) when is_list(list),
+      do: Enum.map(list, &decode_complex_nils/1)
+
+    defp decode_complex_nils(map) when is_map(map) and not is_struct(map),
+      do: Map.new(map, fn {k, v} -> {k, decode_complex_nils(v)} end)
+
+    defp decode_complex_nils(other), do: other
+
+    defp truncate_datetime(%DateTime{} = dt, :microsecond), do: dt
+    defp truncate_datetime(%DateTime{} = dt, precision), do: DateTime.truncate(dt, precision)
+
+    defp truncate_time(%Time{} = t, :microsecond), do: t
+    defp truncate_time(%Time{} = t, precision), do: Time.truncate(t, precision)
+
+    defp coerce_pk_temporal(kind, val) when is_binary(val) do
+      case kind do
+        k when k in [:utc_datetime, :utc_datetime_usec, :datetime] ->
+          case DateTime.from_iso8601(val) do
+            {:ok, dt, _offset} -> dt
+            _ -> val
+          end
+
+        :naive_datetime ->
+          case NaiveDateTime.from_iso8601(val) do
+            {:ok, ndt} -> ndt
+            _ -> val
+          end
+
+        :date ->
+          case Date.from_iso8601(val) do
+            {:ok, d} -> d
+            _ -> val
+          end
+
+        k when k in [:time, :time_usec] ->
+          case Time.from_iso8601(val) do
+            {:ok, t} -> t
+            _ -> val
+          end
+      end
+    end
+
+    defp coerce_pk_temporal(_kind, val), do: val
+
+    defp decode_stored_datetime(raw) when is_binary(raw) do
+      case String.split(raw, "|", parts: 5) do
+        [iso, tz, abbr, utc_str, std_str] ->
+          with {:ok, %DateTime{} = utc_dt, _offset} <- DateTime.from_iso8601(iso),
+               {utc_off, ""} <- Integer.parse(utc_str),
+               {std_off, ""} <- Integer.parse(std_str) do
+            naive = NaiveDateTime.add(DateTime.to_naive(utc_dt), utc_off + std_off, :second)
+
+            %DateTime{
+              utc_dt
+              | year: naive.year,
+                month: naive.month,
+                day: naive.day,
+                hour: naive.hour,
+                minute: naive.minute,
+                second: naive.second,
+                utc_offset: utc_off,
+                std_offset: std_off,
+                time_zone: tz,
+                zone_abbr: abbr
+            }
+          else
+            _ -> elem(DateTime.from_iso8601(iso), 1)
+          end
+
+        _ ->
+          {:ok, dt, _offset} = DateTime.from_iso8601(raw)
+          dt
+      end
+    end
+
     defp counted_set_fields(resource) do
       if function_exported?(Info, :counted_set_fields, 1) do
         MapSet.new(apply(Info, :counted_set_fields, [resource]))
@@ -428,6 +596,21 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     defp load_attribute(_attr, nil, _as_counted_set?), do: {:ok, nil}
 
     defp load_attribute(%Attribute{} = attr, raw, as_counted_set?) do
+      materialized = materialize_cursor_term(raw)
+
+      decoded_raw =
+        if not as_counted_set? and (is_map(materialized) or is_list(materialized)) do
+          decode_complex_nils(materialized)
+        else
+          materialized
+        end
+
+      load_attribute_value(attr, decoded_raw, as_counted_set?)
+    end
+
+    defp load_attribute_value(_attr, nil, _as_counted_set?), do: {:ok, nil}
+
+    defp load_attribute_value(%Attribute{} = attr, raw, as_counted_set?) do
       {kind, constraints} = unwrap_type(attr.type, attr.constraints)
 
       case kind do
@@ -435,6 +618,9 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           {:ok, raw}
 
         :string when is_binary(raw) ->
+          {:ok, :binary.copy(raw)}
+
+        :binary when is_binary(raw) ->
           {:ok, :binary.copy(raw)}
 
         :ci_string when is_binary(raw) ->
@@ -450,13 +636,22 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           {:ok, Decimal.new(raw)}
 
         :utc_datetime when is_integer(raw) ->
-          {:ok, raw |> DateTime.from_unix!(:microsecond) |> DateTime.truncate(:second)}
+          precision = Keyword.get(constraints || [], :precision, :second)
+          dt = raw |> DateTime.from_unix!(:microsecond) |> truncate_datetime(precision)
+          {:ok, dt}
 
         :utc_datetime_usec when is_integer(raw) ->
           {:ok, DateTime.from_unix!(raw, :microsecond)}
 
         :datetime when is_integer(raw) ->
-          {:ok, DateTime.from_unix!(raw, :microsecond)}
+          precision = Keyword.get(constraints || [], :precision, :second)
+          dt = raw |> DateTime.from_unix!(:microsecond) |> truncate_datetime(precision)
+          {:ok, dt}
+
+        :datetime when is_binary(raw) ->
+          precision = Keyword.get(constraints || [], :precision, :second)
+          dt = raw |> decode_stored_datetime() |> truncate_datetime(precision)
+          {:ok, dt}
 
         :naive_datetime when is_integer(raw) ->
           {:ok, raw |> DateTime.from_unix!(:microsecond) |> DateTime.to_naive()}
@@ -465,7 +660,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           {:ok, Date.from_iso8601!(raw)}
 
         :time when is_binary(raw) ->
-          {:ok, raw |> Time.from_iso8601!() |> Time.truncate(:second)}
+          precision = Keyword.get(constraints || [], :precision, :second)
+          {:ok, raw |> Time.from_iso8601!() |> truncate_time(precision)}
 
         :time_usec when is_binary(raw) ->
           {:ok, Time.from_iso8601!(raw)}
@@ -473,42 +669,32 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         :uuid when is_binary(raw) ->
           {:ok, :binary.copy(raw)}
 
-        {:array, inner_type} ->
+        {:array, inner_type} when is_list(raw) ->
           item_constraints = Keyword.get(constraints || [], :items, [])
           elem_attr = %Attribute{attr | type: inner_type, constraints: item_constraints}
-          items = materialize_cursor_term(raw)
 
-          if is_list(items) do
-            items
-            |> Enum.reduce_while({:ok, []}, fn item, {:ok, acc} ->
-              decoded =
-                if as_counted_set? do
-                  decode_stringified_set_member(elem_attr, item)
-                else
-                  item
-                end
-
-              case load_attribute(elem_attr, decoded) do
-                {:ok, loaded_item} -> {:cont, {:ok, [loaded_item | acc]}}
-                {:error, _} = err -> {:halt, err}
+          raw
+          |> Enum.reduce_while({:ok, []}, fn item, {:ok, acc} ->
+            decoded =
+              if as_counted_set? do
+                decode_stringified_set_member(elem_attr, item)
+              else
+                item
               end
-            end)
-            |> case do
-              {:ok, loaded_rev} -> {:ok, Enum.reverse(loaded_rev)}
-              {:error, _} = err -> err
+
+            case load_attribute_value(elem_attr, decoded, false) do
+              {:ok, loaded_item} -> {:cont, {:ok, [loaded_item | acc]}}
+              {:error, _} = err -> {:halt, err}
             end
-          else
-            normalize_cast_stored(
-              Ash.Type.cast_stored(attr.type, items, attr.constraints),
-              attr.name
-            )
+          end)
+          |> case do
+            {:ok, loaded_rev} -> {:ok, Enum.reverse(loaded_rev)}
+            {:error, _} = err -> err
           end
 
         _other ->
-          materialized = materialize_cursor_term(raw)
-
           normalize_cast_stored(
-            Ash.Type.cast_stored(attr.type, materialized, attr.constraints),
+            Ash.Type.cast_stored(attr.type, raw, attr.constraints),
             attr.name
           )
       end
@@ -613,10 +799,10 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     defp encode_attr_scalar(%Attribute{} = attr, value) do
       {kind, constraints} = unwrap_type(attr.type, attr.constraints)
 
-      {effective_kind, effective_value} =
+      {effective_kind, effective_constraints, effective_value} =
         if is_atom(kind) and not canonical_atom_kind?(kind) and Ash.Type.ash_type?(kind) do
           storage_type = Ash.Type.storage_type(kind, constraints)
-          {storage_kind, _} = unwrap_type(storage_type, [])
+          {storage_kind, storage_constraints} = unwrap_type(storage_type, [])
 
           dumped =
             case Ash.Type.dump_to_embedded(kind, value, constraints) do
@@ -624,17 +810,19 @@ if Code.ensure_loaded?(Ash.DataLayer) do
               _ -> value
             end
 
-          {storage_kind, dumped}
+          {storage_kind, storage_constraints, dumped}
         else
-          {kind, value}
+          {kind, constraints, value}
         end
 
-      {effective_kind, encode_typed_scalar(effective_kind, effective_value)}
+      {effective_kind,
+       encode_typed_scalar(effective_kind, effective_value, effective_constraints)}
     end
 
     @canonical_kinds [
       :integer,
       :string,
+      :binary,
       :ci_string,
       :boolean,
       :float,
@@ -659,51 +847,79 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       <<@value_tag, byte_size(scalar)::unsigned-big-32, scalar::binary>>
     end
 
-    defp encode_typed_scalar(:integer, val) when is_integer(val), do: encode_i64_be(val)
-    defp encode_typed_scalar(:boolean, false), do: <<0x00>>
-    defp encode_typed_scalar(:boolean, true), do: <<0x01>>
-    defp encode_typed_scalar(:float, val) when is_number(val), do: encode_f64_be(val * 1.0)
+    defp encode_typed_scalar(:integer, val, _constraints) when is_integer(val),
+      do: encode_i64_be(val)
 
-    defp encode_typed_scalar(:decimal, val), do: val |> coerce_decimal() |> encode_decimal_key()
+    defp encode_typed_scalar(:boolean, false, _constraints), do: <<0x00>>
+    defp encode_typed_scalar(:boolean, true, _constraints), do: <<0x01>>
 
-    defp encode_typed_scalar(:utc_datetime, %DateTime{} = dt) do
-      dt |> DateTime.truncate(:second) |> DateTime.to_unix(:microsecond) |> encode_i64_be()
+    defp encode_typed_scalar(:float, %Decimal{} = dec, _constraints),
+      do: dec |> Decimal.to_float() |> encode_f64_be()
+
+    defp encode_typed_scalar(:float, val, _constraints) when is_number(val),
+      do: encode_f64_be(val * 1.0)
+
+    defp encode_typed_scalar(:decimal, val, _constraints),
+      do: val |> coerce_decimal() |> encode_decimal_key()
+
+    defp encode_typed_scalar(:utc_datetime, %DateTime{} = dt, constraints) do
+      precision = Keyword.get(constraints || [], :precision, :second)
+      dt |> truncate_datetime(precision) |> DateTime.to_unix(:microsecond) |> encode_i64_be()
     end
 
-    defp encode_typed_scalar(kind, %DateTime{} = dt)
-         when kind in [:utc_datetime_usec, :datetime] do
+    defp encode_typed_scalar(:datetime, %DateTime{} = dt, constraints) do
+      precision = Keyword.get(constraints || [], :precision, :second)
+      dt |> truncate_datetime(precision) |> DateTime.to_unix(:microsecond) |> encode_i64_be()
+    end
+
+    defp encode_typed_scalar(:utc_datetime_usec, %DateTime{} = dt, _constraints) do
       dt |> DateTime.to_unix(:microsecond) |> encode_i64_be()
     end
 
-    defp encode_typed_scalar(:naive_datetime, %NaiveDateTime{} = ndt) do
+    defp encode_typed_scalar(:naive_datetime, %NaiveDateTime{} = ndt, _constraints) do
       ndt |> DateTime.from_naive!("Etc/UTC") |> DateTime.to_unix(:microsecond) |> encode_i64_be()
     end
 
-    defp encode_typed_scalar(:date, %Date{} = d) do
+    defp encode_typed_scalar(:date, %Date{} = d, _constraints) do
       d |> Date.to_gregorian_days() |> encode_i64_be()
     end
 
-    defp encode_typed_scalar(:time, %Time{} = t) do
-      {sec, _usec} = Time.to_seconds_after_midnight(t)
-      encode_i64_be(sec * 1_000_000)
+    defp encode_typed_scalar(:time, %Time{} = t, constraints) do
+      precision = Keyword.get(constraints || [], :precision, :second)
+      {sec, usec} = Time.to_seconds_after_midnight(t)
+
+      if precision == :microsecond do
+        encode_i64_be(sec * 1_000_000 + usec)
+      else
+        encode_i64_be(sec * 1_000_000)
+      end
     end
 
-    defp encode_typed_scalar(:time_usec, %Time{} = t) do
+    defp encode_typed_scalar(:time_usec, %Time{} = t, _constraints) do
       {sec, usec} = Time.to_seconds_after_midnight(t)
       encode_i64_be(sec * 1_000_000 + usec)
     end
 
-    defp encode_typed_scalar(:ci_string, %Ash.CiString{} = ci) do
+    defp encode_typed_scalar(:ci_string, %Ash.CiString{} = ci, _constraints) do
       ci |> Ash.CiString.value() |> String.downcase()
     end
 
-    defp encode_typed_scalar(:ci_string, val) when is_binary(val), do: String.downcase(val)
-    defp encode_typed_scalar(:string, val) when is_binary(val), do: val
-    defp encode_typed_scalar(:uuid, val) when is_binary(val), do: String.downcase(val)
-    defp encode_typed_scalar(:atom, val) when is_atom(val), do: Atom.to_string(val)
-    defp encode_typed_scalar(:atom, val) when is_binary(val), do: val
+    defp encode_typed_scalar(:ci_string, val, _constraints) when is_binary(val),
+      do: String.downcase(val)
 
-    defp encode_typed_scalar(_other, val) do
+    defp encode_typed_scalar(:string, %Ash.CiString{} = ci, _constraints),
+      do: Ash.CiString.value(ci)
+
+    defp encode_typed_scalar(:string, val, _constraints) when is_binary(val), do: val
+    defp encode_typed_scalar(:binary, val, _constraints) when is_binary(val), do: val
+
+    defp encode_typed_scalar(:uuid, val, _constraints) when is_binary(val),
+      do: String.downcase(val)
+
+    defp encode_typed_scalar(:atom, val, _constraints) when is_atom(val), do: Atom.to_string(val)
+    defp encode_typed_scalar(:atom, val, _constraints) when is_binary(val), do: val
+
+    defp encode_typed_scalar(_other, val, _constraints) do
       :erlang.term_to_binary(val, [:deterministic])
     end
 
@@ -743,7 +959,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           tenant
 
         nil ->
-          tenant
+          nil
       end
     end
 
@@ -754,9 +970,12 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       <<@scoped_tenant_tag, byte_size(bin)::unsigned-big-32, bin::binary>>
     end
 
-    defp unwrap_type({:array, _} = array_type, constraints), do: {array_type, constraints}
+    @doc false
+    def unwrap_type(type, constraints \\ [])
 
-    defp unwrap_type(type, constraints) when is_atom(type) do
+    def unwrap_type({:array, _} = array_type, constraints), do: {array_type, constraints}
+
+    def unwrap_type(type, constraints) when is_atom(type) do
       resolved = Ash.Type.get_type(type)
       kind = canonical_kind(resolved)
 
@@ -776,6 +995,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
     defp canonical_kind(Ash.Type.Integer), do: :integer
     defp canonical_kind(Ash.Type.String), do: :string
+    defp canonical_kind(Ash.Type.Binary), do: :binary
     defp canonical_kind(Ash.Type.CiString), do: :ci_string
     defp canonical_kind(Ash.Type.Boolean), do: :boolean
     defp canonical_kind(Ash.Type.Float), do: :float
@@ -808,8 +1028,32 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       Enum.map(val, &materialize_cursor_term/1)
     end
 
+    defp materialize_cursor_term(%Xitdb.Cursor{tag_id: -1} = cursor) do
+      cursor |> Xitdb.Cursor.ensure_resolved() |> materialize_cursor_term()
+    end
+
     defp materialize_cursor_term(%MapSet{} = set) do
       set |> Enum.to_list() |> Enum.map(&materialize_cursor_term/1)
+    end
+
+    defp materialize_cursor_term(%Xitdb.Collection{kind: kind, data: data})
+         when kind in [:hash_map, :counted_hash_map, :sorted_map] do
+      Map.new(data, fn {k, v} -> {to_string(k), materialize_cursor_term(v)} end)
+    end
+
+    defp materialize_cursor_term(%Xitdb.Cursor{tag: tag} = cursor)
+         when tag in [:hash_map, :counted_hash_map, :sorted_map] do
+      Map.new(cursor, fn {k, v} -> {to_string(k), materialize_cursor_term(v)} end)
+    end
+
+    defp materialize_cursor_term(%Xitdb.Collection{kind: kind, data: data})
+         when kind in [:array_list, :linked_array_list] do
+      Enum.map(data, &materialize_cursor_term/1)
+    end
+
+    defp materialize_cursor_term(%Xitdb.Cursor{tag: tag} = cursor)
+         when tag in [:array_list, :linked_array_list] do
+      Enum.map(cursor, &materialize_cursor_term/1)
     end
 
     defp materialize_cursor_term(%Xitdb.Collection{kind: kind, data: data})

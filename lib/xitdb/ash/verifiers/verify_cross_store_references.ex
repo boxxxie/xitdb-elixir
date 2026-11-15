@@ -69,7 +69,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     end
 
     defp validate_reference(mod, own_store, %{name: name, destination: dest}, on_delete) do
-      _ = Code.ensure_compiled(dest)
+      _ = Code.ensure_loaded?(dest)
 
       if not xitdb_datalayer_or_dsl_resource?(dest) do
         {:halt,
@@ -126,7 +126,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     defp validate_nested_relationship(_module, _source_store, _parent_col, nil), do: :ok
 
     defp validate_nested_relationship(module, source_store, parent_col, %{destination: dest}) do
-      _ = Code.ensure_compiled(dest)
+      _ = Code.ensure_loaded?(dest)
 
       if not xitdb_datalayer_or_dsl_resource?(dest) do
         {:error,
@@ -176,7 +176,17 @@ if Code.ensure_loaded?(Ash.DataLayer) do
                  )}
 
               {:ok, ^parent_col} ->
-                :ok
+                if Info.nested?(dest) do
+                  {:error,
+                   DslError.exception(
+                     module: module,
+                     path: [:xitdb, :nested_in, parent_col],
+                     message:
+                       "multi-level `nested_in` is not supported: parent #{inspect(dest)} is itself nested"
+                   )}
+                else
+                  :ok
+                end
             end
         end
       end

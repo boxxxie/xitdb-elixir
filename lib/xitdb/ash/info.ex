@@ -300,7 +300,13 @@ if Code.ensure_loaded?(Spark.InfoGenerator) and Code.ensure_loaded?(Ash.Resource
       editable = Extension.get_opt(resource_or_dsl, [:xitdb], :editable_fields, [])
       passthru = Extension.get_opt(resource_or_dsl, [:xitdb], :passthru_fields, [])
 
-      ([:id] ++ editable ++ passthru)
+      pk_fields =
+        case Ash.Resource.Info.primary_key(resource_or_dsl) do
+          [] -> [:id]
+          pks -> pks
+        end
+
+      (pk_fields ++ editable ++ passthru)
       |> Enum.map(&Keyword.get(aliases, &1, &1))
       |> Enum.uniq()
     end
@@ -382,8 +388,14 @@ if Code.ensure_loaded?(Spark.InfoGenerator) and Code.ensure_loaded?(Ash.Resource
     def entity_paths(resource, record) when is_atom(resource) and is_map(record) do
       case nested_mappings(resource) do
         [] ->
+          pk_field =
+            case Ash.Resource.Info.primary_key(resource) do
+              [pk | _] -> pk
+              [] -> :id
+            end
+
           with {:ok, col} <- fetch_collection(resource),
-               id when not is_nil(id) and id != "" <- fetch_record_value(record, :id) do
+               id when not is_nil(id) and id != "" <- fetch_record_value(record, pk_field) do
             [[to_string(col), to_string(id)]]
           else
             _ -> []

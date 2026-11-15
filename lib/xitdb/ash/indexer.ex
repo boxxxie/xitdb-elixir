@@ -62,10 +62,11 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         )
         when is_atom(resource) and is_map(batch_state) do
       collection = Codec.scoped_collection(resource, tenant)
+      pk_attr = pk_attribute(resource)
+      doc_id = Codec.encode_pk_doc_id(pk_attr, Map.fetch!(new_record, pk_attr.name))
 
-      with {:ok, cursor_map} <- Codec.to_cursor_map(resource, new_record),
-           {:ok, identity_ops} <-
-             plan_identity_ops(
+      with {:ok, {effective_old, pre_evict_ops, batch_after_evict}} <-
+             maybe_resolve_existing_one_nested(
                db_or_cursor,
                resource,
                old_record,
@@ -73,10 +74,20 @@ if Code.ensure_loaded?(Ash.DataLayer) do
                tenant,
                batch_state
              ),
+           {:ok, cursor_map} <- Codec.to_cursor_map(resource, new_record),
+           {:ok, identity_ops} <-
+             plan_identity_ops(
+               db_or_cursor,
+               resource,
+               effective_old,
+               new_record,
+               tenant,
+               batch_after_evict
+             ),
            {:ok, locator_plan} <-
-             plan_entity_location(db_or_cursor, resource, old_record, new_record, tenant) do
-        secondary_ops = plan_secondary_ops(resource, old_record, new_record)
-        removed_fields = removed_attribute_fields(resource, old_record, cursor_map)
+             plan_entity_location(db_or_cursor, resource, effective_old, new_record, tenant) do
+        secondary_ops = plan_secondary_ops(resource, effective_old, new_record)
+        removed_fields = removed_attribute_fields(resource, effective_old, cursor_map)
 
         {entity_and_idx_ops, batch_after_idx} =
           Storage.compile_put_ops(
@@ -86,14 +97,19 @@ if Code.ensure_loaded?(Ash.DataLayer) do
             locator_plan,
             identity_ops,
             secondary_ops,
-            batch_state,
+            batch_after_evict,
             removed_fields
           )
 
         {search_ops, batch_after_search} =
           plan_search_ops(db_or_cursor, resource, collection, new_record, nil, batch_after_idx)
 
-        {:ok, entity_and_idx_ops ++ search_ops, batch_after_search}
+        next_batch =
+          batch_after_search
+          |> Map.delete({:deleted_doc, collection, doc_id})
+          |> track_nested_one_put(resource, effective_old, new_record, tenant)
+
+        {:ok, pre_evict_ops ++ entity_and_idx_ops ++ search_ops, next_batch}
       end
     end
 
@@ -147,7 +163,9 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         {search_ops, batch_after_search} =
           plan_search_ops(db_or_cursor, resource, collection, nil, doc_id, batch_after_idx)
 
-        {:ok, child_ops ++ own_delete_ops ++ search_ops, batch_after_search}
+        next_batch = track_nested_one_delete(batch_after_search, resource, record, tenant)
+
+        {:ok, child_ops ++ own_delete_ops ++ search_ops, next_batch}
       end
     end
 
@@ -169,8 +187,9 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       cursor_root = Xitdb.as_of(db, moment)
 
       with {:ok, ops} <- plan_put_ops(cursor_root, resource, old_record, new_record, tenant),
-           {:ok, next_db} <- Xitdb.transact_ops(db, ops, base_moment: moment) do
-        {:ok, {next_db, Xitdb.moment_count(next_db) - 1}}
+           {:ok, next_db, next_moment} <-
+             Xitdb.transact_ops_with_moment(db, ops, base_moment: moment) do
+        {:ok, {next_db, next_moment}}
       end
     end
 
@@ -198,8 +217,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         when is_atom(resource) and is_integer(moment) do
       cursor_root = Xitdb.as_of(db, moment)
       {:ok, ops} = plan_delete_ops(cursor_root, resource, record, tenant)
-      {:ok, next_db} = Xitdb.transact_ops(db, ops, base_moment: moment)
-      {:ok, {next_db, Xitdb.moment_count(next_db) - 1}}
+      {:ok, next_db, next_moment} = Xitdb.transact_ops_with_moment(db, ops, base_moment: moment)
+      {:ok, {next_db, next_moment}}
     end
 
     def delete_record(%Xitdb{} = db, resource, %_{} = record, tenant) when is_atom(resource) do
@@ -297,11 +316,12 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         nested ->
           pk_attr = pk_attribute(resource)
           parent_col_str = resolve_parent_collection(nested, tenant, resource)
+          parent_doc_id = encode_parent_doc_id(resource, nested, parent_id)
 
           Storage.list_nested_cursors_for_parent(
             db_or_cursor,
             parent_col_str,
-            Codec.encode_doc_id(parent_id),
+            parent_doc_id,
             nested.path,
             nested.cardinality,
             pk_attr
@@ -321,14 +341,20 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           :none
 
         {:ok, encoded_key} ->
-          collection = Codec.scoped_collection(resource, tenant)
+          id_col = identity_collection(resource, identity, tenant)
 
-          Storage.lookup_unique(
-            db_or_cursor,
-            collection,
-            identity_slot_name(identity.name),
-            encoded_key
-          )
+          case Storage.lookup_unique(
+                 db_or_cursor,
+                 id_col,
+                 identity_slot_name(identity.name),
+                 encoded_key
+               ) do
+            {:ok, stored_val} ->
+              unpack_identity_lookup(resource, identity, tenant, stored_val)
+
+            :none ->
+              :none
+          end
       end
     end
 
@@ -364,7 +390,14 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       collection = Codec.scoped_collection(resource, tenant)
       attr = Ash.Resource.Info.attribute(resource, field)
       encoded_key = Codec.encode_index_key([attr], [value])
-      Storage.count_set(db_or_cursor, collection, "attr_#{field}", encoded_key)
+
+      slot =
+        case resource |> Info.indexes_for_field(field) |> Enum.find(&(&1.fields == [field])) do
+          nil -> "attr_#{field}"
+          index_spec -> index_slot_name(index_spec)
+        end
+
+      Storage.count_set(db_or_cursor, collection, slot, encoded_key)
     end
 
     @doc """
@@ -475,7 +508,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
              )}
           else
             parent_col_str = resolve_parent_collection(nested, tenant, resource)
-            new_parent_doc_id = Codec.encode_doc_id(new_parent_val)
+            new_parent_doc_id = encode_parent_doc_id(resource, nested, new_parent_val)
 
             case Storage.fetch_top_level_cursor(db_or_cursor, parent_col_str, new_parent_doc_id) do
               :none ->
@@ -488,8 +521,13 @@ if Code.ensure_loaded?(Ash.DataLayer) do
               {:ok, _parent_cursor} ->
                 old_parent_doc_id =
                   case old_record do
-                    nil -> nil
-                    prev -> prev |> Map.get(fk_attr) |> maybe_encode_doc_id()
+                    nil ->
+                      nil
+
+                    prev ->
+                      prev
+                      |> Map.get(fk_attr)
+                      |> then(&maybe_encode_parent_doc_id(resource, nested, &1))
                   end
 
                 pk_key = Codec.encode_scalar_key(pk_attr, pk_val)
@@ -516,10 +554,15 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           {:top_level, doc_id}
 
         nested ->
+          parent_doc_id =
+            record
+            |> Map.get(nested.foreign_key)
+            |> then(&maybe_encode_parent_doc_id(resource, nested, &1))
+
           {:nested,
            %{
              parent_collection: resolve_parent_collection(nested, tenant, resource),
-             parent_doc_id: record |> Map.get(nested.foreign_key) |> maybe_encode_doc_id(),
+             parent_doc_id: parent_doc_id,
              path: nested.path,
              cardinality: nested.cardinality,
              doc_id: doc_id,
@@ -528,8 +571,198 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       end
     end
 
-    defp maybe_encode_doc_id(nil), do: nil
-    defp maybe_encode_doc_id(val), do: Codec.encode_doc_id(val)
+    defp resolve_parent_resource(_resource, %{parent_resource: parent})
+         when is_atom(parent) and not is_nil(parent),
+         do: parent
+
+    defp resolve_parent_resource(resource, %{foreign_key: fk_attr}) do
+      case Enum.find(
+             Ash.Resource.Info.relationships(resource),
+             &(&1.type == :belongs_to and &1.source_attribute == fk_attr)
+           ) do
+        %{destination: dest} when is_atom(dest) -> dest
+        _ -> nil
+      end
+    end
+
+    defp encode_parent_doc_id(resource, nested, val) do
+      case resolve_parent_resource(resource, nested) do
+        parent_res when is_atom(parent_res) and not is_nil(parent_res) ->
+          Codec.encode_pk_doc_id(pk_attribute(parent_res), val)
+
+        nil ->
+          Codec.encode_doc_id(val)
+      end
+    end
+
+    defp maybe_encode_parent_doc_id(_resource, _nested, nil), do: nil
+
+    defp maybe_encode_parent_doc_id(resource, nested, val),
+      do: encode_parent_doc_id(resource, nested, val)
+
+    defp maybe_resolve_existing_one_nested(
+           db_or_cursor,
+           resource,
+           old_record,
+           new_record,
+           tenant,
+           batch_state
+         ) do
+      case resolve_nested_spec(resource) do
+        %{cardinality: :one, foreign_key: fk_attr, path: path} = nested ->
+          new_parent_val = Map.get(new_record, fk_attr)
+          old_parent_val = if old_record, do: Map.get(old_record, fk_attr), else: nil
+
+          if not is_nil(new_parent_val) and
+               (old_record == nil or old_parent_val != new_parent_val) do
+            collection = Codec.scoped_collection(resource, tenant)
+            pk_attr = pk_attribute(resource)
+            parent_col_str = resolve_parent_collection(nested, tenant, resource)
+            new_parent_doc_id = encode_parent_doc_id(resource, nested, new_parent_val)
+            batch_key = {:nested_one_record, parent_col_str, new_parent_doc_id, path}
+
+            existing_res =
+              case Map.fetch(batch_state, batch_key) do
+                {:ok, :deleted} ->
+                  :none
+
+                {:ok, staged_rec} ->
+                  {:ok, staged_rec}
+
+                :error ->
+                  doc_id = Codec.encode_pk_doc_id(pk_attr, Map.fetch!(new_record, pk_attr.name))
+
+                  case Storage.fetch_nested_cursor(
+                         db_or_cursor,
+                         parent_col_str,
+                         new_parent_doc_id,
+                         path,
+                         :one,
+                         doc_id
+                       ) do
+                    {:ok, existing_cursor} ->
+                      case Codec.from_cursor(resource, existing_cursor, tenant) do
+                        {:ok, existing_old} ->
+                          existing_doc_id =
+                            Codec.encode_pk_doc_id(
+                              pk_attr,
+                              Map.fetch!(existing_old, pk_attr.name)
+                            )
+
+                          if Map.has_key?(
+                               batch_state,
+                               {:deleted_doc, collection, existing_doc_id}
+                             ) do
+                            :none
+                          else
+                            {:ok, existing_old}
+                          end
+
+                        _ ->
+                          :none
+                      end
+
+                    :none ->
+                      :none
+                  end
+              end
+
+            case existing_res do
+              :none ->
+                {:ok, {old_record, [], batch_state}}
+
+              {:ok, existing_old} ->
+                if old_record == nil and
+                     Map.get(existing_old, pk_attr.name) == Map.get(new_record, pk_attr.name) do
+                  {:ok, {existing_old, [], batch_state}}
+                else
+                  {:ok, evict_ops, next_batch} =
+                    plan_delete_ops_batched(
+                      db_or_cursor,
+                      resource,
+                      existing_old,
+                      tenant,
+                      batch_state
+                    )
+
+                  {:ok, {old_record, evict_ops, next_batch}}
+                end
+            end
+          else
+            {:ok, {old_record, [], batch_state}}
+          end
+
+        _ ->
+          {:ok, {old_record, [], batch_state}}
+      end
+    end
+
+    defp track_nested_one_put(batch_state, resource, old_record, new_record, tenant) do
+      case resolve_nested_spec(resource) do
+        %{cardinality: :one, foreign_key: fk_attr, path: path} = nested ->
+          parent_col_str = resolve_parent_collection(nested, tenant, resource)
+          new_parent_val = Map.get(new_record, fk_attr)
+
+          batch_state =
+            case old_record do
+              nil ->
+                batch_state
+
+              prev ->
+                old_parent_val = Map.get(prev, fk_attr)
+
+                if not is_nil(old_parent_val) and old_parent_val != new_parent_val do
+                  old_parent_doc_id = encode_parent_doc_id(resource, nested, old_parent_val)
+
+                  Map.put(
+                    batch_state,
+                    {:nested_one_record, parent_col_str, old_parent_doc_id, path},
+                    :deleted
+                  )
+                else
+                  batch_state
+                end
+            end
+
+          if is_nil(new_parent_val) do
+            batch_state
+          else
+            new_parent_doc_id = encode_parent_doc_id(resource, nested, new_parent_val)
+
+            Map.put(
+              batch_state,
+              {:nested_one_record, parent_col_str, new_parent_doc_id, path},
+              new_record
+            )
+          end
+
+        _ ->
+          batch_state
+      end
+    end
+
+    defp track_nested_one_delete(batch_state, resource, record, tenant) do
+      case resolve_nested_spec(resource) do
+        %{cardinality: :one, foreign_key: fk_attr, path: path} = nested ->
+          case Map.get(record, fk_attr) do
+            nil ->
+              batch_state
+
+            parent_val ->
+              parent_col_str = resolve_parent_collection(nested, tenant, resource)
+              parent_doc_id = encode_parent_doc_id(resource, nested, parent_val)
+
+              Map.put(
+                batch_state,
+                {:nested_one_record, parent_col_str, parent_doc_id, path},
+                :deleted
+              )
+          end
+
+        _ ->
+          batch_state
+      end
+    end
 
     defp resolve_nested_spec(resource) do
       raw =
@@ -686,7 +919,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     end
 
     defp plan_identity_ops(db_or_cursor, resource, old_record, new_record, tenant, batch_state) do
-      collection = Codec.scoped_collection(resource, tenant)
+      scoped_col = Codec.scoped_collection(resource, tenant)
       pk_attr = pk_attribute(resource)
 
       current_doc_id =
@@ -702,26 +935,59 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       |> Ash.Resource.Info.identities()
       |> Enum.reduce_while({:ok, []}, fn identity, {:ok, acc} ->
         slot = identity_slot_name(identity.name)
+        id_col = identity_collection(resource, identity, tenant)
+        owner_id = encode_identity_owner(resource, identity, scoped_col, current_doc_id)
         old_key = active_identity_key(resource, identity, old_record, tenant)
         new_key = active_identity_key(resource, identity, new_record, tenant)
 
         case check_identity_collision(
                db_or_cursor,
-               collection,
+               id_col,
                slot,
                new_key,
-               current_doc_id,
+               owner_id,
                identity,
                batch_state
              ) do
           :ok ->
-            ops = diff_unique_keys(slot, old_key, new_key, current_doc_id)
+            ops = diff_unique_keys(id_col, slot, old_key, new_key, owner_id)
             {:cont, {:ok, ops ++ acc}}
 
           {:error, _} = err ->
             {:halt, err}
         end
       end)
+    end
+
+    defp identity_collection(resource, identity, tenant) do
+      if Map.get(identity, :all_tenants?, false) do
+        Atom.to_string(Info.collection!(resource))
+      else
+        Codec.scoped_collection(resource, tenant)
+      end
+    end
+
+    defp encode_identity_owner(resource, identity, scoped_col, doc_id) do
+      if Ash.Resource.Info.multitenancy_strategy(resource) == :context and
+           Map.get(identity, :all_tenants?, false) do
+        scoped_col <> <<0>> <> doc_id
+      else
+        doc_id
+      end
+    end
+
+    defp unpack_identity_lookup(resource, identity, tenant, stored_val) do
+      if Ash.Resource.Info.multitenancy_strategy(resource) == :context and
+           Map.get(identity, :all_tenants?, false) do
+        caller_scoped_col = Codec.scoped_collection(resource, tenant)
+
+        case String.split(stored_val, <<0>>, parts: 2) do
+          [^caller_scoped_col, raw_doc_id] -> {:ok, raw_doc_id}
+          _ -> :none
+        end
+      else
+        {:ok, stored_val}
+      end
     end
 
     defp active_identity_key(_resource, _identity, nil, _tenant), do: nil
@@ -751,33 +1017,41 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       end
     end
 
-    defp check_identity_collision(_db, _collection, _slot, nil, _doc_id, _identity, _batch_state),
-      do: :ok
+    defp check_identity_collision(
+           _db,
+           _id_col,
+           _slot,
+           nil,
+           _owner_id,
+           _identity,
+           _batch_state
+         ),
+         do: :ok
 
     defp check_identity_collision(
            db_or_cursor,
-           collection,
+           id_col,
            slot,
            new_key,
-           current_doc_id,
+           owner_id,
            identity,
            batch_state
          ) do
       lookup_res =
-        case Map.fetch(batch_state, {:unique_slot, collection, slot, new_key}) do
+        case Map.fetch(batch_state, {:unique_slot, id_col, slot, new_key}) do
           {:ok, :deleted} -> :none
-          {:ok, doc_id} -> {:ok, doc_id}
-          :error -> Storage.lookup_unique(db_or_cursor, collection, slot, new_key)
+          {:ok, stored_owner} -> {:ok, stored_owner}
+          :error -> Storage.lookup_unique(db_or_cursor, id_col, slot, new_key)
         end
 
       case lookup_res do
         :none ->
           :ok
 
-        {:ok, ^current_doc_id} ->
+        {:ok, ^owner_id} ->
           :ok
 
-        {:ok, _other_doc_id} ->
+        {:ok, _other_owner} ->
           {:error,
            InvalidChanges.exception(
              fields: identity.keys,
@@ -786,12 +1060,19 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       end
     end
 
-    defp diff_unique_keys(_slot, key, key, _doc_id), do: []
-    defp diff_unique_keys(slot, nil, new_key, doc_id), do: [{:put_unique, slot, new_key, doc_id}]
-    defp diff_unique_keys(slot, old_key, nil, doc_id), do: [{:del_unique, slot, old_key, doc_id}]
+    defp diff_unique_keys(_id_col, _slot, key, key, _owner_id), do: []
 
-    defp diff_unique_keys(slot, old_key, new_key, doc_id) do
-      [{:del_unique, slot, old_key, doc_id}, {:put_unique, slot, new_key, doc_id}]
+    defp diff_unique_keys(id_col, slot, nil, new_key, owner_id),
+      do: [{:put_unique, id_col, slot, new_key, owner_id}]
+
+    defp diff_unique_keys(id_col, slot, old_key, nil, owner_id),
+      do: [{:del_unique, id_col, slot, old_key, owner_id}]
+
+    defp diff_unique_keys(id_col, slot, old_key, new_key, owner_id) do
+      [
+        {:del_unique, id_col, slot, old_key, owner_id},
+        {:put_unique, id_col, slot, new_key, owner_id}
+      ]
     end
 
     defp plan_secondary_ops(resource, old_record, new_record) do
@@ -1197,7 +1478,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           removed_fields
         )
 
-      {unique_ops, b2} = compile_unique_ops(db_or_cursor, collection, identity_ops, b1)
+      {unique_ops, b2} = compile_unique_ops(db_or_cursor, identity_ops, b1)
       {set_ops, b3} = compile_set_ops(db_or_cursor, collection, secondary_ops, b2)
       {entity_ops ++ unique_ops ++ set_ops, b3}
     end
@@ -1215,7 +1496,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       {entity_ops, b1} =
         compile_remove_entity_ops(db_or_cursor, collection, delete_location, batch_state)
 
-      {unique_ops, b2} = compile_unique_ops(db_or_cursor, collection, identity_ops, b1)
+      {unique_ops, b2} = compile_unique_ops(db_or_cursor, identity_ops, b1)
       {set_ops, b3} = compile_set_ops(db_or_cursor, collection, secondary_ops, b2)
       {entity_ops ++ unique_ops ++ set_ops, b3}
     end
@@ -1406,21 +1687,26 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           :many -> parent_prefix <> TxCompiler.format_step(:hash_map, doc_id)
         end
 
-      write_ops = compile_entity_map_ops(target_prefix, cursor_map, removed_fields)
+      write_ops =
+        compile_entity_map_ops(target_prefix, cursor_map, removed_fields, cardinality == :one)
 
       {parent_locator_ops, next_batch} =
         compile_unique_ops(
           db_or_cursor,
-          collection,
-          [{:put_unique, @parent_slot, pk_key, new_parent_id}],
+          [{:put_unique, collection, @parent_slot, pk_key, new_parent_id}],
           batch_state
         )
 
       {reparent_rm_ops ++ write_ops ++ parent_locator_ops, next_batch}
     end
 
-    defp compile_entity_map_ops(prefix, cursor_map, removed_fields) do
-      init_op = {:init_col, prefix, "hash_map"}
+    defp compile_entity_map_ops(prefix, cursor_map, removed_fields, reset? \\ false) do
+      init_op =
+        if reset? do
+          {:reset_col, prefix, "hash_map"}
+        else
+          {:init_col, prefix, "hash_map"}
+        end
 
       put_ops =
         :maps.fold(
@@ -1433,9 +1719,13 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         )
 
       rm_ops =
-        Enum.map(removed_fields, fn field_str ->
-          {:rm, prefix <> TxCompiler.format_step(:hash_map, field_str)}
-        end)
+        if reset? do
+          []
+        else
+          Enum.map(removed_fields, fn field_str ->
+            {:rm, prefix <> TxCompiler.format_step(:hash_map, field_str)}
+          end)
+        end
 
       [init_op | put_ops] ++ rm_ops
     end
@@ -1486,8 +1776,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       {locator_rm, next_batch} =
         compile_unique_ops(
           db_or_cursor,
-          collection,
-          [{:del_unique, @parent_slot, pk_key, parent_id}],
+          [{:del_unique, collection, @parent_slot, pk_key, parent_id}],
           batch_state
         )
 
@@ -1522,34 +1811,34 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       end
     end
 
-    defp compile_unique_ops(db_or_cursor, collection, ops, batch_state) do
-      col_step = TxCompiler.format_step(:hash_map, collection)
-
+    defp compile_unique_ops(db_or_cursor, ops, batch_state) do
       Enum.flat_map_reduce(ops, batch_state, fn
-        {:put_unique, slot, raw_key, doc_id}, b_acc ->
+        {:put_unique, id_col, slot, raw_key, doc_id}, b_acc ->
+          col_step = TxCompiler.format_step(:hash_map, id_col)
           hex_key = encode_btree_key(raw_key)
           slot_path = ".idx" <> col_step <> TxCompiler.format_step(:hash_map, slot)
-          init_key = {:init_slot, collection, slot}
+          init_key = {:init_slot, id_col, slot}
 
           {init_op, b_next} =
             if Map.has_key?(b_acc, init_key) or
-                 get_index_slot(db_or_cursor, collection, slot) != nil do
+                 get_index_slot(db_or_cursor, id_col, slot) != nil do
               {[], Map.put(b_acc, init_key, true)}
             else
               {[{:init_col, slot_path, "sorted_map"}], Map.put(b_acc, init_key, true)}
             end
 
-          b_next = Map.put(b_next, {:unique_slot, collection, slot, raw_key}, doc_id)
+          b_next = Map.put(b_next, {:unique_slot, id_col, slot, raw_key}, doc_id)
           {init_op ++ [{:put, slot_path <> "$" <> hex_key, doc_id}], b_next}
 
-        {:del_unique, slot, raw_key, expected_doc_id}, b_acc ->
-          unique_key = {:unique_slot, collection, slot, raw_key}
+        {:del_unique, id_col, slot, raw_key, expected_doc_id}, b_acc ->
+          col_step = TxCompiler.format_step(:hash_map, id_col)
+          unique_key = {:unique_slot, id_col, slot, raw_key}
 
           current_res =
             case Map.fetch(b_acc, unique_key) do
               {:ok, :deleted} -> :none
               {:ok, doc_id} -> {:ok, doc_id}
-              :error -> lookup_unique(db_or_cursor, collection, slot, raw_key)
+              :error -> lookup_unique(db_or_cursor, id_col, slot, raw_key)
             end
 
           case current_res do

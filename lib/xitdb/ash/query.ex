@@ -78,8 +78,26 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       end
     end
 
-    @spec sort(t(), term(), module()) :: {:ok, t()}
-    def sort(%__MODULE__{} = query, sort, _resource), do: {:ok, %__MODULE__{query | sort: sort}}
+    @spec sort(t(), term(), module()) :: {:ok, t()} | {:error, term()}
+    def sort(%__MODULE__{} = query, sort, resource) do
+      case find_unsortable_item(sort) do
+        nil ->
+          {:ok, %__MODULE__{query | sort: sort}}
+
+        field ->
+          {:error, Ash.Error.Query.UnsortableField.exception(resource: resource, field: field)}
+      end
+    end
+
+    defp find_unsortable_item(sort) when is_list(sort) do
+      Enum.find_value(sort, fn
+        {%{sortable?: false} = item, _dir} -> Map.get(item, :calc_name) || Map.get(item, :name)
+        %{sortable?: false} = item -> Map.get(item, :calc_name) || Map.get(item, :name)
+        _ -> nil
+      end)
+    end
+
+    defp find_unsortable_item(_sort), do: nil
 
     @spec distinct(t(), [atom()], module()) :: {:ok, t()}
     def distinct(%__MODULE__{} = query, distinct, _resource) do
@@ -166,26 +184,29 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     end
 
     def execute(db_or_cursor, %__MODULE__{} = query, resource) when is_atom(resource) do
-      %__MODULE__{} = query = normalize_domain(query, resource)
+      bind_snapshot_if_needed(db_or_cursor, resource, fn ->
+        %__MODULE__{} = query = normalize_domain(query, resource)
 
-      with {:ok, raw_cursors} <- stage1_narrow(db_or_cursor, query, resource),
-           {:ok, hydrated} <- stage2_hydrate(raw_cursors, query, resource),
-           {:ok, prefiltered, residual_filter} <- stage3_prefilter(hydrated, query, resource),
-           {stage4_query, post_slice_query} <-
-             partition_derived_work(query, residual_filter, resource),
-           {:ok, enriched_and_filtered} <-
-             stage4_enrich_and_filter(
-               db_or_cursor,
-               prefiltered,
-               residual_filter,
-               stage4_query,
-               resource
-             ),
-           ordered = stage5_order_and_slice(enriched_and_filtered, query, resource),
-           {:ok, post_enriched} <-
-             attach_derived(db_or_cursor, ordered, post_slice_query, resource) do
-        {:ok, stage6_project(post_enriched, query, resource)}
-      end
+        with {:ok, raw_cursors} <- stage1_narrow(db_or_cursor, query, resource),
+             {:ok, hydrated} <- stage2_hydrate(raw_cursors, query, resource),
+             {:ok, prefiltered, residual_filter} <-
+               stage3_prefilter(db_or_cursor, hydrated, query, resource),
+             {stage4_query, post_slice_query} <-
+               partition_derived_work(query, residual_filter, resource),
+             {:ok, enriched_and_filtered} <-
+               stage4_enrich_and_filter(
+                 db_or_cursor,
+                 prefiltered,
+                 residual_filter,
+                 stage4_query,
+                 resource
+               ),
+             ordered = stage5_order_and_slice(enriched_and_filtered, query, resource),
+             {:ok, post_enriched} <-
+               attach_derived(db_or_cursor, ordered, post_slice_query, resource) do
+          {:ok, stage6_project(post_enriched, query, resource)}
+        end
+      end)
     end
 
     @doc """
@@ -206,15 +227,43 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
     def execute_aggregates(db_or_cursor, %__MODULE__{} = query, aggregates, resource)
         when is_list(aggregates) and is_atom(resource) do
-      %__MODULE__{} = query = normalize_domain(query, resource)
-      base_query = %{query | aggregates: [], calculations: []}
+      bind_snapshot_if_needed(db_or_cursor, resource, fn ->
+        %__MODULE__{} = query = normalize_domain(query, resource)
 
-      case execute(db_or_cursor, base_query, resource) do
-        {:ok, records} ->
-          evaluate_query_aggregates(records, aggregates, query, resource)
+        {filter_sort_query, _post_slice_query} =
+          partition_derived_work(query, query.filter, resource)
 
-        {:error, _} = err ->
-          err
+        base_query = %{filter_sort_query | limit: nil, offset: nil, select: nil}
+
+        case execute(db_or_cursor, base_query, resource) do
+          {:ok, records} ->
+            evaluate_query_aggregates(records, aggregates, query, resource)
+
+          {:error, _} = err ->
+            err
+        end
+      end)
+    end
+
+    defp bind_snapshot_if_needed(db_or_cursor, resource, fun) do
+      snapshot_handle =
+        case db_or_cursor do
+          {%Xitdb{} = db, moment} when is_integer(moment) -> Xitdb.as_of(db, moment)
+          %Xitdb{} = db -> db
+          %Xitdb.Cursor{} = cursor -> cursor
+          _ -> nil
+        end
+
+      case {Info.fetch_store(resource), snapshot_handle} do
+        {{:ok, store}, handle} when not is_nil(handle) ->
+          if Process.get({:xitdb_as_of_db, store}) == handle do
+            fun.()
+          else
+            Store.with_as_of(store, handle, fun)
+          end
+
+        _ ->
+          fun.()
       end
     end
 
@@ -324,9 +373,26 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     defp fetch_nested_parent_cursors(_db_or_cursor, _resource, [], _tenant), do: []
 
     defp fetch_nested_parent_cursors(db_or_cursor, resource, parent_vals, tenant) do
+      nested_fk = nested_foreign_key(resource)
+
+      parent_pk_attr =
+        case Enum.find(Ash.Resource.Info.relationships(resource), fn rel ->
+               rel.type == :belongs_to and rel.source_attribute == nested_fk
+             end) do
+          %{destination: dest, destination_attribute: dest_attr} when is_atom(dest) ->
+            Ash.Resource.Info.attribute(dest, dest_attr)
+
+          _ ->
+            nil
+        end
+
       parent_vals
       |> Enum.reject(&is_nil/1)
-      |> Enum.uniq_by(&Codec.encode_doc_id/1)
+      |> Enum.uniq_by(fn val ->
+        if parent_pk_attr,
+          do: Codec.encode_pk_doc_id(parent_pk_attr, val),
+          else: Codec.encode_doc_id(val)
+      end)
       |> Enum.flat_map(&Indexer.nested_cursors_for_parent(db_or_cursor, resource, &1, tenant))
     end
 
@@ -749,45 +815,85 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     defp is_enum_of_literals?(%Range{}), do: true
     defp is_enum_of_literals?(_), do: false
 
+    @min_i64 -9_223_372_036_854_775_808
+    @max_i64 9_223_372_036_854_775_807
+
+    defp indexable_literal?(%Attribute{type: type, constraints: constraints} = attr, val) do
+      {kind, _} = Codec.unwrap_type(type, constraints)
+
+      kind_compatible? =
+        case kind do
+          :integer ->
+            is_integer(val) and val >= @min_i64 and val <= @max_i64
+
+          :float ->
+            is_float(val) or is_integer(val) or is_struct(val, Decimal)
+
+          :decimal ->
+            is_struct(val, Decimal) or is_integer(val) or is_float(val) or is_binary(val)
+
+          _ ->
+            true
+        end
+
+      if kind_compatible? do
+        try do
+          _ = Codec.encode_scalar_key(attr, val)
+          true
+        rescue
+          _ -> false
+        end
+      else
+        false
+      end
+    end
+
     defp merge_eq(eq_acc, _col, _vals, nil), do: eq_acc
 
     defp merge_eq(eq_acc, col, vals, %Attribute{} = attr) do
-      unique_vals =
-        vals
-        |> Enum.reject(&is_nil/1)
-        |> Enum.uniq_by(&Codec.encode_scalar_key(attr, &1))
+      clean_vals = Enum.reject(vals, &is_nil/1)
 
-      case Map.fetch(eq_acc, col) do
-        :error ->
-          if unique_vals == [], do: :contradiction, else: Map.put(eq_acc, col, unique_vals)
+      if clean_vals != [] and not Enum.all?(clean_vals, &indexable_literal?(attr, &1)) do
+        eq_acc
+      else
+        unique_vals = Enum.uniq_by(clean_vals, &Codec.encode_scalar_key(attr, &1))
 
-        {:ok, existing} ->
-          existing_keys = MapSet.new(existing, &Codec.encode_scalar_key(attr, &1))
+        case Map.fetch(eq_acc, col) do
+          :error ->
+            if unique_vals == [], do: :contradiction, else: Map.put(eq_acc, col, unique_vals)
 
-          intersected =
-            Enum.filter(unique_vals, fn v ->
-              MapSet.member?(existing_keys, Codec.encode_scalar_key(attr, v))
-            end)
+          {:ok, existing} ->
+            existing_keys = MapSet.new(existing, &Codec.encode_scalar_key(attr, &1))
 
-          if intersected == [], do: :contradiction, else: Map.put(eq_acc, col, intersected)
+            intersected =
+              Enum.filter(unique_vals, fn v ->
+                MapSet.member?(existing_keys, Codec.encode_scalar_key(attr, v))
+              end)
+
+            if intersected == [], do: :contradiction, else: Map.put(eq_acc, col, intersected)
+        end
       end
     end
 
     defp merge_range(range_acc, _col, _side, _bound, nil), do: range_acc
 
-    defp merge_range(range_acc, col, bound_side, bound, %Attribute{} = attr) do
-      current = Map.get(range_acc, col, %{min: :unbounded, max: :unbounded})
-
-      tightened =
-        case bound_side do
-          :min -> %{current | min: tighter_min(current.min, bound, attr)}
-          :max -> %{current | max: tighter_max(current.max, bound, attr)}
-        end
-
-      if range_contradiction?(tightened.min, tightened.max, attr) do
-        :contradiction
+    defp merge_range(range_acc, col, bound_side, {_kind, bound_val} = bound, %Attribute{} = attr) do
+      if not indexable_literal?(attr, bound_val) do
+        range_acc
       else
-        Map.put(range_acc, col, tightened)
+        current = Map.get(range_acc, col, %{min: :unbounded, max: :unbounded})
+
+        tightened =
+          case bound_side do
+            :min -> %{current | min: tighter_min(current.min, bound, attr)}
+            :max -> %{current | max: tighter_max(current.max, bound, attr)}
+          end
+
+        if range_contradiction?(tightened.min, tightened.max, attr) do
+          :contradiction
+        else
+          Map.put(range_acc, col, tightened)
+        end
       end
     end
 
@@ -860,10 +966,17 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     # Stage 3: Pure-Attribute Pre-Filtering
     # ==========================================================================
 
-    defp stage3_prefilter(records, %__MODULE__{filter: nil}, _resource), do: {:ok, records, nil}
-    defp stage3_prefilter([], _query, _resource), do: {:ok, [], nil}
+    defp stage3_prefilter(_db_or_cursor, records, %__MODULE__{filter: nil}, _resource),
+      do: {:ok, records, nil}
 
-    defp stage3_prefilter(records, %__MODULE__{filter: %Ash.Filter{} = filter} = query, resource) do
+    defp stage3_prefilter(_db_or_cursor, [], _query, _resource), do: {:ok, [], nil}
+
+    defp stage3_prefilter(
+           db_or_cursor,
+           records,
+           %__MODULE__{filter: %Ash.Filter{} = filter} = query,
+           resource
+         ) do
       conjuncts = split_and_conjuncts(filter.expression)
 
       {derived_conjuncts, pure_conjuncts} =
@@ -874,7 +987,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           {:ok, records, filter}
 
         derived_conjuncts == [] ->
-          with {:ok, filtered} <- run_runtime_filter(records, query, resource) do
+          with {:ok, filtered} <- run_runtime_filter(db_or_cursor, records, query, resource) do
             {:ok, filtered, nil}
           end
 
@@ -887,17 +1000,22 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           }
 
           with {:ok, filtered} <-
-                 run_runtime_filter(records, %{query | filter: pure_filter}, resource) do
+                 run_runtime_filter(
+                   db_or_cursor,
+                   records,
+                   %{query | filter: pure_filter},
+                   resource
+                 ) do
             {:ok, filtered, residual_filter}
           end
       end
     end
 
-    defp stage3_prefilter(records, %__MODULE__{filter: filter} = query, resource) do
+    defp stage3_prefilter(db_or_cursor, records, %__MODULE__{filter: filter} = query, resource) do
       if filter_uses_derived_or_related?(filter, resource) do
         {:ok, records, filter}
       else
-        with {:ok, filtered} <- run_runtime_filter(records, query, resource) do
+        with {:ok, filtered} <- run_runtime_filter(db_or_cursor, records, query, resource) do
           {:ok, filtered, nil}
         end
       end
@@ -955,19 +1073,218 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       not is_nil(found?)
     end
 
-    defp run_runtime_filter([], _query, _resource), do: {:ok, []}
-    defp run_runtime_filter(records, %__MODULE__{filter: nil}, _resource), do: {:ok, records}
+    defp run_runtime_filter(_db_or_cursor, [], _query, _resource), do: {:ok, []}
 
-    defp run_runtime_filter(records, %__MODULE__{} = query, _resource) do
+    defp run_runtime_filter(_db_or_cursor, records, %__MODULE__{filter: nil}, _resource),
+      do: {:ok, records}
+
+    defp run_runtime_filter(db_or_cursor, records, %__MODULE__{} = query, resource) do
       actor = get_in_query_context(query, :actor)
 
-      Ash.Filter.Runtime.filter_matches(
-        query.domain,
-        records,
-        query.filter,
-        tenant: query.tenant,
-        actor: actor
+      resolved_filter =
+        preresolve_unrelated_exists(
+          db_or_cursor,
+          resource,
+          query.filter,
+          query.tenant,
+          query.domain
+        )
+
+      if filter_has_parent_unrelated_exists?(resolved_filter) do
+        records
+        |> Enum.reduce_while({:ok, []}, fn record, {:ok, acc} ->
+          per_rec_filter =
+            resolve_parent_unrelated_exists(
+              db_or_cursor,
+              resource,
+              resolved_filter,
+              record,
+              query.tenant,
+              query.domain
+            )
+
+          case Ash.Filter.Runtime.filter_matches(
+                 query.domain,
+                 [record],
+                 per_rec_filter,
+                 tenant: query.tenant,
+                 actor: actor
+               ) do
+            {:ok, [_matched]} -> {:cont, {:ok, [record | acc]}}
+            {:ok, []} -> {:cont, {:ok, acc}}
+            {:error, _} = err -> {:halt, err}
+          end
+        end)
+        |> reverse_ok()
+      else
+        Ash.Filter.Runtime.filter_matches(
+          query.domain,
+          records,
+          resolved_filter,
+          tenant: query.tenant,
+          actor: actor
+        )
+      end
+    end
+
+    @doc false
+    def preresolve_unrelated_exists(_db_or_cursor, _resource, nil, _tenant, _domain), do: nil
+
+    def preresolve_unrelated_exists(
+          db_or_cursor,
+          resource,
+          %Ash.Filter{expression: expr} = filter,
+          tenant,
+          domain
+        ) do
+      %Ash.Filter{
+        filter
+        | expression: preresolve_unrelated_exists(db_or_cursor, resource, expr, tenant, domain)
+      }
+    end
+
+    def preresolve_unrelated_exists(db_or_cursor, resource, expr, tenant, domain) do
+      if expr_has_unrelated_exists?(expr) do
+        Ash.Filter.map(expr, fn
+          %Ash.Query.Exists{related?: false, at_path: [], resource: other_res, expr: ex_expr} =
+              ex ->
+            if not is_nil(other_res) and not filter_uses_parent?(ex_expr) and
+                 Ash.Resource.Info.data_layer(other_res) == Xitdb.Ash.DataLayer do
+              eval_unrelated_exists_node(
+                db_or_cursor,
+                resource,
+                other_res,
+                ex_expr,
+                ex,
+                tenant,
+                domain
+              )
+            else
+              ex
+            end
+
+          other ->
+            other
+        end)
+      else
+        expr
+      end
+    end
+
+    defp expr_has_unrelated_exists?(expr) do
+      not is_nil(
+        Ash.Filter.find(expr, fn
+          %Ash.Query.Exists{related?: false, at_path: []} -> true
+          _ -> false
+        end)
       )
+    end
+
+    defp filter_has_parent_unrelated_exists?(nil), do: false
+
+    defp filter_has_parent_unrelated_exists?(%Ash.Filter{expression: expr}),
+      do: filter_has_parent_unrelated_exists?(expr)
+
+    defp filter_has_parent_unrelated_exists?(expr) do
+      not is_nil(
+        Ash.Filter.find(expr, fn
+          %Ash.Query.Exists{related?: false, at_path: [], expr: ex_expr} ->
+            filter_uses_parent?(ex_expr)
+
+          _ ->
+            false
+        end)
+      )
+    end
+
+    defp resolve_parent_unrelated_exists(
+           db_or_cursor,
+           resource,
+           %Ash.Filter{expression: expr} = filter,
+           record,
+           tenant,
+           domain
+         ) do
+      %Ash.Filter{
+        filter
+        | expression:
+            resolve_parent_unrelated_exists(
+              db_or_cursor,
+              resource,
+              expr,
+              record,
+              tenant,
+              domain
+            )
+      }
+    end
+
+    defp resolve_parent_unrelated_exists(
+           db_or_cursor,
+           resource,
+           expr,
+           record,
+           tenant,
+           domain
+         ) do
+      Ash.Filter.map(expr, fn
+        %Ash.Query.Exists{related?: false, at_path: [], resource: other_res, expr: ex_expr} = ex ->
+          if not is_nil(other_res) and
+               Ash.Resource.Info.data_layer(other_res) == Xitdb.Ash.DataLayer do
+            substituted = substitute_parent_in_filter(ex_expr, record, resource, domain)
+
+            eval_unrelated_exists_node(
+              db_or_cursor,
+              resource,
+              other_res,
+              substituted,
+              ex,
+              tenant,
+              domain
+            )
+          else
+            ex
+          end
+
+        other ->
+          other
+      end)
+    end
+
+    defp eval_unrelated_exists_node(
+           db_or_cursor,
+           resource,
+           other_res,
+           ex_expr,
+           fallback,
+           tenant,
+           domain
+         ) do
+      target_db = resolve_db_for_resource(db_or_cursor, resource, other_res)
+
+      if is_nil(target_db) do
+        fallback
+      else
+        eff_tenant =
+          if Ash.Resource.Info.multitenancy_strategy(other_res) == nil do
+            nil
+          else
+            Map.get(fallback, :tenant) || tenant
+          end
+
+        sub_q = %__MODULE__{
+          resource: other_res,
+          domain: Ash.Resource.Info.domain(other_res) || domain,
+          filter: %Ash.Filter{resource: other_res, expression: ex_expr},
+          tenant: eff_tenant,
+          limit: 1
+        }
+
+        case execute(target_db, sub_q, other_res) do
+          {:ok, matches} -> matches != []
+          {:error, _} -> fallback
+        end
+      end
     end
 
     # ==========================================================================
@@ -1026,11 +1343,14 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         Ash.Filter.list_refs(expr)
 
       Enum.reduce(refs, acc, fn
-        %Ref{attribute: %Calculation{name: name, load: load}}, set ->
-          set |> add_if_atom(name) |> add_if_atom(load)
+        %Ref{attribute: %Calculation{name: name, load: load, opts: opts}}, set ->
+          set
+          |> add_calc_key(name)
+          |> add_calc_key(load)
+          |> collect_calc_opts_expr_refs(opts)
 
         %Ref{attribute: %Aggregate{name: name, load: load}}, set ->
-          set |> add_if_atom(name) |> add_if_atom(load)
+          set |> add_calc_key(name) |> add_calc_key(load)
 
         %Ref{attribute: name}, set when is_atom(name) ->
           MapSet.put(set, name)
@@ -1049,20 +1369,33 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       end)
     end
 
-    defp add_sort_key_names(set, name) when is_atom(name), do: add_if_atom(set, name)
+    defp add_sort_key_names(set, name) when is_atom(name), do: add_calc_key(set, name)
 
-    defp add_sort_key_names(set, %Calculation{name: name, load: load}) do
-      set |> add_if_atom(name) |> add_if_atom(load)
+    defp add_sort_key_names(set, %Calculation{name: name, load: load, opts: opts}) do
+      set
+      |> add_calc_key(name)
+      |> add_calc_key(load)
+      |> collect_calc_opts_expr_refs(opts)
     end
 
     defp add_sort_key_names(set, %Aggregate{name: name, load: load}) do
-      set |> add_if_atom(name) |> add_if_atom(load)
+      set |> add_calc_key(name) |> add_calc_key(load)
     end
 
     defp add_sort_key_names(set, _other), do: set
 
-    defp add_if_atom(set, nil), do: set
-    defp add_if_atom(set, atom) when is_atom(atom), do: MapSet.put(set, atom)
+    defp collect_calc_opts_expr_refs(set, opts) when is_list(opts) do
+      case Keyword.get(opts, :expr) do
+        nil -> set
+        inner_expr -> collect_expr_ref_names(set, inner_expr)
+      end
+    end
+
+    defp collect_calc_opts_expr_refs(set, _opts), do: set
+
+    defp add_calc_key(set, nil), do: set
+    defp add_calc_key(set, key) when is_atom(key) or is_tuple(key), do: MapSet.put(set, key)
+    defp add_calc_key(set, _other), do: set
 
     defp expand_calc_dependencies(needed_set, calculations) do
       Enum.reduce_while(calculations, {:cont, needed_set}, fn {calc, expr}, {_, acc} ->
@@ -1101,7 +1434,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         if is_nil(residual_filter) do
           {:ok, enriched}
         else
-          run_runtime_filter(enriched, %{query | filter: residual_filter}, resource)
+          run_runtime_filter(db_or_cursor, enriched, %{query | filter: residual_filter}, resource)
         end
       end
     end
@@ -1147,7 +1480,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         unrelated_aggregate?(agg, resource) ->
           compute_unrelated_aggregate_for_records(db_or_cursor, records, agg, query, resource)
 
-        per_record_related_aggregate?(agg) ->
+        per_record_related_aggregate?(agg, resource) ->
           compute_per_record_related_aggregate(db_or_cursor, records, agg, query, resource)
 
         true ->
@@ -1163,10 +1496,26 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
     defp unrelated_aggregate?(_agg, _resource), do: false
 
-    defp per_record_related_aggregate?(%Aggregate{} = agg) do
+    defp per_record_related_aggregate?(%Aggregate{} = agg, resource) do
       join_filters = Map.get(agg, :join_filters) || %{}
       filter = get_agg_filter(agg)
-      (join_filters != %{} and join_filters != []) or filter_uses_parent?(filter)
+
+      (join_filters != %{} and join_filters != []) or filter_uses_parent?(filter) or
+        relationship_path_filter_uses_parent?(resource, agg.relationship_path)
+    end
+
+    defp relationship_path_filter_uses_parent?(_resource, []), do: false
+    defp relationship_path_filter_uses_parent?(nil, _path), do: false
+
+    defp relationship_path_filter_uses_parent?(resource, [step | rest]) do
+      case Ash.Resource.Info.relationship(resource, step) do
+        nil ->
+          false
+
+        rel ->
+          filter_uses_parent?(Map.get(rel, :filter)) or
+            relationship_path_filter_uses_parent?(rel.destination, rest)
+      end
     end
 
     defp filter_uses_parent?(nil), do: false
@@ -1241,7 +1590,11 @@ if Code.ensure_loaded?(Ash.DataLayer) do
                 end)
 
               sorted =
-                apply_optional_sort(dest_for_parent, agg_sort, domain: domain, tenant: tenant)
+                apply_optional_sort(dest_for_parent, agg_sort,
+                  domain: domain,
+                  tenant: tenant,
+                  actor: actor
+                )
 
               value = compute_aggregate_value(sorted, agg, dest_res)
               put_aggregate_result(record, agg, value)
@@ -1294,7 +1647,9 @@ if Code.ensure_loaded?(Ash.DataLayer) do
                  ),
                {:ok, loaded} <-
                  ensure_agg_field_loaded(filtered, agg.field, dest_res, domain, tenant, actor) do
-            sorted = apply_optional_sort(loaded, agg_sort, domain: domain, tenant: tenant)
+            sorted =
+              apply_optional_sort(loaded, agg_sort, domain: domain, tenant: tenant, actor: actor)
+
             value = compute_aggregate_value(sorted, agg, dest_res)
             {:cont, {:ok, [put_aggregate_result(parent_record, agg, value) | acc]}}
           else
@@ -1490,41 +1845,43 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       else
         dest_res = rel.destination
         dest_db = resolve_db_for_resource(db_or_cursor, root_res, dest_res)
+        rel_filter = Map.get(rel, :filter)
+        rel_sort = Map.get(rel, :sort)
 
         with {:ok, dest_records} <-
                hop_direct_relationship(dest_db, dest_res, all_curr, rel, tenant, actor, domain) do
-          if Map.get(rel, :no_attributes?, false) do
-            {:ok,
-             Map.new(frontier, fn {idx, curr} ->
-               {idx, if(curr == [], do: [], else: dest_records)}
-             end)}
-          else
-            key_attr =
-              join_attr_for_pair(
-                Ash.Resource.Info.attribute(rel.source, rel.source_attribute),
-                Ash.Resource.Info.attribute(dest_res, rel.destination_attribute)
-              )
+          matcher =
+            if Map.get(rel, :no_attributes?, false) do
+              fn _c -> dest_records end
+            else
+              key_attr =
+                join_attr_for_pair(
+                  Ash.Resource.Info.attribute(rel.source, rel.source_attribute),
+                  Ash.Resource.Info.attribute(dest_res, rel.destination_attribute)
+                )
 
-            grouped =
-              Enum.group_by(dest_records, fn rec ->
-                join_key_value(key_attr, Map.get(rec, rel.destination_attribute))
-              end)
+              grouped =
+                Enum.group_by(dest_records, fn rec ->
+                  join_key_value(key_attr, Map.get(rec, rel.destination_attribute))
+                end)
 
-            next_frontier =
-              Map.new(frontier, fn {idx, curr_list} ->
-                children =
-                  Enum.flat_map(curr_list, fn c ->
-                    case Map.get(c, rel.source_attribute) do
-                      nil -> []
-                      key -> Map.get(grouped, join_key_value(key_attr, key), [])
-                    end
-                  end)
+              fn c ->
+                case Map.get(c, rel.source_attribute) do
+                  nil -> []
+                  key -> Map.get(grouped, join_key_value(key_attr, key), [])
+                end
+              end
+            end
 
-                {idx, children}
-              end)
-
-            {:ok, next_frontier}
-          end
+          build_filtered_sorted_frontier(
+            frontier,
+            matcher,
+            rel_filter,
+            rel_sort,
+            domain,
+            tenant,
+            actor
+          )
         end
       end
     end
@@ -1539,6 +1896,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         dest_res = rel.destination
         join_db = resolve_db_for_resource(db_or_cursor, root_res, join_res)
         dest_db = resolve_db_for_resource(db_or_cursor, root_res, dest_res)
+        rel_filter = Map.get(rel, :filter)
+        rel_sort = Map.get(rel, :sort)
 
         src_join_attr =
           join_attr_for_pair(
@@ -1564,7 +1923,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
                  join_res,
                  rel.source_attribute_on_join_resource,
                  source_vals,
-                 tenant
+                 tenant,
+                 src_join_attr
                ),
              dest_vals =
                join_records
@@ -1577,10 +1937,17 @@ if Code.ensure_loaded?(Ash.DataLayer) do
                  dest_res,
                  rel.destination_attribute,
                  dest_vals,
-                 tenant
+                 tenant,
+                 dest_join_attr
                ),
              {:ok, filtered_dest} <-
-               apply_optional_filter(domain, raw_dest_records, rel.filter, tenant, actor, nil) do
+               maybe_prefilter_rel_dest(
+                 domain,
+                 raw_dest_records,
+                 rel_filter,
+                 tenant,
+                 actor
+               ) do
           joins_by_src =
             Enum.group_by(join_records, fn rec ->
               join_key_value(src_join_attr, Map.get(rec, rel.source_attribute_on_join_resource))
@@ -1591,25 +1958,88 @@ if Code.ensure_loaded?(Ash.DataLayer) do
               join_key_value(dest_join_attr, Map.get(rec, rel.destination_attribute))
             end)
 
-          next_frontier =
-            Map.new(frontier, fn {idx, curr_list} ->
-              children =
-                for curr <- curr_list,
-                    src_val = Map.get(curr, rel.source_attribute),
-                    not is_nil(src_val),
-                    join_row <- Map.get(joins_by_src, join_key_value(src_join_attr, src_val), []),
+          matcher = fn curr ->
+            case Map.get(curr, rel.source_attribute) do
+              nil ->
+                []
+
+              src_val ->
+                for join_row <-
+                      Map.get(joins_by_src, join_key_value(src_join_attr, src_val), []),
                     dest_val = Map.get(join_row, rel.destination_attribute_on_join_resource),
                     not is_nil(dest_val),
-                    dest_row <- Map.get(dest_by_key, join_key_value(dest_join_attr, dest_val), []) do
+                    dest_row <-
+                      Map.get(dest_by_key, join_key_value(dest_join_attr, dest_val), []) do
                   dest_row
                 end
+            end
+          end
 
-              {idx, children}
-            end)
-
-          {:ok, next_frontier}
+          build_filtered_sorted_frontier(
+            frontier,
+            matcher,
+            rel_filter,
+            rel_sort,
+            domain,
+            tenant,
+            actor
+          )
         end
       end
+    end
+
+    defp maybe_prefilter_rel_dest(domain, candidates, rel_filter, tenant, actor) do
+      if filter_uses_parent?(rel_filter) do
+        {:ok, candidates}
+      else
+        apply_optional_filter(domain, candidates, rel_filter, tenant, actor, nil)
+      end
+    end
+
+    defp build_filtered_sorted_frontier(
+           frontier,
+           matcher,
+           rel_filter,
+           rel_sort,
+           domain,
+           tenant,
+           actor
+         ) do
+      sort_opts = [domain: domain, tenant: tenant, actor: actor]
+      per_parent_filter? = filter_uses_parent?(rel_filter)
+
+      Enum.reduce_while(frontier, {:ok, %{}}, fn {idx, curr_list}, {:ok, acc} ->
+        bucket_result =
+          if per_parent_filter? do
+            Enum.reduce_while(curr_list, {:ok, []}, fn curr, {:ok, chunks} ->
+              case matcher.(curr) do
+                [] ->
+                  {:cont, {:ok, chunks}}
+
+                matched ->
+                  case apply_optional_filter(domain, matched, rel_filter, tenant, actor, curr) do
+                    {:ok, filtered} -> {:cont, {:ok, [filtered | chunks]}}
+                    {:error, _} = err -> {:halt, err}
+                  end
+              end
+            end)
+            |> case do
+              {:ok, chunks} -> {:ok, chunks |> Enum.reverse() |> List.flatten()}
+              {:error, _} = err -> err
+            end
+          else
+            {:ok, Enum.flat_map(curr_list, matcher)}
+          end
+
+        case bucket_result do
+          {:ok, children} ->
+            sorted = apply_optional_sort(children, rel_sort, sort_opts)
+            {:cont, {:ok, Map.put(acc, idx, sorted)}}
+
+          {:error, _} = err ->
+            {:halt, err}
+        end
+      end)
     end
 
     defp hop_direct_relationship(dest_db, dest_res, source_records, rel, tenant, actor, domain) do
@@ -1638,24 +2068,40 @@ if Code.ensure_loaded?(Ash.DataLayer) do
             dest_res,
             rel.destination_attribute,
             source_vals,
-            tenant
+            tenant,
+            key_attr
           )
         end
 
       with {:ok, candidates} <- candidates_result do
-        apply_optional_filter(domain, candidates, rel.filter, tenant, actor, nil)
+        maybe_prefilter_rel_dest(domain, candidates, Map.get(rel, :filter), tenant, actor)
       end
     end
 
-    defp fetch_matching_destination_records(_db, _dest_res, _dest_attr, [], _tenant),
+    defp fetch_matching_destination_records(_db, _dest_res, _dest_attr, [], _tenant, _pair_attr),
       do: {:ok, []}
 
-    defp fetch_matching_destination_records(dest_db, dest_res, dest_attr, values, tenant) do
+    defp fetch_matching_destination_records(
+           dest_db,
+           dest_res,
+           dest_attr,
+           values,
+           tenant,
+           pair_attr
+         ) do
       [pk_name | _] = Ash.Resource.Info.primary_key(dest_res)
       nested_fk = nested_foreign_key(dest_res)
+      dest_attr_def = Ash.Resource.Info.attribute(dest_res, dest_attr)
+      effective_pair_attr = pair_attr || dest_attr_def
+
+      ci_string_join_fallback? =
+        ci_string_attr?(effective_pair_attr) and not ci_string_attr?(dest_attr_def)
 
       cursors =
         cond do
+          ci_string_join_fallback? ->
+            Indexer.all_cursors(dest_db, dest_res, tenant)
+
           dest_attr == pk_name ->
             case resolve_pk_candidates(dest_db, dest_res, values, tenant) do
               {:cursors, found} -> found
@@ -1700,20 +2146,25 @@ if Code.ensure_loaded?(Ash.DataLayer) do
             end
         end
 
-      dest_attr_def = Ash.Resource.Info.attribute(dest_res, dest_attr)
-
       with {:ok, hydrated} <- stage2_hydrate(cursors, %__MODULE__{tenant: tenant}, dest_res) do
-        allowed = MapSet.new(values, &join_key_value(dest_attr_def, &1))
+        allowed = MapSet.new(values, &join_key_value(effective_pair_attr, &1))
 
         {:ok,
          Enum.filter(hydrated, fn rec ->
-           MapSet.member?(allowed, join_key_value(dest_attr_def, Map.get(rec, dest_attr)))
+           val = Map.get(rec, dest_attr)
+           val != nil and MapSet.member?(allowed, join_key_value(effective_pair_attr, val))
          end)}
       end
     end
 
-    defp join_attr_for_pair(%Attribute{type: t1} = a1, %Attribute{} = a2) do
-      if t1 in [:ci_string, Ash.Type.CiString], do: a1, else: a2
+    defp ci_string_attr?(%Attribute{type: type, constraints: constraints}) do
+      elem(Codec.unwrap_type(type, constraints), 0) == :ci_string
+    end
+
+    defp ci_string_attr?(_), do: false
+
+    defp join_attr_for_pair(%Attribute{} = a1, %Attribute{} = a2) do
+      if ci_string_attr?(a1), do: a1, else: a2
     end
 
     defp join_attr_for_pair(a1, a2), do: a2 || a1
@@ -1827,10 +2278,23 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
         with {:ok, filtered} <-
                apply_optional_filter(domain, records, agg_filter, agg_tenant, agg_actor, nil),
-             sorted = apply_optional_sort(filtered, agg_sort, domain: domain, tenant: agg_tenant),
              {:ok, loaded} <-
-               ensure_agg_field_loaded(sorted, agg.field, agg_res, domain, agg_tenant, agg_actor) do
-          value = compute_aggregate_value(loaded, agg, agg_res)
+               ensure_agg_field_loaded(
+                 filtered,
+                 agg.field,
+                 agg_res,
+                 domain,
+                 agg_tenant,
+                 agg_actor
+               ) do
+          sorted =
+            apply_optional_sort(loaded, agg_sort,
+              domain: domain,
+              tenant: agg_tenant,
+              actor: agg_actor
+            )
+
+          value = compute_aggregate_value(sorted, agg, agg_res)
           {:cont, {:ok, Map.put(acc, agg.name, value)}}
         else
           {:error, _} = err -> {:halt, err}
@@ -2184,7 +2648,12 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     defp stage5_order_and_slice([], _query, _resource), do: []
 
     defp stage5_order_and_slice(records, %__MODULE__{} = query, resource) do
-      opts = [domain: query.domain, tenant: query.tenant, rekey?: false]
+      opts = [
+        domain: query.domain,
+        tenant: query.tenant,
+        actor: get_in_query_context(query, :actor),
+        rekey?: false
+      ]
 
       records
       |> apply_distinct_and_sort(query.sort, query.distinct, query.distinct_sort, opts, resource)
@@ -2256,11 +2725,25 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     defp normalize_domain(query, _resource), do: query
 
     defp resolve_db_for_resource(current_db, current_resource, target_resource) do
-      if Info.store!(current_resource) == Info.store!(target_resource) do
-        current_db
-      else
-        Store.current_db(Info.store!(target_resource))
+      curr_store = Info.store(current_resource)
+      target_store = Info.store(target_resource)
+
+      cond do
+        curr_store != nil and curr_store == target_store and current_db != nil ->
+          current_db
+
+        target_store != nil ->
+          safe_store_current_db(target_store)
+
+        true ->
+          current_db
       end
+    end
+
+    defp safe_store_current_db(store) do
+      Store.current_db(store)
+    rescue
+      ArgumentError -> nil
     end
 
     defp apply_optional_filter(_domain, records, nil, _tenant, _actor, _parent),
