@@ -207,12 +207,12 @@ min_salary = 115
       users[id].salary == salary,
       salary >= ^min_salary,
       not users[id].flags.set_member("suspended"),
-      reach(id, :manager_id, mgr, users)
+      reach(id, mgr, users[id].manager_id == mgr)
     ]
   end
 ```
 
-- **Transitive Graph Reachability**: Use `reach(from, :edge_field, to)` or `reach(from, :edge_field, to, collection)` in `where` for cycle-safe recursive graph traversal.
+- **Transitive Graph Reachability**: Use `reach(from, to, [depth,] edge_clause)` in `where` for cycle-safe recursive graph traversal where `from` and `to` are logic variables referenced inside `edge_clause` (e.g., `reach(id, mgr, users[id].manager_id == mgr)`).
 - **Cross-Moment Joins**: Wrap any path expression in `at_moment(moment_or_var, path)` (e.g. `at_moment(0, users[id].salary) == old_salary` or `at_moment(m, users[id].role) == role`) to join across historical moments within a single query.
 - **Path Existence & Absence**: Use bare paths (`users[id].mfa_secret`) or negated bare paths (`not users[id].deleted_at`) to filter by key presence without binding a variable.
 
@@ -272,7 +272,7 @@ end
 
 ### Hybrid MDM Extension Rules (`extensions: [Xitdb.Ash.Resource]`)
 
-When attaching `Xitdb.Ash.Resource` as a secondary MDM sync extension onto an external data layer (such as `Ash.DataLayer.Postgres`):
+When attaching `Xitdb.Ash.Resource` as a secondary MDM sync extension onto an external data layer (such as `AshPostgres.DataLayer`):
 - Declare **either** top-level `collection :name` **or** `nested_in ParentResource, as: :slot, parent_key: :fk, key: :entry_key`—never both on an MDM-only `Xitdb.Ash.Resource`, and never declare `indexes` on MDM `nested_in` resources.
 - Every attribute accepted by `sync_update_action` (unless listed in `ignored_sync_attributes`) **must** appear in `editable_fields` or `passthru_fields`, or `VerifySyncProjection` raises a compile-time `Spark.Error.DslError`.
 - Set `require_atomic? false` on `lock_action` and `unlock_action` when your `lock_change` module implements `change/3` via `Ash.Changeset.get_data/2` without an `atomic/3` callback.
@@ -304,6 +304,8 @@ Query the transactional `idx.search.<collection>` B+Tree index and preserve BM25
 
 ```elixir
 # Inside a Domain action or Preparation:
+require Ash.Query
+
 ranked_ids = Xitdb.Ash.Search.ids(MyApp.Accounts.Profile, query_text, limit: 50)
 
 Profile

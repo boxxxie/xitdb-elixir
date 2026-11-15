@@ -13,8 +13,8 @@ All notable changes to this project will be documented in this file.
   - `Xitdb.Ash.Codec`, `Xitdb.Ash.Indexer`, `Xitdb.Ash.Query`, and `Xitdb.Ash.Mutator`: binary index key encoding, single-attribute and composite B+Tree (`:sorted_map`) secondary indexes (`index [:status, :inserted_at]`), automatic `belongs_to` foreign-key indexing (`index_relationships? true`), incoming/outgoing same-store foreign-key cascades (`references` with `:nothing | :delete | :nilify | :restrict`), and co-located `nested_in` physical subtrees with reparenting and child index purging.
   - Compile-time Spark transformers and verifiers: `Xitdb.Ash.Transformers.BuildIndexPlan`, `Xitdb.Ash.Verifiers.VerifyNoSqlFragments`, and `Xitdb.Ash.Verifiers.VerifyCrossStoreReferences`.
 - **Nested Sub-Collections (`nested_in`) & Expanded `Xitdb.Ash.Info` Introspection:**
-  - `nested_in` entity on both `Xitdb.Ash.DataLayer` (co-located parent subtrees for 9-byte `fork` snapshots) and `Xitdb.Ash.Resource` (MDM sub-collections such as `people[id].phones[e164]` or `events[id].conference`).
-  - `Xitdb.Ash.Info.nested_in/1`, `nested_mappings/1`, `nested?/1`, `nested_under/2`, `entity_paths/2`, `indexes/1`, `search_fields/1`, `references/1`, `counted_set_fields/1`, and `index_relationships?/1`.
+  - `nested_in` entity on `Xitdb.Ash.DataLayer` for co-located parent subtrees (enabling 9-byte `fork` snapshots), alongside the MDM `nested_in` support on `Xitdb.Ash.Resource`.
+  - Added `Xitdb.Ash.Info.nested_in/1`, `indexes/1`, `search_fields/1`, `references/1`, `counted_set_fields/1`, and `index_relationships?/1`.
 - **Native Odin NIF Range-Seek & Client Hardening:**
   - `nif_sorted_map_seek/5,6` and `nif_bm25_search/7` NIF entrypoints supporting open-ended lower-bound B+Tree range scans (`prefix_only = 0`) and prefix-bounded scans (`prefix_only = 1`).
   - Structured `%Xitdb.Error{reason: ..., details: ...}` exception module (`Exception.message/1`) and `NimbleOptions` validation schemas across `Xitdb.open/1`, `Xitdb.transact/3`, `Xitdb.query/3`, and `Xitdb.compact/2`.
@@ -23,12 +23,22 @@ All notable changes to this project will be documented in this file.
 ### Changed
 - `Xitdb.Pull` range slices (`field: first..last`) are now inclusive of `last`, matching Elixir's `Enum.slice/2`.
 - Refactored `Xitdb.DSL` into dedicated `PathCompiler`, `DatalogCompiler`, `TxRewriter`, and `TxRuntime` submodules, and inverted `Xitdb.Ash.Tx` compile-time coupling.
-- `VerifySyncProjection` validates `nested_in` mappings (`cardinality: :many` key presence, `parent_key`/`key` attribute existence, and no secondary `indexes` on MDM nested resources).
 
 ### Fixed
 - Escaped `@` and backslashes in selector keys and handled quoted hash-map keys in `TxRuntime` path step parsing.
 - Eliminated cyclic compilation deadlocks in `Xitdb.Ash.Transformers.WireChanges` via per-pair `:persistent_term` caching and `O(1)` staged operation accumulation on `%Xitdb.Cursor{}`.
 - Cloned BM25 top hits out of the local temporary arena before returning in the Raw Odin benchmark runner.
+
+## [1.0.2] - 2026-11-11
+
+### Added
+- `nested_in` entity on the `Xitdb.Ash.Resource` DSL. A resource can now live inside a parent entity (`people[id].phones[e164]`, `events[id].conference`) instead of a top-level collection, and can be nested in several parents.
+- `Xitdb.Ash.Info.nested_mappings/1`, `nested?/1`, `nested_under/2`, and `entity_paths/2` for resolving where a record is stored.
+- `__xitdb_nested_in__/0` is compiled onto every resource.
+
+### Changed
+- `collection` is no longer required when the resource declares `nested_in`.
+- `VerifySyncProjection` rejects resources that declare neither or both of `collection` and `nested_in`, `cardinality: :many` mappings without a `key`, unknown `parent_key`/`key` attributes, and `indexes` on nested resources.
 
 ## [1.0.1] - 2026-11-06
 

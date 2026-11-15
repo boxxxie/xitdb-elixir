@@ -5,7 +5,7 @@
 1. **Native Lock-Free Ash Storage & BM25 Search (`data_layer: Xitdb.Ash.DataLayer`):**
    Persist `Ash.Resource` entities directly in immutable copy-on-write `.xit` files managed by `Xitdb.Ash.Store`—with ~10ns lock-free `:persistent_term` snapshot reads, single/composite B+Tree secondary indexes (`index`), transactional Odin NIF BM25 + prefix search (`search_field` & `Xitdb.Ash.Search`), incoming/outgoing FK cascades (`references`), co-located parent subtrees (`nested_in`), historical time-travel (`Store.with_as_of/3`), and `async: true` sandboxes (`Xitdb.Ash.TestSandbox`).
 2. **Hybrid MDM Sync Extension (`extensions: [Xitdb.Ash.Resource]`):**
-   Attach a declarative [`Spark`](https://hexdocs.pm/spark) DSL extension onto resources backed by another data layer (such as `Ash.DataLayer.Postgres`) for Master Data Management (MDM) projections, survivorship field locks, zero-allocation introspection (`Xitdb.Ash.Info`), compile-time sync verification (`Xitdb.Ash.Verifiers.VerifySyncProjection`), and resource-aware transactions (`tx_for/3,4` and `tx_for!/3,4`).
+   Attach a declarative [`Spark`](https://hexdocs.pm/spark) DSL extension onto resources backed by another data layer (such as `AshPostgres.DataLayer`) for Master Data Management (MDM) projections, survivorship field locks, zero-allocation introspection (`Xitdb.Ash.Info`), compile-time sync verification (`Xitdb.Ash.Verifiers.VerifySyncProjection`), and resource-aware transactions (`tx_for/3,4` and `tx_for!/3,4`).
 
 ---
 
@@ -17,7 +17,7 @@ Add `Xitdb.Ash.Resource` to `extensions:` in `use Ash.Resource` and configure th
 defmodule MyApp.Accounts.Organization do
   use Ash.Resource,
     domain: MyApp.Accounts,
-    data_layer: Ash.DataLayer.Postgres,
+    data_layer: AshPostgres.DataLayer,
     extensions: [Xitdb.Ash.Resource]
 
   xitdb do
@@ -287,6 +287,8 @@ end)
   end)
 ```
 
+### 2. Native `Xitdb.Ash.DataLayer` Resources & `TestSandbox`
+
 For resources persisted directly in `.xit` files without Postgres, set `data_layer: Xitdb.Ash.DataLayer` (which automatically includes the `xitdb do ... end` DSL, secondary `index` / `search_field` / `references` entities, and `Store` transaction coordination) and isolate concurrent tests in `test_helper.exs` / `DataCase` via `Xitdb.Ash.TestSandbox.init()` and `Xitdb.Ash.TestSandbox.checkout([MyApp.MDM.Store])`.
 
 ```elixir
@@ -319,12 +321,37 @@ defmodule MyApp.Accounts.Profile do
       reference :organization, on_delete: :nilify
     end
   end
+
+  attributes do
+    integer_primary_key :id
+    attribute :full_name, :string, allow_nil?: false, public?: true
+    attribute :headline, :string, public?: true
+    attribute :status, :atom, default: :active, public?: true
+    timestamps()
+  end
+
+  relationships do
+    belongs_to :organization, MyApp.Accounts.Organization,
+      attribute_type: :integer,
+      attribute_writable?: true,
+      public?: true
+  end
+
+  actions do
+    defaults [:read, :destroy, create: :*, update: :*]
+  end
+
+  policies do
+    policy always() do
+      authorize_if always()
+    end
+  end
 end
 ```
 
-### 2. Reference `lock_change` Module (`MyApp.MDM.Changes.ModifyLockedFields`)
+### 3. Reference `lock_change` Module for Hybrid MDM (`MyApp.MDM.Changes.ModifyLockedFields`)
 
-`WireChanges` attaches `{lock_change_mod, op: :lock}` to `lock_action` and `{lock_change_mod, op: :unlock}` to `unlock_action`.
+For hybrid MDM resources using `extensions: [Xitdb.Ash.Resource]` (as shown in Section 1), `WireChanges` attaches `{lock_change_mod, op: :lock}` to `lock_action` and `{lock_change_mod, op: :unlock}` to `unlock_action`.
 
 > [!IMPORTANT]
 > Because `ModifyLockedFields` inspects `Ash.Changeset.get_data(changeset, :locked_fields)` inside `change/3` without an `atomic/3` callback—and `WireChanges` preserves your action flags as written—both `lock_action` (`:lock_field`) and `unlock_action` (`:unlock_field`) **must** set `require_atomic? false` on the resource (as shown in Section 1).

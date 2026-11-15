@@ -191,6 +191,7 @@ defmodule MyApp.Accounts.Profile do
   relationships do
     belongs_to :organization, MyApp.Accounts.Organization,
       attribute_type: :integer,
+      attribute_writable?: true,
       public?: true
   end
 
@@ -204,6 +205,8 @@ Query BM25 search rankings, pin historical time-travel snapshots, and isolate `a
 
 ```elixir
 # 1. Ranked BM25 + prefix search preserved on an Ash.Query:
+require Ash.Query
+
 ranked_ids = Xitdb.Ash.Search.ids(MyApp.Accounts.Profile, "alice principal", limit: 25)
 
 profiles =
@@ -220,13 +223,13 @@ end)
 
 ### 2. Hybrid MDM Sync Extension (`extensions: [Xitdb.Ash.Resource]`)
 
-When pairing `Xitdb` with an external primary store (such as `Ash.DataLayer.Postgres`) as an immutable Master Data Management engine or secondary audit graph, add `Xitdb.Ash.Resource` to `extensions:` to configure collections, survivorship/lock fields, nested sub-collections (`nested_in`), and compile-time verified sync projections (`VerifySyncProjection`):
+When pairing `Xitdb` with an external primary store (such as `AshPostgres.DataLayer`) as an immutable Master Data Management engine or secondary audit graph, add `Xitdb.Ash.Resource` to `extensions:` to configure collections, survivorship/lock fields, nested sub-collections (`nested_in`), and compile-time verified sync projections (`VerifySyncProjection`):
 
 ```elixir
 defmodule MyApp.Accounts.Organization do
   use Ash.Resource,
     domain: MyApp.Accounts,
-    data_layer: Ash.DataLayer.Postgres,
+    data_layer: AshPostgres.DataLayer,
     extensions: [Xitdb.Ash.Resource]
 
   xitdb do
@@ -300,7 +303,7 @@ Xitdb.pull!(db["organizations"]["101"], pattern)
 │ Elixir Client & Ash DataLayer (lib/xitdb*.ex)                              │
 │  • %Xitdb{} handle + %Xitdb.Cursor{db_ref, tag, tag_id, value, moment}     │
 │  • Access, Enumerable, Inspect protocols                                   │
-│  • Xitdb.DSL + Xitdb.Pull + Xitdb.TxCompiler + Xitdb.Sigils (~x, ~q)       │
+│  • Xitdb.DSL + Xitdb.Pull + Xitdb.Sigils (~x, ~q)                          │
 │  • Xitdb.Ash.{DataLayer, Store, Search, TestSandbox, Resource, Info, Tx}   │
 ├────────────────────────────────────────────────────────────────────────────┤
 │ C-ABI Erlang NIF Boundary (native/nif_entry.c + native/xitdb_nif.odin)     │

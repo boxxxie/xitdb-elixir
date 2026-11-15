@@ -105,12 +105,11 @@ defmodule Xitdb.MixProject do
         "Macro DSLs, Selectors & Pull": [
           Xitdb.DSL,
           Xitdb.Pull,
-          Xitdb.Selector,
-          Xitdb.Sigils,
-          Xitdb.TxCompiler
+          Xitdb.Sigils
         ],
         "Ash DataLayer, Store & Search": [
           Xitdb.Ash.DataLayer,
+          Xitdb.Ash.Dsl,
           Xitdb.Ash.Store,
           Xitdb.Ash.Search,
           Xitdb.Ash.TestSandbox,
