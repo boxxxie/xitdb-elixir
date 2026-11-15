@@ -16,3 +16,6 @@ All completed tracks from **Waves 0–5** (Tracks 1–17, including split tracks
 
 - [x] **Track: Benchmark Follow-Up Optimizations: Dirty-Tree Sample Isolation, Pull Harness Parity & Bulk Tx Prefix Grouping**
 *Link: [./tracks/benchmark_followup_optimizations_20261115/](./tracks/benchmark_followup_optimizations_20261115/)*
+
+- [ ] **Track: `odin-xitdb` History/Selector Parity, Full Release Pipeline & `elixir/xitdb` Sync**
+*Link: [./tracks/odin_xitdb_history_and_release_sync_20261115/](./tracks/odin_xitdb_history_and_release_sync_20261115/)*

@@ -1,0 +1,10 @@
+{
+  "id": "odin_xitdb_history_and_release_sync_20261115",
+  "title": "odin-xitdb History/Selector Parity, Full Release Pipeline & elixir/xitdb Sync",
+  "type": "feature",
+  "status": "pending",
+  "created_at": "2026-11-15T16:32:00+08:00",
+  "updated_at": "2026-11-15T16:32:00+08:00",
+  "current_phase": "Phase 1: Finalize Upstream Zig 89da8e7 Parity in odin-xitdb",
+  "current_task": "1.1 Audit feat/upstream-parity-89da8e7 against Zig upstream 89da8e7 and master be1b53c"
+}
