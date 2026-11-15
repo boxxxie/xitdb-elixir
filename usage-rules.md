@@ -311,27 +311,47 @@ Query the transactional `idx.search.<collection>` B+Tree index and preserve BM25
 # Inside a Domain action or Preparation:
 require Ash.Query
 
+# Return `{id, score}` hits, or just ranked primary keys:
+hits = Xitdb.Ash.Search.query(MyApp.Accounts.Profile, query_text, limit: 50)
 ranked_ids = Xitdb.Ash.Search.ids(MyApp.Accounts.Profile, query_text, limit: 50)
 
 Profile
 |> Ash.Query.filter(id in ^ranked_ids)
 |> Xitdb.Ash.Search.sort_by_rank(ranked_ids)
+|> Ash.read!()
 ```
 
-When a referenced parent entity changes a field used in a child's `search_field` `resolver:` (for example, `Organization.name` indexed onto `Profile`), call `Xitdb.Ash.Search.reindex_records/3` in an `after_action` hook on the same store so both updates commit in one moment.
+When a referenced parent entity changes a field used in a child's `search_field` `resolver:` (for example, `Organization.name` indexed onto `Profile`), call `Xitdb.Ash.Search.reindex_records(db_or_snapshot, ChildResource, records, tenant \\ nil)` in an `after_action` hook on the same store (setting `require_atomic? false` on the `:update` action, or using a `Change` module that implements `atomic/3`, so Ash 3 does not raise `Ash.Error.Framework.CanNotBeAtomic`):
+
+```elixir
+update :rename do
+  require_atomic? false
+  accept [:name]
+
+  change after_action(fn _changeset, org, _ctx ->
+           profiles = MyApp.Accounts.list_org_profiles!(org.id, authorize?: false)
+
+           Xitdb.Ash.Store.mutate(MyApp.MDM.Store, fn snapshot ->
+             {:ok, Xitdb.Ash.Search.reindex_records(snapshot, MyApp.Accounts.Profile, profiles), :ok}
+           end)
+
+           {:ok, org}
+         end)
+end
+```
 
 ### Time-Travel Queries (`with_as_of/3`, `xitdb_moment`, `as_of:`)
 
-Pin historical moments across `Ash.read`, `Ash.count`, aggregates, relationship loads, and BM25 search without touching the `Store` GenServer:
+Pin historical moments across `Ash.read`, `Ash.count`, aggregates, relationship loads, and BM25 search without touching the `Store` GenServer. Use `Store.with_as_of/3` or `context: %{shared: %{xitdb_moment: prev_moment}}` when loading relationships or calculations (Ash 3 only copies `context[:shared]` to child queries, dropping top-level `context[:xitdb_moment]`):
 
 ```elixir
-# 1. Scoped historical block for all Ash reads & BM25 searches on a store:
+# 1. Scoped historical block for all Ash reads, loads & BM25 searches on a store:
 Xitdb.Ash.Store.with_as_of(MyApp.MDM.Store, prev_moment, fn ->
-  Ash.read!(MyApp.Accounts.Profile)
+  Ash.read!(MyApp.Accounts.Profile, load: [:organization])
 end)
 
-# 2. Per-query Ash context or Search option:
-Ash.read!(MyApp.Accounts.Profile, context: %{xitdb_moment: prev_moment})
+# 2. Per-query Ash context (use `shared:` when loading relationships/calculations) or Search option:
+Ash.read!(MyApp.Accounts.Profile, load: [:organization], context: %{shared: %{xitdb_moment: prev_moment}})
 Xitdb.Ash.Search.ids(MyApp.Accounts.Profile, "northleaf", as_of: prev_moment)
 ```
 
@@ -344,7 +364,7 @@ Xitdb.Ash.Search.ids(MyApp.Accounts.Profile, "northleaf", as_of: prev_moment)
 
 ### Introspection Helpers (`Xitdb.Ash.Info`)
 
-- Use `Xitdb.Ash.Info.pull_fields(Resource)`, `Xitdb.Ash.Info.pull_pattern_for(Resource)`, `Xitdb.Ash.Info.search_fields(Resource)`, `Xitdb.Ash.Info.indexes(Resource)`, and `Xitdb.Ash.Info.resolve_store(Resource, context_or_opts)` instead of hardcoding field lists or index maps.
+- Use `Xitdb.Ash.Info.pull_fields(Resource)`, `Xitdb.Ash.Info.pull_pattern_for(Resource)`, `Xitdb.Ash.Info.search_fields(Resource)`, `Xitdb.Ash.Info.indexes(Resource)`, `Xitdb.Ash.Info.counted_set_fields(Resource)`, and `Xitdb.Ash.Info.resolve_store(Resource, context_or_opts)` instead of hardcoding field lists or index maps.
 - Use `Xitdb.Ash.Info.nested_in(Resource)` for `Xitdb.Ash.DataLayer` co-located subtrees (which support child secondary indexes) and `Xitdb.Ash.Info.nested_mappings(Resource)` for `Xitdb.Ash.Resource` MDM sub-collections (which forbid secondary indexes); `Xitdb.Ash.Info.nested?(Resource)` returns `true` for either.
 - Use `tx_for(db, Resource) do ... end` (`Xitdb.Ash.Tx`) to automatically inject all `index_on` declarations configured on resources so secondary B+Tree indexes never drift on raw transactions.
 

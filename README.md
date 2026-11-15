@@ -185,7 +185,7 @@ defmodule MyApp.Accounts.Profile do
     attribute :full_name, :string, allow_nil?: false, public?: true
     attribute :headline, :string, public?: true
     attribute :status, :atom, default: :active, public?: true
-    timestamps()
+    timestamps(public?: true)
   end
 
   relationships do
@@ -204,9 +204,10 @@ end
 Query BM25 search rankings, pin historical time-travel snapshots, and isolate `async: true` tests via `Xitdb.Ash.TestSandbox`:
 
 ```elixir
-# 1. Ranked BM25 + prefix search preserved on an Ash.Query:
+# 1. Ranked BM25 + prefix search (`query/3` for `{id, score}` hits, or `ids/3` + `sort_by_rank/2` on Ash.Query):
 require Ash.Query
 
+hits = Xitdb.Ash.Search.query(MyApp.Accounts.Profile, "alice principal", limit: 25)
 ranked_ids = Xitdb.Ash.Search.ids(MyApp.Accounts.Profile, "alice principal", limit: 25)
 
 profiles =
@@ -301,7 +302,8 @@ Xitdb.pull!(db["organizations"]["101"], pattern)
 ```
 ┌────────────────────────────────────────────────────────────────────────────┐
 │ Elixir Client & Ash DataLayer (lib/xitdb*.ex)                              │
-│  • %Xitdb{} handle + %Xitdb.Cursor{db_ref, tag, tag_id, value, moment}     │
+│  • %Xitdb{} + %Xitdb.Cursor{db_ref, tag, tag_id, value, full, moment, root,│
+│    tx_mode, path_steps, staged_ops, staged_overrides, deleted_paths}       │
 │  • Access, Enumerable, Inspect protocols                                   │
 │  • Xitdb.DSL + Xitdb.Pull + Xitdb.Sigils (~x, ~q)                          │
 │  • Xitdb.Ash.{DataLayer, Store, Search, TestSandbox, Resource, Info, Tx}   │

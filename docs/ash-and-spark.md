@@ -260,9 +260,10 @@ children = [
 # Lock-free root snapshot cursor (`%Xitdb.Cursor{}` pinned to the latest committed moment):
 root_cursor = MyApp.MDM.Store.root()
 
-# Historical time-travel across `Ash.read`, `Ash.count`, and `Xitdb.Ash.Search`:
+# Historical time-travel across `Ash.read`, `Ash.count`, `load:`, and `Xitdb.Ash.Search`
+# (use `context: %{shared: %{xitdb_moment: ...}}` so Ash 3 propagates to relationship `load:` queries):
 prev_moment = root_cursor.moment
-prev_orgs = Ash.read!(MyApp.Accounts.Organization, context: %{xitdb_moment: prev_moment})
+prev_orgs = Ash.read!(MyApp.Accounts.Organization, context: %{shared: %{xitdb_moment: prev_moment}})
 prev_hits = Xitdb.Ash.Search.ids(MyApp.Accounts.Organization, "northleaf", as_of: prev_moment)
 
 MyApp.MDM.Store.with_as_of(prev_moment, fn ->
@@ -327,7 +328,7 @@ defmodule MyApp.Accounts.Profile do
     attribute :full_name, :string, allow_nil?: false, public?: true
     attribute :headline, :string, public?: true
     attribute :status, :atom, default: :active, public?: true
-    timestamps()
+    timestamps(public?: true)
   end
 
   relationships do
@@ -408,7 +409,7 @@ Key store APIs:
 - `Xitdb.Ash.Store.transact(store, fun, opts \\ [])` — acquires a monitored writer lease (re-entrant with savepoints) and commits or rolls back on `Xitdb.Ash.Store.rollback(store, reason)`.
 - `Xitdb.Ash.Store.mutate(store, fun, opts \\ [])` — executes a raw `{db, moment}` mutation function inside the writer lease.
 - `Xitdb.Ash.Store.as_of(store, moment)` — returns a read-only `%Xitdb.Cursor{}` pinned to `moment`.
-- `Xitdb.Ash.Store.with_as_of(store, moment, fun)` — pins `moment` in process-dictionary context across all `Ash.read`, `Ash.count`, aggregates, relationship loads, and `Xitdb.Ash.Search` calls inside `fun` (or pass `context: %{xitdb_moment: moment}` per Ash call).
+- `Xitdb.Ash.Store.with_as_of(store, moment, fun)` — pins `moment` in process-dictionary context across all `Ash.read`, `Ash.count`, aggregates, relationship loads, and `Xitdb.Ash.Search` calls inside `fun` (or pass `context: %{shared: %{xitdb_moment: moment}}` per Ash call so Ash 3 propagates it to child relationship/calculation queries).
 
 ---
 
@@ -433,7 +434,7 @@ profiles =
 Xitdb.Ash.Search.ids(MyApp.Accounts.Profile, "alice", as_of: prev_moment)
 ```
 
-When a referenced parent record changes a field indexed onto a child via `resolver:`, call `Xitdb.Ash.Search.reindex_records(db_or_snapshot, ChildResource, children)` (using `Xitdb.Ash.Search.lookup_field/4` inside the resolver) in an `after_action` hook on the same store so both updates commit atomically.
+When a referenced parent record changes a field indexed onto a child via `resolver:`, call `Xitdb.Ash.Search.reindex_records(db_or_snapshot, ChildResource, children)` (using `Xitdb.Ash.Search.lookup_field/4` inside the resolver) in an `after_action` hook on the same store (with `require_atomic? false` on the `:update` action, or a `Change` module implementing `atomic/3`) so both updates commit atomically. When destroying a parent with `on_delete: :nilify`, `Xitdb.Ash.Mutator` automatically re-runs child `search_field` resolvers (and `Xitdb.Ash.Search.lookup_field/4` short-circuits to `nil` when given a `nil` ID), purging stale BM25 postings in the same commit; `on_delete: :nothing` requires explicit `reindex_records/4`.
 
 ---
 
@@ -471,3 +472,4 @@ For spawned worker processes (such as `Task.async/1`), share the caller's checke
 - **Native `Xitdb.Ash.DataLayer` (`Xitdb.Ash.Info.nested_in/1`):** Declares a co-located parent subtree (`nested_in :events, foreign_key: :event_id, path: :sessions, cardinality: :many`) enabling 9-byte `fork` snapshots and **supporting** child secondary `index` / `search_field` declarations (with automatic reparenting and child index purging).
 - **Hybrid `Xitdb.Ash.Resource` (`Xitdb.Ash.Info.nested_mappings/1`, `nested_under/2`, `entity_paths/2`):** Declares MDM sub-collection projections (`people[id].phones[e164]`) and **forbids** secondary `indexes` (enforced by `VerifySyncProjection`).
 - **`Xitdb.Ash.Info.nested?/1`:** Returns `true` for either mode (`nested_in/1 != nil or nested_mappings/1 != []`).
+- **`Xitdb.Ash.Info.counted_set_fields/1`:** Returns the list of `{:array, inner_type}` attributes configured via `counted_set_fields [...]` to persist as frequency-counted `:counted_set` collections.
