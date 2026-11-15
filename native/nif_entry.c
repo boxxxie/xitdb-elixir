@@ -221,6 +221,31 @@ int nif_make_map_from_arrays(ErlNifEnv* env, ERL_NIF_TERM* keys, ERL_NIF_TERM* v
     return enif_make_map_from_arrays(env, keys, vals, cnt, map_out);
 }
 
+ERL_NIF_TERM nif_make_new_map(ErlNifEnv* env) {
+    return enif_make_new_map(env);
+}
+
+int nif_make_map_put(ErlNifEnv* env, ERL_NIF_TERM map_in, ERL_NIF_TERM key, ERL_NIF_TERM value, ERL_NIF_TERM* map_out) {
+    return enif_make_map_put(env, map_in, key, value, map_out);
+}
+
+int nif_map_to_kv_list(ErlNifEnv* env, ERL_NIF_TERM map_term, ERL_NIF_TERM* list_out) {
+    ErlNifMapIterator iter;
+    if (!enif_map_iterator_create(env, map_term, &iter, ERL_NIF_MAP_ITERATOR_FIRST)) {
+        return 0;
+    }
+    ERL_NIF_TERM acc = enif_make_list(env, 0);
+    ERL_NIF_TERM k, v;
+    while (enif_map_iterator_get_pair(env, &iter, &k, &v)) {
+        ERL_NIF_TERM pair = enif_make_tuple2(env, k, v);
+        acc = enif_make_list_cell(env, pair, acc);
+        enif_map_iterator_next(env, &iter);
+    }
+    enif_map_iterator_destroy(env, &iter);
+    *list_out = acc;
+    return 1;
+}
+
 static ErlNifFunc nif_funcs[] = {
     {"nif_open",             3, odin_nif_open,             ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"nif_close",            1, odin_nif_close,            ERL_NIF_DIRTY_JOB_IO_BOUND},
@@ -233,13 +258,13 @@ static ErlNifFunc nif_funcs[] = {
     {"nif_slot_contains",    4, odin_nif_slot_contains,    0},
     {"nif_slot_slice",       5, odin_nif_slot_slice,       0},
     {"nif_slot_entries",     5, odin_nif_slot_entries,     0},
-    {"nif_slot_materialize", 4, odin_nif_slot_materialize, 0},
+    {"nif_slot_materialize", 4, odin_nif_slot_materialize, ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_transact",         4, odin_nif_transact,         ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"nif_select",           3, odin_nif_select,           0},
-    {"nif_pull",             4, odin_nif_pull,             0},
-    {"nif_diff_moments",     3, odin_nif_diff_moments,     0},
-    {"nif_history_of",       2, odin_nif_history_of,       0},
-    {"nif_query_datalog",    3, odin_nif_query_datalog,    0},
+    {"nif_pull",             4, odin_nif_pull,             ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_diff_moments",     3, odin_nif_diff_moments,     ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_history_of",       2, odin_nif_history_of,       ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_query_datalog",    3, odin_nif_query_datalog,    ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_compact",          2, odin_nif_compact,          ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"nif_sorted_map_seek",  5, odin_nif_sorted_map_seek,  ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_sorted_map_seek",  6, odin_nif_sorted_map_seek,  ERL_NIF_DIRTY_JOB_CPU_BOUND},
