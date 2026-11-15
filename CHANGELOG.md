@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.1.1] - 2026-11-15
+
+### Fixed
+- **NIF Boundary & Safety Hardening:**
+  - Moved heavy read/query NIFs (`nif_slot_materialize`, `nif_pull`, `nif_diff_moments`, `nif_history_of`, `nif_query_datalog`) to dirty CPU schedulers (`ERL_NIF_DIRTY_JOB_CPU_BOUND`), added rwlock helpers (`acquire_rlock`/`acquire_wlock`), validated forged slots and malformed transaction op terms, and prevented duplicate leaf key crashes when building Erlang maps.
+- **Client, Cursor, Pull & DSL Hardening:**
+  - Added staged overlay prefix purging/forking on `%Xitdb.Cursor{}`, wildcard pull plan splitting/merging with escaped field names in `Xitdb.Pull`, and adversarial key escaping across `Xitdb.DSL`, `Xitdb.Sigils`, and internal selector/Datalog/transaction compilers.
+- **Ash DataLayer, Search & Spark DSL Hardening:**
+  - Restricted `Xitdb.Ash.Search` `:as_of` validation to `:non_neg_integer | nil`, typed `search_field :resolver` as `{:fun, 2} | nil` in `Xitdb.Ash.Dsl` and `Xitdb.Ash.Resource` (supporting inline `fn` resolvers), and hardened `Codec`, `Indexer`, `Mutator`, `Query`, `Store`, and `TestSandbox` edge cases (empty maps, `nil`-valued overrides, lease queue, and snapshot handling).
+- **Benchmarks & Documentation:**
+  - Normalized `Ops` counts in benchmarks `#10` (`Enum.to_list/1`) and `#13` (bulk 100-entity batch transact) to measure per-call/commit latency, fixed `benchmarks/update_readme.sh` to retain all 26 rows across partial commit runs, fixed Ash examples in `README.md` and `docs/ash-and-spark.md`, and cleaned up ExDoc module groups and extras in `mix.exs`.
+
 ## [1.1.0] - 2026-11-14
 
 ### Added
