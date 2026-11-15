@@ -674,6 +674,44 @@ bench_raw_bm25_search :: proc(root_map: xitdb.Read_Hash_Map, collection: string,
 	return out
 }
 
+Bench_Single_Entity_Ctx :: struct {
+	uid: string,
+}
+
+bench_single_entity_cb :: proc(moment_cur: ^xitdb.Write_Cursor, user_data: rawptr) -> xitdb.Error {
+	ctx := (^Bench_Single_Entity_Ctx)(user_data)
+	moment_hm := xitdb.write_hash_map_init(moment_cur^) or_return
+	users_cur := xitdb.hash_map_put_cursor(&moment_hm, "users") or_return
+	users_hm := xitdb.write_hash_map_init(users_cur) or_return
+	u_cur := xitdb.hash_map_put_cursor(&users_hm, ctx.uid) or_return
+	u_hm := xitdb.write_hash_map_init(u_cur) or_return
+	xitdb.hash_map_put(&u_hm, "name", "Alice") or_return
+	xitdb.hash_map_put(&u_hm, "age", u64(30)) or_return
+	xitdb.hash_map_put(&u_hm, "dept", "eng") or_return
+	xitdb.hash_map_put(&u_hm, "city", "Montreal") or_return
+	roles_cur := xitdb.hash_map_put_cursor(&u_hm, "roles") or_return
+	xitdb.cursor_write(&roles_cur, xitdb.Slot{}) or_return
+	roles_al := xitdb.write_array_list_init(roles_cur) or_return
+	xitdb.array_list_append(&roles_al, "admin") or_return
+	xitdb.array_list_append(&roles_al, "staff") or_return
+	return nil
+}
+
+bench_bulk_entities_cb :: proc(moment_cur: ^xitdb.Write_Cursor, _user_data: rawptr) -> xitdb.Error {
+	moment_hm := xitdb.write_hash_map_init(moment_cur^) or_return
+	users_cur := xitdb.hash_map_put_cursor(&moment_hm, "users") or_return
+	users_hm := xitdb.write_hash_map_init(users_cur) or_return
+	for i in 0 ..< 100 {
+		uid := fmt.tprintf("u%d", i)
+		u_cur := xitdb.hash_map_put_cursor(&users_hm, uid) or_return
+		u_hm := xitdb.write_hash_map_init(u_cur) or_return
+		xitdb.hash_map_put(&u_hm, "name", "Alice") or_return
+		xitdb.hash_map_put(&u_hm, "age", u64(30)) or_return
+		xitdb.hash_map_put(&u_hm, "dept", "eng") or_return
+	}
+	return nil
+}
+
 main :: proc() {
 	parse_cli_args()
 	g_records = make([dynamic]Bench_Record, 0, 26)
@@ -955,13 +993,8 @@ main :: proc() {
 		t0 := time.now()
 		for i in 0 ..< 100 {
 			tx := xitdb.tx_init(&d, base_moment = -1, track_changes = false, allocator = context.temp_allocator)
-			uid := fmt.tprintf("u%d", i)
-			_ = xitdb.tx_put(&tx, fmt.tprintf(".users.%s.name", uid), "Alice")
-			_ = xitdb.tx_put(&tx, fmt.tprintf(".users.%s.age", uid), u64(30))
-			_ = xitdb.tx_put(&tx, fmt.tprintf(".users.%s.dept", uid), "eng")
-			_ = xitdb.tx_put(&tx, fmt.tprintf(".users.%s.city", uid), "Montreal")
-			_ = xitdb.tx_put(&tx, fmt.tprintf(".users.%s.roles[0]", uid), "admin")
-			_ = xitdb.tx_put(&tx, fmt.tprintf(".users.%s.roles[1]", uid), "staff")
+			ctx := Bench_Single_Entity_Ctx{uid = fmt.tprintf("u%d", i)}
+			xitdb.tx_with_cursor(&tx, bench_single_entity_cb, &ctx)
 			rep, _ := xitdb.tx_commit(&tx)
 			xitdb.tx_report_destroy(&rep, context.temp_allocator)
 			xitdb.tx_destroy(&tx)
@@ -978,12 +1011,7 @@ main :: proc() {
 		d, _ := xitdb.database_init(&c, xitdb.sha1_hasher())
 		t0 := time.now()
 		tx := xitdb.tx_init(&d, base_moment = -1, track_changes = false, allocator = context.temp_allocator)
-		for i in 0 ..< 100 {
-			uid := fmt.tprintf("u%d", i)
-			_ = xitdb.tx_put(&tx, fmt.tprintf(".users.%s.name", uid), "Alice")
-			_ = xitdb.tx_put(&tx, fmt.tprintf(".users.%s.age", uid), u64(30))
-			_ = xitdb.tx_put(&tx, fmt.tprintf(".users.%s.dept", uid), "eng")
-		}
+		xitdb.tx_with_cursor(&tx, bench_bulk_entities_cb)
 		rep, _ := xitdb.tx_commit(&tx)
 		xitdb.tx_report_destroy(&rep, context.temp_allocator)
 		xitdb.tx_destroy(&tx)

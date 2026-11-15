@@ -755,6 +755,16 @@ resolve_slot_arg :: proc(
 ) {
 	if tag_int == -1 {
 		rc := xitdb.database_root_cursor(&handle.db).read_cursor
+		slot_maybe, s_err := xitdb.cursor_read_path_slot(
+			rc,
+			[]xitdb.Path_Part{xitdb.Array_List_Get{index = val_int}},
+		)
+		if s_err != nil {
+			return {}, true, false, s_err, ""
+		}
+		if m_slot, has_slot := slot_maybe.?; has_slot {
+			return m_slot, true, false, nil, ""
+		}
 		hist, h_err := xitdb.read_array_list_init(rc)
 		if h_err != nil {
 			return {}, true, false, h_err, ""
@@ -773,15 +783,7 @@ resolve_slot_arg :: proc(
 		if resolved < 0 || resolved >= cnt {
 			return {}, true, false, nil, "moment_out_of_range"
 		}
-		slot_maybe, s_err := xitdb.array_list_get_slot(hist, resolved)
-		if s_err != nil {
-			return {}, true, false, s_err, ""
-		}
-		m_slot, has_slot := slot_maybe.?
-		if !has_slot {
-			return {}, true, false, nil, "moment_not_found"
-		}
-		return m_slot, true, false, nil, ""
+		return {}, true, false, nil, "moment_not_found"
 	}
 
 	if tag_int < 0 || tag_int > i64(xitdb.MAX_TAG_VALUE) {
