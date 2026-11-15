@@ -1,0 +1,10 @@
+{
+  "id": "benchmark_followup_optimizations_20261115",
+  "title": "Benchmark Follow-Up Optimizations: Dirty-Tree Sample Isolation, Pull Harness Parity & Bulk Tx Prefix Grouping",
+  "type": "chore",
+  "status": "pending",
+  "created_at": "2026-11-15T13:10:00+08:00",
+  "updated_at": "2026-11-15T13:10:00+08:00",
+  "current_phase": 1,
+  "current_task": "1.1"
+}

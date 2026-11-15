@@ -11,3 +11,8 @@ All completed tracks from **Waves 0–5** (Tracks 1–17, including split tracks
 
 - [x] **Track: Adopt `odin-xitdb` Benchmark Suite Architecture**
 *Link: [./tracks/benchmark_suite_adoption_20261115/](./tracks/benchmark_suite_adoption_20261115/)*
+
+---
+
+- [ ] **Track: Benchmark Follow-Up Optimizations: Dirty-Tree Sample Isolation, Pull Harness Parity & Bulk Tx Prefix Grouping**
+*Link: [./tracks/benchmark_followup_optimizations_20261115/](./tracks/benchmark_followup_optimizations_20261115/)*
