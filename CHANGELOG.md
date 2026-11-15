@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.1.2] - 2026-11-15
+
+### Changed
+- **Client, Cursor, Pull & NIF Performance Optimizations:**
+  - Replaced `:binary.match/2` pattern lists in `Xitdb.Selector` with compile-time byte pattern matching (`bare_key?/1` and `needs_escape?/1`).
+  - Removed redundant `ensure_resolved/1` calls on string/atom keys in `Xitdb.Cursor` (`fetch/2`, `get_and_update/3`, `pop/2`), deferred `steps_to_selector/1` to leaf writes, and added empty-collection fast paths for staged overrides.
+  - Precomputed default `NimbleOptions` schemas in `Xitdb`, skipped `index_rules` `MapSet` allocation when empty, and bypassed `Pull.split_wildcard_plan/1` when patterns contain no `"*"`.
+  - Added subtree `merge_map` transaction operation, Pull fast path, and moment slot lookup fast path in `native/xitdb_nif.odin` (`odin_nif_transact`, `odin_nif_pull`, `odin_nif_sorted_map_seek`, `odin_nif_bm25_search`), and eliminated duplicate step slice cloning and eager visited-map allocation.
+- **Benchmarks & Documentation:**
+  - Added selective 1v1 benchmark runner, git-diff change-to-benchmark planner, dirty-run isolation, and static call-graph code slices (`benchmarks/slices/`), and updated the 1v1 baseline and `~255 ns` NIF boundary cost model documentation.
+  - Expanded `Xitdb.Ash.Store`, `Xitdb.Ash.Search`, `Xitdb.Ash.TestSandbox`, and `nested_in` documentation, and fixed `timestamps` `public?` examples, the `Cursor` diagram, and search notes in `README.md`, `docs/ash-and-spark.md`, and `usage-rules.md`.
+
+### Fixed
+- **Ash `Info` Cache & `Search` Option Validation:**
+  - Keyed `Xitdb.Ash.Info` pair cache by module MD5 and purged stale `:persistent_term` entries on recompile in `Xitdb.Ash.Transformers.WireChanges`.
+  - Restricted `Xitdb.Ash.Search` `:db` option validation to `%Xitdb{}`, `%Xitdb.Cursor{}`, or `nil`, and aligned `reverse_fk` typespecs for `nested_in` resources.
+  - Added test coverage for shared `xitdb_moment` propagation, `:nilify` BM25 cleanup, and raw `nil`/empty map `TxCompiler` assertions.
+
 ## [1.1.1] - 2026-11-15
 
 ### Fixed

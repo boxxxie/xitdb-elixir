@@ -1,7 +1,7 @@
 defmodule Xitdb.MixProject do
   use Mix.Project
 
-  @version "1.1.1"
+  @version "1.1.2"
   @source_url "https://github.com/boxxxie/xitdb-elixir"
 
   def project do
