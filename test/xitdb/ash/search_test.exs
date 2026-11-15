@@ -190,4 +190,10 @@ defmodule Xitdb.Ash.SearchTest do
       Search.query(SearchProfile, "alice", db: db, as_of: -1)
     end
   end
+
+  test "query rejects non-db values passed to :db" do
+    assert_raise NimbleOptions.ValidationError, ~r/db/, fn ->
+      Search.query(SearchProfile, "alice", db: MyApp.Store)
+    end
+  end
 end

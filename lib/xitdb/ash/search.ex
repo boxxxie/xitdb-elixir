@@ -61,10 +61,10 @@ if Code.ensure_loaded?(Ash.DataLayer) do
                       doc: "BM25 document-length normalization parameter."
                     ],
                     db: [
-                      type: :any,
+                      type: {:or, [{:struct, Xitdb}, {:struct, Xitdb.Cursor}, {:in, [nil]}]},
                       default: nil,
                       doc:
-                        "Explicit `%Xitdb{}` handle; defaults to `Xitdb.Ash.Store.current_db/1`."
+                        "Explicit `%Xitdb{}` or `%Xitdb.Cursor{}` handle; defaults to `Xitdb.Ash.Store.current_db/1`."
                     ],
                     as_of: [
                       type: {:or, [:non_neg_integer, {:in, [nil]}]},

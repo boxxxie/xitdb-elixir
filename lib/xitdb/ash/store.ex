@@ -37,10 +37,12 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
     @type working_snapshot :: {Xitdb.t(), non_neg_integer()}
     @type reverse_fk :: %{
-            source_resource: module(),
-            source_collection: atom(),
-            foreign_key: atom(),
-            on_delete: :delete | :nilify | :restrict
+            :source_resource => module(),
+            :source_collection => atom() | nil,
+            :source_attribute => atom(),
+            :destination_attribute => atom(),
+            :on_delete => :delete | :nilify | :restrict,
+            optional(:nested?) => boolean()
           }
 
     @options_schema NimbleOptions.new!(

@@ -321,7 +321,7 @@ Pin historical moments across `Ash.read`, `Ash.count`, aggregates, relationship 
 
 ```elixir
 # 1. Scoped historical block for all Ash reads & BM25 searches on a store:
-MyApp.MDM.Store.with_as_of(prev_moment, fn ->
+Xitdb.Ash.Store.with_as_of(MyApp.MDM.Store, prev_moment, fn ->
   Ash.read!(MyApp.Accounts.Profile)
 end)
 
@@ -332,13 +332,15 @@ Xitdb.Ash.Search.ids(MyApp.Accounts.Profile, "northleaf", as_of: prev_moment)
 
 ### Concurrent Testing (`Xitdb.Ash.TestSandbox`)
 
-- **DO** check out stores in `DataCase` `setup` via `Xitdb.Ash.TestSandbox.checkout([MyApp.MDM.Store, MyApp.AppStore])` and run tests with `async: true`.
+- **DO** call `Xitdb.Ash.TestSandbox.init()` once in `test/test_helper.exs` before `ExUnit.start()`.
+- **DO** optionally pre-seed shared fixtures once via `Xitdb.Ash.TestSandbox.seed_template(MyApp.Store, fn db -> ... end)`, then check out isolated `:memory` stores per test in `DataCase` `setup` via `Xitdb.Ash.TestSandbox.checkout([MyApp.Store])` (with `checkin/2` or `ExUnit.Callbacks.on_exit/1`) and run tests with `async: true`. Use `Xitdb.Ash.TestSandbox.allow(MyApp.Store, self(), child_pid)` when spawned worker processes read/write the checked-out sandbox.
 - **DO** generate unique values via `System.unique_integer([:positive])` for all `identities` in `Ash.Generator` fixtures.
-- **DON'T** check out `Ecto.Adapters.SQL.Sandbox` for domain tests; reserve SQL Sandbox strictly for tests asserting on `oban_jobs` (with `Oban` set to `testing: :manual`).
+- **DO** skip `Ecto.Adapters.SQL.Sandbox` for tests that only touch pure `Xitdb.Ash.DataLayer` resources; **keep** `Ecto.Adapters.SQL.Sandbox` for hybrid `AshPostgres` + `Xitdb.Ash.Resource` tests (or any test touching Postgres/Ecto tables).
 
 ### Introspection Helpers (`Xitdb.Ash.Info`)
 
 - Use `Xitdb.Ash.Info.pull_fields(Resource)`, `Xitdb.Ash.Info.pull_pattern_for(Resource)`, `Xitdb.Ash.Info.search_fields(Resource)`, `Xitdb.Ash.Info.indexes(Resource)`, and `Xitdb.Ash.Info.resolve_store(Resource, context_or_opts)` instead of hardcoding field lists or index maps.
+- Use `Xitdb.Ash.Info.nested_in(Resource)` for `Xitdb.Ash.DataLayer` co-located subtrees (which support child secondary indexes) and `Xitdb.Ash.Info.nested_mappings(Resource)` for `Xitdb.Ash.Resource` MDM sub-collections (which forbid secondary indexes); `Xitdb.Ash.Info.nested?(Resource)` returns `true` for either.
 - Use `tx_for(db, Resource) do ... end` (`Xitdb.Ash.Tx`) to automatically inject all `index_on` declarations configured on resources so secondary B+Tree indexes never drift on raw transactions.
 
 ---

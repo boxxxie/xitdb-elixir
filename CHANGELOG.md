@@ -27,12 +27,17 @@ All notable changes to this project will be documented in this file.
 - **Nested Sub-Collections (`nested_in`) & Expanded `Xitdb.Ash.Info` Introspection:**
   - `nested_in` entity on `Xitdb.Ash.DataLayer` for co-located parent subtrees (enabling 9-byte `fork` snapshots), alongside the MDM `nested_in` support on `Xitdb.Ash.Resource`.
   - Added `Xitdb.Ash.Info.nested_in/1`, `indexes/1`, `search_fields/1`, `references/1`, `counted_set_fields/1`, and `index_relationships?/1`.
-- **Native Odin NIF Range-Seek & Client Hardening:**
+- **Native Odin NIF Range-Seek, Client Hardening & Benchmarks:**
   - `nif_sorted_map_seek/5,6` and `nif_bm25_search/7` NIF entrypoints supporting open-ended lower-bound B+Tree range scans (`prefix_only = 0`) and prefix-bounded scans (`prefix_only = 1`).
   - Structured `%Xitdb.Error{reason: ..., details: ...}` exception module (`Exception.message/1`) and `NimbleOptions` validation schemas across `Xitdb.open/1`, `Xitdb.transact/3`, `Xitdb.query/3`, and `Xitdb.compact/2`.
   - Root-cursor guard on `Xitdb.select/2` returning `{:error, %Xitdb.Error{reason: :non_root_cursor}}` when given a non-root child cursor.
+  - Added two 1v1 benchmark workloads: `#25` (`Search: Sorted_Map B+Tree prefix seek (limit=16)`) and `#26` (`Search: BM25 corpus search (N=200, 2-term prefix, limit=10)`).
 
 ### Changed
+> **Breaking / Behavior Change:**
+> - `Xitdb.Pull` range slices (`field: first..last`) are now **inclusive** of `last` (matching Elixir's `Enum.slice/2`), so `0..2` returns 3 elements (`0`, `1`, `2`) instead of 2. Audit existing `first..last` Pull patterns when upgrading from `1.0.x`.
+> - `Xitdb` operations now return `{:error, %Xitdb.Error{reason: ..., details: ...}}` structs instead of bare error atoms/tuples. Audit `{:error, reason}` pattern matches that expect bare atoms.
+
 - `Xitdb.Pull` range slices (`field: first..last`) are now inclusive of `last`, matching Elixir's `Enum.slice/2`.
 - Refactored `Xitdb.DSL` into dedicated `PathCompiler`, `DatalogCompiler`, `TxRewriter`, and `TxRuntime` submodules, and inverted `Xitdb.Ash.Tx` compile-time coupling.
 

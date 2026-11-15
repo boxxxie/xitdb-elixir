@@ -382,3 +382,92 @@ defmodule MyApp.MDM.Changes.ModifyLockedFields do
   end
 end
 ```
+
+---
+
+## 4. `Xitdb.Ash.Store` (Supervision, Transactions & Time-Travel)
+
+`Xitdb.Ash.Store` is a caller-supervised single-writer `GenServer` that publishes lock-free `:persistent_term` + `:atomics` snapshots (~10ns reads) and coordinates monitored writer leases for transactions:
+
+```elixir
+# Option A: Supervise directly by registered atom name
+children = [
+  {Xitdb.Ash.Store,
+   name: MyApp.Store,
+   path: "/var/data/app.xit",
+   domains: [MyApp.Accounts]}
+]
+
+# Option B: Define a dedicated module with `use Xitdb.Ash.Store`
+defmodule MyApp.Store do
+  use Xitdb.Ash.Store
+end
+```
+
+Key store APIs:
+- `Xitdb.Ash.Store.transact(store, fun, opts \\ [])` — acquires a monitored writer lease (re-entrant with savepoints) and commits or rolls back on `Xitdb.Ash.Store.rollback(store, reason)`.
+- `Xitdb.Ash.Store.mutate(store, fun, opts \\ [])` — executes a raw `{db, moment}` mutation function inside the writer lease.
+- `Xitdb.Ash.Store.as_of(store, moment)` — returns a read-only `%Xitdb.Cursor{}` pinned to `moment`.
+- `Xitdb.Ash.Store.with_as_of(store, moment, fun)` — pins `moment` in process-dictionary context across all `Ash.read`, `Ash.count`, aggregates, relationship loads, and `Xitdb.Ash.Search` calls inside `fun` (or pass `context: %{xitdb_moment: moment}` per Ash call).
+
+---
+
+## 5. `Xitdb.Ash.Search` (BM25 + Prefix Search & Reindexing)
+
+Declare `search_field` entries inside `xitdb do ... end` on `Xitdb.Ash.DataLayer` resources (with optional `boost:` and 2-arity `resolver: fn record, db -> ... end`), then query the transactional `idx.search.<collection>` B+Tree index:
+
+```elixir
+require Ash.Query
+
+# Ranked hits with score metadata, or just ordered IDs:
+hits = Xitdb.Ash.Search.query(MyApp.Accounts.Profile, "alice capital", limit: 25)
+ranked_ids = Xitdb.Ash.Search.ids(MyApp.Accounts.Profile, "alice capital", limit: 25)
+
+profiles =
+  MyApp.Accounts.Profile
+  |> Ash.Query.filter(id in ^ranked_ids)
+  |> Xitdb.Ash.Search.sort_by_rank(ranked_ids)
+  |> Ash.read!()
+
+# Historical search at a prior moment:
+Xitdb.Ash.Search.ids(MyApp.Accounts.Profile, "alice", as_of: prev_moment)
+```
+
+When a referenced parent record changes a field indexed onto a child via `resolver:`, call `Xitdb.Ash.Search.reindex_records(db_or_snapshot, ChildResource, children)` (using `Xitdb.Ash.Search.lookup_field/4` inside the resolver) in an `after_action` hook on the same store so both updates commit atomically.
+
+---
+
+## 6. `Xitdb.Ash.TestSandbox` (Concurrent `async: true` Testing)
+
+`Xitdb.Ash.TestSandbox` isolates `:memory` `%Xitdb{}` snapshots per test process so `async: true` ExUnit suites run concurrently without lock contention:
+
+```elixir
+# test/test_helper.exs
+Xitdb.Ash.TestSandbox.init()
+ExUnit.start()
+
+# Optional once-per-suite fixture template seeding:
+Xitdb.Ash.TestSandbox.seed_template(MyApp.Store, fn db ->
+  # seed shared baseline records and return updated db
+  db
+end)
+
+# test/support/data_case.ex
+setup do
+  :ok = Xitdb.Ash.TestSandbox.checkout([MyApp.Store])
+  on_exit(fn -> Xitdb.Ash.TestSandbox.checkin([MyApp.Store]) end)
+  :ok
+end
+```
+
+For spawned worker processes (such as `Task.async/1`), share the caller's checked-out sandbox via `Xitdb.Ash.TestSandbox.allow(MyApp.Store, self(), worker_pid)`.
+
+---
+
+## 7. `nested_in` Semantics & `Xitdb.Ash.Info` Introspection
+
+`nested_in` exists in both Ash integration modes with distinct storage semantics and `Xitdb.Ash.Info` accessors:
+
+- **Native `Xitdb.Ash.DataLayer` (`Xitdb.Ash.Info.nested_in/1`):** Declares a co-located parent subtree (`nested_in :events, foreign_key: :event_id, path: :sessions, cardinality: :many`) enabling 9-byte `fork` snapshots and **supporting** child secondary `index` / `search_field` declarations (with automatic reparenting and child index purging).
+- **Hybrid `Xitdb.Ash.Resource` (`Xitdb.Ash.Info.nested_mappings/1`, `nested_under/2`, `entity_paths/2`):** Declares MDM sub-collection projections (`people[id].phones[e164]`) and **forbids** secondary `indexes` (enforced by `VerifySyncProjection`).
+- **`Xitdb.Ash.Info.nested?/1`:** Returns `true` for either mode (`nested_in/1 != nil or nested_mappings/1 != []`).

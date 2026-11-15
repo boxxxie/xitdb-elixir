@@ -216,7 +216,7 @@ profiles =
   |> Ash.read!()
 
 # 2. Time-travel any Ash read, aggregate, or BM25 search to an earlier moment:
-MyApp.Store.with_as_of(moment_v0, fn ->
+Xitdb.Ash.Store.with_as_of(MyApp.Store, moment_v0, fn ->
   Ash.read!(MyApp.Accounts.Profile)
 end)
 ```

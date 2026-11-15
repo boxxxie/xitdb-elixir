@@ -406,5 +406,103 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       state = :sys.get_state(pid)
       assert state.queue.active == nil
     end
+
+    test "Store.with_as_of/3 pins historical moments on plain atom-named stores" do
+      {store, _pid} = start_ephemeral_store()
+
+      {:ok, m0} =
+        Store.mutate(store, fn {db, moment} ->
+          {:ok, db2} =
+            Xitdb.transact(db, %{"vals" => %{"v" => 1}}, base_moment: moment)
+
+          m0 = Xitdb.moment_count(db2) - 1
+          {:ok, {db2, m0}, m0}
+        end)
+
+      {:ok, _m1} =
+        Store.mutate(store, fn {db, moment} ->
+          {:ok, db2} =
+            Xitdb.transact(db, %{"vals" => %{"v" => 2}}, base_moment: moment)
+
+          m1 = Xitdb.moment_count(db2) - 1
+          {:ok, {db2, m1}, m1}
+        end)
+
+      assert Store.root(store)["vals"]["v"] == 2
+
+      assert 1 ==
+               Store.with_as_of(store, m0, fn ->
+                 Store.root(store)["vals"]["v"]
+               end)
+
+      assert Store.root(store)["vals"]["v"] == 2
+    end
+
+    test "reverse_fks/2 includes nested_in children with nested?: true" do
+      defmodule NestedParentOrg do
+        use Ash.Resource,
+          domain: nil,
+          data_layer: Xitdb.Ash.DataLayer,
+          validate_domain_inclusion?: false
+
+        xitdb do
+          store(Xitdb.Ash.StoreTest.NestedFkStore)
+          collection(:parent_orgs)
+        end
+
+        attributes do
+          integer_primary_key(:id)
+        end
+      end
+
+      defmodule NestedChildSession do
+        use Ash.Resource,
+          domain: nil,
+          data_layer: Xitdb.Ash.DataLayer,
+          validate_domain_inclusion?: false
+
+        xitdb do
+          store(Xitdb.Ash.StoreTest.NestedFkStore)
+          collection(:nested_sessions)
+
+          nested_in(:parent_orgs,
+            foreign_key: :parent_org_id,
+            path: :sessions,
+            cardinality: :many
+          )
+        end
+
+        attributes do
+          integer_primary_key(:id)
+          attribute(:parent_org_id, :integer, allow_nil?: false, public?: true)
+        end
+      end
+
+      defmodule NestedFkDomain do
+        use Ash.Domain, validate_config_inclusion?: false
+
+        resources do
+          resource(NestedParentOrg)
+          resource(NestedChildSession)
+        end
+      end
+
+      {store, _pid} =
+        start_ephemeral_store(
+          name: Xitdb.Ash.StoreTest.NestedFkStore,
+          domains: [NestedFkDomain]
+        )
+
+      assert [
+               %{
+                 source_resource: NestedChildSession,
+                 source_collection: :nested_sessions,
+                 source_attribute: :parent_org_id,
+                 destination_attribute: :id,
+                 on_delete: :delete,
+                 nested?: true
+               }
+             ] = Store.reverse_fks(store, NestedParentOrg)
+    end
   end
 end
