@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.2.0] - 2026-11-15
+
+### Added
+- **Pre-Tokenized `Xitdb.DSL.path_steps/1` & Direct Step-List API:**
+  - Added [`Xitdb.DSL.path_steps/1`](lib/xitdb/dsl.ex) to compile Elixir path expressions into pre-tokenized `[term()]` path-step lists at compile time, eliminating runtime selector formatting and NIF-side selector parsing.
+  - Widened `Xitdb.select/2`, `Xitdb.select!/2`, `Xitdb.history_of/2`, `Xitdb.fork/3`, and `Xitdb.DSL` transaction helpers (`put`, `put_set_member`, `update`, `rm`, `append`, `slice`, `init_col`) to accept pre-tokenized step lists alongside selector strings.
+
+### Changed
+- **Client & NIF Fast Paths:**
+  - Added stack-buffered step-list execution in `native/xitdb_nif.odin` and fast-path `Xitdb.transact/3`, `Xitdb.insert_at/4`, and `Xitdb.fork/3` clauses for default options and empty staged cursor ops.
+  - Updated 1v1 benchmark baseline, history, and static code slices (`benchmarks/`).
+
 ## [1.1.2] - 2026-11-15
 
 ### Changed
