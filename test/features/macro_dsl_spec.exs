@@ -509,6 +509,8 @@ defmodule Xitdb.Features.MacroDslSpec do
               put metrics["c,d"], 2
               put metrics["e{f}"], 3
               put metrics["g h"], 4
+              put raw_nil_map, %{"keep" => 1, "skip_nil" => nil}
+              put raw_empty_map, %{}
             end
           end)
 
@@ -525,6 +527,8 @@ defmodule Xitdb.Features.MacroDslSpec do
           )
 
     @then resolved_value_is(:dot_metric, 1)
+    @then materialized_subtree_is(["raw_nil_map"], %{"keep" => 1})
+    @then materialized_subtree_is(["raw_empty_map"], %{})
     @then resolved_value_is(:wildcard_card, %{
             "name" => "Alice",
             "role" => "admin",
