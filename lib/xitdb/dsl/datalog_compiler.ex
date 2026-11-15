@@ -22,29 +22,51 @@ defmodule Xitdb.DSL.DatalogCompiler do
 
     {find_ast, from_ast, where_ast} = extract_sections!(exprs, opts[:from], caller)
     {find_parts, find_vars} = compile_find!(find_ast, caller)
-    initial_bindings = init_bindings(from_ast, find_vars, caller)
     where_clauses_ast = unwrap_where_clauses!(where_ast)
+    initial_bindings = init_bindings(from_ast, find_vars, where_clauses_ast, caller)
+    initial_counters = %{wild: 0, cmp: 0}
 
-    {where_segments, _final_bindings} =
-      Enum.reduce(where_clauses_ast, {[], initial_bindings}, fn
-        {:<-, _, [{alias_var, _, ctx}, source_ast]}, {seg_acc, binds}
+    {where_segments, _final_bindings, _counters} =
+      Enum.reduce(where_clauses_ast, {[], initial_bindings, initial_counters}, fn
+        {:<-, _, [{alias_var, _, ctx}, source_ast]}, {seg_acc, binds, counters}
         when is_atom(alias_var) and is_atom(ctx) ->
+          {source_ast2, counters} = replace_path_wildcards(source_ast, counters)
+          norm_alias = normalize_var_atom(alias_var)
+
           new_binds =
-            Map.put(binds, alias_var, build_collection_binding(source_ast, alias_var, caller))
+            Map.put(binds, norm_alias, build_collection_binding(source_ast2, norm_alias, caller))
 
-          {seg_acc, new_binds}
+          {seg_acc, new_binds, counters}
 
-        clause_ast, {seg_acc, binds} ->
-          clause_segs = compile_where_clause!(clause_ast, find_vars, binds, caller)
+        clause_ast, {seg_acc, binds, counters} ->
+          {expanded_clauses, counters} = expand_and_desugar_clause(clause_ast, counters)
 
-          line_segs =
-            case seg_acc do
-              [] -> clause_segs
-              _ -> [{:static, "\n  "} | clause_segs]
-            end
+          seg_acc =
+            Enum.reduce(expanded_clauses, seg_acc, fn expanded_clause, inner_acc ->
+              clause_segs = compile_where_clause!(expanded_clause, find_vars, binds, caller)
 
-          {seg_acc ++ line_segs, binds}
+              line_segs =
+                case inner_acc do
+                  [] -> clause_segs
+                  _ -> [{:static, "\n  "} | clause_segs]
+                end
+
+              inner_acc ++ line_segs
+            end)
+
+          {seg_acc, binds, counters}
       end)
+
+    all_vars =
+      MapSet.union(
+        MapSet.new(find_vars, &format_logic_var/1),
+        extract_static_vars(where_segments)
+      )
+
+    if MapSet.size(all_vars) > 16 do
+      raise ArgumentError,
+            "Datalog query uses #{MapSet.size(all_vars)} logic variables (maximum is 16)"
+    end
 
     header = "find " <> Enum.join(find_parts, ", ") <> "\nwhere\n  "
     PathCompiler.fold_and_quote([{:static, header} | where_segments])
@@ -82,30 +104,110 @@ defmodule Xitdb.DSL.DatalogCompiler do
           "invalid pinned bracket key in Datalog path: #{inspect(invalid)}"
   end
 
-  defp init_bindings(nil, _find_vars, _caller), do: %{}
+  defp init_bindings(nil, _find_vars, _where_clauses, _caller), do: %{}
 
-  defp init_bindings({alias_var, col_ast}, _find_vars, caller) when is_atom(alias_var) do
-    %{alias_var => build_collection_binding(col_ast, alias_var, caller)}
+  defp init_bindings({alias_var, col_ast}, _find_vars, _where_clauses, caller)
+       when is_atom(alias_var) do
+    norm_alias = normalize_var_atom(alias_var)
+    %{norm_alias => build_collection_binding(col_ast, norm_alias, caller)}
   end
 
-  defp init_bindings({col_name, _, ctx} = col_ast, find_vars, caller)
+  defp init_bindings({col_name, _, ctx} = col_ast, find_vars, where_clauses, caller)
        when is_atom(col_name) and is_atom(ctx) do
-    primary_var = List.first(find_vars) || :_e
+    norm_col = normalize_var_atom(col_name)
+    primary_var = select_primary_var(find_vars, where_clauses, norm_col)
 
-    if primary_var == col_name do
-      %{col_name => build_collection_binding(col_ast, col_name, caller)}
+    if primary_var == norm_col do
+      %{norm_col => build_collection_binding(col_ast, norm_col, caller)}
     else
       %{
         primary_var => build_collection_binding(col_ast, primary_var, caller),
-        col_name => build_collection_binding(col_ast, :_e, caller)
+        norm_col => build_collection_binding(col_ast, :_e, caller)
       }
     end
   end
 
-  defp init_bindings(col_ast, find_vars, caller) do
-    primary_var = List.first(find_vars) || :e
+  defp init_bindings(col_ast, find_vars, where_clauses, caller) do
+    primary_var = select_primary_var(find_vars, where_clauses, nil)
     %{primary_var => build_collection_binding(col_ast, primary_var, caller)}
   end
+
+  defp select_primary_var(find_vars, where_clauses, excluded_col) do
+    rebound_vars =
+      Enum.reduce(where_clauses, MapSet.new(), fn
+        {:<-, _, [{alias_var, _, ctx}, _]}, acc when is_atom(alias_var) and is_atom(ctx) ->
+          MapSet.put(acc, normalize_var_atom(alias_var))
+
+        _, acc ->
+          acc
+      end)
+
+    excluded =
+      [:root, :_]
+      |> then(fn list -> if excluded_col, do: [excluded_col | list], else: list end)
+      |> MapSet.new()
+      |> MapSet.union(rebound_vars)
+
+    candidate_roots =
+      where_clauses
+      |> Enum.flat_map(&collect_member_root_vars(&1, find_vars, excluded))
+      |> Enum.uniq()
+
+    Enum.find(find_vars, fn var -> var in candidate_roots end) ||
+      List.first(candidate_roots) ||
+      List.first(find_vars) ||
+      :_e
+  end
+
+  defp collect_member_root_vars(ast, find_vars, excluded) do
+    {_ast, vars} =
+      Macro.prewalk(ast, [], fn
+        {{:., _, [left, _field]}, _, []} = node, acc ->
+          case extract_root_var(left) do
+            {:ok, var} ->
+              if MapSet.member?(excluded, var), do: {node, acc}, else: {node, [var | acc]}
+
+            :none ->
+              {node, acc}
+          end
+
+        {{:., _, [left, mod_or_set]}, _, [_]} = node, acc
+        when is_atom(mod_or_set) and mod_or_set != :get ->
+          case extract_root_var(left) do
+            {:ok, var} ->
+              if MapSet.member?(excluded, var), do: {node, acc}, else: {node, [var | acc]}
+
+            :none ->
+              {node, acc}
+          end
+
+        {{:., _, [Access, :get]}, _, [left, _right]} = node, acc ->
+          case extract_root_var(left) do
+            {:ok, var} ->
+              if var in find_vars and not MapSet.member?(excluded, var) do
+                {node, [var | acc]}
+              else
+                {node, acc}
+              end
+
+            :none ->
+              {node, acc}
+          end
+
+        node, acc ->
+          {node, acc}
+      end)
+
+    Enum.reverse(vars)
+  end
+
+  defp extract_root_var({var, _, ctx}) when is_atom(var) and is_atom(ctx),
+    do: {:ok, normalize_var_atom(var)}
+
+  defp extract_root_var({:at_moment, _, [_, inner]}), do: extract_root_var(inner)
+  defp extract_root_var({{:., _, [Access, :get]}, _, [left, _]}), do: extract_root_var(left)
+  defp extract_root_var({{:., _, [left, _]}, _, _}), do: extract_root_var(left)
+  defp extract_root_var(_), do: :none
 
   defp extract_sections!(exprs, default_from, caller) do
     exprs
@@ -223,12 +325,19 @@ defmodule Xitdb.DSL.DatalogCompiler do
          caller
        )
        when is_atom(from_var) and is_atom(c1) and is_atom(to_var) and is_atom(c2) do
-    reach_vars =
-      Enum.uniq(find_vars ++ [normalize_var_atom(from_var), normalize_var_atom(to_var)])
+    from_norm = normalize_var_atom(from_var)
+    to_norm = normalize_var_atom(to_var)
 
+    if from_norm == to_norm do
+      raise ArgumentError,
+            "reach/3 requires distinct from and to logic variables, got: #{format_logic_var(from_var)}"
+    end
+
+    reach_vars = Enum.uniq(find_vars ++ [from_norm, to_norm])
     edge_segs = compile_where_clause!(edge_clause, reach_vars, binds, caller)
+    validate_reach_edge_vars!(edge_segs, from_norm, to_norm)
 
-    [{:static, "reach(#{format_logic_var(from_var)}, #{format_logic_var(to_var)}, "}] ++
+    [{:static, "reach(#{format_logic_var(from_norm)}, #{format_logic_var(to_norm)}, "}] ++
       edge_segs ++
       [{:static, ")"}]
   end
@@ -241,24 +350,30 @@ defmodule Xitdb.DSL.DatalogCompiler do
        )
        when is_atom(from_var) and is_atom(c1) and is_atom(to_var) and is_atom(c2) and
               is_atom(depth_var) and is_atom(c3) do
-    reach_vars =
-      Enum.uniq(
-        find_vars ++
-          [
-            normalize_var_atom(from_var),
-            normalize_var_atom(to_var),
-            normalize_var_atom(depth_var)
-          ]
-      )
+    from_norm = normalize_var_atom(from_var)
+    to_norm = normalize_var_atom(to_var)
+    depth_norm = normalize_var_atom(depth_var)
 
+    if from_norm == to_norm do
+      raise ArgumentError,
+            "reach/4 requires distinct from and to logic variables, got: #{format_logic_var(from_var)}"
+    end
+
+    reach_vars = Enum.uniq(find_vars ++ [from_norm, to_norm, depth_norm])
     edge_segs = compile_where_clause!(edge_clause, reach_vars, binds, caller)
+    validate_reach_edge_vars!(edge_segs, from_norm, to_norm)
 
     [
       {:static,
-       "reach(#{format_logic_var(from_var)}, #{format_logic_var(to_var)}, #{format_logic_var(depth_var)}, "}
+       "reach(#{format_logic_var(from_norm)}, #{format_logic_var(to_norm)}, #{format_logic_var(depth_norm)}, "}
     ] ++
       edge_segs ++
       [{:static, ")"}]
+  end
+
+  defp compile_where_clause!({:reach, _, args}, _find_vars, _binds, _caller) do
+    raise ArgumentError,
+          "reach/3,4 requires logic variables for from, to (and optional depth), got: #{Enum.map_join(args, ", ", &Macro.to_string/1)}"
   end
 
   defp compile_where_clause!({pred, _, [arg1, arg2]}, _find_vars, _binds, caller)
@@ -321,8 +436,18 @@ defmodule Xitdb.DSL.DatalogCompiler do
   end
 
   defp datalog_path_expr?({:at_moment, _, [_, _]}), do: true
-  defp datalog_path_expr?({{:., _, _}, _, _}), do: true
-  defp datalog_path_expr?({mod_fn, _, _}) when is_typed_modifier(mod_fn), do: true
+  defp datalog_path_expr?({{:., _, [Access, :get]}, _, [_, _]}), do: true
+
+  defp datalog_path_expr?({{:., _, [_left, mod_fn]}, _, [_]}) when is_typed_modifier(mod_fn),
+    do: true
+
+  defp datalog_path_expr?({{:., _, [_left, set_fn]}, _, [_]}) when is_set_modifier(set_fn),
+    do: true
+
+  defp datalog_path_expr?({{:., _, [left, field]}, _, []}) when is_atom(field),
+    do: not match?({:__aliases__, _, _}, left)
+
+  defp datalog_path_expr?({mod_fn, _, [_]}) when is_typed_modifier(mod_fn), do: true
   defp datalog_path_expr?(_), do: false
 
   defp compile_path_segments({:root, _, ctx}, _find_vars, _binds, _caller) when is_atom(ctx),
@@ -373,10 +498,12 @@ defmodule Xitdb.DSL.DatalogCompiler do
          caller
        )
        when is_atom(root_name) and is_atom(ctx) do
+    norm_root = normalize_var_atom(root_name)
+
     base_segs =
       cond do
-        root_name in [:root, :_] -> []
-        Map.has_key?(binds, root_name) -> Map.fetch!(binds, root_name)
+        norm_root in [:root, :_] -> []
+        Map.has_key?(binds, norm_root) -> Map.fetch!(binds, norm_root)
         true -> [{:static, Selector.format_step(:hash_map, root_name)}]
       end
 
@@ -527,6 +654,263 @@ defmodule Xitdb.DSL.DatalogCompiler do
       atom
     end
   end
+
+  defp validate_reach_edge_vars!(edge_segs, from_norm, to_norm) do
+    edge_vars = extract_static_vars(edge_segs)
+    from_str = format_logic_var(from_norm)
+    to_str = format_logic_var(to_norm)
+
+    missing =
+      [from_str, to_str]
+      |> Enum.reject(&MapSet.member?(edge_vars, &1))
+
+    if missing != [] do
+      raise ArgumentError,
+            "reach edge clause must reference both #{from_str} and #{to_str}, missing: #{Enum.join(missing, ", ")}"
+    end
+  end
+
+  defp expand_and_desugar_clause(clause_ast, counters) do
+    {rewritten, counters} = replace_clause_wildcards(clause_ast, counters)
+    expand_comparisons(rewritten, counters)
+  end
+
+  defp replace_clause_wildcards({:not, meta, [inner]}, counters) do
+    {inner2, counters} = replace_clause_wildcards(inner, counters)
+    {{:not, meta, [inner2]}, counters}
+  end
+
+  defp replace_clause_wildcards({:reach, meta, [from_ast, to_ast, edge]}, counters) do
+    {edge2, counters} = replace_clause_wildcards(edge, counters)
+    {{:reach, meta, [from_ast, to_ast, edge2]}, counters}
+  end
+
+  defp replace_clause_wildcards({:reach, meta, [from_ast, to_ast, depth_ast, edge]}, counters) do
+    {edge2, counters} = replace_clause_wildcards(edge, counters)
+    {{:reach, meta, [from_ast, to_ast, depth_ast, edge2]}, counters}
+  end
+
+  defp replace_clause_wildcards({op, meta, [lhs, rhs]}, counters)
+       when op in [:==, :=, :!=, :>, :>=, :<, :<=] do
+    {lhs2, counters} =
+      if datalog_path_expr?(lhs),
+        do: replace_path_wildcards(lhs, counters),
+        else: replace_scalar_wildcards(lhs, counters)
+
+    {rhs2, counters} =
+      if datalog_path_expr?(rhs),
+        do: replace_path_wildcards(rhs, counters),
+        else: replace_scalar_wildcards(rhs, counters)
+
+    {{op, meta, [lhs2, rhs2]}, counters}
+  end
+
+  defp replace_clause_wildcards({pred, meta, [arg1, arg2]}, counters) when pred in @predicates do
+    {arg1_2, counters} = replace_scalar_wildcards(arg1, counters)
+    {arg2_2, counters} = replace_scalar_wildcards(arg2, counters)
+    {{pred, meta, [arg1_2, arg2_2]}, counters}
+  end
+
+  defp replace_clause_wildcards({{:., m1, [left, set_fn]}, m2, [member_arg]}, counters)
+       when is_set_modifier(set_fn) do
+    {left2, counters} = replace_path_wildcards(left, counters)
+    {arg2, counters} = replace_scalar_wildcards(member_arg, counters)
+    {{{:., m1, [left2, set_fn]}, m2, [arg2]}, counters}
+  end
+
+  defp replace_clause_wildcards({set_fn, meta, [left, member_arg]}, counters)
+       when is_set_modifier(set_fn) do
+    {left2, counters} = replace_path_wildcards(left, counters)
+    {arg2, counters} = replace_scalar_wildcards(member_arg, counters)
+    {{set_fn, meta, [left2, arg2]}, counters}
+  end
+
+  defp replace_clause_wildcards(other, counters) do
+    if datalog_path_expr?(other) do
+      replace_path_wildcards(other, counters)
+    else
+      {other, counters}
+    end
+  end
+
+  defp replace_path_wildcards({:_, _, ctx} = node, counters) when is_atom(ctx),
+    do: {node, counters}
+
+  defp replace_path_wildcards({:at_moment, meta, [moment_ast, inner_ast]}, counters) do
+    {moment2, counters} = replace_scalar_wildcards(moment_ast, counters)
+    {inner2, counters} = replace_path_wildcards(inner_ast, counters)
+    {{:at_moment, meta, [moment2, inner2]}, counters}
+  end
+
+  defp replace_path_wildcards({{:., m1, [Access, :get]}, m2, [left, right]}, counters) do
+    {left2, counters} = replace_path_wildcards(left, counters)
+    {right2, counters} = replace_bracket_wildcards(right, counters)
+    {{{:., m1, [Access, :get]}, m2, [left2, right2]}, counters}
+  end
+
+  defp replace_path_wildcards({{:., m1, [left, set_fn]}, m2, [arg]}, counters)
+       when is_set_modifier(set_fn) do
+    {left2, counters} = replace_path_wildcards(left, counters)
+    {arg2, counters} = replace_scalar_wildcards(arg, counters)
+    {{{:., m1, [left2, set_fn]}, m2, [arg2]}, counters}
+  end
+
+  defp replace_path_wildcards({{:., m1, [left, mod_fn]}, m2, [arg]}, counters)
+       when is_typed_modifier(mod_fn) do
+    {left2, counters} = replace_path_wildcards(left, counters)
+    {{{:., m1, [left2, mod_fn]}, m2, [arg]}, counters}
+  end
+
+  defp replace_path_wildcards({{:., m1, [left, field]}, m2, []}, counters) when is_atom(field) do
+    {left2, counters} = replace_path_wildcards(left, counters)
+    {{{:., m1, [left2, field]}, m2, []}, counters}
+  end
+
+  defp replace_path_wildcards(other, counters), do: {other, counters}
+
+  defp replace_bracket_wildcards([inner], counters) do
+    {inner2, counters} = replace_scalar_wildcards(inner, counters)
+    {[inner2], counters}
+  end
+
+  defp replace_bracket_wildcards(other, counters),
+    do: replace_scalar_wildcards(other, counters)
+
+  defp replace_scalar_wildcards({:_, _, ctx}, %{wild: n} = counters) when is_atom(ctx) do
+    {{:"?__wild_#{n}", [], nil}, %{counters | wild: n + 1}}
+  end
+
+  defp replace_scalar_wildcards(other, counters), do: {other, counters}
+
+  defp expand_comparisons({:not, meta, [inner]}, counters) do
+    {inner_clauses, counters} = expand_comparisons(inner, counters)
+    {lead, [last]} = Enum.split(inner_clauses, -1)
+    {lead ++ [{:not, meta, [last]}], counters}
+  end
+
+  defp expand_comparisons({:reach, meta, [from_ast, to_ast, edge]}, counters) do
+    case expand_comparisons(edge, counters) do
+      {[edge2], counters} ->
+        {{:reach, meta, [from_ast, to_ast, edge2]}, counters} |> wrap_single()
+
+      _ ->
+        raise ArgumentError, "reach/3 edge clause cannot contain multi-clause comparisons"
+    end
+  end
+
+  defp expand_comparisons({:reach, meta, [from_ast, to_ast, depth_ast, edge]}, counters) do
+    case expand_comparisons(edge, counters) do
+      {[edge2], counters} ->
+        {{:reach, meta, [from_ast, to_ast, depth_ast, edge2]}, counters} |> wrap_single()
+
+      _ ->
+        raise ArgumentError, "reach/4 edge clause cannot contain multi-clause comparisons"
+    end
+  end
+
+  defp expand_comparisons({op, _meta, [lhs, rhs]}, counters)
+       when op in [:==, :=, :!=, :>, :>=, :<, :<=] do
+    {op, lhs, rhs} = normalize_comparison_order(op, lhs, rhs)
+    lhs_path? = datalog_path_expr?(lhs)
+    rhs_path? = datalog_path_expr?(rhs)
+
+    cond do
+      op in [:==, :=] and lhs_path? and not rhs_path? ->
+        {[{op, [], [lhs, rhs]}], counters}
+
+      lhs_path? and rhs_path? ->
+        {v1, counters} = next_cmp_var(counters)
+        {v2, counters} = next_cmp_var(counters)
+        scalar_op = if op == :=, do: :==, else: op
+        {[{:=, [], [lhs, v1]}, {:=, [], [rhs, v2]}, {scalar_op, [], [v1, v2]}], counters}
+
+      lhs_path? ->
+        {v1, counters} = next_cmp_var(counters)
+        {[{:=, [], [lhs, v1]}, {op, [], [v1, rhs]}], counters}
+
+      true ->
+        {[{op, [], [lhs, rhs]}], counters}
+    end
+  end
+
+  defp expand_comparisons(other, counters), do: {[other], counters}
+
+  defp wrap_single({clause, counters}), do: {[clause], counters}
+
+  defp normalize_comparison_order(op, lhs, rhs) do
+    lhs_path? = datalog_path_expr?(lhs)
+    rhs_path? = datalog_path_expr?(rhs)
+
+    cond do
+      not lhs_path? and rhs_path? ->
+        {flip_cmp_op(op), rhs, lhs}
+
+      not lhs_path? and not rhs_path? and is_pin_or_literal?(lhs) and logic_var_ast?(rhs) ->
+        {flip_cmp_op(op), rhs, lhs}
+
+      true ->
+        {op, lhs, rhs}
+    end
+  end
+
+  defp flip_cmp_op(:<), do: :>
+  defp flip_cmp_op(:<=), do: :>=
+  defp flip_cmp_op(:>), do: :<
+  defp flip_cmp_op(:>=), do: :<=
+  defp flip_cmp_op(op), do: op
+
+  defp is_pin_or_literal?({:^, _, [_]}), do: true
+  defp is_pin_or_literal?({:-, _, [n]}) when is_integer(n) or is_float(n), do: true
+
+  defp is_pin_or_literal?(v) when is_binary(v) or is_number(v) or is_boolean(v) or is_atom(v),
+    do: true
+
+  defp is_pin_or_literal?(_), do: false
+
+  defp logic_var_ast?({name, _, ctx}) when is_atom(name) and is_atom(ctx), do: true
+  defp logic_var_ast?(_), do: false
+
+  defp next_cmp_var(%{cmp: n} = counters) do
+    {{:"?__cmp_#{n}", [], nil}, %{counters | cmp: n + 1}}
+  end
+
+  defp extract_static_vars(segments) do
+    segments
+    |> Enum.reduce(MapSet.new(), fn
+      {:static, bin}, acc when is_binary(bin) -> scan_vars_outside_quotes(bin, false, false, acc)
+      _, acc -> acc
+    end)
+  end
+
+  defp scan_vars_outside_quotes(<<>>, _in_q, _esc, acc), do: acc
+
+  defp scan_vars_outside_quotes(<<?\\, _, rest::binary>>, true, false, acc),
+    do: scan_vars_outside_quotes(rest, true, false, acc)
+
+  defp scan_vars_outside_quotes(<<?", rest::binary>>, in_q, false, acc),
+    do: scan_vars_outside_quotes(rest, not in_q, false, acc)
+
+  defp scan_vars_outside_quotes(<<??, rest::binary>>, false, false, acc) do
+    case consume_ident(rest, []) do
+      {"", tail} -> scan_vars_outside_quotes(tail, false, false, acc)
+      {ident, tail} -> scan_vars_outside_quotes(tail, false, false, MapSet.put(acc, "?" <> ident))
+    end
+  end
+
+  defp scan_vars_outside_quotes(<<_, rest::binary>>, in_q, _esc, acc),
+    do: scan_vars_outside_quotes(rest, in_q, false, acc)
+
+  defp consume_ident(<<c, rest::binary>>, [])
+       when c in ?A..?Z or c in ?a..?z or c == ?_ do
+    consume_ident(rest, [c])
+  end
+
+  defp consume_ident(<<c, rest::binary>>, [_ | _] = acc)
+       when c in ?A..?Z or c in ?a..?z or c in ?0..?9 or c == ?_ do
+    consume_ident(rest, [c | acc])
+  end
+
+  defp consume_ident(rest, acc), do: {IO.iodata_to_binary(:lists.reverse(acc)), rest}
 
   defp compile_error!(%Macro.Env{file: file, line: line}, description) do
     raise CompileError, file: file, line: line, description: description

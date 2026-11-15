@@ -252,6 +252,20 @@ defmodule Xitdb.Features.MacroDslSpec do
               %{"username" => "carol", "profile" => %{"city" => "Paris"}}
             ]
           })
+
+    @upon executing_dsl_transaction(fn db ->
+            tx db, base_moment: 0, doc: "branch from staging" do
+              put config.env, "canary"
+              put branch_flag, true
+            end
+          end)
+    @upon selecting_path(:v1_after_branch, path(at_moment(1, config.env)))
+
+    @then database_moment_count_is(3)
+    @then resolved_value_is(:v1_after_branch, "prod")
+    @then access_path_equals(["config", "env"], "canary")
+    @then access_path_equals(["branch_flag"], true)
+    @then access_path_equals(["accounts", "a1"], nil)
   end
 
   scenario "datalog supports top-level from clause, min/max aggregations, contains predicate, sorted/counted sets, and historical moment queries" do
@@ -475,5 +489,53 @@ defmodule Xitdb.Features.MacroDslSpec do
             [0, 100],
             [1, 130]
           ])
+  end
+
+  scenario "tx, path, and pull_pattern preserve wildcard overrides and special-character map keys" do
+    @given memory_database()
+    @upon executing_dsl_transaction(fn db ->
+            tx db do
+              put user.name, "Alice"
+              put user.role, "admin"
+              put user.profile, %{"city" => "NYC", "zip" => "10001"}
+
+              put user.friends, [
+                %{"name" => "Bob", "age" => 30},
+                %{"name" => "Carol", "age" => 28},
+                %{"name" => "Dave", "age" => 35}
+              ]
+
+              put metrics["a.b"], 1
+              put metrics["c,d"], 2
+              put metrics["e{f}"], 3
+              put metrics["g h"], 4
+            end
+          end)
+
+    @upon selecting_path(:dot_metric, path(metrics["a.b"]))
+    @upon pulling_projection(
+            :wildcard_card,
+            path(user),
+            pull_pattern([:*, profile: [:city], friends: {0..1, [:name]}])
+          )
+    @upon pulling_projection(
+            :escaped_metrics,
+            path(metrics),
+            pull_pattern(["a.b", "c,d", "e{f}", "g h"])
+          )
+
+    @then resolved_value_is(:dot_metric, 1)
+    @then resolved_value_is(:wildcard_card, %{
+            "name" => "Alice",
+            "role" => "admin",
+            "profile" => %{"city" => "NYC"},
+            "friends" => [%{"name" => "Bob"}, %{"name" => "Carol"}]
+          })
+    @then resolved_value_is(:escaped_metrics, %{
+            "a.b" => 1,
+            "c,d" => 2,
+            "e{f}" => 3,
+            "g h" => 4
+          })
   end
 end

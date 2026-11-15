@@ -374,7 +374,22 @@ defmodule Xitdb do
     end
   end
 
-  defp do_transact_ops(%__MODULE__{db_ref: db_ref} = db, ops, validated) do
+  @doc false
+  @spec transact_ops_with_moment(t(), list(), keyword()) ::
+          {:ok, t(), integer()} | {:error, Error.t()}
+  def transact_ops_with_moment(%__MODULE__{} = db, ops, opts \\ []) when is_list(ops) do
+    with {:ok, validated} <- validate_opts(opts, @transact_schema) do
+      do_transact_ops_with_moment(db, ops, validated)
+    end
+  end
+
+  defp do_transact_ops(%__MODULE__{} = db, ops, validated) do
+    with {:ok, updated_db, _moment_idx} <- do_transact_ops_with_moment(db, ops, validated) do
+      {:ok, updated_db}
+    end
+  end
+
+  defp do_transact_ops_with_moment(%__MODULE__{db_ref: db_ref} = db, ops, validated) do
     base_moment = validated[:base_moment]
     doc = validated[:doc]
 
@@ -405,7 +420,7 @@ defmodule Xitdb do
         end
 
     case NIF.nif_transact(db_ref, base_moment, opt_ops ++ ops, doc) do
-      {:ok, _} -> {:ok, db}
+      {:ok, moment_idx} -> {:ok, db, moment_idx}
       {:error, reason} -> {:error, %Error{reason: reason}}
     end
   end
@@ -421,7 +436,9 @@ defmodule Xitdb do
   def insert_at(%Cursor{} = root, path_or_selector, index, value)
       when (is_list(path_or_selector) or is_binary(path_or_selector)) and is_integer(index) do
     selector = Selector.format_path_steps(path_or_selector)
-    %Cursor{root | staged_ops: [{:insert, selector, index, value} | root.staged_ops]}
+
+    updated = Cursor.purge_staged_prefix(root, selector)
+    %Cursor{updated | staged_ops: [{:insert, selector, index, value} | updated.staged_ops]}
   end
 
   @doc """
@@ -431,11 +448,11 @@ defmodule Xitdb do
   @spec delete_at(Cursor.t(), String.t() | [term()], integer()) :: Cursor.t()
   def delete_at(%Cursor{} = root, path_or_selector, index)
       when (is_list(path_or_selector) or is_binary(path_or_selector)) and is_integer(index) do
-    selector =
-      Selector.format_path_steps(path_or_selector) <>
-        Selector.format_step(:linked_array_list, index)
+    base_selector = Selector.format_path_steps(path_or_selector)
+    selector = base_selector <> Selector.format_step(:linked_array_list, index)
 
-    %Cursor{root | staged_ops: [{:rm, selector} | root.staged_ops]}
+    updated = Cursor.purge_staged_prefix(root, base_selector)
+    %Cursor{updated | staged_ops: [{:rm, selector} | updated.staged_ops]}
   end
 
   @doc """
@@ -443,7 +460,12 @@ defmodule Xitdb do
   """
   @spec fork(Cursor.t(), String.t(), String.t()) :: Cursor.t()
   def fork(%Cursor{} = root, from_selector, to_selector) do
-    %Cursor{root | staged_ops: [{:fork, from_selector, to_selector} | root.staged_ops]}
+    updated = Cursor.fork_staged_prefix(root, from_selector, to_selector)
+
+    %Cursor{
+      updated
+      | staged_ops: [{:fork, from_selector, to_selector} | updated.staged_ops]
+    }
   end
 
   # ============================================================================
@@ -460,18 +482,44 @@ defmodule Xitdb do
   end
 
   def materialize(%Cursor{} = cursor) do
-    %Cursor{db_ref: db_ref, tag_id: tag_id, value: val, full: full, moment: moment} =
-      Cursor.ensure_resolved(cursor)
+    base =
+      cond do
+        cursor.root and cursor.tag == :none ->
+          nil
 
-    full_int = if full, do: 1, else: 0
+        cursor.root ->
+          case NIF.nif_slot_materialize(cursor.db_ref, -1, cursor.moment, 0) do
+            {:ok, raw} -> Cursor.unwrap_nif_value(cursor.db_ref, raw, cursor.moment, [])
+            {:error, reason} -> raise Error, reason: reason
+          end
 
-    case NIF.nif_slot_materialize(db_ref, tag_id, val, full_int) do
-      {:ok, raw} -> Cursor.unwrap_nif_value(db_ref, raw, moment, [])
-      {:error, reason} -> raise Error, reason: reason
-    end
+        cursor.tx_mode and cursor.value == 0 ->
+          empty_cursor_default(cursor.tag)
+
+        true ->
+          %Cursor{db_ref: db_ref, tag_id: tag_id, value: val, full: full, moment: moment} =
+            Cursor.ensure_resolved(cursor)
+
+          full_int = if full, do: 1, else: 0
+
+          case NIF.nif_slot_materialize(db_ref, tag_id, val, full_int) do
+            {:ok, raw} -> Cursor.unwrap_nif_value(db_ref, raw, moment, [])
+            {:error, reason} -> raise Error, reason: reason
+          end
+      end
+
+    Cursor.apply_staged_overlay(cursor, base)
   end
 
   def materialize(scalar), do: scalar
+
+  defp empty_cursor_default(tag) when tag in [:hash_map, :counted_hash_map, :sorted_map], do: %{}
+  defp empty_cursor_default(tag) when tag in [:array_list, :linked_array_list], do: []
+
+  defp empty_cursor_default(tag) when tag in [:hash_set, :counted_hash_set, :sorted_set],
+    do: MapSet.new()
+
+  defp empty_cursor_default(_), do: nil
 
   @doc """
   Resolves a canonical root-anchored `xitdb` selector string (`~x|.users["101"].todos[1]|`)
@@ -513,20 +561,40 @@ defmodule Xitdb do
   or a structural Elixir list (`[:username, :age, todos: 0..2, profile: [:city]]`).
   """
   @spec pull(t() | Cursor.t(), Pull.pattern()) :: {:ok, term()} | {:error, Error.t()}
-  def pull(%__MODULE__{} = db, pattern) do
-    pull(as_of(db, -1), pattern)
+  def pull(%__MODULE__{db_ref: db_ref}, pattern) do
+    pull(
+      %Cursor{db_ref: db_ref, tag: :hash_map, tag_id: -1, value: -1, moment: -1, root: true},
+      pattern
+    )
   end
 
   def pull(%Cursor{} = cursor, pattern) when is_binary(pattern) do
-    %Cursor{db_ref: db_ref, tag_id: tag_id, value: val} = Cursor.ensure_resolved(cursor)
+    case Pull.split_wildcard_plan(pattern) do
+      {:single, single_pat} ->
+        do_nif_pull(cursor, single_pat)
 
-    db_ref |> NIF.nif_pull(tag_id, val, pattern) |> Error.wrap(%{pattern: pattern})
+      {:merge_top, wild_pat, spec_pat} ->
+        with {:ok, wild_res} <- do_nif_pull(cursor, wild_pat),
+             {:ok, spec_res} <- pull(cursor, spec_pat) do
+          {:ok, Pull.merge_wildcard_results(wild_res, spec_res)}
+        end
+    end
   end
 
   def pull(%Cursor{} = cursor, pattern) when is_list(pattern) do
     with {:ok, compiled} <- Pull.compile(pattern) do
       pull(cursor, compiled)
     end
+  end
+
+  defp do_nif_pull(%Cursor{root: true, tag: tag, db_ref: db_ref, moment: moment}, pattern)
+       when tag != :none do
+    db_ref |> NIF.nif_pull(-1, moment, pattern) |> Error.wrap(%{pattern: pattern})
+  end
+
+  defp do_nif_pull(%Cursor{} = cursor, pattern) do
+    %Cursor{db_ref: db_ref, tag_id: tag_id, value: val} = Cursor.ensure_resolved(cursor)
+    db_ref |> NIF.nif_pull(tag_id, val, pattern) |> Error.wrap(%{pattern: pattern})
   end
 
   @doc "Same as `pull/2`, but raises `Xitdb.Error` on failure."

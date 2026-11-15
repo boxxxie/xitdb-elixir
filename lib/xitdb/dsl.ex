@@ -78,12 +78,14 @@ defmodule Xitdb.DSL do
   when given a literal list, or at runtime if dynamic.
   """
   defmacro pull_pattern(pattern) when is_list(pattern) do
-    if Macro.quoted_literal?(pattern) do
-      Pull.compile!(pattern)
-    else
-      quote do
-        Xitdb.Pull.compile!(unquote(pattern))
-      end
+    case eval_static_pull_ast(pattern) do
+      {:ok, static_pattern} ->
+        Pull.compile!(static_pattern)
+
+      :dynamic ->
+        quote do
+          Xitdb.Pull.compile!(unquote(pattern))
+        end
     end
   end
 
@@ -92,6 +94,66 @@ defmodule Xitdb.DSL do
       Xitdb.Pull.compile!(unquote(pattern))
     end
   end
+
+  defp eval_static_pull_ast(list) when is_list(list) do
+    Enum.reduce_while(list, {:ok, []}, fn elem, {:ok, acc} ->
+      case eval_static_pull_elem(elem) do
+        {:ok, v} -> {:cont, {:ok, [v | acc]}}
+        :dynamic -> {:halt, :dynamic}
+      end
+    end)
+    |> case do
+      {:ok, rev} -> {:ok, :lists.reverse(rev)}
+      :dynamic -> :dynamic
+    end
+  end
+
+  defp eval_static_pull_ast(_), do: :dynamic
+
+  defp eval_static_pull_elem(v) when is_atom(v) or is_binary(v), do: {:ok, v}
+
+  defp eval_static_pull_elem({k, v}) when is_atom(k) or is_binary(k) do
+    with {:ok, ev} <- eval_static_pull_val(v), do: {:ok, {k, ev}}
+  end
+
+  defp eval_static_pull_elem(_), do: :dynamic
+
+  defp eval_static_pull_val(list) when is_list(list), do: eval_static_pull_ast(list)
+
+  defp eval_static_pull_val({:.., _, [first_ast, last_ast]}) do
+    with {:ok, first} <- eval_static_int(first_ast),
+         {:ok, last} <- eval_static_int(last_ast) do
+      {:ok, first..last}
+    end
+  end
+
+  defp eval_static_pull_val({:..//, _, [first_ast, last_ast, step_ast]}) do
+    with {:ok, first} <- eval_static_int(first_ast),
+         {:ok, last} <- eval_static_int(last_ast),
+         {:ok, step} <- eval_static_int(step_ast) do
+      {:ok, first..last//step}
+    end
+  end
+
+  defp eval_static_pull_val({:{}, _, [:slice, off_ast, lim_ast]}) do
+    with {:ok, off} <- eval_static_int(off_ast),
+         {:ok, lim} <- eval_static_int(lim_ast) do
+      {:ok, {:slice, off, lim}}
+    end
+  end
+
+  defp eval_static_pull_val({a, b}) do
+    with {:ok, ea} <- eval_static_pull_val(a),
+         {:ok, eb} <- eval_static_pull_ast(b) do
+      {:ok, {ea, eb}}
+    end
+  end
+
+  defp eval_static_pull_val(_), do: :dynamic
+
+  defp eval_static_int(i) when is_integer(i), do: {:ok, i}
+  defp eval_static_int({:-, _, [i]}) when is_integer(i), do: {:ok, -i}
+  defp eval_static_int(_), do: :dynamic
 
   # ============================================================================
   # 2. Transaction Mutation Block DSL (`tx/2`, `tx/3`, `tx!/2`, `tx!/3`)

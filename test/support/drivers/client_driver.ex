@@ -10,6 +10,7 @@ defmodule Xitdb.TestDrivers.ClientDriver do
     unique_id = System.unique_integer([:positive])
     tmp_dir = Path.join(System.tmp_dir!(), "xitdb_ex_test_#{unique_id}")
     File.mkdir_p!(tmp_dir)
+    ExUnit.Callbacks.on_exit(fn -> File.rm_rf(tmp_dir) end)
 
     %{
       tmp_dir: tmp_dir,
@@ -33,6 +34,7 @@ defmodule Xitdb.TestDrivers.ClientDriver do
 
   def open_database(ctx, opts) do
     {:ok, db} = Xitdb.open(opts)
+    ExUnit.Callbacks.on_exit(fn -> Xitdb.close(db) end)
     %{ctx | db: db}
   end
 
@@ -40,6 +42,7 @@ defmodule Xitdb.TestDrivers.ClientDriver do
     path = Path.join(ctx.tmp_dir, "#{label}.xit")
     full_opts = Keyword.merge([path: path, backend: :buffered_file], opts)
     {:ok, db} = Xitdb.open(full_opts)
+    ExUnit.Callbacks.on_exit(fn -> Xitdb.close(db) end)
     %{ctx | db: db, file_paths: Map.put(ctx.file_paths, label, path)}
   end
 
@@ -47,6 +50,7 @@ defmodule Xitdb.TestDrivers.ClientDriver do
     if ctx.db, do: Xitdb.close(ctx.db)
     path = Map.fetch!(ctx.file_paths, label)
     {:ok, db} = Xitdb.open(path: path, backend: :buffered_file)
+    ExUnit.Callbacks.on_exit(fn -> Xitdb.close(db) end)
     %{ctx | db: db}
   end
 
@@ -167,6 +171,7 @@ defmodule Xitdb.TestDrivers.ClientDriver do
     info_before = Xitdb.info!(ctx.db)
     target_path = Path.join(ctx.tmp_dir, "#{target_label}.xit")
     {:ok, compacted_db} = Xitdb.compact(ctx.db, path: target_path)
+    ExUnit.Callbacks.on_exit(fn -> Xitdb.close(compacted_db) end)
 
     %{
       ctx
@@ -456,9 +461,8 @@ defmodule Xitdb.TestDrivers.ClientDriver do
         {d.op, d.path, d.new_value}
       end)
 
-    for expected <- expected_changes do
-      assert expected in simplified
-    end
+    assert length(simplified) == length(expected_changes)
+    assert Enum.sort(simplified) == Enum.sort(expected_changes)
 
     ctx
   end

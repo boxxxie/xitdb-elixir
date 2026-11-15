@@ -7,6 +7,11 @@ defmodule Xitdb.TestDSL.ClientDSL do
 
   alias Xitdb.TestDrivers.ClientDriver
 
+  @spec new_world(map()) :: map()
+  def new_world(_ex_unit_ctx \\ %{}) do
+    ClientDriver.new_context()
+  end
+
   # ============================================================================
   # @given steps
   # ============================================================================
@@ -120,94 +125,222 @@ defmodule Xitdb.TestDSL.ClientDSL do
   end
 
   # ============================================================================
-  # @then steps
+  # @then steps (macros preserve caller line numbers on failure)
   # ============================================================================
 
-  def resolved_value_is(ctx, result_key, expected_value) do
-    ClientDriver.assert_resolved_value(ctx, result_key, expected_value)
+  defmacro resolved_value_is(ctx_ast, result_key, expected_value) do
+    quote line: __CALLER__.line do
+      ClientDriver.assert_resolved_value(
+        unquote(ctx_ast),
+        unquote(result_key),
+        unquote(expected_value)
+      )
+    end
   end
 
-  def resolved_node_is_lazy_cursor(ctx, result_key, expected_opts) do
-    ClientDriver.assert_lazy_cursor(ctx, result_key, expected_opts)
+  defmacro resolved_node_is_lazy_cursor(ctx_ast, result_key, expected_opts) do
+    quote line: __CALLER__.line do
+      ClientDriver.assert_lazy_cursor(
+        unquote(ctx_ast),
+        unquote(result_key),
+        unquote(expected_opts)
+      )
+    end
   end
 
-  def access_path_equals(ctx, path_keys, expected_value) do
-    ClientDriver.assert_access_path_equals(ctx, path_keys, expected_value)
+  defmacro access_path_equals(ctx_ast, path_keys, expected_value) do
+    quote line: __CALLER__.line do
+      ClientDriver.assert_access_path_equals(
+        unquote(ctx_ast),
+        unquote(path_keys),
+        unquote(expected_value)
+      )
+    end
   end
 
-  def snapshot_access_path_equals(ctx, snapshot_name, path_keys, expected_value) do
-    ClientDriver.assert_snapshot_access_path_equals(ctx, snapshot_name, path_keys, expected_value)
+  defmacro snapshot_access_path_equals(ctx_ast, snapshot_name, path_keys, expected_value) do
+    quote line: __CALLER__.line do
+      ClientDriver.assert_snapshot_access_path_equals(
+        unquote(ctx_ast),
+        unquote(snapshot_name),
+        unquote(path_keys),
+        unquote(expected_value)
+      )
+    end
   end
 
-  def enumerable_count_is(ctx, path_keys, expected_count) do
-    ClientDriver.assert_enumerable_count(ctx, path_keys, expected_count)
+  defmacro enumerable_count_is(ctx_ast, path_keys, expected_count) do
+    quote line: __CALLER__.line do
+      ClientDriver.assert_enumerable_count(
+        unquote(ctx_ast),
+        unquote(path_keys),
+        unquote(expected_count)
+      )
+    end
   end
 
-  def enumerable_membership_is(ctx, path_keys, candidate, expected_bool) do
-    ClientDriver.assert_enumerable_member(ctx, path_keys, candidate, expected_bool)
+  defmacro enumerable_membership_is(ctx_ast, path_keys, candidate, expected_bool) do
+    quote line: __CALLER__.line do
+      ClientDriver.assert_enumerable_member(
+        unquote(ctx_ast),
+        unquote(path_keys),
+        unquote(candidate),
+        unquote(expected_bool)
+      )
+    end
   end
 
-  def enumerable_slice_is(ctx, path_keys, range, expected_list) do
-    ClientDriver.assert_enumerable_slice(ctx, path_keys, range, expected_list)
+  defmacro enumerable_slice_is(ctx_ast, path_keys, range, expected_list) do
+    quote line: __CALLER__.line do
+      ClientDriver.assert_enumerable_slice(
+        unquote(ctx_ast),
+        unquote(path_keys),
+        unquote(range),
+        unquote(expected_list)
+      )
+    end
   end
 
-  def enumerable_entries_are(ctx, path_keys, expected_entries, opts \\ []) do
-    ClientDriver.assert_enumerable_entries(ctx, path_keys, expected_entries, opts)
+  defmacro enumerable_entries_are(ctx_ast, path_keys, expected_entries, opts \\ []) do
+    quote line: __CALLER__.line do
+      ClientDriver.assert_enumerable_entries(
+        unquote(ctx_ast),
+        unquote(path_keys),
+        unquote(expected_entries),
+        unquote(opts)
+      )
+    end
   end
 
-  def stream_take_is(ctx, path_keys, count, expected_items) do
-    ClientDriver.assert_stream_take(ctx, path_keys, count, expected_items)
+  defmacro stream_take_is(ctx_ast, path_keys, count, expected_items) do
+    quote line: __CALLER__.line do
+      ClientDriver.assert_stream_take(
+        unquote(ctx_ast),
+        unquote(path_keys),
+        unquote(count),
+        unquote(expected_items)
+      )
+    end
   end
 
-  def materialized_subtree_is(ctx, path_keys, expected_term) do
-    ClientDriver.assert_materialized_subtree(ctx, path_keys, expected_term)
+  defmacro materialized_subtree_is(ctx_ast, path_keys, expected_term) do
+    quote line: __CALLER__.line do
+      ClientDriver.assert_materialized_subtree(
+        unquote(ctx_ast),
+        unquote(path_keys),
+        unquote(expected_term)
+      )
+    end
   end
 
-  def cursor_inspect_includes(ctx, path_keys, expected_substrings) do
-    ClientDriver.assert_cursor_inspect(ctx, path_keys, expected_substrings)
+  defmacro cursor_inspect_includes(ctx_ast, path_keys, expected_substrings) do
+    quote line: __CALLER__.line do
+      ClientDriver.assert_cursor_inspect(
+        unquote(ctx_ast),
+        unquote(path_keys),
+        unquote(expected_substrings)
+      )
+    end
   end
 
-  def database_moment_count_is(ctx, expected_count) do
-    ClientDriver.assert_moment_count(ctx, expected_count)
+  defmacro database_moment_count_is(ctx_ast, expected_count) do
+    quote line: __CALLER__.line do
+      ClientDriver.assert_moment_count(unquote(ctx_ast), unquote(expected_count))
+    end
   end
 
-  def last_transaction_failed_with(ctx, expected_reason) do
-    ClientDriver.assert_last_tx_error(ctx, expected_reason)
+  defmacro last_transaction_failed_with(ctx_ast, expected_reason) do
+    quote line: __CALLER__.line do
+      ClientDriver.assert_last_tx_error(unquote(ctx_ast), unquote(expected_reason))
+    end
   end
 
-  def diff_changes_are(ctx, result_key, expected_changes) do
-    ClientDriver.assert_diff_changes(ctx, result_key, expected_changes)
+  defmacro diff_changes_are(ctx_ast, result_key, expected_changes) do
+    quote line: __CALLER__.line do
+      ClientDriver.assert_diff_changes(
+        unquote(ctx_ast),
+        unquote(result_key),
+        unquote(expected_changes)
+      )
+    end
   end
 
-  def history_lineage_is(ctx, result_key, expected_entries) do
-    ClientDriver.assert_history_lineage(ctx, result_key, expected_entries)
+  defmacro history_lineage_is(ctx_ast, result_key, expected_entries) do
+    quote line: __CALLER__.line do
+      ClientDriver.assert_history_lineage(
+        unquote(ctx_ast),
+        unquote(result_key),
+        unquote(expected_entries)
+      )
+    end
   end
 
-  def datalog_rows_are(ctx, result_key, expected_rows, opts \\ []) do
-    ClientDriver.assert_datalog_rows(ctx, result_key, expected_rows, opts)
+  defmacro datalog_rows_are(ctx_ast, result_key, expected_rows, opts \\ []) do
+    quote line: __CALLER__.line do
+      ClientDriver.assert_datalog_rows(
+        unquote(ctx_ast),
+        unquote(result_key),
+        unquote(expected_rows),
+        unquote(opts)
+      )
+    end
   end
 
-  def compacted_database_Shrinks_and_preserves(ctx, path_keys, expected_value) do
-    ClientDriver.assert_compacted_valid(ctx, path_keys, expected_value)
+  defmacro compacted_database_shrinks_and_preserves(ctx_ast, path_keys, expected_value) do
+    quote line: __CALLER__.line do
+      ClientDriver.assert_compacted_valid(
+        unquote(ctx_ast),
+        unquote(path_keys),
+        unquote(expected_value)
+      )
+    end
   end
 
-  def ash_action_includes_change(ctx, resource, action_name, expected_change_tuple) do
-    ClientDriver.assert_ash_action_has_change(ctx, resource, action_name, expected_change_tuple)
+  defmacro ash_action_includes_change(ctx_ast, resource, action_name, expected_change_tuple) do
+    quote line: __CALLER__.line do
+      ClientDriver.assert_ash_action_has_change(
+        unquote(ctx_ast),
+        unquote(resource),
+        unquote(action_name),
+        unquote(expected_change_tuple)
+      )
+    end
   end
 
-  def ash_record_attribute_equals(ctx, record_key, attribute, expected_value) do
-    ClientDriver.assert_ash_record_attribute(ctx, record_key, attribute, expected_value)
+  defmacro ash_record_attribute_equals(ctx_ast, record_key, attribute, expected_value) do
+    quote line: __CALLER__.line do
+      ClientDriver.assert_ash_record_attribute(
+        unquote(ctx_ast),
+        unquote(record_key),
+        unquote(attribute),
+        unquote(expected_value)
+      )
+    end
   end
 
-  def ash_verifier_succeeded(ctx, result_key) do
-    ClientDriver.assert_ash_verifier_ok(ctx, result_key)
+  defmacro ash_verifier_succeeded(ctx_ast, result_key) do
+    quote line: __CALLER__.line do
+      ClientDriver.assert_ash_verifier_ok(unquote(ctx_ast), unquote(result_key))
+    end
   end
 
-  def ash_verifier_failed_with(ctx, result_key, expected_opts) do
-    ClientDriver.assert_ash_verifier_error(ctx, result_key, expected_opts)
+  defmacro ash_verifier_failed_with(ctx_ast, result_key, expected_opts) do
+    quote line: __CALLER__.line do
+      ClientDriver.assert_ash_verifier_error(
+        unquote(ctx_ast),
+        unquote(result_key),
+        unquote(expected_opts)
+      )
+    end
   end
 
-  def compile_error_raised_with(ctx, result_key, expected_snippets) do
-    ClientDriver.assert_compile_error(ctx, result_key, expected_snippets)
+  defmacro compile_error_raised_with(ctx_ast, result_key, expected_snippets) do
+    quote line: __CALLER__.line do
+      ClientDriver.assert_compile_error(
+        unquote(ctx_ast),
+        unquote(result_key),
+        unquote(expected_snippets)
+      )
+    end
   end
 end

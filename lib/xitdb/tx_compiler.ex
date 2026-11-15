@@ -49,7 +49,8 @@ defmodule Xitdb.TxCompiler do
   defp kind_str(:sorted_set), do: "sorted_set"
 
   defp compile_node_acc(prefix, map, reset?, acc) when is_map(map) and not is_struct(map) do
-    compile_kv_collection(prefix, :hash_map, map, reset?, acc)
+    eff_reset? = reset? or (prefix != "" and map_size(map) == 0)
+    compile_kv_collection(prefix, :hash_map, map, eff_reset?, acc)
   end
 
   defp compile_node_acc(prefix, list, _reset?, acc) when is_list(list) do
@@ -62,42 +63,40 @@ defmodule Xitdb.TxCompiler do
     compile_kv_collection(prefix, kind, data, reset?, acc)
   end
 
-  defp compile_node_acc(prefix, %Collection{kind: kind, data: list}, reset?, acc)
+  defp compile_node_acc(prefix, %Collection{kind: kind, data: list}, _reset?, acc)
        when kind in [:array_list, :linked_array_list] and is_list(list) do
     k_str = kind_str(kind)
-    op = if reset?, do: {:reset_col, prefix, k_str}, else: {:init_col, prefix, k_str}
-    compile_list_elems(list, prefix, kind, 0, [op | acc])
+    compile_list_elems(list, prefix, kind, 0, [{:reset_col, prefix, k_str} | acc])
   end
 
-  defp compile_node_acc(prefix, %Collection{kind: kind, data: members}, reset?, acc)
+  defp compile_node_acc(prefix, %Collection{kind: kind, data: members}, _reset?, acc)
        when kind in [:hash_set, :counted_hash_set, :sorted_set] do
     k_str = kind_str(kind)
     member_list = Enum.to_list(members)
 
-    if member_list == [] do
-      op = if reset?, do: {:reset_col, prefix, k_str}, else: {:init_col, prefix, k_str}
-      [op | acc]
-    else
-      acc = if reset?, do: [{:reset_col, prefix, k_str} | acc], else: acc
+    acc = [{:reset_col, prefix, k_str} | acc]
 
-      Enum.reduce(member_list, acc, fn m, a ->
-        member_str = to_string(m)
-        [{:put, prefix <> Selector.format_step(kind, member_str), member_str} | a]
-      end)
-    end
+    Enum.reduce(member_list, acc, fn m, a ->
+      member_str = to_string(m)
+      [{:put, prefix <> Selector.format_step(kind, member_str), member_str} | a]
+    end)
   end
 
-  defp compile_node_acc(prefix, %MapSet{} = set, reset?, acc) do
+  defp compile_node_acc(prefix, %MapSet{} = set, _reset?, acc) do
     compile_node_acc(
       prefix,
       %Collection{kind: :counted_hash_set, data: MapSet.to_list(set)},
-      reset?,
+      true,
       acc
     )
   end
 
-  defp compile_node_acc(prefix, nil, _reset?, acc) do
-    [{:rm, prefix} | acc]
+  defp compile_node_acc(prefix, nil, false, acc) do
+    [{:rm_if_exists, prefix} | acc]
+  end
+
+  defp compile_node_acc(prefix, nil, true, acc) do
+    [{:put, prefix, nil} | acc]
   end
 
   defp compile_node_acc(prefix, scalar, _reset?, acc) do
@@ -115,8 +114,15 @@ defmodule Xitdb.TxCompiler do
       acc = if reset?, do: [{:reset_col, prefix, k_str} | acc], else: acc
 
       :maps.fold(
-        fn k, v, a ->
-          compile_node_acc(prefix <> Selector.format_step(kind, k), v, false, a)
+        fn
+          _k, nil, a when reset? ->
+            a
+
+          k, nil, a ->
+            [{:rm_if_exists, prefix <> Selector.format_step(kind, k)} | a]
+
+          k, v, a ->
+            compile_node_acc(prefix <> Selector.format_step(kind, k), v, reset?, a)
         end,
         acc,
         map
@@ -142,8 +148,13 @@ defmodule Xitdb.TxCompiler do
 
   defp compile_list_elems([], _prefix, _kind, _idx, acc), do: acc
 
+  defp compile_list_elems([nil | rest], prefix, kind, idx, acc) do
+    acc = [{:put, prefix <> Selector.format_step(kind, idx), nil} | acc]
+    compile_list_elems(rest, prefix, kind, idx + 1, acc)
+  end
+
   defp compile_list_elems([elem | rest], prefix, kind, idx, acc) do
-    acc = compile_node_acc(prefix <> Selector.format_step(kind, idx), elem, false, acc)
+    acc = compile_node_acc(prefix <> Selector.format_step(kind, idx), elem, true, acc)
     compile_list_elems(rest, prefix, kind, idx + 1, acc)
   end
 end

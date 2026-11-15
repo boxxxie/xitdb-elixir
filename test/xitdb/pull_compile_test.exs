@@ -30,4 +30,73 @@ defmodule Xitdb.PullCompileTest do
       assert_raise ArgumentError, fn -> Pull.compile!(invalid) end
     end
   end
+
+  test "supports root [*] wildcard, runtime mixed pull with nested/range specs, and escaped field names" do
+    assert {:ok, "*"} = Pull.compile([:*])
+    assert "*" == Pull.compile!([:*])
+
+    {:ok, db} = Xitdb.open(backend: :memory)
+
+    try do
+      {:ok, db} =
+        Xitdb.transact(db, %{
+          "user" => %{
+            "name" => "Alice",
+            "role" => "admin",
+            "profile" => %{"city" => "NYC", "zip" => "10001"},
+            "friends" => [
+              %{"name" => "Bob", "secret" => "x"},
+              %{"name" => "Carol", "secret" => "y"}
+            ],
+            "scores" => [10, 20, 30]
+          },
+          "weird" => %{
+            "a.b" => 1,
+            "c,d" => 2,
+            "e{f}" => 3,
+            "g h" => 4
+          }
+        })
+
+      assert {:ok, pulled} =
+               Xitdb.pull(
+                 Xitdb.db(db)["user"],
+                 [:*, profile: [:city], friends: {0..1, [:name]}, scores: 0..1]
+               )
+
+      assert pulled == %{
+               "name" => "Alice",
+               "role" => "admin",
+               "profile" => %{"city" => "NYC"},
+               "friends" => [%{"name" => "Bob"}, %{"name" => "Carol"}],
+               "scores" => [10, 20]
+             }
+
+      weird_pattern = Pull.compile!(["a.b", "c,d", "e{f}", "g h"])
+      assert weird_pattern == ~s({["a.b"], ["c,d"], ["e{f}"], ["g h"]})
+
+      assert Xitdb.pull!(Xitdb.db(db)["weird"], ["a.b", "c,d", "e{f}", "g h"]) == %{
+               "a.b" => 1,
+               "c,d" => 2,
+               "e{f}" => 3,
+               "g h" => 4
+             }
+    after
+      :ok = Xitdb.close(db)
+    end
+  end
+
+  test "pull_pattern/1 raises ArgumentError at compile time on invalid static patterns" do
+    assert_raise ArgumentError, fn ->
+      Code.compile_quoted(
+        quote do
+          use Xitdb.DSL
+
+          defmodule BadPullPattern do
+            def bad, do: pull_pattern(todos: 5..2//1)
+          end
+        end
+      )
+    end
+  end
 end

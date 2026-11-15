@@ -237,7 +237,7 @@ defmodule Xitdb.DSL.TxRuntime do
 
   def savepoint(tx_ref) do
     %__MODULE__{} = state = Process.get(tx_ref)
-    Process.put(tx_ref, %__MODULE__{state | ops: [{:savepoint, ""} | state.ops]})
+    Process.put(tx_ref, %__MODULE__{state | ops: [{:savepoint} | state.ops]})
     :ok
   end
 
@@ -309,10 +309,27 @@ defmodule Xitdb.DSL.TxRuntime do
 
   defp effective_base_steps(chronological, target_steps) do
     Enum.reduce(chronological, target_steps, fn
-      {:append, steps, _}, cur -> if prefix_steps?(steps, cur), do: steps, else: cur
-      {:insert, steps, _, _}, cur -> if prefix_steps?(steps, cur), do: steps, else: cur
-      {:slice, steps, _, _}, cur -> if prefix_steps?(steps, cur), do: steps, else: cur
-      _, cur -> cur
+      {:append, steps, _}, cur ->
+        if prefix_steps?(steps, cur), do: steps, else: cur
+
+      {:insert, steps, _, _}, cur ->
+        if prefix_steps?(steps, cur), do: steps, else: cur
+
+      {:slice, steps, _, _}, cur ->
+        if prefix_steps?(steps, cur), do: steps, else: cur
+
+      {:rm, steps}, cur ->
+        case List.last(steps) do
+          {:linked_array_list, _} ->
+            parent = Enum.drop(steps, -1)
+            if prefix_steps?(parent, cur), do: parent, else: cur
+
+          _ ->
+            cur
+        end
+
+      _, cur ->
+        cur
     end)
   end
 
@@ -620,6 +637,11 @@ defmodule Xitdb.DSL.TxRuntime do
     do_parse_steps(tail, [{:linked_array_list, String.to_integer(int_str)} | acc])
   end
 
+  defp do_parse_steps(<<?[, ?', rest::binary>>, acc) do
+    {unescaped, <<?], tail::binary>>} = parse_single_quoted_string(rest, [])
+    do_parse_steps(tail, [{:hash_map, unescaped} | acc])
+  end
+
   defp do_parse_steps(<<?[, ?", rest::binary>>, acc) do
     {unescaped, <<?], tail::binary>>} = parse_quoted_string(rest, [])
     do_parse_steps(tail, [{:hash_map, unescaped} | acc])
@@ -633,6 +655,11 @@ defmodule Xitdb.DSL.TxRuntime do
   defp do_parse_steps(bin, acc) do
     {key, tail} = parse_key_token(bin)
     do_parse_steps(tail, [{:hash_map, key} | acc])
+  end
+
+  defp parse_key_token(<<?[, ?', rest::binary>>) do
+    {unescaped, <<?], tail::binary>>} = parse_single_quoted_string(rest, [])
+    {unescaped, tail}
   end
 
   defp parse_key_token(<<?[, ?", rest::binary>>) do
@@ -664,6 +691,27 @@ defmodule Xitdb.DSL.TxRuntime do
   defp do_take_until_byte(<<_, rest::binary>>, stop_byte, len, orig) do
     do_take_until_byte(rest, stop_byte, len + 1, orig)
   end
+
+  defp parse_single_quoted_string(<<?', tail::binary>>, acc),
+    do: {IO.iodata_to_binary(:lists.reverse(acc)), tail}
+
+  defp parse_single_quoted_string(<<?\\, ?\\, rest::binary>>, acc),
+    do: parse_single_quoted_string(rest, [?\\ | acc])
+
+  defp parse_single_quoted_string(<<?\\, ?', rest::binary>>, acc),
+    do: parse_single_quoted_string(rest, [?' | acc])
+
+  defp parse_single_quoted_string(<<?\\, ?n, rest::binary>>, acc),
+    do: parse_single_quoted_string(rest, [?\n | acc])
+
+  defp parse_single_quoted_string(<<?\\, ?r, rest::binary>>, acc),
+    do: parse_single_quoted_string(rest, [?\r | acc])
+
+  defp parse_single_quoted_string(<<?\\, ?t, rest::binary>>, acc),
+    do: parse_single_quoted_string(rest, [?\t | acc])
+
+  defp parse_single_quoted_string(<<b, rest::binary>>, acc),
+    do: parse_single_quoted_string(rest, [b | acc])
 
   defp parse_quoted_string(<<?", tail::binary>>, acc),
     do: {IO.iodata_to_binary(:lists.reverse(acc)), tail}

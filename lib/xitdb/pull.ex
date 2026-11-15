@@ -11,7 +11,7 @@ defmodule Xitdb.Pull do
       "{*, friends[0..5]{username, profile{city}}}"
   """
 
-  alias Xitdb.Error
+  alias Xitdb.{Error, Selector}
 
   @type pattern_entry ::
           atom()
@@ -43,6 +43,9 @@ defmodule Xitdb.Pull do
     end
   end
 
+  def compile([:*]), do: {:ok, "*"}
+  def compile(["*"]), do: {:ok, "*"}
+
   def compile(pattern) when is_list(pattern) and pattern != [] do
     {:ok, compile_list!(pattern)}
   rescue
@@ -64,6 +67,9 @@ defmodule Xitdb.Pull do
       {:error, err} -> raise ArgumentError, Exception.message(err)
     end
   end
+
+  def compile!([:*]), do: "*"
+  def compile!(["*"]), do: "*"
 
   def compile!(pattern) when is_list(pattern) and pattern != [] do
     compile_list!(pattern)
@@ -87,11 +93,11 @@ defmodule Xitdb.Pull do
 
   defp compile_entry!(field)
        when is_atom(field) and not is_nil(field) and not is_boolean(field) do
-    Atom.to_string(field)
+    format_field_name!(field)
   end
 
   defp compile_entry!(field) when is_binary(field) and field != "" do
-    field
+    format_field_name!(field)
   end
 
   defp compile_entry!({field, nested}) when is_list(nested) and nested != [] do
@@ -131,12 +137,108 @@ defmodule Xitdb.Pull do
   end
 
   defp format_field_name!(field)
-       when is_atom(field) and not is_nil(field) and not is_boolean(field),
-       do: Atom.to_string(field)
+       when is_atom(field) and not is_nil(field) and not is_boolean(field) do
+    field |> Atom.to_string() |> Selector.format_key()
+  end
 
-  defp format_field_name!(field) when is_binary(field) and field != "", do: field
+  defp format_field_name!(field) when is_binary(field) and field != "" do
+    Selector.format_key(field)
+  end
 
   defp format_field_name!(other) do
     raise ArgumentError, "Invalid pull field name: #{inspect(other)}"
   end
+
+  @doc false
+  def split_wildcard_plan(pattern) when is_binary(pattern) do
+    trimmed = String.trim(pattern)
+
+    case parse_outer_braces(trimmed) do
+      {:ok, items} ->
+        split_brace_items(items, trimmed)
+
+      :not_brace ->
+        {:single, trimmed}
+    end
+  end
+
+  defp split_brace_items(items, orig) do
+    has_star? = "*" in items
+    non_star = Enum.reject(items, &(&1 == "*"))
+
+    cond do
+      has_star? and non_star == [] ->
+        {:single, "*"}
+
+      has_star? and non_star != [] ->
+        {:merge_top, "*", "{" <> Enum.join(non_star, ", ") <> "}"}
+
+      true ->
+        {:single, orig}
+    end
+  end
+
+  @doc false
+  def merge_wildcard_results(w, s) when is_map(w) and is_map(s) do
+    Map.merge(w, s)
+  end
+
+  def merge_wildcard_results(_w, s), do: s
+
+  defp parse_outer_braces(<<"{" <> rest>>) do
+    len = byte_size(rest)
+
+    if len > 0 and :binary.at(rest, len - 1) == ?} do
+      inner = binary_part(rest, 0, len - 1)
+      {:ok, split_top_level_commas(inner, 0, 0, nil, [], [])}
+    else
+      :not_brace
+    end
+  end
+
+  defp parse_outer_braces(_), do: :not_brace
+
+  defp split_top_level_commas(<<>>, _b, _c, _q, cur, acc) do
+    item = cur |> :lists.reverse() |> IO.iodata_to_binary() |> String.trim()
+    final = if item == "", do: acc, else: [item | acc]
+    :lists.reverse(final)
+  end
+
+  defp split_top_level_commas(<<?\\, ch, rest::binary>>, b, c, q, cur, acc)
+       when not is_nil(q) do
+    split_top_level_commas(rest, b, c, q, [ch, ?\\ | cur], acc)
+  end
+
+  defp split_top_level_commas(<<?", rest::binary>>, b, c, nil, cur, acc),
+    do: split_top_level_commas(rest, b, c, ?", [?" | cur], acc)
+
+  defp split_top_level_commas(<<?", rest::binary>>, b, c, ?", cur, acc),
+    do: split_top_level_commas(rest, b, c, nil, [?" | cur], acc)
+
+  defp split_top_level_commas(<<?', rest::binary>>, b, c, nil, cur, acc),
+    do: split_top_level_commas(rest, b, c, ?', [?' | cur], acc)
+
+  defp split_top_level_commas(<<?', rest::binary>>, b, c, ?', cur, acc),
+    do: split_top_level_commas(rest, b, c, nil, [?' | cur], acc)
+
+  defp split_top_level_commas(<<?[, rest::binary>>, b, c, nil, cur, acc),
+    do: split_top_level_commas(rest, b + 1, c, nil, [?[ | cur], acc)
+
+  defp split_top_level_commas(<<?], rest::binary>>, b, c, nil, cur, acc),
+    do: split_top_level_commas(rest, max(b - 1, 0), c, nil, [?] | cur], acc)
+
+  defp split_top_level_commas(<<?{, rest::binary>>, b, c, nil, cur, acc),
+    do: split_top_level_commas(rest, b, c + 1, nil, [?{ | cur], acc)
+
+  defp split_top_level_commas(<<?}, rest::binary>>, b, c, nil, cur, acc),
+    do: split_top_level_commas(rest, b, max(c - 1, 0), nil, [?} | cur], acc)
+
+  defp split_top_level_commas(<<?,, rest::binary>>, 0, 0, nil, cur, acc) do
+    item = cur |> :lists.reverse() |> IO.iodata_to_binary() |> String.trim()
+    new_acc = if item == "", do: acc, else: [item | acc]
+    split_top_level_commas(rest, 0, 0, nil, [], new_acc)
+  end
+
+  defp split_top_level_commas(<<byte, rest::binary>>, b, c, q, cur, acc),
+    do: split_top_level_commas(rest, b, c, q, [byte | cur], acc)
 end

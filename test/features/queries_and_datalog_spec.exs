@@ -117,6 +117,65 @@ defmodule Xitdb.Features.QueriesAndDatalogSpec do
 
     @then database_moment_count_is(3)
     @then access_path_equals(["counter"], 3)
-    @then compacted_database_Shrinks_and_preserves(["scratch"], "compact-final")
+    @then compacted_database_shrinks_and_preserves(["scratch"], "compact-final")
+  end
+
+  scenario "Xitdb.DSL.datalog supports inline path comparisons, independent wildcards, and negated string predicates" do
+    @given memory_database()
+    @given committed_moment(%{
+             "users" => %{
+               "u1" => %{
+                 "tag_a" => 1,
+                 "tag_b" => 2,
+                 "salary" => 130,
+                 "username" => "alice",
+                 "bio" => "distributed systems"
+               },
+               "u2" => %{
+                 "tag_a" => 5,
+                 "tag_b" => 6,
+                 "salary" => 140,
+                 "username" => "adm_bob",
+                 "bio" => "human"
+               },
+               "u3" => %{
+                 "tag_a" => 7,
+                 "tag_b" => 8,
+                 "salary" => 125,
+                 "username" => "carol",
+                 "bio" => "support_bot"
+               },
+               "u4" => %{
+                 "tag_a" => 9,
+                 "tag_b" => 10,
+                 "salary" => 115,
+                 "username" => "dave",
+                 "bio" => "human"
+               }
+             }
+           })
+
+    @upon querying_datalog(
+            :filtered_staff,
+            datalog do
+              find {id, name, salary}
+
+              where [
+                users[id].tag_a == _,
+                users[id].tag_b == _,
+                users[id].salary >= 120,
+                145 > users[id].salary,
+                salary == users[id].salary,
+                name == users[id].username,
+                bio == users[id].bio,
+                not starts_with(name, "adm_"),
+                not contains(bio, "bot")
+              ]
+            end
+          )
+
+    @then datalog_rows_are(:filtered_staff, [
+            ["u1", "alice", 130]
+          ])
   end
 end
