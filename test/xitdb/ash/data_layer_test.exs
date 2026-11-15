@@ -1672,6 +1672,16 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
         assert Enum.map(v1_via_shared, &{&1.id, &1.name}) == [{org.id, "Helios Alpha"}]
 
+        # Relationship `load:` propagates `context[:shared][:xitdb_moment]` to child queries
+        [v1_event_with_sessions] =
+          Event
+          |> Ash.Query.filter(id == ^event.id)
+          |> Ash.Query.load(:sessions)
+          |> Ash.Query.set_context(%{shared: %{xitdb_moment: moment_v1}})
+          |> Ash.read!(authorize?: false)
+
+        assert Enum.map(v1_event_with_sessions.sessions, & &1.title) == ["Helios Opening"]
+
         # 2. Explicit `context: %{xitdb_db: Store.as_of(moment_v1)}`
         v1_cursor = TestMdmStore.as_of(moment_v1)
         v1_via_db = Ash.read!(Organization, context: %{xitdb_db: v1_cursor}, authorize?: false)

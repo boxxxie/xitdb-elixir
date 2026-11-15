@@ -540,6 +540,13 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         store MutatorPrimaryStore
         collection :m_cascade_nilify_children
         index([:parent_id])
+        search_field :label, boost: 1.0
+
+        search_field :parent_name,
+          boost: 2.0,
+          resolver: fn child, db ->
+            Search.lookup_field(db, :m_cascade_parents, child.parent_id, "name")
+          end
 
         references do
           reference :parent, on_delete: :nilify
@@ -1214,6 +1221,16 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           )
 
         assert Search.ids(CascadeDeleteChild, "sovereign") == [del_child.id]
+        assert Search.ids(CascadeNilifyChild, "root") == [nil_child.id]
+
+        assert is_nil(
+                 Search.lookup_field(
+                   Store.current_db(MutatorPrimaryStore),
+                   :m_cascade_parents,
+                   nil,
+                   "name"
+                 )
+               )
 
         :ok = Ash.destroy!(parent, domain: Domain)
 
@@ -1231,9 +1248,11 @@ if Code.ensure_loaded?(Ash.DataLayer) do
                )
                |> MapSet.size() == 0
 
-        # :nilify cleared FK and updated secondary index
+        # :nilify cleared FK, updated secondary index, and purged stale cross-resource BM25 postings
         reloaded_nil = Ash.get!(CascadeNilifyChild, nil_child.id, domain: Domain)
         assert is_nil(reloaded_nil.parent_id)
+        assert Search.ids(CascadeNilifyChild, "root") == []
+        assert Search.ids(CascadeNilifyChild, "audit") == [nil_child.id]
 
         assert Indexer.lookup_secondary_eq(
                  Store.current_db(MutatorPrimaryStore),
