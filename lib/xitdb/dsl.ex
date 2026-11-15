@@ -74,6 +74,14 @@ defmodule Xitdb.DSL do
   end
 
   @doc """
+  Compiles an Elixir path expression into a pre-tokenized `xitdb` path-step list,
+  eliminating selector string formatting and NIF-side selector parsing at runtime.
+  """
+  defmacro path_steps(expr) do
+    PathCompiler.compile_steps(expr)
+  end
+
+  @doc """
   Compiles a structural Pull pattern into a canonical `xitdb` Pull string at compile time
   when given a literal list, or at runtime if dynamic.
   """

@@ -315,6 +315,12 @@ defmodule Xitdb do
           {:ok, t()} | {:error, Error.t()}
   def transact(db, map_or_fun, opts \\ [])
 
+  def transact(%__MODULE__{db_ref: db_ref} = db, map, [])
+      when is_map(map) and not is_struct(map) do
+    ops = TxCompiler.compile_moment_map(map)
+    do_transact_ops_default(db, db_ref, ops)
+  end
+
   def transact(%__MODULE__{} = db, map, opts) when is_map(map) and not is_struct(map) do
     with {:ok, validated} <- validate_opts(opts, @transact_schema) do
       ops = TxCompiler.compile_moment_map(map)
@@ -322,43 +328,60 @@ defmodule Xitdb do
     end
   end
 
+  def transact(%__MODULE__{db_ref: db_ref} = db, fun, []) when is_function(fun, 1) do
+    run_transact_fun(db, db_ref, fun, -1, :default)
+  end
+
   def transact(%__MODULE__{db_ref: db_ref} = db, fun, opts) when is_function(fun, 1) do
     with {:ok, validated} <- validate_opts(opts, @transact_schema) do
-      base_moment = validated[:base_moment]
-
-      root_cursor = %Cursor{
-        db_ref: db_ref,
-        tag: :hash_map,
-        tag_id: -1,
-        value: base_moment,
-        moment: base_moment,
-        root: true,
-        tx_mode: true
-      }
-
-      try do
-        case fun.(root_cursor) do
-          %Cursor{staged_ops: ops} ->
-            do_transact_ops(db, :lists.reverse(ops), validated)
-
-          {:abort, reason} ->
-            {:error, %Error{reason: reason}}
-
-          other when is_map(other) and not is_struct(other) ->
-            ops = TxCompiler.compile_moment_map(other)
-            do_transact_ops(db, ops, validated)
-
-          other ->
-            {:error, %Error{reason: :invalid_transaction_return, details: %{value: other}}}
-        end
-      rescue
-        e in Error ->
-          {:error, e}
-
-        e ->
-          {:error, %Error{reason: :transaction_exception, details: %{exception: e}}}
-      end
+      run_transact_fun(db, db_ref, fun, validated[:base_moment], validated)
     end
+  end
+
+  defp run_transact_fun(db, db_ref, fun, base_moment, validated_or_default) do
+    root_cursor = %Cursor{
+      db_ref: db_ref,
+      tag: :hash_map,
+      tag_id: -1,
+      value: base_moment,
+      moment: base_moment,
+      root: true,
+      tx_mode: true
+    }
+
+    try do
+      case fun.(root_cursor) do
+        %Cursor{staged_ops: [_] = ops} ->
+          dispatch_transact_ops(db, db_ref, ops, validated_or_default)
+
+        %Cursor{staged_ops: ops} ->
+          dispatch_transact_ops(db, db_ref, :lists.reverse(ops), validated_or_default)
+
+        {:abort, reason} ->
+          {:error, %Error{reason: reason}}
+
+        other when is_map(other) and not is_struct(other) ->
+          ops = TxCompiler.compile_moment_map(other)
+          dispatch_transact_ops(db, db_ref, ops, validated_or_default)
+
+        other ->
+          {:error, %Error{reason: :invalid_transaction_return, details: %{value: other}}}
+      end
+    rescue
+      e in Error ->
+        {:error, e}
+
+      e ->
+        {:error, %Error{reason: :transaction_exception, details: %{exception: e}}}
+    end
+  end
+
+  defp dispatch_transact_ops(db, db_ref, ops, :default) do
+    do_transact_ops_default(db, db_ref, ops)
+  end
+
+  defp dispatch_transact_ops(db, _db_ref, ops, validated) do
+    do_transact_ops(db, ops, validated)
   end
 
   @doc "Same as `transact/3`, but raises `Xitdb.Error` on failure."
@@ -388,9 +411,27 @@ defmodule Xitdb do
     end
   end
 
+  defp do_transact_ops(%__MODULE__{db_ref: db_ref} = db, ops, @default_transact_opts) do
+    do_transact_ops_default(db, db_ref, ops)
+  end
+
   defp do_transact_ops(%__MODULE__{} = db, ops, validated) do
     with {:ok, updated_db, _moment_idx} <- do_transact_ops_with_moment(db, ops, validated) do
       {:ok, updated_db}
+    end
+  end
+
+  defp do_transact_ops_default(db, db_ref, ops) do
+    case NIF.nif_transact(db_ref, -1, ops, "") do
+      {:ok, _moment_idx} -> {:ok, db}
+      {:error, reason} -> {:error, %Error{reason: reason}}
+    end
+  end
+
+  defp do_transact_ops_with_moment(%__MODULE__{db_ref: db_ref} = db, ops, @default_transact_opts) do
+    case NIF.nif_transact(db_ref, -1, ops, "") do
+      {:ok, moment_idx} -> {:ok, db, moment_idx}
+      {:error, reason} -> {:error, %Error{reason: reason}}
     end
   end
 
@@ -446,12 +487,19 @@ defmodule Xitdb do
   typed `{kind, key}` steps (`[{:counted, "users"}, "alice", "queue"]`).
   """
   @spec insert_at(Cursor.t(), String.t() | [term()], integer(), term()) :: Cursor.t()
+  def insert_at(%Cursor{staged_ops: []} = root, path_or_selector, index, value)
+      when (is_list(path_or_selector) or is_binary(path_or_selector)) and is_integer(index) do
+    %Cursor{root | staged_ops: [{:insert, path_or_selector, index, value}]}
+  end
+
   def insert_at(%Cursor{} = root, path_or_selector, index, value)
       when (is_list(path_or_selector) or is_binary(path_or_selector)) and is_integer(index) do
-    selector = Selector.format_path_steps(path_or_selector)
+    updated = Cursor.purge_staged_prefix(root, path_or_selector)
 
-    updated = Cursor.purge_staged_prefix(root, selector)
-    %Cursor{updated | staged_ops: [{:insert, selector, index, value} | updated.staged_ops]}
+    %Cursor{
+      updated
+      | staged_ops: [{:insert, path_or_selector, index, value} | updated.staged_ops]
+    }
   end
 
   @doc """
@@ -461,18 +509,36 @@ defmodule Xitdb do
   @spec delete_at(Cursor.t(), String.t() | [term()], integer()) :: Cursor.t()
   def delete_at(%Cursor{} = root, path_or_selector, index)
       when (is_list(path_or_selector) or is_binary(path_or_selector)) and is_integer(index) do
-    base_selector = Selector.format_path_steps(path_or_selector)
-    selector = base_selector <> Selector.format_step(:linked_array_list, index)
+    selector =
+      if is_binary(path_or_selector) do
+        path_or_selector <> Selector.format_step(:linked_array_list, index)
+      else
+        path_or_selector ++ [[index]]
+      end
 
-    updated = Cursor.purge_staged_prefix(root, base_selector)
-    %Cursor{updated | staged_ops: [{:rm, selector} | updated.staged_ops]}
+    case root do
+      %Cursor{staged_ops: []} ->
+        %Cursor{root | staged_ops: [{:rm, selector}]}
+
+      _ ->
+        updated = Cursor.purge_staged_prefix(root, path_or_selector)
+        %Cursor{updated | staged_ops: [{:rm, selector} | updated.staged_ops]}
+    end
   end
 
   @doc """
   Stages an `O(1)` zero-copy structural clone (`tx_fork`) from `from_selector` to `to_selector`.
   """
-  @spec fork(Cursor.t(), String.t(), String.t()) :: Cursor.t()
-  def fork(%Cursor{} = root, from_selector, to_selector) do
+  @spec fork(Cursor.t(), String.t() | [term()], String.t() | [term()]) :: Cursor.t()
+  def fork(%Cursor{staged_ops: []} = root, from_selector, to_selector)
+      when (is_binary(from_selector) or is_list(from_selector)) and
+             (is_binary(to_selector) or is_list(to_selector)) do
+    %Cursor{root | staged_ops: [{:fork, from_selector, to_selector}]}
+  end
+
+  def fork(%Cursor{} = root, from_selector, to_selector)
+      when (is_binary(from_selector) or is_list(from_selector)) and
+             (is_binary(to_selector) or is_list(to_selector)) do
     updated = Cursor.fork_staged_prefix(root, from_selector, to_selector)
 
     %Cursor{
@@ -538,17 +604,19 @@ defmodule Xitdb do
   Resolves a canonical root-anchored `xitdb` selector string (`~x|.users["101"].todos[1]|`)
   against `db` or a committed root snapshot `%Xitdb.Cursor{}` (from `Xitdb.db/1` or `Xitdb.as_of/2`).
   """
-  @spec select(t() | Cursor.t(), String.t()) :: {:ok, term()} | {:error, Error.t()}
-  def select(%__MODULE__{db_ref: db_ref}, selector) when is_binary(selector) do
+  @spec select(t() | Cursor.t(), String.t() | [term()]) :: {:ok, term()} | {:error, Error.t()}
+  def select(%__MODULE__{db_ref: db_ref}, selector)
+      when is_binary(selector) or is_list(selector) do
     do_select(db_ref, -1, selector)
   end
 
   def select(%Cursor{root: true, tx_mode: false, db_ref: db_ref, moment: moment}, selector)
-      when is_binary(selector) do
+      when is_binary(selector) or is_list(selector) do
     do_select(db_ref, moment, selector)
   end
 
-  def select(%Cursor{tag: tag, tx_mode: tx_mode}, selector) when is_binary(selector) do
+  def select(%Cursor{tag: tag, tx_mode: tx_mode}, selector)
+      when is_binary(selector) or is_list(selector) do
     {:error,
      %Error{
        reason: :non_root_cursor,
@@ -564,7 +632,7 @@ defmodule Xitdb do
   end
 
   @doc "Same as `select/2`, but raises `Xitdb.Error` on failure."
-  @spec select!(t() | Cursor.t(), String.t()) :: term()
+  @spec select!(t() | Cursor.t(), String.t() | [term()]) :: term()
   def select!(target, selector), do: target |> select(selector) |> Error.unwrap!()
 
   @doc """
@@ -631,8 +699,9 @@ defmodule Xitdb do
   @doc """
   Returns the historical lineage of `selector` across all moments where its `Slot` changed.
   """
-  @spec history_of(t(), String.t()) :: {:ok, [map()]} | {:error, Error.t()}
-  def history_of(%__MODULE__{db_ref: db_ref}, selector) when is_binary(selector) do
+  @spec history_of(t(), String.t() | [term()]) :: {:ok, [map()]} | {:error, Error.t()}
+  def history_of(%__MODULE__{db_ref: db_ref}, selector)
+      when is_binary(selector) or is_list(selector) do
     db_ref |> NIF.nif_history_of(selector) |> Error.wrap(%{selector: selector})
   end
 

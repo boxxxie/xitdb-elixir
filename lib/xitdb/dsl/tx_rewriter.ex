@@ -147,6 +147,13 @@ defmodule Xitdb.DSL.TxRewriter do
     found?
   end
 
+  defp compile_tx_path({:path_steps, _, [inner_ast]}), do: PathCompiler.compile_steps(inner_ast)
+
+  defp compile_tx_path({{:., _, [_mod, :path_steps]}, _, [inner_ast]}),
+    do: PathCompiler.compile_steps(inner_ast)
+
+  defp compile_tx_path(path_ast), do: PathCompiler.compile(path_ast)
+
   defp rewrite_ast({op, meta, _args} = node, _tx_ref_var, _caller)
        when op in @nested_tx_macros and is_list(meta) do
     node
@@ -158,7 +165,7 @@ defmodule Xitdb.DSL.TxRewriter do
   end
 
   defp rewrite_ast({:put, _meta, [path_ast]}, tx_ref_var, _caller) do
-    selector_ast = PathCompiler.compile(path_ast)
+    selector_ast = compile_tx_path(path_ast)
 
     quote do
       Xitdb.DSL.TxRuntime.put_set_member(unquote(tx_ref_var), unquote(selector_ast))
@@ -166,7 +173,7 @@ defmodule Xitdb.DSL.TxRewriter do
   end
 
   defp rewrite_ast({:put, _meta, [path_ast, val_ast]}, tx_ref_var, caller) do
-    selector_ast = PathCompiler.compile(path_ast)
+    selector_ast = compile_tx_path(path_ast)
     rewritten_val = rewrite_ast(val_ast, tx_ref_var, caller)
 
     quote do
@@ -175,7 +182,7 @@ defmodule Xitdb.DSL.TxRewriter do
   end
 
   defp rewrite_ast({:update, _meta, [path_ast, fun_ast]}, tx_ref_var, caller) do
-    selector_ast = PathCompiler.compile(path_ast)
+    selector_ast = compile_tx_path(path_ast)
     rewritten_fun = rewrite_ast(fun_ast, tx_ref_var, caller)
 
     quote do
@@ -188,7 +195,7 @@ defmodule Xitdb.DSL.TxRewriter do
   end
 
   defp rewrite_ast({:update, _meta, [path_ast, default_ast, fun_ast]}, tx_ref_var, caller) do
-    selector_ast = PathCompiler.compile(path_ast)
+    selector_ast = compile_tx_path(path_ast)
     rewritten_default = rewrite_ast(default_ast, tx_ref_var, caller)
     rewritten_fun = rewrite_ast(fun_ast, tx_ref_var, caller)
 
@@ -203,7 +210,7 @@ defmodule Xitdb.DSL.TxRewriter do
   end
 
   defp rewrite_ast({:rm, _meta, [path_ast]}, tx_ref_var, _caller) do
-    selector_ast = PathCompiler.compile(path_ast)
+    selector_ast = compile_tx_path(path_ast)
 
     quote do
       Xitdb.DSL.TxRuntime.rm(unquote(tx_ref_var), unquote(selector_ast))
@@ -211,7 +218,7 @@ defmodule Xitdb.DSL.TxRewriter do
   end
 
   defp rewrite_ast({:append, _meta, [path_ast, val_ast]}, tx_ref_var, caller) do
-    selector_ast = PathCompiler.compile(path_ast)
+    selector_ast = compile_tx_path(path_ast)
     rewritten_val = rewrite_ast(val_ast, tx_ref_var, caller)
 
     quote do
@@ -225,7 +232,7 @@ defmodule Xitdb.DSL.TxRewriter do
 
   defp rewrite_ast({:insert, _meta, [target_ast, val_ast]}, tx_ref_var, caller) do
     {list_path_ast, idx_ast} = split_insert_target!(target_ast, caller)
-    selector_ast = PathCompiler.compile(list_path_ast)
+    selector_ast = compile_tx_path(list_path_ast)
     rewritten_val = rewrite_ast(val_ast, tx_ref_var, caller)
 
     quote do
@@ -239,7 +246,7 @@ defmodule Xitdb.DSL.TxRewriter do
   end
 
   defp rewrite_ast({:insert, _meta, [list_path_ast, idx_ast, val_ast]}, tx_ref_var, caller) do
-    selector_ast = PathCompiler.compile(list_path_ast)
+    selector_ast = compile_tx_path(list_path_ast)
     rewritten_val = rewrite_ast(val_ast, tx_ref_var, caller)
 
     quote do
@@ -253,7 +260,7 @@ defmodule Xitdb.DSL.TxRewriter do
   end
 
   defp rewrite_ast({:slice, _meta, [path_ast, range_ast]}, tx_ref_var, _caller) do
-    selector_ast = PathCompiler.compile(path_ast)
+    selector_ast = compile_tx_path(path_ast)
 
     quote do
       Xitdb.DSL.TxRuntime.slice(unquote(tx_ref_var), unquote(selector_ast), unquote(range_ast))
@@ -261,7 +268,7 @@ defmodule Xitdb.DSL.TxRewriter do
   end
 
   defp rewrite_ast({:slice, _meta, [path_ast, offset_ast, size_ast]}, tx_ref_var, _caller) do
-    selector_ast = PathCompiler.compile(path_ast)
+    selector_ast = compile_tx_path(path_ast)
 
     quote do
       Xitdb.DSL.TxRuntime.slice(
@@ -274,8 +281,8 @@ defmodule Xitdb.DSL.TxRewriter do
   end
 
   defp rewrite_ast({:fork, _meta, [from_path_ast, to_path_ast]}, tx_ref_var, _caller) do
-    from_selector = PathCompiler.compile(from_path_ast)
-    to_selector = PathCompiler.compile(to_path_ast)
+    from_selector = compile_tx_path(from_path_ast)
+    to_selector = compile_tx_path(to_path_ast)
 
     quote do
       Xitdb.DSL.TxRuntime.fork(
@@ -298,7 +305,7 @@ defmodule Xitdb.DSL.TxRewriter do
   end
 
   defp rewrite_ast({:init_col, _meta, [path_ast, kind_ast]}, tx_ref_var, _caller) do
-    selector_ast = PathCompiler.compile(path_ast)
+    selector_ast = compile_tx_path(path_ast)
 
     quote do
       Xitdb.DSL.TxRuntime.init_col(
@@ -311,7 +318,7 @@ defmodule Xitdb.DSL.TxRewriter do
   end
 
   defp rewrite_ast({:reset_col, _meta, [path_ast, kind_ast]}, tx_ref_var, _caller) do
-    selector_ast = PathCompiler.compile(path_ast)
+    selector_ast = compile_tx_path(path_ast)
 
     quote do
       Xitdb.DSL.TxRuntime.init_col(

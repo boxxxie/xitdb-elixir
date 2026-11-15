@@ -32,7 +32,7 @@ defmodule Xitdb.DSL.TxRuntime do
     Xitdb.transact_ops(db, all_ops, opts)
   end
 
-  def put(tx_ref, selector, value) when is_binary(selector) do
+  def put(tx_ref, selector, value) when is_binary(selector) or is_list(selector) do
     %__MODULE__{} = state = Process.get(tx_ref)
 
     cond do
@@ -44,13 +44,19 @@ defmodule Xitdb.DSL.TxRuntime do
         op = {:put, selector, value}
 
         staged_log =
-          append_staged(state.staged_log, {:put, parse_selector_steps(selector), value})
+          case state.staged_log do
+            nil -> nil
+            log -> [{:put, parse_selector_steps(selector), value} | log]
+          end
 
         Process.put(tx_ref, %__MODULE__{state | ops: [op | state.ops], staged_log: staged_log})
         value
 
       true ->
-        compiled_ops = TxCompiler.compile_node(selector, value, true)
+        compiled_ops =
+          selector
+          |> Xitdb.Selector.format_path_steps()
+          |> TxCompiler.compile_node(value, true)
 
         staged_log =
           case state.staged_log do
@@ -72,34 +78,43 @@ defmodule Xitdb.DSL.TxRuntime do
     end
   end
 
-  def put_set_member(tx_ref, selector) when is_binary(selector) do
+  def put_set_member(tx_ref, selector) when is_binary(selector) or is_list(selector) do
     %__MODULE__{} = state = Process.get(tx_ref)
     op = {:put, selector, ""}
 
     staged_log =
-      append_staged(state.staged_log, {:put_set_member, parse_selector_steps(selector)})
+      case state.staged_log do
+        nil -> nil
+        log -> [{:put_set_member, parse_selector_steps(selector)} | log]
+      end
 
     Process.put(tx_ref, %__MODULE__{state | ops: [op | state.ops], staged_log: staged_log})
     true
   end
 
-  def update(tx_ref, selector, fun) when is_binary(selector) and is_function(fun, 1) do
+  def update(tx_ref, selector, fun)
+      when (is_binary(selector) or is_list(selector)) and is_function(fun, 1) do
     %__MODULE__{} = state = Process.get(tx_ref)
     current = read_current_value(state, selector)
     put(tx_ref, selector, fun.(current))
   end
 
   def update(tx_ref, selector, default, fun)
-      when is_binary(selector) and is_function(fun, 1) do
+      when (is_binary(selector) or is_list(selector)) and is_function(fun, 1) do
     %__MODULE__{} = state = Process.get(tx_ref)
     current = read_current_value(state, selector)
     resolved = if is_nil(current), do: default, else: current
     put(tx_ref, selector, fun.(resolved))
   end
 
-  def rm(tx_ref, selector) when is_binary(selector) do
+  def rm(tx_ref, selector) when is_binary(selector) or is_list(selector) do
     %__MODULE__{} = state = Process.get(tx_ref)
-    staged_log = append_staged(state.staged_log, {:rm, parse_selector_steps(selector)})
+
+    staged_log =
+      case state.staged_log do
+        nil -> nil
+        log -> [{:rm, parse_selector_steps(selector)} | log]
+      end
 
     Process.put(tx_ref, %__MODULE__{
       state
@@ -110,7 +125,7 @@ defmodule Xitdb.DSL.TxRuntime do
     :ok
   end
 
-  def append(tx_ref, selector, value) when is_binary(selector) do
+  def append(tx_ref, selector, value) when is_binary(selector) or is_list(selector) do
     %__MODULE__{} = state = Process.get(tx_ref)
 
     staged_log =
@@ -132,7 +147,7 @@ defmodule Xitdb.DSL.TxRuntime do
   end
 
   def insert(tx_ref, selector, index, value)
-      when is_binary(selector) and is_integer(index) do
+      when (is_binary(selector) or is_list(selector)) and is_integer(index) do
     %__MODULE__{} = state = Process.get(tx_ref)
 
     staged_log =
@@ -156,16 +171,21 @@ defmodule Xitdb.DSL.TxRuntime do
     value
   end
 
-  def slice(tx_ref, selector, first.._last//1 = range) when is_binary(selector) do
+  def slice(tx_ref, selector, first.._last//1 = range)
+      when is_binary(selector) or is_list(selector) do
     slice(tx_ref, selector, first, Range.size(range))
   end
 
   def slice(tx_ref, selector, offset, size)
-      when is_binary(selector) and is_integer(offset) and is_integer(size) do
+      when (is_binary(selector) or is_list(selector)) and is_integer(offset) and
+             is_integer(size) do
     %__MODULE__{} = state = Process.get(tx_ref)
 
     staged_log =
-      append_staged(state.staged_log, {:slice, parse_selector_steps(selector), offset, size})
+      case state.staged_log do
+        nil -> nil
+        log -> [{:slice, parse_selector_steps(selector), offset, size} | log]
+      end
 
     Process.put(tx_ref, %__MODULE__{
       state
@@ -177,7 +197,8 @@ defmodule Xitdb.DSL.TxRuntime do
   end
 
   def fork(tx_ref, from_selector, to_selector)
-      when is_binary(from_selector) and is_binary(to_selector) do
+      when (is_binary(from_selector) or is_list(from_selector)) and
+             (is_binary(to_selector) or is_list(to_selector)) do
     %__MODULE__{} = state = Process.get(tx_ref)
 
     staged_log =
@@ -206,13 +227,16 @@ defmodule Xitdb.DSL.TxRuntime do
     :ok
   end
 
-  def init_col(tx_ref, selector, kind, reset?) when is_binary(selector) do
+  def init_col(tx_ref, selector, kind, reset?) when is_binary(selector) or is_list(selector) do
     %__MODULE__{} = state = Process.get(tx_ref)
     op_tag = if reset?, do: :reset_col, else: :init_col
     empty_val = empty_collection_value(kind)
 
     staged_log =
-      append_staged(state.staged_log, {op_tag, parse_selector_steps(selector), empty_val})
+      case state.staged_log do
+        nil -> nil
+        log -> [{op_tag, parse_selector_steps(selector), empty_val} | log]
+      end
 
     Process.put(tx_ref, %__MODULE__{
       state
@@ -240,9 +264,6 @@ defmodule Xitdb.DSL.TxRuntime do
     Process.put(tx_ref, %__MODULE__{state | ops: [{:savepoint} | state.ops]})
     :ok
   end
-
-  defp append_staged(nil, _entry), do: nil
-  defp append_staged(log, entry), do: [entry | log]
 
   defp empty_collection_value(kind) when kind in [:hash_map, :counted_hash_map, :sorted_map],
     do: %{}
@@ -588,149 +609,40 @@ defmodule Xitdb.DSL.TxRuntime do
   end
 
   defp parse_selector_steps(selector) when is_binary(selector) do
-    selector
-    |> strip_leading_moment()
-    |> do_parse_steps([])
+    Xitdb.Selector.parse_selector_steps(selector, false)
   end
 
-  defp strip_leading_moment(<<?@, rest::binary>>) do
-    {_num, tail} = take_until_sigil(rest)
-    tail
+  defp parse_selector_steps([{:at_moment, _} | rest]) do
+    parse_selector_steps(rest)
   end
 
-  defp strip_leading_moment(bin), do: bin
+  defp parse_selector_steps(steps) when is_list(steps) do
+    Enum.map(steps, fn
+      [idx] when is_integer(idx) ->
+        {:linked_array_list, idx}
 
-  defp do_parse_steps(<<>>, acc), do: :lists.reverse(acc)
+      idx when is_integer(idx) ->
+        {:array_list, idx}
 
-  defp do_parse_steps(<<?#, ?%, rest::binary>>, acc) do
-    {key, tail} = parse_key_token(rest)
-    do_parse_steps(tail, [{:counted_hash_set, key} | acc])
+      {kind, val} ->
+        case Xitdb.Selector.normalize_typed_step(kind, val) do
+          {norm_kind, k}
+          when norm_kind in [
+                 :hash_map,
+                 :counted_hash_map,
+                 :sorted_map,
+                 :hash_set,
+                 :counted_hash_set,
+                 :sorted_set
+               ] ->
+            {norm_kind, to_string(k)}
+
+          {norm_kind, idx} ->
+            {norm_kind, idx}
+        end
+
+      key ->
+        {:hash_map, key |> Xitdb.Selector.validate_step_key() |> to_string()}
+    end)
   end
-
-  defp do_parse_steps(<<?., rest::binary>>, acc) do
-    {key, tail} = parse_key_token(rest)
-    do_parse_steps(tail, [{:hash_map, key} | acc])
-  end
-
-  defp do_parse_steps(<<?#, rest::binary>>, acc) do
-    {key, tail} = parse_key_token(rest)
-    do_parse_steps(tail, [{:counted_hash_map, key} | acc])
-  end
-
-  defp do_parse_steps(<<?$, rest::binary>>, acc) do
-    {key, tail} = parse_key_token(rest)
-    do_parse_steps(tail, [{:sorted_map, key} | acc])
-  end
-
-  defp do_parse_steps(<<?%, rest::binary>>, acc) do
-    {key, tail} = parse_key_token(rest)
-    do_parse_steps(tail, [{:hash_set, key} | acc])
-  end
-
-  defp do_parse_steps(<<?^, rest::binary>>, acc) do
-    {key, tail} = parse_key_token(rest)
-    do_parse_steps(tail, [{:sorted_set, key} | acc])
-  end
-
-  defp do_parse_steps(<<?[, ?[, rest::binary>>, acc) do
-    {int_str, <<?], ?], tail::binary>>} = take_until_byte(rest, ?])
-    do_parse_steps(tail, [{:linked_array_list, String.to_integer(int_str)} | acc])
-  end
-
-  defp do_parse_steps(<<?[, ?', rest::binary>>, acc) do
-    {unescaped, <<?], tail::binary>>} = parse_single_quoted_string(rest, [])
-    do_parse_steps(tail, [{:hash_map, unescaped} | acc])
-  end
-
-  defp do_parse_steps(<<?[, ?", rest::binary>>, acc) do
-    {unescaped, <<?], tail::binary>>} = parse_quoted_string(rest, [])
-    do_parse_steps(tail, [{:hash_map, unescaped} | acc])
-  end
-
-  defp do_parse_steps(<<?[, rest::binary>>, acc) do
-    {int_str, <<?], tail::binary>>} = take_until_byte(rest, ?])
-    do_parse_steps(tail, [{:array_list, String.to_integer(int_str)} | acc])
-  end
-
-  defp do_parse_steps(bin, acc) do
-    {key, tail} = parse_key_token(bin)
-    do_parse_steps(tail, [{:hash_map, key} | acc])
-  end
-
-  defp parse_key_token(<<?[, ?', rest::binary>>) do
-    {unescaped, <<?], tail::binary>>} = parse_single_quoted_string(rest, [])
-    {unescaped, tail}
-  end
-
-  defp parse_key_token(<<?[, ?", rest::binary>>) do
-    {unescaped, <<?], tail::binary>>} = parse_quoted_string(rest, [])
-    {unescaped, tail}
-  end
-
-  defp parse_key_token(bin), do: take_until_sigil(bin)
-
-  defp take_until_sigil(bin), do: do_take_until_sigil(bin, 0, bin)
-
-  defp do_take_until_sigil(<<>>, len, orig), do: {binary_part(orig, 0, len), <<>>}
-
-  defp do_take_until_sigil(<<b, _::binary>> = tail, len, orig)
-       when b in [?., ?#, ?$, ?[, ?%, ?^] do
-    {binary_part(orig, 0, len), tail}
-  end
-
-  defp do_take_until_sigil(<<_, rest::binary>>, len, orig) do
-    do_take_until_sigil(rest, len + 1, orig)
-  end
-
-  defp take_until_byte(bin, stop_byte), do: do_take_until_byte(bin, stop_byte, 0, bin)
-
-  defp do_take_until_byte(<<b, _::binary>> = tail, b, len, orig) do
-    {binary_part(orig, 0, len), tail}
-  end
-
-  defp do_take_until_byte(<<_, rest::binary>>, stop_byte, len, orig) do
-    do_take_until_byte(rest, stop_byte, len + 1, orig)
-  end
-
-  defp parse_single_quoted_string(<<?', tail::binary>>, acc),
-    do: {IO.iodata_to_binary(:lists.reverse(acc)), tail}
-
-  defp parse_single_quoted_string(<<?\\, ?\\, rest::binary>>, acc),
-    do: parse_single_quoted_string(rest, [?\\ | acc])
-
-  defp parse_single_quoted_string(<<?\\, ?', rest::binary>>, acc),
-    do: parse_single_quoted_string(rest, [?' | acc])
-
-  defp parse_single_quoted_string(<<?\\, ?n, rest::binary>>, acc),
-    do: parse_single_quoted_string(rest, [?\n | acc])
-
-  defp parse_single_quoted_string(<<?\\, ?r, rest::binary>>, acc),
-    do: parse_single_quoted_string(rest, [?\r | acc])
-
-  defp parse_single_quoted_string(<<?\\, ?t, rest::binary>>, acc),
-    do: parse_single_quoted_string(rest, [?\t | acc])
-
-  defp parse_single_quoted_string(<<b, rest::binary>>, acc),
-    do: parse_single_quoted_string(rest, [b | acc])
-
-  defp parse_quoted_string(<<?", tail::binary>>, acc),
-    do: {IO.iodata_to_binary(:lists.reverse(acc)), tail}
-
-  defp parse_quoted_string(<<?\\, ?\\, rest::binary>>, acc),
-    do: parse_quoted_string(rest, [?\\ | acc])
-
-  defp parse_quoted_string(<<?\\, ?", rest::binary>>, acc),
-    do: parse_quoted_string(rest, [?" | acc])
-
-  defp parse_quoted_string(<<?\\, ?n, rest::binary>>, acc),
-    do: parse_quoted_string(rest, [?\n | acc])
-
-  defp parse_quoted_string(<<?\\, ?r, rest::binary>>, acc),
-    do: parse_quoted_string(rest, [?\r | acc])
-
-  defp parse_quoted_string(<<?\\, ?t, rest::binary>>, acc),
-    do: parse_quoted_string(rest, [?\t | acc])
-
-  defp parse_quoted_string(<<b, rest::binary>>, acc),
-    do: parse_quoted_string(rest, [b | acc])
 end

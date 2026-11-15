@@ -681,19 +681,30 @@ defmodule Xitdb.Cursor do
   end
 
   @doc false
-  def purge_staged_prefix(%__MODULE__{} = cursor, selector) when is_binary(selector) do
-    %__MODULE__{
-      cursor
-      | staged_overrides: purge_prefix_from_map(cursor.staged_overrides, selector),
-        deleted_paths: purge_prefix_from_set(cursor.deleted_paths, selector)
-    }
-  end
-
-  @doc false
-  def fork_staged_prefix(%__MODULE__{} = cursor, from_selector, to_selector) do
+  def purge_staged_prefix(%__MODULE__{} = cursor, selector)
+      when is_binary(selector) or is_list(selector) do
     if map_size(cursor.staged_overrides) == 0 and MapSet.size(cursor.deleted_paths) == 0 do
       cursor
     else
+      formatted = Selector.format_path_steps(selector)
+
+      %__MODULE__{
+        cursor
+        | staged_overrides: purge_prefix_from_map(cursor.staged_overrides, formatted),
+          deleted_paths: purge_prefix_from_set(cursor.deleted_paths, formatted)
+      }
+    end
+  end
+
+  @doc false
+  def fork_staged_prefix(%__MODULE__{} = cursor, from_selector, to_selector)
+      when (is_binary(from_selector) or is_list(from_selector)) and
+             (is_binary(to_selector) or is_list(to_selector)) do
+    if map_size(cursor.staged_overrides) == 0 and MapSet.size(cursor.deleted_paths) == 0 do
+      cursor
+    else
+      from_selector = Selector.format_path_steps(from_selector)
+      to_selector = Selector.format_path_steps(to_selector)
       cleared_overrides = purge_prefix_from_map(cursor.staged_overrides, to_selector)
       cleared_deleted = purge_prefix_from_set(cursor.deleted_paths, to_selector)
 
