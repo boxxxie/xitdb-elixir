@@ -646,21 +646,23 @@ main :: proc() {
 	// #10: Full Enum.to_list stream over Array_List (N=500)
 	for r in 0 ..< (g_warmup + g_runs) {
 		t0 := time.now()
-		it, _ := xitdb.array_list_iterator(items_al)
-		for {
-			nm, _ := xitdb.cursor_iterator_next(&it)
-			ec, ok := nm.?
-			if !ok {
-				break
+		for _ in 0 ..< 50 {
+			it, _ := xitdb.array_list_iterator(items_al)
+			for {
+				nm, _ := xitdb.cursor_iterator_next(&it)
+				ec, ok := nm.?
+				if !ok {
+					break
+				}
+				_, _ = xitdb.cursor_read_string(ec, 0, context.temp_allocator)
 			}
-			_, _ = xitdb.cursor_read_string(ec, 0, context.temp_allocator)
 		}
 		if r >= g_warmup {
-			samples[r - g_warmup] = f64(time.duration_nanoseconds(time.since(t0))) / 500.0
+			samples[r - g_warmup] = f64(time.duration_nanoseconds(time.since(t0))) / 50.0
 		}
 		free_all(context.temp_allocator)
 	}
-	record_samples(10, "Enum: Full Enum.to_list/1 stream over Array_List (N=500)", 500, samples)
+	record_samples(10, "Enum: Full Enum.to_list/1 stream over Array_List (N=500)", 50, samples)
 
 	// #11: Subtree materialize (nested user profile)
 	u0_cur_maybe, _ := xitdb.hash_map_get_cursor(users_map, "u0")
@@ -702,7 +704,7 @@ main :: proc() {
 	})
 
 	// #13: Bulk batch transact (100 entities in 1 commit)
-	run_bench(13, "Tx: Bulk batch transact (100 entities in 1 commit)", 100, proc() -> (time.Duration, i64) {
+	run_bench(13, "Tx: Bulk batch transact (100 entities in 1 commit)", 1, proc() -> (time.Duration, i64) {
 		c := xitdb.core_memory_init()
 		defer xitdb.core_destroy(&c)
 		d, _ := xitdb.database_init(&c, xitdb.sha1_hasher())

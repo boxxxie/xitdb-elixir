@@ -177,8 +177,42 @@ def pool_records($recs):
 
 def latest_snapshot_for_lang($all; $lang):
   ($all | map(select(.lang == $lang))) as $lang_recs |
-  (if $target_commit != "" then $target_commit else ($lang_recs | last.commit // "unknown") end) as $lc |
-  ($lang_recs | map(select((.commit // "unknown") == $lc)) | group_by(.name) | map(pool_records(.)) | sort_by(.rank));
+  if ($lang_recs | length) == 0 then
+    []
+  elif $target_commit != "" then
+    ($lang_recs
+     | map(select((.commit // "unknown") == $target_commit))
+     | group_by(.name)
+     | map(pool_records(.))
+     | sort_by(.rank))
+  else
+    (($lang_recs | map(select((.commit // "unknown") != "unknown"))) as $known |
+     (if ($known | length) > 0 then $known else $lang_recs end) as $scoped |
+     ($scoped | last.commit // "unknown") as $overall_lc |
+     (reduce $scoped[] as $r ({order: [], counts: {}};
+       ($r.commit // "unknown") as $c |
+       (if (.counts[$c] // null) == null then
+          .order += [$c] | .counts[$c] = {}
+        else . end)
+       | .counts[$c][$r.name] = true
+     )) as $by_commit |
+     ([ $by_commit.order[] | {c: ., n: ($by_commit.counts[.] | keys | length)} ]) as $commit_sizes |
+     ([$commit_sizes[].n] | max) as $max_n |
+     ([$commit_sizes | to_entries[] | select(.value.n == $max_n) | .key] | last) as $full_idx |
+     ([$commit_sizes[$full_idx:][].c]) as $active_commits |
+     ($active_commits | map($by_commit.counts[.] | keys[]) | unique) as $active_names |
+     ($active_names | map({key: ., value: true}) | from_entries) as $active_set |
+     $scoped
+     | map(select($active_set[.name] == true))
+     | group_by(.name)
+     | map(
+         (last.commit // "unknown") as $name_lc |
+         map(select((.commit // "unknown") == $name_lc))
+         | pool_records(.)
+         | .commit = $overall_lc
+       )
+     | sort_by(.rank))
+  end;
 
 def tier_table_ns($list):
   "| # | Benchmark | Med\u00a0(`ns`) | Mean\u00a0±\u00a0σ | CV | Min\u00a0`ops/s` | Max\u00a0`ops/s` | IQR | `p95` | `p99` | Min | Max | Ops |",
@@ -211,7 +245,7 @@ def single_lang_section($sec_num; $lang_label; $flags; $sha; $list):
 def compare_1v1_table($list; $ex_map; $unit):
   "| # | Benchmark | NIF\u00a0Ratio | Raw\u00a0Odin\u00a0Med\u00a0(`\($unit)`) | Elixir\u00a0Med\u00a0(`\($unit)`) | Welch\u00a0`z` | Odin\u00a0Mean\u00a0±\u00a0σ | Odin\u00a0CV | Elixir\u00a0Mean\u00a0±\u00a0σ | Elixir\u00a0CV |",
   "| ---: | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
-  ($list[] | . as $o | $ex_map[$o.name] as $e |
+  ($list[] | . as $o | $ex_map[$o.name] as $e | select($e != null) |
     welch_z($o; $e) as $wz |
     (if $wz >= 1.96 then "`\(fmt_dec1($wz))`\u00a0★" else "`\(fmt_dec1($wz))`\u00a0~" end) as $sig_col |
     (if $unit == "µs" then

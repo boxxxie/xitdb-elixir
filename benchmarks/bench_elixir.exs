@@ -145,9 +145,12 @@ defmodule Xitdb.ClientBench do
 
          0
        end},
-      {10, "Enum: Full Enum.to_list/1 stream over Array_List (N=500)", 500,
+      {10, "Enum: Full Enum.to_list/1 stream over Array_List (N=500)", 50,
        fn ->
-         _ = Enum.to_list(items_cur)
+         for _ <- 1..50 do
+           _ = Enum.to_list(items_cur)
+         end
+
          0
        end},
       {11, "Materialize: Eager subtree materialize/1 (user profile)", 200,
@@ -185,7 +188,7 @@ defmodule Xitdb.ClientBench do
          Xitdb.close(d)
          {elapsed, sz}
        end},
-      {13, "Tx: Bulk batch transact (100 entities in 1 commit)", 100,
+      {13, "Tx: Bulk batch transact (100 entities in 1 commit)", 1,
        fn ->
          {:ok, d} = Xitdb.open(backend: :memory)
          t0 = System.monotonic_time(:nanosecond)
