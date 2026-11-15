@@ -31,35 +31,35 @@ defmodule Xitdb.Selector do
     :sorted_set
   ]
 
-  @special_chars [
-    ".",
-    "[",
-    "]",
-    "{",
-    "}",
-    ",",
-    "=",
-    "!",
-    "<",
-    ">",
-    "?",
-    "*",
-    ":",
-    "#",
-    "$",
-    "%",
-    "^",
-    "@",
-    "\"",
-    "'",
-    "\\",
-    " ",
-    "\t",
-    "\n",
-    "\r"
+  @special_bytes [
+    ?.,
+    ?[,
+    ?],
+    ?{,
+    ?},
+    ?,,
+    ?=,
+    ?!,
+    ?<,
+    ?>,
+    ??,
+    ?*,
+    ?:,
+    ?#,
+    ?$,
+    ?%,
+    ?^,
+    ?@,
+    ?",
+    ?',
+    ?\\,
+    ?\s,
+    ?\t,
+    ?\n,
+    ?\r
   ]
 
-  @escapable_chars ["\\", "\"", "\n", "\r", "\t"]
+  @escapable_bytes [?\\, ?", ?\n, ?\r, ?\t]
 
   defguard is_valid_selector_start(byte) when byte in @valid_selector_starts
   defguard is_typed_modifier(name) when name in @typed_modifiers
@@ -140,7 +140,7 @@ defmodule Xitdb.Selector do
   end
 
   def format_key(key) when is_binary(key) do
-    if key != <<>> and :binary.match(key, @special_chars) == :nomatch do
+    if bare_key?(key) do
       key
     else
       "[" <> encode_quoted(key) <> "]"
@@ -152,12 +152,23 @@ defmodule Xitdb.Selector do
 
   @spec encode_quoted(String.t()) :: String.t()
   def encode_quoted(str) when is_binary(str) do
-    if :binary.match(str, @escapable_chars) == :nomatch do
-      "\"" <> str <> "\""
-    else
+    if needs_escape?(str) do
       IO.iodata_to_binary([?", escape_bytes(str, []), ?"])
+    else
+      "\"" <> str <> "\""
     end
   end
+
+  defp bare_key?(<<>>), do: false
+  defp bare_key?(bin), do: do_bare_key?(bin)
+
+  defp do_bare_key?(<<>>), do: true
+  defp do_bare_key?(<<b, _rest::binary>>) when b in @special_bytes, do: false
+  defp do_bare_key?(<<_b, rest::binary>>), do: do_bare_key?(rest)
+
+  defp needs_escape?(<<>>), do: false
+  defp needs_escape?(<<b, _rest::binary>>) when b in @escapable_bytes, do: true
+  defp needs_escape?(<<_b, rest::binary>>), do: needs_escape?(rest)
 
   defp escape_bytes(<<>>, acc), do: Enum.reverse(acc)
   defp escape_bytes(<<?\\, rest::binary>>, acc), do: escape_bytes(rest, ["\\\\" | acc])

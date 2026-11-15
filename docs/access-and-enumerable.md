@@ -171,11 +171,32 @@ root["leaderboard"]
 
 ---
 
-## 5. When to Use `Access` vs. the Macro DSL (`use Xitdb.DSL`)
+## 5. NIF Boundary Cost Model & When to Use `Access` vs. the Macro DSL
+
+Every BEAM-to-Odin NIF call pays a predictable boundary marshaling and lock-acquisition cost. Understanding this cost model makes it easy to pick the fastest `Xitdb` API for a given workload:
+
+### Fixed Per-Call NIF Floor (`~255 ns`)
+
+Each RW-locked NIF call (`enif_get_resource` + `enif_rwlock_rlock` + `resolve_slot_coord` + `enif_make_*` term construction) carries a fixed overhead of **`~170–290 ns`** relative to in-process Raw Odin execution:
+- **`O(1)` header read (`Enum.count/1` on `Counted_Hash_Map`):** `~174 ns` in Elixir vs. `~6 ns` in Raw Odin.
+- **Single-hop container lookups (`Array_List`, `Linked_Array_List`, `Sorted_Map`):** `~382–624 ns` in Elixir vs. `~109–380 ns` in Raw Odin (adding `~245–285 ns` of boundary overhead).
+
+### Multi-Hop `Access` (`N × ~255 ns`) vs. Single-Call `Xitdb.select/2` & `Xitdb.pull/2`
+
+- **Chained `Access` (`root["users"][id]["name"]`):** Executes one NIF crossing per bracket hop (`3 × nif_slot_get`) and allocates intermediate `%Xitdb.Cursor{}` structs (`~2.49 µs` for 3 hops vs. `~0.65 µs` in Raw Odin).
+- **Single-call selector (`Xitdb.select!(db, path(users[id].name))`):** Resolves the entire selector path inside Odin in **1 NIF crossing** (`~2.28 µs` for 3 hops), keeping boundary overhead constant as path depth grows to 4+ hops.
+- **Structural Pull (`Xitdb.pull!(cursor, [:username, :age, todos: 0..3, profile: [:city]])`):** Projects multiple fields and bounded list slices in **1 NIF crossing** instead of issuing `K` separate `cursor[field]` calls across the boundary.
+
+### Transactional Writes (`put_in/3` vs. `Xitdb.DSL.tx` / Map `Xitdb.transact/3`)
+
+- **Nested `put_in/3` (`put_in(root["users"][id]["score"], val)`):** Elixir's `Access` protocol invokes `get_and_update/3` at each nesting level, performing read-before-write `Cursor.fetch/2` NIF calls to resolve intermediate cursors before staging `{:put, selector, val}` (`~12.3 µs` for a 3-hop `put_in/3` commit vs. `~3.76 µs` in Raw Odin).
+- **Declarative `Xitdb.DSL.tx` (`put users[id].score, val`) & map `Xitdb.transact/3`:** Perform **zero intermediate NIF reads**, compiling all operations into a single batched `nif_transact` call (auto-vivifying missing intermediate maps inside Odin).
+
+### Choosing the Right API
 
 | Use Case | Recommended API | Why |
 | :--- | :--- | :--- |
-| Interactive exploration, passing subtrees to functions/LiveViews, or shallow reads | **Lazy `Access` (`db["users"][id]`)** | Returns composable `%Xitdb.Cursor{}` values that work with standard Elixir `Enum`, `Stream`, and `Access` functions. |
-| Reading a known deep path in a single NIF hop | **`Xitdb.select(db, path(users[id].profile.city))`** | Resolves the entire selector inside Odin in 1 NIF call instead of 1 NIF call per bracket hop. |
-| Projecting multiple fields + bounded list slices from an entity | **`Xitdb.pull(cursor, [:username, todos: 0..5])`** | Projects the exact shape in a single NIF call without materializing unneeded subtrees. |
-| Writing to deep paths where intermediate maps might not exist yet, or batching list `append`/`insert`/`slice`/`fork` | **`Xitdb.DSL.tx db do ... end`** | Auto-vivifies missing intermediate collections with **zero intermediate NIF reads** and supports all native `xitdb` operations declaratively. |
+| Interactive exploration, passing subtrees to functions/LiveViews, or shallow 1–2 hop reads | **Lazy `Access` (`db["users"][id]`)** | Returns composable `%Xitdb.Cursor{}` values that work with standard Elixir `Enum`, `Stream`, and `Access` functions. |
+| Reading a known deep (3+ hop) path in a single NIF crossing | **`Xitdb.select(db, path(users[id].profile.city))`** | Resolves the entire selector inside Odin in 1 NIF call instead of paying `~255 ns` per bracket hop. |
+| Projecting multiple fields + bounded list slices from an entity | **`Xitdb.pull(cursor, [:username, todos: 0..5])`** | Projects the exact shape in 1 NIF call without materializing unneeded subtrees. |
+| Writing to deep paths in tight loops, auto-vivifying missing maps, or batching list `append`/`insert`/`slice`/`fork` | **`Xitdb.DSL.tx db do ... end`** | Avoids `put_in/3` read-before-write NIF hops, auto-vivifies missing intermediate collections with **zero intermediate NIF reads**, and batches all ops into one commit. |

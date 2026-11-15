@@ -2630,7 +2630,7 @@ odin_nif_transact :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TER
 				if len(steps) == 0 {
 					return make_xitdb_err(env, .Invalid_Range)
 				}
-				xitdb.tx_put_steps(&tx, steps, val)
+				append(&tx.ops, xitdb.Tx_Op{kind = .Put, steps = steps, val = val})
 			} else if validate_write_term(env, elems[2]) {
 				if len(steps) == 0 {
 					return make_xitdb_err(env, .Invalid_Range)
@@ -2658,7 +2658,7 @@ odin_nif_transact :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TER
 				return make_err(env, "invalid_append_op")
 			}
 			if val, ok_v := decode_writeable_value(env, elems[2]); ok_v {
-				xitdb.tx_append_steps(&tx, steps, val)
+				append(&tx.ops, xitdb.Tx_Op{kind = .Append, steps = steps, val = val})
 			} else if validate_write_term(env, elems[2]) {
 				sc := new(Structured_Op_Ctx, tx.allocator)
 				sc^ = Structured_Op_Ctx{kind = .Append, steps = steps, env = env, term = elems[2]}
@@ -2706,7 +2706,7 @@ odin_nif_transact :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TER
 			if s_err != "" {
 				return make_err(env, s_err)
 			}
-			xitdb.tx_rm_steps(&tx, steps)
+			append(&tx.ops, xitdb.Tx_Op{kind = .Remove, steps = steps})
 
 		case ATOM_RM_IF_EXISTS:
 			if arity != 2 {
@@ -3387,7 +3387,8 @@ odin_nif_pull :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -
 		slot_ptr = xitdb.Slot_Pointer{position = nil, slot = slot},
 		db       = &handle.db,
 	}
-	visited := make(map[i64]bool, 16, context.temp_allocator)
+	visited: map[i64]bool
+	visited.allocator = context.temp_allocator
 	res_term, p_reason, p_err := nif_pull_cursor(env, &handle.db, cur, pattern_str, is_root, &visited)
 	if p_err != nil {
 		return make_xitdb_err(env, p_err)
@@ -5807,18 +5808,9 @@ collect_postings_into_map :: proc(
 @(export)
 odin_nif_sorted_map_seek :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {
 	context = runtime.default_context()
-
-	arena: mem.Dynamic_Arena
-	mem.dynamic_arena_init(
-		&arena,
-		block_allocator = runtime.default_allocator(),
-		array_allocator = runtime.default_allocator(),
-	)
-	defer mem.dynamic_arena_destroy(&arena)
-
-	arena_alloc := mem.dynamic_arena_allocator(&arena)
+	defer free_all(context.temp_allocator)
+	arena_alloc := context.temp_allocator
 	context.allocator = arena_alloc
-	context.temp_allocator = arena_alloc
 
 	if argc != 5 && argc != 6 {
 		return make_err(env, "badarg")
@@ -5954,18 +5946,9 @@ odin_nif_sorted_map_seek :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_
 @(export)
 odin_nif_bm25_search :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {
 	context = runtime.default_context()
-
-	arena: mem.Dynamic_Arena
-	mem.dynamic_arena_init(
-		&arena,
-		block_allocator = runtime.default_allocator(),
-		array_allocator = runtime.default_allocator(),
-	)
-	defer mem.dynamic_arena_destroy(&arena)
-
-	arena_alloc := mem.dynamic_arena_allocator(&arena)
+	defer free_all(context.temp_allocator)
+	arena_alloc := context.temp_allocator
 	context.allocator = arena_alloc
-	context.temp_allocator = arena_alloc
 
 	if argc != 7 {
 		return make_err(env, "badarg")

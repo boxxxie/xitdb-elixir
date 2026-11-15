@@ -141,6 +141,11 @@ defmodule Xitdb do
                     ]
                   )
 
+  @default_open_opts NimbleOptions.validate!([], @open_schema)
+  @default_transact_opts NimbleOptions.validate!([], @transact_schema)
+  @default_query_opts NimbleOptions.validate!([], @query_schema)
+  @default_compact_opts NimbleOptions.validate!([], @compact_schema)
+
   @enforce_keys [:db_ref, :backend]
   defstruct [:db_ref, :backend, :path, hash: :sha1]
 
@@ -312,7 +317,7 @@ defmodule Xitdb do
 
   def transact(%__MODULE__{} = db, map, opts) when is_map(map) and not is_struct(map) do
     with {:ok, validated} <- validate_opts(opts, @transact_schema) do
-      ops = TxCompiler.compile_moment_map(map, Keyword.delete(validated, :index_rules))
+      ops = TxCompiler.compile_moment_map(map)
       do_transact_ops(db, ops, validated)
     end
   end
@@ -340,7 +345,7 @@ defmodule Xitdb do
             {:error, %Error{reason: reason}}
 
           other when is_map(other) and not is_struct(other) ->
-            ops = TxCompiler.compile_moment_map(other, Keyword.delete(validated, :index_rules))
+            ops = TxCompiler.compile_moment_map(other)
             do_transact_ops(db, ops, validated)
 
           other ->
@@ -393,33 +398,41 @@ defmodule Xitdb do
     base_moment = validated[:base_moment]
     doc = validated[:doc]
 
-    existing_index_ops =
-      for {:index_on, _, _, _} = op <- ops, into: MapSet.new(), do: op
-
     index_ops =
-      validated
-      |> Keyword.get(:index_rules, [])
-      |> Enum.map(fn {:index_on, src, field, idx} ->
-        {:index_on, to_string(src), to_string(field), to_string(idx)}
-      end)
-      |> Enum.uniq()
-      |> Enum.reject(&MapSet.member?(existing_index_ops, &1))
+      case validated[:index_rules] do
+        rules when is_list(rules) and rules != [] ->
+          existing_index_ops =
+            for {:index_on, _, _, _} = op <- ops, into: MapSet.new(), do: op
+
+          rules
+          |> Enum.map(fn {:index_on, src, field, idx} ->
+            {:index_on, to_string(src), to_string(field), to_string(idx)}
+          end)
+          |> Enum.uniq()
+          |> Enum.reject(&MapSet.member?(existing_index_ops, &1))
+
+        _ ->
+          []
+      end
 
     opt_ops =
-      index_ops ++
-        case validated[:instant] do
-          inst when is_integer(inst) -> [{:instant, inst}]
-          _ -> []
-        end ++
-        case validated[:meta] do
-          meta when is_map(meta) or is_list(meta) ->
-            Enum.map(meta, fn {k, v} -> {:meta, to_string(k), v} end)
+      case validated[:instant] do
+        inst when is_integer(inst) -> index_ops ++ [{:instant, inst}]
+        _ -> index_ops
+      end
 
-          _ ->
-            []
-        end
+    opt_ops =
+      case validated[:meta] do
+        meta when is_map(meta) or (is_list(meta) and meta != []) ->
+          opt_ops ++ Enum.map(meta, fn {k, v} -> {:meta, to_string(k), v} end)
 
-    case NIF.nif_transact(db_ref, base_moment, opt_ops ++ ops, doc) do
+        _ ->
+          opt_ops
+      end
+
+    all_ops = if opt_ops == [], do: ops, else: opt_ops ++ ops
+
+    case NIF.nif_transact(db_ref, base_moment, all_ops, doc) do
       {:ok, moment_idx} -> {:ok, db, moment_idx}
       {:error, reason} -> {:error, %Error{reason: reason}}
     end
@@ -569,15 +582,19 @@ defmodule Xitdb do
   end
 
   def pull(%Cursor{} = cursor, pattern) when is_binary(pattern) do
-    case Pull.split_wildcard_plan(pattern) do
-      {:single, single_pat} ->
-        do_nif_pull(cursor, single_pat)
+    if :binary.match(pattern, "*") == :nomatch do
+      do_nif_pull(cursor, pattern)
+    else
+      case Pull.split_wildcard_plan(pattern) do
+        {:single, single_pat} ->
+          do_nif_pull(cursor, single_pat)
 
-      {:merge_top, wild_pat, spec_pat} ->
-        with {:ok, wild_res} <- do_nif_pull(cursor, wild_pat),
-             {:ok, spec_res} <- pull(cursor, spec_pat) do
-          {:ok, Pull.merge_wildcard_results(wild_res, spec_res)}
-        end
+        {:merge_top, wild_pat, spec_pat} ->
+          with {:ok, wild_res} <- do_nif_pull(cursor, wild_pat),
+               {:ok, spec_res} <- pull(cursor, spec_pat) do
+            {:ok, Pull.merge_wildcard_results(wild_res, spec_res)}
+          end
+      end
     end
   end
 
@@ -727,6 +744,11 @@ defmodule Xitdb do
   @doc false
   @spec validate_transact_opts(term()) :: {:ok, keyword()} | {:error, Error.t()}
   def validate_transact_opts(opts), do: validate_opts(opts, @transact_schema)
+
+  defp validate_opts([], @open_schema), do: {:ok, @default_open_opts}
+  defp validate_opts([], @transact_schema), do: {:ok, @default_transact_opts}
+  defp validate_opts([], @query_schema), do: {:ok, @default_query_opts}
+  defp validate_opts([], @compact_schema), do: {:ok, @default_compact_opts}
 
   defp validate_opts(opts, schema) when is_list(opts) do
     case NimbleOptions.validate(opts, schema) do

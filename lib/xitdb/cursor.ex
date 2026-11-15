@@ -101,10 +101,8 @@ defmodule Xitdb.Cursor do
     fetch(cursor, Atom.to_string(key))
   end
 
-  def fetch(%__MODULE__{tx_mode: false} = raw_cursor, key)
+  def fetch(%__MODULE__{tx_mode: false} = cursor, key)
       when is_integer(key) or is_binary(key) do
-    cursor = if is_integer(key), do: ensure_resolved(raw_cursor), else: raw_cursor
-
     case nif_slot_get(cursor, key) do
       {:ok, {:cursor, _, _, _, _} = tuple} ->
         {:ok, from_nif_tuple(cursor.db_ref, tuple, cursor.moment)}
@@ -472,8 +470,9 @@ defmodule Xitdb.Cursor do
   def try_resolve(%__MODULE__{} = cursor), do: {:ok, cursor}
 
   @impl Access
-  def get_and_update(%__MODULE__{} = raw_cursor, key, fun) do
-    %__MODULE__{} = cursor = ensure_resolved(raw_cursor)
+  def get_and_update(%__MODULE__{} = raw_cursor, raw_key, fun) do
+    key = if is_atom(raw_key), do: Atom.to_string(raw_key), else: raw_key
+    %__MODULE__{} = cursor = if is_integer(key), do: ensure_resolved(raw_cursor), else: raw_cursor
     resolved_key = resolve_list_key(cursor, key)
 
     current =
@@ -484,7 +483,6 @@ defmodule Xitdb.Cursor do
 
     child_key = if is_integer(resolved_key), do: resolved_key, else: to_string(resolved_key)
     child_steps = [{cursor.tag, child_key} | cursor.path_steps]
-    selector = steps_to_selector(child_steps)
 
     callback_result =
       if is_nil(current) do
@@ -493,6 +491,8 @@ defmodule Xitdb.Cursor do
         rescue
           e in ArgumentError ->
             if String.contains?(e.message, "nil value") do
+              selector = steps_to_selector(child_steps)
+
               vivified_base =
                 if MapSet.member?(cursor.deleted_paths, selector) do
                   %__MODULE__{
@@ -519,6 +519,8 @@ defmodule Xitdb.Cursor do
         {get_val, merge_child_staged(cursor, updated_child)}
 
       {get_val, nil} when cursor.tag not in [:array_list, :linked_array_list] ->
+        selector = steps_to_selector(child_steps)
+
         updated_cursor = %__MODULE__{
           cursor
           | tx_mode: true,
@@ -533,6 +535,8 @@ defmodule Xitdb.Cursor do
         {get_val, updated_cursor}
 
       {get_val, new_val} ->
+        selector = steps_to_selector(child_steps)
+
         new_ops =
           if is_nil(new_val) and cursor.tag in [:array_list, :linked_array_list] do
             [{:put, selector, nil}]
@@ -546,9 +550,13 @@ defmodule Xitdb.Cursor do
           |> Map.put(selector, new_val)
 
         updated_deleted =
-          cursor.deleted_paths
-          |> purge_prefix_from_set(selector)
-          |> MapSet.delete(selector)
+          if MapSet.size(cursor.deleted_paths) == 0 do
+            cursor.deleted_paths
+          else
+            cursor.deleted_paths
+            |> purge_prefix_from_set(selector)
+            |> MapSet.delete(selector)
+          end
 
         updated_cursor = %__MODULE__{
           cursor
@@ -566,8 +574,9 @@ defmodule Xitdb.Cursor do
   end
 
   @impl Access
-  def pop(%__MODULE__{} = raw_cursor, key) do
-    %__MODULE__{} = cursor = ensure_resolved(raw_cursor)
+  def pop(%__MODULE__{} = raw_cursor, raw_key) do
+    key = if is_atom(raw_key), do: Atom.to_string(raw_key), else: raw_key
+    %__MODULE__{} = cursor = if is_integer(key), do: ensure_resolved(raw_cursor), else: raw_cursor
     resolved_key = resolve_list_key(cursor, key)
 
     current =
@@ -682,34 +691,38 @@ defmodule Xitdb.Cursor do
 
   @doc false
   def fork_staged_prefix(%__MODULE__{} = cursor, from_selector, to_selector) do
-    cleared_overrides = purge_prefix_from_map(cursor.staged_overrides, to_selector)
-    cleared_deleted = purge_prefix_from_set(cursor.deleted_paths, to_selector)
+    if map_size(cursor.staged_overrides) == 0 and MapSet.size(cursor.deleted_paths) == 0 do
+      cursor
+    else
+      cleared_overrides = purge_prefix_from_map(cursor.staged_overrides, to_selector)
+      cleared_deleted = purge_prefix_from_set(cursor.deleted_paths, to_selector)
 
-    copied_overrides =
-      Enum.reduce(cursor.staged_overrides, cleared_overrides, fn {k, v}, acc ->
-        if selector_prefix?(k, from_selector) do
-          suffix =
-            binary_part(k, byte_size(from_selector), byte_size(k) - byte_size(from_selector))
+      copied_overrides =
+        Enum.reduce(cursor.staged_overrides, cleared_overrides, fn {k, v}, acc ->
+          if selector_prefix?(k, from_selector) do
+            suffix =
+              binary_part(k, byte_size(from_selector), byte_size(k) - byte_size(from_selector))
 
-          Map.put(acc, to_selector <> suffix, v)
-        else
-          acc
-        end
-      end)
+            Map.put(acc, to_selector <> suffix, v)
+          else
+            acc
+          end
+        end)
 
-    copied_deleted =
-      Enum.reduce(cursor.deleted_paths, cleared_deleted, fn k, acc ->
-        if selector_prefix?(k, from_selector) do
-          suffix =
-            binary_part(k, byte_size(from_selector), byte_size(k) - byte_size(from_selector))
+      copied_deleted =
+        Enum.reduce(cursor.deleted_paths, cleared_deleted, fn k, acc ->
+          if selector_prefix?(k, from_selector) do
+            suffix =
+              binary_part(k, byte_size(from_selector), byte_size(k) - byte_size(from_selector))
 
-          MapSet.put(acc, to_selector <> suffix)
-        else
-          acc
-        end
-      end)
+            MapSet.put(acc, to_selector <> suffix)
+          else
+            acc
+          end
+        end)
 
-    %__MODULE__{cursor | staged_overrides: copied_overrides, deleted_paths: copied_deleted}
+      %__MODULE__{cursor | staged_overrides: copied_overrides, deleted_paths: copied_deleted}
+    end
   end
 
   @doc false
@@ -840,20 +853,19 @@ defmodule Xitdb.Cursor do
 
   defp delete_overlay_steps(acc, _), do: acc
 
-  defp purge_prefix_from_map(map, "") do
-    _ = map
-    %{}
-  end
+  defp purge_prefix_from_map(map, _prefix) when map_size(map) == 0, do: map
+  defp purge_prefix_from_map(_map, ""), do: %{}
 
   defp purge_prefix_from_map(map, prefix) do
     :maps.filter(fn k, _v -> not selector_prefix?(k, prefix) end, map)
   end
 
-  defp purge_prefix_from_set(set, ""),
-    do: MapSet.new(tap(set, fn _ -> :ok end) |> then(fn _ -> [] end))
-
   defp purge_prefix_from_set(set, prefix) do
-    set |> Enum.reject(&selector_prefix?(&1, prefix)) |> MapSet.new()
+    cond do
+      MapSet.size(set) == 0 -> set
+      prefix == "" -> MapSet.new()
+      true -> set |> Enum.reject(&selector_prefix?(&1, prefix)) |> MapSet.new()
+    end
   end
 
   defp selector_prefix?(sel, ""), do: is_binary(sel)

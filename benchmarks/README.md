@@ -53,6 +53,23 @@ To regenerate the slices and reference tables below from `benchmarks/odin.jsonl`
 
 ---
 
+## NIF Boundary Cost Model
+
+Across the 26 orthogonal workloads, the BEAM ↔ Odin NIF boundary separates cleanly into four latency regimes:
+
+1. **Single-Hop Read Floor (`~170–290 ns` per NIF call — `#3–#6`):**
+   Every RW-locked NIF crossing pays fixed `enif_get_resource`, `enif_rwlock_rlock`, `resolve_slot_coord`, and `enif_make_*` term construction overhead (`~174 ns` vs. `6 ns` Raw Odin on `O(1)` `Enum.count/1`, and `~245–285 ns` added to single-hop `Array_List`, `Linked_Array_List`, and `Sorted_Map` lookups).
+2. **Multi-Hop Navigation vs. Single-Call Selectors & Projections (`#1`, `#2`, `#11`, `#21`):**
+   Chaining `N` bracket hops via `Access` (`#1`: `root["users"][id]["name"]`) pays `N × ~255 ns` across separate NIF crossings plus intermediate `%Xitdb.Cursor{}` struct allocations (`~2.49 µs`), whereas `Xitdb.select!/2` (`#2`: `~2.28 µs`), `Xitdb.materialize/1` (`#11`: `~2.10x`), and `Xitdb.pull/2` (`#21`) collapse multi-step traversal or multi-field projection into a single NIF crossing.
+3. **Transactional Write Batching vs. `put_in/3` (`tx` / Map `transact/3` vs. `#14`):**
+   Single-call batched commits (`#12`, `#13`, `#15`, `#16` at `~1.96x–2.39x` after tier optimizations) pay only one NIF boundary crossing, whereas nested `put_in/3` (`#14`, `~3.27x` after optimizations) traverses intermediate maps via `Access.get_and_update/3`, issuing read-before-write `Cursor.fetch/2` NIF hops before staging the leaf write. Use `Xitdb.DSL.tx` (`put users[id].score, val`) or map `Xitdb.transact/3` in write-heavy paths.
+4. **Compute- & Storage-Amortized Engine Operations (`1.09x–1.85x` near-native parity — `#19`, `#20`, `#22–#24`, `#26`):**
+   When engine work dominates boundary marshaling—such as structural moment diffs (`#19`, `~1.80x`), database compaction (`#20`, `~1.53x`), Datalog index joins and aggregations (`#22` `~1.83x`, `#23` `~1.14x`), `Buffered_File` sync commits (`#24`, `~1.27x`), and BM25 corpus search (`#26`, `~1.60x`)—Elixir tracks Raw Odin closely.
+
+See [Lazy Cursors, `Access` & `Enumerable`](../docs/access-and-enumerable.md#5-nif-boundary-cost-model--when-to-use-access-vs-the-macro-dsl) for API selection guidelines based on these regimes.
+
+---
+
 ## Reference Results (`Elixir NIF Wrapper` vs. `Raw Odin`, `Core_Memory`)
 
 <!-- BEGIN_BENCHMARK_TABLE -->

@@ -14,6 +14,11 @@
    - Elixir's built-in `Access.at/1` guards `is_list(data)` and raises on structs. When navigating `Array_List` or `Linked_Array_List` cursors with `get_in/2` or `put_in/3`, either pass integer keys directly in the path list (`get_in(root, ["users", "alice", "roles", 1])`) or use `Xitdb.at(1)`.
 3. **Never Eagerly Materialize Large Subtrees Unless Needed**:
    - Never call `Xitdb.materialize(db)` on the entire database root in hot paths. Prefer lazy navigation (`cursor["key"]`, `cursor[0]`), `Xitdb.pull/2` projections, `Enum.count/1`, `Enum.member?/2`, `Enum.slice/2`, or `Stream` pipelines, or navigate to the leaf entity first (`user = db["users"][id]`) before calling `Xitdb.materialize(user)`.
+4. **Understand the `~255 ns` NIF Boundary Cost Model**:
+   - Each RW-locked NIF crossing (`enif_get_resource` + `enif_rwlock_rlock` + `resolve_slot_coord` + `enif_make_*`) carries a fixed `~170–290 ns` (`~255 ns` median) overhead.
+   - Use lazy `Access` (`cursor[key]`) for shallow 1–2 hop reads or when passing `%Xitdb.Cursor{}` handles across functions/processes.
+   - Use `Xitdb.select!/2` (`path(...)` / `~x`) for deep 3+ hop scalar reads and `Xitdb.pull!/2` when reading multiple fields or bounded slices from the same entity in a single NIF call.
+   - Prefer `Xitdb.DSL.tx` (`put users[id].field, val`) or batched map `Xitdb.transact/3` over deep `put_in/3` chains in write-heavy loops to avoid `Access.get_and_update/3` read-before-write NIF hops.
 
 ---
 
