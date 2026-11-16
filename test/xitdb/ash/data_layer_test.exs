@@ -1859,5 +1859,536 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         assert to_string(reloaded.domain_key) == "atomic.ca"
       end
     end
+
+    defmodule RegLoadCheckCalc do
+      use Ash.Resource.Calculation
+
+      @impl true
+      def load(%Ash.Query{} = query, _opts, _ctx) do
+        send(self(), {:calc_load_query, query})
+        [:organization]
+      end
+
+      @impl true
+      def calculate(records, _opts, _ctx) do
+        Enum.map(records, fn rec ->
+          case rec.organization do
+            %{name: name} -> "org:" <> name
+            _ -> "none"
+          end
+        end)
+      end
+    end
+
+    defmodule RegDualFallbackCalc do
+      use Ash.Resource.Calculation
+      import Ash.Expr
+
+      @impl true
+      def expression(opts, _ctx) do
+        case Keyword.get(opts, :mode) do
+          :nil_expr -> nil
+          :normal -> expr(title <> "!")
+          _ -> expr(organization.name)
+        end
+      end
+
+      @impl true
+      def calculate(records, opts, _ctx) do
+        suffix = if Keyword.get(opts, :mode) == :nil_expr, do: "-nil-fb", else: "-unk-fb"
+        Enum.map(records, &(&1.title <> suffix))
+      end
+    end
+
+    defmodule RegAccount do
+      use Ash.Resource,
+        domain: Xitdb.Ash.DataLayerTest.RegDomainA,
+        data_layer: Xitdb.Ash.DataLayer
+
+      xitdb do
+        store TestMdmStore
+        collection :reg_accounts
+      end
+
+      actions do
+        defaults([:read, :destroy])
+
+        create :create do
+          primary?(true)
+          accept([:email, :name, :handle, :due_on])
+          validate(string_length(:name, min: 3))
+        end
+
+        update :update do
+          primary?(true)
+          accept([:name, :handle, :due_on])
+        end
+      end
+
+      identities do
+        identity(:unique_email, [:email])
+        identity(:unique_handle, [:handle])
+      end
+
+      attributes do
+        integer_primary_key(:id)
+        attribute(:email, :string, allow_nil?: false, public?: true)
+        attribute(:name, :string, allow_nil?: false, public?: true)
+        attribute(:handle, :string, public?: true)
+        attribute(:due_on, :date, public?: true)
+        create_timestamp(:inserted_at, type: :utc_datetime_usec)
+        update_timestamp(:updated_at, type: :utc_datetime_usec)
+      end
+    end
+
+    defmodule RegCrossTarget do
+      use Ash.Resource,
+        domain: Xitdb.Ash.DataLayerTest.RegDomainB,
+        data_layer: Xitdb.Ash.DataLayer
+
+      xitdb do
+        store TestAppStore
+        collection :reg_cross_targets
+      end
+
+      actions do
+        defaults([:read, :destroy])
+
+        create :create do
+          primary?(true)
+          accept([:tag, :score, :account_id])
+        end
+      end
+
+      attributes do
+        integer_primary_key(:id)
+        attribute(:tag, :ci_string, public?: true)
+        attribute(:score, :integer, public?: true)
+        attribute(:account_id, :integer, public?: true)
+      end
+
+      relationships do
+        has_many(:notes, Xitdb.Ash.DataLayerTest.RegCrossNote,
+          destination_attribute: :target_id,
+          public?: true
+        )
+      end
+    end
+
+    defmodule RegCrossNote do
+      use Ash.Resource,
+        domain: Xitdb.Ash.DataLayerTest.RegDomainB,
+        data_layer: Xitdb.Ash.DataLayer
+
+      xitdb do
+        store TestAppStore
+        collection :reg_cross_notes
+      end
+
+      actions do
+        defaults([:read, :destroy])
+
+        create :create do
+          primary?(true)
+          accept([:target_id, :label])
+        end
+      end
+
+      attributes do
+        integer_primary_key(:id)
+        attribute(:target_id, :integer, public?: true)
+        attribute(:label, :ci_string, public?: true)
+      end
+    end
+
+    defmodule RegDomainA do
+      use Ash.Domain, validate_config_inclusion?: false
+
+      resources do
+        resource(RegAccount)
+        resource(Deal)
+        resource(Organization)
+        resource(User)
+        resource(Profile)
+      end
+    end
+
+    defmodule RegDomainB do
+      use Ash.Domain, validate_config_inclusion?: false
+
+      resources do
+        resource(RegCrossTarget)
+        resource(RegCrossNote)
+      end
+    end
+
+    describe "Regression fixes (BUG-001..005, 019, 024..027, 038..043)" do
+      import Ash.Expr
+
+      test "BUG-043: LeaseQueue and Store tolerate lease_timeout == 0 without CaseClauseError" do
+        queue = Xitdb.Ash.Store.LeaseQueue.new()
+
+        {:granted, _lease_ref, next_queue} =
+          Xitdb.Ash.Store.LeaseQueue.acquire(
+            queue,
+            :owner,
+            make_ref(),
+            {self(), make_ref()},
+            0,
+            100,
+            :snap
+          )
+
+        assert Xitdb.Ash.Store.LeaseQueue.verify_holder(next_queue, next_queue.active.ref, self()) ==
+                 :ok
+
+        assert Xitdb.Ash.Store.min_timeout(0, 50) == 0
+      end
+
+      test "BUG-041/042: Search staged cursor sees re-indexed document after :reset_col and :rm in same tx" do
+        db = Xitdb.open!(backend: :memory)
+
+        assert {:ok, _} =
+                 Xitdb.transact(db, fn root ->
+                   diff1 = %{
+                     doc_count_delta: 1,
+                     len_delta: 2,
+                     new_doc: %{len: 2, terms: %{"quantum" => 100, "beam" => 100}},
+                     term_ops: [{:put, "quantum", 100}, {:put, "beam", 100}]
+                   }
+
+                   root = Xitdb.Ash.Search.Storage.apply_diff(root, "messages", "doc1", diff1)
+                   # Staged :reset_col on terms + :put children is visible via read_staged_path
+                   doc_entry = Xitdb.Ash.Search.Storage.read_doc(root, "messages", "doc1")
+                   assert doc_entry.terms["quantum"] == 100
+
+                   # Delete doc1 (:rm doc + :rm terms) then re-insert doc1 in same transaction
+                   del_diff = %{
+                     doc_count_delta: -1,
+                     len_delta: -2,
+                     new_doc: :delete,
+                     term_ops: [{:delete, "quantum"}, {:delete, "beam"}]
+                   }
+
+                   root = Xitdb.Ash.Search.Storage.apply_diff(root, "messages", "doc1", del_diff)
+                   root = Xitdb.Ash.Search.Storage.apply_diff(root, "messages", "doc1", diff1)
+
+                   reloaded = Xitdb.Ash.Search.Storage.read_doc(root, "messages", "doc1")
+                   assert reloaded.terms["quantum"] == 100
+                   assert reloaded.terms["beam"] == 100
+                   assert reloaded.len == 2
+                   root
+                 end)
+
+        :ok = Xitdb.close(db)
+      end
+
+      test "BUG-019 & BUG-025: bulk_create upsert is atomic on mid-batch failure and honors touch_update_defaults?: false" do
+        initial =
+          RegAccount
+          |> Ash.Changeset.for_create(:create, %{email: "keep@x.io", name: "Keep", handle: "keep"})
+          |> Ash.create!(authorize?: false)
+
+        old_updated_at = initial.updated_at
+
+        # BUG-019: collision in item 2 inside Mutator rolls back item 1 atomically
+        bulk_inputs = [
+          %{email: "atomic1@x.io", name: "Valid One", handle: "dup_handle"},
+          %{email: "atomic2@x.io", name: "Valid Two", handle: "dup_handle"}
+        ]
+
+        assert %Ash.BulkResult{status: :error} =
+                 Ash.bulk_create(bulk_inputs, RegAccount, :create,
+                   upsert?: true,
+                   upsert_identity: :unique_email,
+                   upsert_fields: [:name, :handle],
+                   stop_on_error?: true,
+                   authorize?: false
+                 )
+
+        assert Ash.read!(RegAccount, authorize?: false) |> length() == 1
+
+        # BUG-025: touch_update_defaults?: false preserves updated_at on conflict
+        Process.sleep(10)
+
+        upserted =
+          RegAccount
+          |> Ash.Changeset.for_create(:create, %{
+            email: "keep@x.io",
+            name: "Renamed",
+            handle: "keep"
+          })
+          |> Ash.create!(
+            upsert?: true,
+            upsert_identity: :unique_email,
+            touch_update_defaults?: false,
+            authorize?: false
+          )
+
+        assert upserted.name == "Renamed"
+        assert DateTime.compare(upserted.updated_at, old_updated_at) == :eq
+      end
+
+      test "BUG-004: :min and :max aggregates compare Date and CiString semantically" do
+        a1 =
+          RegAccount
+          |> Ash.Changeset.for_create(:create, %{
+            email: "d1@x.io",
+            name: "One",
+            due_on: ~D[2025-01-01]
+          })
+          |> Ash.create!(authorize?: false)
+
+        _a2 =
+          RegAccount
+          |> Ash.Changeset.for_create(:create, %{
+            email: "d2@x.io",
+            name: "Two",
+            due_on: ~D[2024-12-31]
+          })
+          |> Ash.create!(authorize?: false)
+
+        # In Erlang term ordering, day 1 < day 31 puts 2025-01-01 < 2024-12-31; semantic Date.compare must pick 2024-12-31
+        min_agg = %Ash.Query.Aggregate{
+          name: :min_due,
+          relationship_path: [],
+          kind: :min,
+          field: :due_on,
+          resource: RegAccount,
+          related?: false
+        }
+
+        max_agg = %Ash.Query.Aggregate{
+          name: :max_due,
+          relationship_path: [],
+          kind: :max,
+          field: :due_on,
+          resource: RegAccount,
+          related?: false
+        }
+
+        t1 =
+          RegCrossTarget
+          |> Ash.Changeset.for_create(:create, %{tag: "Beta", account_id: a1.id})
+          |> Ash.create!(authorize?: false)
+
+        _t2 =
+          RegCrossTarget
+          |> Ash.Changeset.for_create(:create, %{tag: "alpha", account_id: a1.id})
+          |> Ash.create!(authorize?: false)
+
+        min_ci = %Ash.Query.Aggregate{
+          name: :min_tag,
+          relationship_path: [],
+          kind: :min,
+          field: :tag,
+          resource: RegCrossTarget,
+          related?: false
+        }
+
+        max_ci = %Ash.Query.Aggregate{
+          name: :max_tag,
+          relationship_path: [],
+          kind: :max,
+          field: :tag,
+          resource: RegCrossTarget,
+          related?: false
+        }
+
+        {:ok, [res]} =
+          Xitdb.Ash.Query.execute(
+            Xitdb.Ash.Store.root(TestAppStore),
+            %Xitdb.Ash.Query{
+              resource: RegCrossTarget,
+              domain: RegDomainB,
+              filter: Ash.Filter.parse!(RegCrossTarget, id: t1.id),
+              aggregates: [min_agg, max_agg, min_ci, max_ci]
+            },
+            RegCrossTarget
+          )
+
+        assert res.aggregates[:min_due] == ~D[2024-12-31]
+        assert res.aggregates[:max_due] == ~D[2025-01-01]
+        assert Ash.CiString.value(res.aggregates[:min_tag]) == "alpha"
+        assert Ash.CiString.value(res.aggregates[:max_tag]) == "Beta"
+      end
+
+      test "BUG-001/002/003/039: scoped nested exists/parent, cross-domain unrelated agg, and non-Xitdb guard" do
+        acc =
+          RegAccount
+          |> Ash.Changeset.for_create(:create, %{email: "cross@x.io", name: "CrossTarget"})
+          |> Ash.create!(authorize?: false)
+
+        target =
+          RegCrossTarget
+          |> Ash.Changeset.for_create(:create, %{
+            tag: "CrossTarget",
+            score: 42,
+            account_id: acc.id
+          })
+          |> Ash.create!(authorize?: false)
+
+        _note =
+          RegCrossNote
+          |> Ash.Changeset.for_create(:create, %{target_id: target.id, label: "CrossTarget"})
+          |> Ash.create!(authorize?: false)
+
+        # BUG-003: inner exists referencing parent(tag) must keep inner parent scoped to RegCrossTarget
+        expr_with_nested_parent =
+          expr(
+            exists(
+              RegCrossTarget,
+              account_id == parent(id) and exists(notes, label == parent(tag))
+            )
+          )
+
+        matched =
+          RegAccount
+          |> Ash.Query.filter(^expr_with_nested_parent)
+          |> Ash.read!(authorize?: false)
+
+        assert Enum.map(matched, & &1.id) == [acc.id]
+
+        # BUG-002 & BUG-039: cross-domain unrelated aggregate works and non-Xitdb target returns default cleanly
+        cross_agg = %Ash.Query.Aggregate{
+          name: :cross_count,
+          relationship_path: [],
+          kind: :count,
+          resource: RegCrossTarget,
+          related?: false
+        }
+
+        ext_agg = %Ash.Query.Aggregate{
+          name: :ext_count,
+          relationship_path: [],
+          kind: :count,
+          resource: ExternalSimpleResource,
+          related?: false
+        }
+
+        {:ok, [enriched]} =
+          Xitdb.Ash.Query.execute(
+            Xitdb.Ash.Store.root(TestMdmStore),
+            %Xitdb.Ash.Query{
+              resource: RegAccount,
+              domain: RegDomainA,
+              filter: Ash.Filter.parse!(RegAccount, id: acc.id),
+              aggregates: [cross_agg, ext_agg]
+            },
+            RegAccount
+          )
+
+        assert enriched.aggregates[:cross_count] == 1
+        assert enriched.aggregates[:ext_count] == 0
+      end
+
+      test "BUG-005/024/027/038/040: calc load receives Ash.Query, dual calc falls back, DataLayer.calculate preserves values & snapshot" do
+        user =
+          User
+          |> Ash.Changeset.for_create(:create, %{email: unique_email("calc"), role: :member})
+          |> Ash.create!(authorize?: false)
+
+        org =
+          Organization
+          |> Ash.Changeset.for_create(:create, %{
+            name: "OrgOne",
+            slug: unique_slug("org-calc"),
+            admin_id: user.id
+          })
+          |> Ash.create!(authorize?: false)
+
+        %Deal{} =
+          deal =
+          Deal
+          |> Ash.Changeset.for_create(:create, %{
+            title: "DealOne",
+            organization_id: org.id,
+            poster_id: user.id
+          })
+          |> Ash.create!(authorize?: false)
+
+        # BUG-005 & BUG-027: module calc load/3 receives %Ash.Query{} with context[:shared]
+        calc_loaded = %Ash.Query.Calculation{
+          name: :org_tag,
+          module: RegLoadCheckCalc,
+          opts: [],
+          context: %Ash.Resource.Calculation.Context{resource: Deal, domain: TestDomain},
+          type: :string
+        }
+
+        # BUG-040: dual calc returning nil from expression/2 falls back to calculate/3
+        calc_dual = %Ash.Query.Calculation{
+          name: :dual_fb,
+          module: RegDualFallbackCalc,
+          opts: [mode: :nil_expr],
+          context: %Ash.Resource.Calculation.Context{resource: Deal, domain: TestDomain},
+          type: :string
+        }
+
+        app_db = Xitdb.Ash.Store.current_db(TestAppStore)
+        mdm_db = Xitdb.Ash.Store.current_db(TestMdmStore)
+
+        {:ok, [enriched_deal]} =
+          Xitdb.Ash.Query.execute(
+            app_db,
+            %Xitdb.Ash.Query{
+              resource: Deal,
+              domain: TestDomain,
+              filter: Ash.Filter.parse!(Deal, id: deal.id),
+              calculations: [{calc_loaded, nil}, {calc_dual, nil}],
+              context: %{shared: %{marker: :preserved}}
+            },
+            Deal
+          )
+
+        assert_received {:calc_load_query, %Ash.Query{context: %{shared: %{marker: :preserved}}}}
+        assert enriched_deal.calculations[:org_tag] == "org:OrgOne"
+        assert enriched_deal.calculations[:dual_fb] == "DealOne-nil-fb"
+
+        # BUG-024: non-boolean relational expression returns actual value, not coerced boolean; nil record returns error
+        unloaded_deal = %{deal | organization: %Ash.NotLoaded{field: :organization}}
+        non_bool_expr = expr(organization.name)
+
+        assert {:ok, ["OrgOne"]} =
+                 Xitdb.Ash.DataLayer.calculate(Deal, [non_bool_expr], %{
+                   record: unloaded_deal,
+                   domain: TestDomain,
+                   calculation_context: %Ash.Resource.Calculation.Context{
+                     domain: TestDomain,
+                     resource: Deal
+                   }
+                 })
+
+        unknown_call = %Ash.Query.Call{name: :nonexistent_fn, args: [1]}
+
+        assert {:error, _} =
+                 Xitdb.Ash.DataLayer.calculate(Deal, [unknown_call], %{
+                   record: unloaded_deal,
+                   domain: TestDomain
+                 })
+
+        # BUG-038: %Ash.Resource.Calculation.Context{source_context: %{shared: %{xitdb_moment: ...}}} respected
+        snapshot_moment =
+          Xitdb.moment_count(%Xitdb{db_ref: mdm_db.db_ref, backend: :memory}) - 1
+
+        _org_v2 =
+          org
+          |> Ash.Changeset.for_update(:update, %{name: "OrgTwo"})
+          |> Ash.update!(authorize?: false)
+
+        rel_exists_expr = expr(exists(Organization, id == ^org.id and name == "OrgOne"))
+
+        assert {:ok, [true]} =
+                 Xitdb.Ash.DataLayer.calculate(
+                   Organization,
+                   [rel_exists_expr],
+                   %Ash.Resource.Calculation.Context{
+                     domain: TestDomain,
+                     resource: Organization,
+                     source_context: %{shared: %{xitdb_moment: snapshot_moment}}
+                   }
+                 )
+      end
+    end
   end
 end

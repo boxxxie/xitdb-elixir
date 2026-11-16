@@ -308,7 +308,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
         expressions
         |> Enum.reduce_while({:ok, []}, fn raw_expr, {:ok, acc} ->
-          expr = Query.preresolve_unrelated_exists(db, resource, raw_expr, tenant, domain)
+          expr =
+            Query.preresolve_unrelated_exists(db, resource, raw_expr, tenant, domain, source_ctx)
 
           case Ash.Expr.eval(expr, base_eval_opts) do
             {:ok, value} ->
@@ -330,9 +331,16 @@ if Code.ensure_loaded?(Ash.DataLayer) do
                              actor,
                              tenant
                            ) do
-                        {:ok, val} -> {:cont, {:ok, [val | acc]}}
-                        :unknown -> {:cont, {:ok, [nil | acc]}}
-                        {:error, _} = err -> {:halt, err}
+                        {:ok, val} ->
+                          {:cont, {:ok, [val | acc]}}
+
+                        :unknown ->
+                          {:halt,
+                           {:error,
+                            "unable to evaluate expression #{inspect(raw_expr)} without a loaded record"}}
+
+                        {:error, _} = err ->
+                          {:halt, err}
                       end
 
                     {:error, _} = err ->
@@ -356,20 +364,20 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
     defp with_context_db(context, resource, fun) do
       calc_ctx = Map.get(context, :calculation_context)
+      direct_source_ctx = Map.get(context, :source_context)
 
-      source_ctx =
-        if match?(%Ash.Resource.Calculation.Context{}, calc_ctx),
-          do: calc_ctx.source_context,
-          else: nil
+      calc_source_ctx =
+        if is_map(calc_ctx), do: Map.get(calc_ctx, :source_context), else: nil
 
       override =
-        case extract_db_override(context) do
-          {:override, _} = found ->
-            found
-
-          :none ->
-            if is_map(source_ctx), do: extract_db_override(source_ctx), else: :none
-        end
+        Enum.find_value([context, calc_ctx, direct_source_ctx, calc_source_ctx], :none, fn ctx ->
+          if is_map(ctx) do
+            case extract_db_override(ctx) do
+              {:override, _} = found -> found
+              :none -> nil
+            end
+          end
+        end)
 
       case {Info.fetch_store(resource), override} do
         {{:ok, store}, {:override, moment_or_db}} ->
@@ -395,27 +403,125 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
     defp eval_relational_fallback(expr, record, eval_opts, domain, actor, tenant)
          when is_map(record) do
-      case Ash.Expr.eval_hydrated(expr, Keyword.put(eval_opts, :record, record)) do
-        {:ok, val} ->
-          {:ok, val}
+      if boolean_filter_expr?(expr) do
+        case Ash.Filter.Runtime.filter_matches(domain, [record], expr,
+               actor: actor,
+               tenant: tenant,
+               authorize?: false
+             ) do
+          {:ok, [_ | _]} -> {:ok, true}
+          {:ok, []} -> {:ok, false}
+          {:error, _} = err -> err
+        end
+      else
+        case collect_refs_to_load(expr) do
+          [] ->
+            :unknown
 
-        {:error, _} = err ->
-          err
+          refs ->
+            load_ctx = Keyword.get(eval_opts, :context, %{})
 
-        :unknown ->
-          case Ash.Filter.Runtime.filter_matches(domain, [record], expr,
-                 actor: actor,
-                 tenant: tenant,
-                 authorize?: false
-               ) do
-            {:ok, [_ | _]} -> {:ok, true}
-            {:ok, []} -> {:ok, false}
-            {:error, _} = err -> err
-          end
+            with {:ok, [loaded]} <-
+                   Ash.load([record], refs,
+                     domain: domain,
+                     actor: actor,
+                     tenant: tenant,
+                     context: load_ctx,
+                     authorize?: false
+                   ),
+                 {:ok, val} <-
+                   Ash.Expr.eval_hydrated(expr, Keyword.put(eval_opts, :record, loaded)) do
+              {:ok, val}
+            else
+              :unknown -> :unknown
+              {:error, _} = err -> err
+              _ -> :unknown
+            end
+        end
       end
     rescue
       _ -> :unknown
     end
+
+    @boolean_filter_structs [
+      Ash.Filter,
+      Ash.Query.Exists,
+      Ash.Query.BooleanExpression,
+      Ash.Query.Not,
+      Ash.Query.Operator.IsNil,
+      Ash.Query.Operator.In,
+      Ash.Query.Operator.Eq,
+      Ash.Query.Operator.NotEq,
+      Ash.Query.Operator.LessThan,
+      Ash.Query.Operator.LessThanOrEqual,
+      Ash.Query.Operator.GreaterThan,
+      Ash.Query.Operator.GreaterThanOrEqual
+    ]
+
+    defp boolean_filter_expr?(%mod{}) when mod in @boolean_filter_structs, do: true
+
+    defp boolean_filter_expr?(%{__struct__: mod}) do
+      function_exported?(mod, :evaluate_operator, 1) and
+        Code.ensure_loaded?(Ash.Filter.Simple) and
+        Ash.Filter.Simple in (mod.__info__(:attributes)[:behaviour] || [])
+    end
+
+    defp boolean_filter_expr?(_), do: false
+
+    defp collect_refs_to_load(expr) do
+      expr
+      |> do_collect_refs_to_load([])
+      |> Enum.uniq()
+    end
+
+    defp do_collect_refs_to_load(
+           %Ash.Query.Ref{relationship_path: [_ | _] = path, attribute: attr},
+           acc
+         ) do
+      leaf =
+        case attr do
+          %{__struct__: mod, name: name}
+          when mod in [Ash.Resource.Calculation, Ash.Resource.Aggregate] ->
+            [name]
+
+          _ ->
+            []
+        end
+
+      [nest_load_path(path, leaf) | acc]
+    end
+
+    defp do_collect_refs_to_load(
+           %Ash.Query.Ref{relationship_path: [], attribute: %{__struct__: mod, name: name}},
+           acc
+         )
+         when mod in [Ash.Resource.Calculation, Ash.Resource.Aggregate] do
+      [name | acc]
+    end
+
+    defp do_collect_refs_to_load(%_{} = struct, acc) do
+      struct
+      |> Map.from_struct()
+      |> Enum.reduce(acc, fn {_k, v}, inner -> do_collect_refs_to_load(v, inner) end)
+    end
+
+    defp do_collect_refs_to_load(list, acc) when is_list(list) do
+      Enum.reduce(list, acc, &do_collect_refs_to_load/2)
+    end
+
+    defp do_collect_refs_to_load(tuple, acc) when is_tuple(tuple) do
+      tuple |> Tuple.to_list() |> Enum.reduce(acc, &do_collect_refs_to_load/2)
+    end
+
+    defp do_collect_refs_to_load(map, acc) when is_map(map) do
+      Enum.reduce(map, acc, fn {_k, v}, inner -> do_collect_refs_to_load(v, inner) end)
+    end
+
+    defp do_collect_refs_to_load(_other, acc), do: acc
+
+    defp nest_load_path([last], []), do: last
+    defp nest_load_path([last], leaf), do: {last, leaf}
+    defp nest_load_path([head | rest], leaf), do: {head, [nest_load_path(rest, leaf)]}
 
     # -- Mutation & Transaction Callbacks --
 

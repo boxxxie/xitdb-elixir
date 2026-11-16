@@ -14,13 +14,22 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     def verify(dsl_state) do
       module = Verifier.get_persisted(dsl_state, :module)
 
-      with :ok <- check_calculations(module, dsl_state),
+      with :ok <- check_base_filter(module, dsl_state),
+           :ok <- check_calculations(module, dsl_state),
            :ok <- check_aggregates(module, dsl_state),
            :ok <- check_relationships(module, dsl_state),
            :ok <- check_identities(module, dsl_state),
            :ok <- check_resource_validations_changes_and_preparations(module, dsl_state),
            :ok <- check_actions(module, dsl_state) do
         check_policies(module, dsl_state)
+      end
+    end
+
+    defp check_base_filter(module, dsl_state) do
+      if contains_sql_fragment?(Ash.Resource.Info.base_filter(dsl_state)) do
+        fragment_error(module, [:resource, :base_filter], "resource `base_filter`")
+      else
+        :ok
       end
     end
 
@@ -68,7 +77,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       dsl_state
       |> Ash.Resource.Info.relationships()
       |> Enum.reduce_while(:ok, fn rel, :ok ->
-        rel_terms = [Map.get(rel, :filter), Map.get(rel, :sort)]
+        rel_terms = [Map.get(rel, :filter), Map.get(rel, :sort), Map.get(rel, :default_sort)]
 
         if contains_sql_fragment?(rel_terms) do
           {:halt,
@@ -103,7 +112,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     defp check_resource_validations_changes_and_preparations(module, dsl_state) do
       validations = Ash.Resource.Info.validations(dsl_state)
       changes = Ash.Resource.Info.changes(dsl_state)
-      preparations = Ash.Resource.Info.preparations(dsl_state)
+      preparations = Spark.Dsl.Extension.get_entities(dsl_state, [:preparations])
 
       cond do
         Enum.any?(validations, &contains_sql_fragment?/1) ->

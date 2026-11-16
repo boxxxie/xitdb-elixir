@@ -737,7 +737,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
     defp normalize_timeout(nil), do: 15_000
     defp normalize_timeout(:infinity), do: :infinity
-    defp normalize_timeout(ms) when is_integer(ms) and ms > 0, do: ms
+    defp normalize_timeout(ms) when is_integer(ms) and ms >= 0, do: ms
 
     @doc false
     def min_timeout(:infinity, b), do: b

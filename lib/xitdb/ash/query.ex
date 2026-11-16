@@ -1053,7 +1053,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           resource,
           query.filter,
           query.tenant,
-          query.domain
+          query.domain,
+          query.context
         )
 
       if filter_has_parent_unrelated_exists?(resolved_filter) do
@@ -1066,7 +1067,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
               resolved_filter,
               record,
               query.tenant,
-              query.domain
+              query.domain,
+              query.context
             )
 
           case Ash.Filter.Runtime.filter_matches(
@@ -1094,24 +1096,36 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     end
 
     @doc false
-    def preresolve_unrelated_exists(_db_or_cursor, _resource, nil, _tenant, _domain), do: nil
+    def preresolve_unrelated_exists(
+          db_or_cursor,
+          resource,
+          filter_or_expr,
+          tenant,
+          domain,
+          context \\ %{}
+        )
+
+    def preresolve_unrelated_exists(_db_or_cursor, _resource, nil, _tenant, _domain, _context),
+      do: nil
 
     def preresolve_unrelated_exists(
           db_or_cursor,
           resource,
           %Ash.Filter{expression: expr} = filter,
           tenant,
-          domain
+          domain,
+          context
         ) do
       %Ash.Filter{
         filter
-        | expression: preresolve_unrelated_exists(db_or_cursor, resource, expr, tenant, domain)
+        | expression:
+            preresolve_unrelated_exists(db_or_cursor, resource, expr, tenant, domain, context)
       }
     end
 
-    def preresolve_unrelated_exists(db_or_cursor, resource, expr, tenant, domain) do
+    def preresolve_unrelated_exists(db_or_cursor, resource, expr, tenant, domain, context) do
       if expr_has_unrelated_exists?(expr) do
-        Ash.Filter.map(expr, fn
+        map_current_scope_expr(expr, fn
           %Ash.Query.Exists{related?: false, at_path: [], resource: other_res, expr: ex_expr} =
               ex ->
             if not is_nil(other_res) and not filter_uses_parent?(ex_expr) and
@@ -1123,7 +1137,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
                 ex_expr,
                 ex,
                 tenant,
-                domain
+                domain,
+                context
               )
             else
               ex
@@ -1138,12 +1153,10 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     end
 
     defp expr_has_unrelated_exists?(expr) do
-      not is_nil(
-        Ash.Filter.find(expr, fn
-          %Ash.Query.Exists{related?: false, at_path: []} -> true
-          _ -> false
-        end)
-      )
+      find_in_current_scope_expr?(expr, fn
+        %Ash.Query.Exists{related?: false, at_path: []} -> true
+        _ -> false
+      end)
     end
 
     defp filter_has_parent_unrelated_exists?(nil), do: false
@@ -1152,15 +1165,13 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       do: filter_has_parent_unrelated_exists?(expr)
 
     defp filter_has_parent_unrelated_exists?(expr) do
-      not is_nil(
-        Ash.Filter.find(expr, fn
-          %Ash.Query.Exists{related?: false, at_path: [], expr: ex_expr} ->
-            filter_uses_parent?(ex_expr)
+      find_in_current_scope_expr?(expr, fn
+        %Ash.Query.Exists{related?: false, at_path: [], expr: ex_expr} ->
+          filter_uses_parent?(ex_expr)
 
-          _ ->
-            false
-        end)
-      )
+        _ ->
+          false
+      end)
     end
 
     defp resolve_parent_unrelated_exists(
@@ -1169,7 +1180,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
            %Ash.Filter{expression: expr} = filter,
            record,
            tenant,
-           domain
+           domain,
+           context
          ) do
       %Ash.Filter{
         filter
@@ -1180,7 +1192,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
               expr,
               record,
               tenant,
-              domain
+              domain,
+              context
             )
       }
     end
@@ -1191,9 +1204,10 @@ if Code.ensure_loaded?(Ash.DataLayer) do
            expr,
            record,
            tenant,
-           domain
+           domain,
+           context
          ) do
-      Ash.Filter.map(expr, fn
+      map_current_scope_expr(expr, fn
         %Ash.Query.Exists{related?: false, at_path: [], resource: other_res, expr: ex_expr} = ex ->
           if not is_nil(other_res) and
                Ash.Resource.Info.data_layer(other_res) == Xitdb.Ash.DataLayer do
@@ -1206,7 +1220,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
               substituted,
               ex,
               tenant,
-              domain
+              domain,
+              context
             )
           else
             ex
@@ -1224,7 +1239,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
            ex_expr,
            fallback,
            tenant,
-           domain
+           domain,
+           context
          ) do
       target_db = resolve_db_for_resource(db_or_cursor, resource, other_res)
 
@@ -1243,6 +1259,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           domain: Ash.Resource.Info.domain(other_res) || domain,
           filter: %Ash.Filter{resource: other_res, expression: ex_expr},
           tenant: eff_tenant,
+          context: context || %{},
           limit: 1
         }
 
@@ -1252,6 +1269,71 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         end
       end
     end
+
+    defp find_in_current_scope_expr?(%Ash.Query.Exists{} = ex, pred), do: pred.(ex)
+    defp find_in_current_scope_expr?(%Parent{} = p, pred), do: pred.(p)
+
+    defp find_in_current_scope_expr?(%_{} = s, pred) do
+      pred.(s) or
+        s
+        |> Map.from_struct()
+        |> Map.values()
+        |> Enum.any?(&find_in_current_scope_expr?(&1, pred))
+    end
+
+    defp find_in_current_scope_expr?(list, pred) when is_list(list) do
+      Enum.any?(list, &find_in_current_scope_expr?(&1, pred))
+    end
+
+    defp find_in_current_scope_expr?(tuple, pred) when is_tuple(tuple) do
+      tuple
+      |> Tuple.to_list()
+      |> Enum.any?(&find_in_current_scope_expr?(&1, pred))
+    end
+
+    defp find_in_current_scope_expr?(map, pred) when is_map(map) do
+      Enum.any?(map, fn {k, v} ->
+        find_in_current_scope_expr?(k, pred) or find_in_current_scope_expr?(v, pred)
+      end)
+    end
+
+    defp find_in_current_scope_expr?(other, pred), do: pred.(other)
+
+    defp map_current_scope_expr(%Ash.Query.Exists{} = ex, mapper), do: mapper.(ex)
+    defp map_current_scope_expr(%Parent{} = p, mapper), do: mapper.(p)
+
+    defp map_current_scope_expr(%_{} = s, mapper) do
+      updated =
+        s
+        |> Map.from_struct()
+        |> Map.new(fn {k, v} -> {k, map_current_scope_expr(v, mapper)} end)
+
+      mapper.(Map.merge(s, updated))
+    end
+
+    defp map_current_scope_expr(list, mapper) when is_list(list) do
+      list
+      |> Enum.map(&map_current_scope_expr(&1, mapper))
+      |> mapper.()
+    end
+
+    defp map_current_scope_expr(tuple, mapper) when is_tuple(tuple) do
+      tuple
+      |> Tuple.to_list()
+      |> Enum.map(&map_current_scope_expr(&1, mapper))
+      |> List.to_tuple()
+      |> mapper.()
+    end
+
+    defp map_current_scope_expr(map, mapper) when is_map(map) do
+      map
+      |> Map.new(fn {k, v} ->
+        {map_current_scope_expr(k, mapper), map_current_scope_expr(v, mapper)}
+      end)
+      |> mapper.()
+    end
+
+    defp map_current_scope_expr(other, mapper), do: mapper.(other)
 
     # ==========================================================================
     # Stage 4: Derived Enrichment (Aggregates + Calculations) & Residual Filter
@@ -1488,12 +1570,10 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     defp filter_uses_parent?(%Ash.Filter{expression: expr}), do: filter_uses_parent?(expr)
 
     defp filter_uses_parent?(expr) do
-      not is_nil(
-        Ash.Filter.find(expr, fn
-          %Parent{} -> true
-          _ -> false
-        end)
-      )
+      find_in_current_scope_expr?(expr, fn
+        %Parent{} -> true
+        _ -> false
+      end)
     end
 
     defp compute_batched_related_aggregate(
@@ -1519,6 +1599,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
                %{}
              ) do
         dest_res = resolve_path_leaf_resource(resource, agg.relationship_path)
+        dest_domain = (dest_res && Ash.Resource.Info.domain(dest_res)) || domain
         agg_filter = get_agg_filter(agg)
         agg_sort = get_agg_sort(agg)
 
@@ -1528,15 +1609,16 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           |> List.flatten()
 
         with {:ok, prefiltered_all} <-
-               apply_optional_filter(domain, all_dest, agg_filter, tenant, actor, nil),
+               apply_optional_filter(dest_domain, all_dest, agg_filter, tenant, actor, nil),
              {:ok, loaded_all} <-
                ensure_agg_field_loaded(
                  prefiltered_all,
                  agg.field,
                  dest_res,
-                 domain,
+                 dest_domain,
                  tenant,
-                 actor
+                 actor,
+                 query.context
                ) do
           loaded_by_pk = index_records_by_pk(loaded_all, dest_res)
           pk_fields = Ash.Resource.Info.primary_key(dest_res)
@@ -1557,7 +1639,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
               sorted =
                 apply_optional_sort(dest_for_parent, agg_sort,
-                  domain: domain,
+                  domain: dest_domain,
                   tenant: tenant,
                   actor: actor
                 )
@@ -1583,6 +1665,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       domain = query.domain
       join_filters = normalize_join_filters(Map.get(agg, :join_filters))
       dest_res = resolve_path_leaf_resource(resource, agg.relationship_path)
+      dest_domain = (dest_res && Ash.Resource.Info.domain(dest_res)) || domain
       agg_filter = get_agg_filter(agg)
       agg_sort = get_agg_sort(agg)
 
@@ -1604,7 +1687,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
           with {:ok, filtered} <-
                  apply_optional_filter(
-                   domain,
+                   dest_domain,
                    candidates,
                    agg_filter,
                    tenant,
@@ -1612,9 +1695,21 @@ if Code.ensure_loaded?(Ash.DataLayer) do
                    parent_record
                  ),
                {:ok, loaded} <-
-                 ensure_agg_field_loaded(filtered, agg.field, dest_res, domain, tenant, actor) do
+                 ensure_agg_field_loaded(
+                   filtered,
+                   agg.field,
+                   dest_res,
+                   dest_domain,
+                   tenant,
+                   actor,
+                   query.context
+                 ) do
             sorted =
-              apply_optional_sort(loaded, agg_sort, domain: domain, tenant: tenant, actor: actor)
+              apply_optional_sort(loaded, agg_sort,
+                domain: dest_domain,
+                tenant: tenant,
+                actor: actor
+              )
 
             value = compute_aggregate_value(sorted, agg, dest_res)
             {:cont, {:ok, [put_aggregate_result(parent_record, agg, value) | acc]}}
@@ -1633,51 +1728,80 @@ if Code.ensure_loaded?(Ash.DataLayer) do
            query,
            resource
          ) do
-      tenant = get_in_agg_context(agg, :tenant) || query.tenant
-      actor = get_in_agg_context(agg, :actor) || get_in_query_context(query, :actor)
-      domain = query.domain
-      agg_filter = get_agg_filter(agg)
-      agg_sort = get_agg_sort(agg)
-      target_db = resolve_db_for_resource(db_or_cursor, resource, target_res)
-
-      if filter_uses_parent?(agg_filter) do
-        records
-        |> Enum.reduce_while({:ok, []}, fn parent_record, {:ok, acc} ->
-          resolved_filter =
-            substitute_parent_in_filter(agg_filter, parent_record, resource, domain)
-
-          sub_query = %__MODULE__{
-            resource: target_res,
-            domain: domain,
-            filter: resolved_filter,
-            tenant: tenant,
-            sort: agg_sort
-          }
-
-          with {:ok, matches} <- execute(target_db, sub_query, target_res),
-               {:ok, loaded} <-
-                 ensure_agg_field_loaded(matches, agg.field, target_res, domain, tenant, actor) do
-            value = compute_aggregate_value(loaded, agg, target_res)
-            {:cont, {:ok, [put_aggregate_result(parent_record, agg, value) | acc]}}
-          else
-            {:error, _} = err -> {:halt, err}
-          end
-        end)
-        |> reverse_ok()
+      if is_nil(target_res) or Ash.Resource.Info.data_layer(target_res) != Xitdb.Ash.DataLayer do
+        default_val = default_aggregate_value(agg)
+        {:ok, Enum.map(records, &put_aggregate_result(&1, agg, default_val))}
       else
-        sub_query = %__MODULE__{
-          resource: target_res,
-          domain: domain,
-          filter: agg_filter,
-          tenant: tenant,
-          sort: agg_sort
-        }
+        tenant = get_in_agg_context(agg, :tenant) || query.tenant
+        actor = get_in_agg_context(agg, :actor) || get_in_query_context(query, :actor)
+        target_domain = Ash.Resource.Info.domain(target_res) || query.domain
+        sub_context = put_actor_in_context(query.context, actor)
+        agg_filter = get_agg_filter(agg)
+        agg_sort = get_agg_sort(agg)
+        target_db = resolve_db_for_resource(db_or_cursor, resource, target_res)
 
-        with {:ok, matches} <- execute(target_db, sub_query, target_res),
-             {:ok, loaded} <-
-               ensure_agg_field_loaded(matches, agg.field, target_res, domain, tenant, actor) do
-          value = compute_aggregate_value(loaded, agg, target_res)
-          {:ok, Enum.map(records, &put_aggregate_result(&1, agg, value))}
+        if is_nil(target_db) do
+          default_val = default_aggregate_value(agg)
+          {:ok, Enum.map(records, &put_aggregate_result(&1, agg, default_val))}
+        else
+          if filter_uses_parent?(agg_filter) do
+            records
+            |> Enum.reduce_while({:ok, []}, fn parent_record, {:ok, acc} ->
+              resolved_filter =
+                substitute_parent_in_filter(agg_filter, parent_record, resource, query.domain)
+
+              sub_query = %__MODULE__{
+                resource: target_res,
+                domain: target_domain,
+                filter: resolved_filter,
+                tenant: tenant,
+                sort: agg_sort,
+                context: sub_context
+              }
+
+              with {:ok, matches} <- execute(target_db, sub_query, target_res),
+                   {:ok, loaded} <-
+                     ensure_agg_field_loaded(
+                       matches,
+                       agg.field,
+                       target_res,
+                       target_domain,
+                       tenant,
+                       actor,
+                       sub_context
+                     ) do
+                value = compute_aggregate_value(loaded, agg, target_res)
+                {:cont, {:ok, [put_aggregate_result(parent_record, agg, value) | acc]}}
+              else
+                {:error, _} = err -> {:halt, err}
+              end
+            end)
+            |> reverse_ok()
+          else
+            sub_query = %__MODULE__{
+              resource: target_res,
+              domain: target_domain,
+              filter: agg_filter,
+              tenant: tenant,
+              sort: agg_sort,
+              context: sub_context
+            }
+
+            with {:ok, matches} <- execute(target_db, sub_query, target_res),
+                 {:ok, loaded} <-
+                   ensure_agg_field_loaded(
+                     matches,
+                     agg.field,
+                     target_res,
+                     target_domain,
+                     tenant,
+                     actor,
+                     sub_context
+                   ) do
+              value = compute_aggregate_value(loaded, agg, target_res)
+              {:ok, Enum.map(records, &put_aggregate_result(&1, agg, value))}
+            end
+          end
         end
       end
     end
@@ -1685,7 +1809,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     defp substitute_parent_in_filter(nil, _parent_record, _parent_resource, _domain), do: nil
 
     defp substitute_parent_in_filter(filter, parent_record, parent_resource, domain) do
-      Ash.Filter.map(filter, fn
+      map_current_scope_expr(filter, fn
         %Parent{expr: p_expr} ->
           case Ash.Expr.eval(p_expr,
                  record: parent_record,
@@ -1768,12 +1892,13 @@ if Code.ensure_loaded?(Ash.DataLayer) do
          ) do
       next_prefix = prefix ++ [step_name]
       rel = Ash.Resource.Info.relationship(curr_res, step_name)
+      step_domain = Ash.Resource.Info.domain(rel.destination) || domain
 
       result =
         if rel.type == :many_to_many do
-          do_many_to_many_step(db_or_cursor, root_res, frontier, rel, tenant, actor, domain)
+          do_many_to_many_step(db_or_cursor, root_res, frontier, rel, tenant, actor, step_domain)
         else
-          do_direct_step(db_or_cursor, root_res, frontier, rel, tenant, actor, domain)
+          do_direct_step(db_or_cursor, root_res, frontier, rel, tenant, actor, step_domain)
         end
 
       with {:ok, next_frontier} <- result,
@@ -1783,7 +1908,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
                rel.destination,
                root_by_idx,
                Map.get(join_filters, next_prefix),
-               domain,
+               step_domain,
                tenant,
                actor
              ) do
@@ -1797,7 +1922,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           next_prefix,
           tenant,
           actor,
-          domain,
+          step_domain,
           join_filters
         )
       end
@@ -2268,16 +2393,44 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       end)
     end
 
-    defp ensure_agg_field_loaded([], _field, _res, _domain, _tenant, _actor), do: {:ok, []}
-    defp ensure_agg_field_loaded(records, nil, _res, _domain, _tenant, _actor), do: {:ok, records}
+    defp ensure_agg_field_loaded(
+           records,
+           field,
+           resource,
+           domain,
+           tenant,
+           actor,
+           context \\ %{}
+         )
 
-    defp ensure_agg_field_loaded(records, field, resource, domain, tenant, actor) do
+    defp ensure_agg_field_loaded([], _field, _res, _domain, _tenant, _actor, _context),
+      do: {:ok, []}
+
+    defp ensure_agg_field_loaded(records, nil, _res, _domain, _tenant, _actor, _context),
+      do: {:ok, records}
+
+    defp ensure_agg_field_loaded(records, field, resource, domain, tenant, actor, context) do
       if is_atom(field) and not is_nil(Ash.Resource.Info.attribute(resource, field)) do
         {:ok, records}
       else
-        Ash.load(records, field, domain: domain, tenant: tenant, actor: actor, authorize?: false)
+        Ash.load(records, field,
+          domain: domain,
+          tenant: tenant,
+          actor: actor,
+          context: context || %{},
+          authorize?: false
+        )
       end
     end
+
+    defp default_aggregate_value(%Aggregate{kind: :count}), do: 0
+    defp default_aggregate_value(%Aggregate{kind: :exists}), do: false
+
+    defp default_aggregate_value(%Aggregate{kind: :list, default_value: default_value}) do
+      if is_list(default_value), do: default_value, else: []
+    end
+
+    defp default_aggregate_value(%Aggregate{} = agg), do: Map.get(agg, :default_value)
 
     defp compute_aggregate_value(records, %Aggregate{} = agg, target_resource) do
       pk_fields = Ash.Resource.Info.primary_key(target_resource)
@@ -2345,15 +2498,13 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         :min ->
           case extract_non_nil_agg_values(records, field, field_attr, uniq?) do
             [] -> default_value
-            [%Decimal{} = first | rest] -> Enum.reduce(rest, first, &Decimal.min/2)
-            values -> Enum.min(values)
+            [first | rest] -> Enum.reduce(rest, first, &min_agg_value/2)
           end
 
         :max ->
           case extract_non_nil_agg_values(records, field, field_attr, uniq?) do
             [] -> default_value
-            [%Decimal{} = first | rest] -> Enum.reduce(rest, first, &Decimal.max/2)
-            values -> Enum.max(values)
+            [first | rest] -> Enum.reduce(rest, first, &max_agg_value/2)
           end
 
         :avg ->
@@ -2413,7 +2564,16 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       actor = get_in_query_context(query, :actor)
 
       Enum.reduce_while(calcs, {:ok, records}, fn {calc, expr}, {:ok, acc_records} ->
-        case eval_single_calculation(acc_records, calc, expr, resource, domain, tenant, actor) do
+        case eval_single_calculation(
+               acc_records,
+               calc,
+               expr,
+               resource,
+               domain,
+               tenant,
+               actor,
+               query.context
+             ) do
           {:ok, updated_records} -> {:cont, {:ok, updated_records}}
           {:error, _} = err -> {:halt, err}
         end
@@ -2427,39 +2587,95 @@ if Code.ensure_loaded?(Ash.DataLayer) do
            resource,
            domain,
            tenant,
-           actor
+           actor,
+           query_context
          ) do
-      has_expr? = expr != nil or function_exported?(calc.module, :expression, 2)
+      has_calculate? = function_exported?(calc.module, :calculate, 3)
 
-      if function_exported?(calc.module, :calculate, 3) and not has_expr? do
-        eval_module_calculation(records, calc, resource, domain, tenant, actor)
-      else
-        effective_expr =
-          cond do
-            expr != nil ->
-              expr
+      effective_expr =
+        cond do
+          expr != nil ->
+            expr
 
-            function_exported?(calc.module, :expression, 2) ->
-              calc.module.expression(calc.opts, calc.context)
+          function_exported?(calc.module, :expression, 2) ->
+            calc.module.expression(calc.opts, calc.context)
 
-            true ->
-              nil
+          true ->
+            nil
+        end
+
+      cond do
+        is_nil(effective_expr) and has_calculate? ->
+          eval_module_calculation(records, calc, resource, domain, tenant, actor, query_context)
+
+        not is_nil(effective_expr) ->
+          case eval_expression_calculation(
+                 records,
+                 calc,
+                 effective_expr,
+                 resource,
+                 domain,
+                 tenant,
+                 actor,
+                 query_context,
+                 has_calculate?
+               ) do
+            {:ok, updated} ->
+              {:ok, updated}
+
+            :fallback_to_module ->
+              eval_module_calculation(
+                records,
+                calc,
+                resource,
+                domain,
+                tenant,
+                actor,
+                query_context
+              )
+
+            {:error, _} = err ->
+              err
           end
 
-        eval_expression_calculation(
-          records,
-          calc,
-          effective_expr,
-          resource,
-          domain,
-          tenant,
-          actor
-        )
+        true ->
+          eval_expression_calculation(
+            records,
+            calc,
+            nil,
+            resource,
+            domain,
+            tenant,
+            actor,
+            query_context,
+            false
+          )
       end
     end
 
-    defp eval_module_calculation(records, %Calculation{} = calc, _resource, domain, tenant, actor) do
-      with {:ok, loaded_for_calc} <- maybe_load_calc_deps(records, calc, domain, tenant, actor),
+    defp eval_module_calculation(
+           records,
+           %Calculation{} = calc,
+           resource,
+           domain,
+           tenant,
+           actor,
+           query_context
+         ) do
+      calc_actor = get_in_calc_context(calc, :actor) || actor
+      calc_tenant = get_in_calc_context(calc, :tenant) || tenant
+      source_ctx = merge_calc_source_context(calc, query_context)
+
+      with {:ok, loaded_for_calc} <-
+             maybe_load_calc_deps(
+               records,
+               calc,
+               resource,
+               domain,
+               calc_tenant,
+               calc_actor,
+               source_ctx
+             ),
            {:ok, values} <- invoke_calc_module(calc, loaded_for_calc) do
         {:ok, zip_calculation_values(loaded_for_calc, calc, values)}
       end
@@ -2468,13 +2684,32 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     defp maybe_load_calc_deps(
            records,
            %Calculation{module: mod, opts: opts, context: ctx},
+           resource,
            domain,
            tenant,
-           actor
+           actor,
+           source_ctx
          ) do
+      args =
+        case ctx do
+          %Ash.Resource.Calculation.Context{arguments: a} when is_map(a) -> a
+          %{arguments: a} when is_map(a) -> a
+          _ -> %{}
+        end
+
+      %Ash.Query{} = base_query = Ash.Query.new(resource)
+
+      ash_query = %{
+        base_query
+        | domain: domain,
+          tenant: tenant,
+          arguments: args,
+          context: source_ctx
+      }
+
       deps =
         if function_exported?(mod, :load, 3) do
-          mod.load(nil, opts, ctx) || []
+          mod.load(ash_query, opts, ctx) || []
         else
           []
         end
@@ -2482,7 +2717,13 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       if deps == [] do
         {:ok, records}
       else
-        Ash.load(records, deps, domain: domain, tenant: tenant, actor: actor, authorize?: false)
+        Ash.load(records, deps,
+          domain: domain,
+          tenant: tenant,
+          actor: actor,
+          context: source_ctx,
+          authorize?: false
+        )
       end
     end
 
@@ -2501,17 +2742,13 @@ if Code.ensure_loaded?(Ash.DataLayer) do
            resource,
            domain,
            tenant,
-           actor
+           actor,
+           query_context,
+           has_calculate?
          ) do
       calc_actor = get_in_calc_context(calc, :actor) || actor
       calc_tenant = get_in_calc_context(calc, :tenant) || tenant
-
-      source_ctx =
-        case Map.get(calc, :context) do
-          %Ash.Resource.Calculation.Context{source_context: sc} when is_map(sc) -> sc
-          ctx when is_map(ctx) and not is_struct(ctx) -> ctx
-          _ -> %{}
-        end
+      source_ctx = merge_calc_source_context(calc, query_context)
 
       records
       |> Enum.reduce_while({:ok, []}, fn record, {:ok, acc} ->
@@ -2541,12 +2778,25 @@ if Code.ensure_loaded?(Ash.DataLayer) do
                    calc_actor,
                    source_ctx
                  ) do
-              {:ok, val} -> {:cont, {:ok, [put_calculation_result(record, calc, val) | acc]}}
-              {:error, _} = err -> {:halt, err}
+              {:ok, val} ->
+                {:cont, {:ok, [put_calculation_result(record, calc, val) | acc]}}
+
+              :unknown ->
+                if has_calculate? do
+                  {:halt, :fallback_to_module}
+                else
+                  {:cont, {:ok, [put_calculation_result(record, calc, nil) | acc]}}
+                end
+
+              {:error, _} = err ->
+                {:halt, err}
             end
         end
       end)
-      |> reverse_ok()
+      |> case do
+        {:ok, rev} -> {:ok, Enum.reverse(rev)}
+        other -> other
+      end
     end
 
     defp eval_hydrated_calculation(
@@ -2570,9 +2820,31 @@ if Code.ensure_loaded?(Ash.DataLayer) do
              ) do
           {:ok, raw} -> cast_calculation_output(calc, raw)
           {:error, _} = err -> err
-          :unknown -> {:ok, nil}
+          :unknown -> :unknown
         end
       end
+    end
+
+    defp merge_calc_source_context(%Calculation{context: ctx}, query_context) do
+      base = query_context || %{}
+
+      extra =
+        case ctx do
+          %Ash.Resource.Calculation.Context{source_context: sc} when is_map(sc) -> sc
+          map when is_map(map) and not is_struct(map) -> map
+          _ -> %{}
+        end
+
+      merged_shared =
+        case {Map.get(base, :shared), Map.get(extra, :shared)} do
+          {b, e} when is_map(b) and is_map(e) -> Map.merge(b, e)
+          {b, nil} when is_map(b) -> b
+          {_, e} when is_map(e) -> e
+          _ -> nil
+        end
+
+      merged = Map.merge(base, extra)
+      if is_map(merged_shared), do: Map.put(merged, :shared, merged_shared), else: merged
     end
 
     defp cast_calculation_output(_calc, nil), do: {:ok, nil}
@@ -2741,6 +3013,38 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
     defp get_agg_sort(%Aggregate{query: %{sort: sort}}), do: sort
     defp get_agg_sort(_), do: nil
+
+    defp min_agg_value(val, acc), do: if(compare_agg_values(val, acc) == :lt, do: val, else: acc)
+    defp max_agg_value(val, acc), do: if(compare_agg_values(val, acc) == :gt, do: val, else: acc)
+
+    defp compare_agg_values(%Decimal{} = a, %Decimal{} = b), do: Decimal.compare(a, b)
+    defp compare_agg_values(%Date{} = a, %Date{} = b), do: Date.compare(a, b)
+    defp compare_agg_values(%Time{} = a, %Time{} = b), do: Time.compare(a, b)
+
+    defp compare_agg_values(%NaiveDateTime{} = a, %NaiveDateTime{} = b),
+      do: NaiveDateTime.compare(a, b)
+
+    defp compare_agg_values(%DateTime{} = a, %DateTime{} = b), do: DateTime.compare(a, b)
+
+    defp compare_agg_values(%Ash.CiString{} = a, %Ash.CiString{} = b) do
+      Ash.CiString.compare(a, b)
+    end
+
+    defp compare_agg_values(a, b) do
+      cond do
+        a < b -> :lt
+        a > b -> :gt
+        true -> :eq
+      end
+    end
+
+    defp put_actor_in_context(context, nil), do: context || %{}
+
+    defp put_actor_in_context(context, actor) do
+      ctx = context || %{}
+      private = ctx |> Map.get(:private, %{}) |> Map.put(:actor, actor)
+      ctx |> Map.put(:actor, actor) |> Map.put(:private, private)
+    end
 
     defp get_in_query_context(%__MODULE__{context: %{private: %{actor: actor}}}, :actor),
       do: actor

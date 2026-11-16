@@ -175,7 +175,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           :infinity ->
             make_ref()
 
-          ms when is_integer(ms) and ms > 0 ->
+          ms when is_integer(ms) and ms >= 0 ->
             Process.send_after(self(), {:xitdb_lease_expired, owner_key, lease_ref}, ms)
         end
 

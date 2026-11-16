@@ -580,5 +580,97 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         ~r/must share the same store as parent/
       )
     end
+
+    test "BUG-029/053/054/058: Info.resolve_store falls back on store: nil and VerifyNoSqlFragments checks base_filter, default_sort, and on: :action preparations" do
+      # BUG-058: store: nil falls back to default_store
+      assert Info.resolve_store(Event, store: nil) == StoreA
+
+      # BUG-029: base_filter fragment rejected
+      assert_verifier_error(
+        """
+        defmodule Xitdb.Ash.DslTest.BadBaseFilterResource do
+          use Ash.Resource,
+            domain: nil,
+            validate_domain_inclusion?: false,
+            extensions: [Xitdb.Ash.Dsl]
+
+          xitdb do
+            store Xitdb.Ash.DslTest.StoreA
+            collection :bad_base_filter
+          end
+
+          resource do
+            base_filter expr(fragment("deleted_at IS NULL"))
+          end
+
+          attributes do
+            uuid_primary_key :id
+          end
+        end
+        """,
+        Xitdb.Ash.DslTest.BadBaseFilterResource,
+        Xitdb.Ash.Verifiers.VerifyNoSqlFragments,
+        ~r/base_filter/
+      )
+
+      # BUG-053: relationship default_sort fragment rejected
+      assert_verifier_error(
+        """
+        defmodule Xitdb.Ash.DslTest.BadDefaultSortResource do
+          use Ash.Resource,
+            domain: nil,
+            validate_domain_inclusion?: false,
+            extensions: [Xitdb.Ash.Dsl]
+
+          xitdb do
+            store Xitdb.Ash.DslTest.StoreA
+            collection :bad_default_sort
+          end
+
+          attributes do
+            uuid_primary_key :id
+          end
+
+          relationships do
+            has_many :sessions, Xitdb.Ash.DslTest.Session do
+              default_sort [calc(fragment("lower(title)"), type: :string)]
+            end
+          end
+        end
+        """,
+        Xitdb.Ash.DslTest.BadDefaultSortResource,
+        Xitdb.Ash.Verifiers.VerifyNoSqlFragments,
+        ~r/SQL `fragment\(\.\.\.\)` is not supported/
+      )
+
+      # BUG-054: on: :action preparation fragment rejected
+      assert_verifier_error(
+        """
+        defmodule Xitdb.Ash.DslTest.BadActionPrepResource do
+          use Ash.Resource,
+            domain: nil,
+            validate_domain_inclusion?: false,
+            extensions: [Xitdb.Ash.Dsl]
+
+          xitdb do
+            store Xitdb.Ash.DslTest.StoreA
+            collection :bad_action_prep
+          end
+
+          preparations do
+            require Ash.Expr
+            prepare build(filter: [title: Ash.Expr.expr(fragment("1 = 1"))]), on: :action
+          end
+
+          attributes do
+            uuid_primary_key :id
+          end
+        end
+        """,
+        Xitdb.Ash.DslTest.BadActionPrepResource,
+        Xitdb.Ash.Verifiers.VerifyNoSqlFragments,
+        ~r/preparations/
+      )
+    end
   end
 end

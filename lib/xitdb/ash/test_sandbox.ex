@@ -278,16 +278,13 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     end
 
     defp find_chain_owner(store, [pid | rest]) when is_pid(pid) do
-      cond do
-        :ets.member(@checkouts_table, {:db, store, pid}) ->
-          {:ok, pid}
-
-        match?([{_, _}], :ets.lookup(@checkouts_table, {:allow, store, pid})) ->
-          [{_, owner}] = :ets.lookup(@checkouts_table, {:allow, store, pid})
-          {:ok, owner}
-
-        true ->
-          find_chain_owner(store, rest)
+      if :ets.member(@checkouts_table, {:db, store, pid}) do
+        {:ok, pid}
+      else
+        case :ets.lookup(@checkouts_table, {:allow, store, pid}) do
+          [{_, owner} | _] -> {:ok, owner}
+          [] -> find_chain_owner(store, rest)
+        end
       end
     end
 
