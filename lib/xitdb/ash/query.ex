@@ -1012,7 +1012,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     end
 
     defp stage3_prefilter(db_or_cursor, records, %__MODULE__{filter: filter} = query, resource) do
-      if filter_uses_derived_or_related?(filter, resource) do
+      if expr_uses_derived_or_related?(filter, resource) do
         {:ok, records, filter}
       else
         with {:ok, filtered} <- run_runtime_filter(db_or_cursor, records, query, resource) do
@@ -1033,16 +1033,6 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       Enum.reduce(tail, head, fn expr, acc ->
         %Ash.Query.BooleanExpression{op: :and, left: acc, right: expr}
       end)
-    end
-
-    defp filter_uses_derived_or_related?(nil, _resource), do: false
-
-    defp filter_uses_derived_or_related?(%Ash.Filter{expression: expr}, resource) do
-      expr_uses_derived_or_related?(expr, resource)
-    end
-
-    defp filter_uses_derived_or_related?(expr, resource) do
-      expr_uses_derived_or_related?(expr, resource)
     end
 
     defp expr_uses_derived_or_related?(expr, resource) do
@@ -1074,9 +1064,6 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     end
 
     defp run_runtime_filter(_db_or_cursor, [], _query, _resource), do: {:ok, []}
-
-    defp run_runtime_filter(_db_or_cursor, records, %__MODULE__{filter: nil}, _resource),
-      do: {:ok, records}
 
     defp run_runtime_filter(db_or_cursor, records, %__MODULE__{} = query, resource) do
       actor = get_in_query_context(query, :actor)
@@ -1537,7 +1524,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
            query,
            resource
          ) do
-      tenant = Map.get(agg, :tenant) || get_in_agg_context(agg, :tenant) || query.tenant
+      tenant = get_in_agg_context(agg, :tenant) || query.tenant
       actor = get_in_agg_context(agg, :actor) || get_in_query_context(query, :actor)
       domain = query.domain
 
@@ -1612,7 +1599,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
            query,
            resource
          ) do
-      tenant = Map.get(agg, :tenant) || get_in_agg_context(agg, :tenant) || query.tenant
+      tenant = get_in_agg_context(agg, :tenant) || query.tenant
       actor = get_in_agg_context(agg, :actor) || get_in_query_context(query, :actor)
       domain = query.domain
       join_filters = normalize_join_filters(Map.get(agg, :join_filters))
@@ -1667,7 +1654,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
            query,
            resource
          ) do
-      tenant = Map.get(agg, :tenant) || get_in_agg_context(agg, :tenant) || query.tenant
+      tenant = get_in_agg_context(agg, :tenant) || query.tenant
       actor = get_in_agg_context(agg, :actor) || get_in_query_context(query, :actor)
       domain = query.domain
       agg_filter = get_agg_filter(agg)
@@ -2273,7 +2260,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         agg_filter = get_agg_filter(agg)
         agg_sort = get_agg_sort(agg)
         agg_res = agg.resource || resource
-        agg_tenant = Map.get(agg, :tenant) || get_in_agg_context(agg, :tenant) || tenant
+        agg_tenant = get_in_agg_context(agg, :tenant) || tenant
         agg_actor = get_in_agg_context(agg, :actor) || actor
 
         with {:ok, filtered} <-
