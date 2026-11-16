@@ -1,14 +1,15 @@
-# Declarative Datalog Query DSL (`datalog/1`, `query/2,3`, `query!/2,3`, `~q`)
+# Datalog & Graph Queries
 
-`Xitdb` includes a native structural and temporal Datalog engine in Odin that supports:
-- Pattern unification across maps, counted maps, sorted maps, lists, and sets
-- Automatic `O(log N)` B+Tree secondary index prefix and range pushdown
-- Negated clauses (`not`) and key existence checks
-- Cycle-safe BFS transitive graph traversal (`reach/3,4`)
-- Cross-moment and full-history temporal queries (`at_moment/2`)
+`Xitdb` includes a built-in Datalog engine for expressive declarative queries right against your stored maps, lists, sets, and sorted indexes:
+
+- Pattern matching and equijoins across multiple collections
+- Automatic `O(log N)` prefix and lower-bound range seeks on `:sorted_map` and `:sorted_set` indexes
+- Negation (`not`) and key-existence checks
 - Grouped and global aggregations (`count`, `sum`, `min`, `max`)
+- Cycle-safe recursive graph reachability (`reach/3,4`)
+- Cross-moment historical joins and full-history queries (`at_moment/2`)
 
-In addition to the compile-time validated `~q` sigil (`~q"find ?name where ..."`), `Xitdb.DSL` provides an Ecto/Datomic-style macro DSL (`datalog/1`, `query/2,3`, `query!/2,3`) so you can write queries in native Elixir syntax and safely pin runtime Elixir variables with `^var`.
+Write queries in native Elixir syntax with `query/2,3` or `datalog/1` (supporting runtime variable pinning with `^var`), or use the compile-time validated `~q` sigil (`~q"find ?name where ..."`).
 
 ---
 
@@ -34,7 +35,7 @@ min_salary = 115
   end
 ```
 
-If you want to inspect or reuse the compiled Datalog query string without immediately executing it, use `datalog/1`:
+To inspect or reuse a compiled Datalog query string without running it right away, use `datalog/1`:
 
 ```elixir
 q =
@@ -54,23 +55,49 @@ query!(db, ~q"find ?name where .users[?id].username = ?name")
 
 ---
 
-## 2. Logic Variables vs. Pinned Runtime Values (`^`)
+## 2. Logic Variables vs. Pinned Runtime Values (`^var`)
 
 Inside `find` and `where`:
-- **Bare identifiers** (`id`, `name`, `salary`, `u`, `m`) are compiled as Datalog logic variables (`?id`, `?name`, `?salary`, `?u`, `?m`).
-- **Pinned expressions** (`^min_salary`, `^prefix`, `^(user.dept)`) evaluate the Elixir expression at runtime and safely serialize the literal into the Datalog clause.
-- **Literals** (`"eng"`, `100`, `true`, `:active`) are serialized directly at compile time.
+- **Bare identifiers** (`id`, `name`, `salary`, `u`, `m`) become Datalog logic variables (`?id`, `?name`, `?salary`, `?u`, `?m`).
+- **Pinned expressions** (`^min_salary`, `^prefix`, `^(user.dept)`) evaluate the Elixir expression at runtime and safely bind the value into the query.
+- **Literals** (`"eng"`, `100`, `true`, `:active`) compile directly into the query.
 
 ---
 
-## 3. Entity Generator Bindings (`<-` and `from`)
+## 3. Entity Bindings (`from` / `<-`) & Multi-Collection Joins
 
-Instead of repeating `users[id].field` on every line, you can bind an entity variable to a collection using any of four equivalent forms:
+Instead of repeating `users[id].field` on every line, bind an entity variable to a collection with any of four equivalent forms:
 
-1. **In-clause generator (`u <- users`)**: inside `where [...]`
+1. **In-clause generator (`u <- users`):** inside `where [...]`
 2. **Top-level `from u in users`** (or `from u <- users`)
 3. **Top-level `from users`** (binds the first variable in `find` to `users`)
 4. **Option `query(db, from: :users) do ... end`**
+
+### Multi-Collection Equijoins
+
+Sharing a logic variable across two collections joins them automatically:
+
+```elixir
+{:ok, %{rows: rows}} =
+  query db do
+    find {emp_name, dept_name, budget}
+
+    where [
+      u <- users,
+      u.name == emp_name,
+      u.dept_id == dept_id,
+      counted(:departments)[dept_id].title == dept_name,
+      counted(:departments)[dept_id].budget == budget,
+      budget >= 250_000
+    ]
+  end
+```
+
+---
+
+## 4. Aggregations (`count`, `sum`, `min`, `max`)
+
+Any non-aggregated variable in `find` acts as the grouping key. When all items in `find` are aggregations (for example `find {min(salary), max(salary), count(u)}`), the engine returns a single global summary row.
 
 ```elixir
 excluded_flag = "suspended"
@@ -100,11 +127,11 @@ where
 
 ---
 
-## 4. Transitive Graph Traversal (`reach/3` and `reach/4`)
+## 5. Recursive Graph Traversal (`reach/3` and `reach/4`)
 
-`xitdb`'s Datalog engine natively supports cycle-safe Breadth-First Search (BFS) transitive closure via `reach`:
+`Xitdb`'s Datalog engine supports cycle-safe Breadth-First Search (BFS) transitive graph traversal via `reach`:
 
-- `reach(from_var, to_var, edge_clause)` — transitively steps `edge_clause` from `from_var` to all reachable `to_var` nodes.
+- `reach(from_var, to_var, edge_clause)` — walks `edge_clause` transitively from `from_var` to every reachable `to_var`.
 - `reach(from_var, to_var, depth_var, edge_clause)` — also binds `depth_var` to the integer hop count (`1` for direct neighbors, `2` for neighbors-of-neighbors, etc.).
 
 ```elixir
@@ -125,12 +152,10 @@ root_mgr = "alice"
 
 ---
 
-## 5. Temporal Queries & Cross-Moment Joins (`at_moment/2`)
+## 6. Querying Across Time (`moment:` & `at_moment/2`)
 
-You can query historical data in two ways:
-
-### A. Querying a Single Historical Snapshot (`moment: idx`)
-Pass `moment: idx` to `query/3` (or pass a snapshot cursor from `Xitdb.as_of(db, idx)`):
+### Querying a Single Historical Snapshot (`moment: idx`)
+Pass `moment: idx` to `query/3` (or pass a cursor from `Xitdb.as_of(db, idx)`):
 
 ```elixir
 {:ok, v0_res} =
@@ -140,11 +165,11 @@ Pass `moment: idx` to `query/3` (or pass a snapshot cursor from `Xitdb.as_of(db,
   end
 ```
 
-### B. Per-Clause `at_moment(moment_or_var, path)`
-Use `at_moment/2` inside `where` to compare state across different moments in a single query—or pass a **logic variable** `m` as the first argument to unify across **all committed moments** in the database:
+### Cross-Moment Joins & Full-History Scans (`at_moment/2`)
+Wrap any path expression in `at_moment(moment_or_var, path)` inside `where` to compare values across different commits—or pass a **logic variable** `m` as the first argument to unify across **every committed moment** in the database:
 
 ```elixir
-# 1. Cross-moment comparison (find everyone whose salary increased between moment 0 and moment 1):
+# 1. Cross-moment comparison (find everyone whose salary increased from moment 0 to moment 1)
 {:ok, raises} =
   query db do
     find {id, old_salary, new_salary}
@@ -156,7 +181,7 @@ Use `at_moment/2` inside `where` to compare state across different moments in a 
     ]
   end
 
-# 2. Temporal variable unification (bind `m` to every moment index and return Alice's salary timeline):
+# 2. Temporal variable unification (bind `m` to every moment and return Alice's salary timeline)
 {:ok, timeline} =
   query db do
     find {m, sal}
@@ -170,56 +195,28 @@ Use `at_moment/2` inside `where` to compare state across different moments in a 
 
 ---
 
-## 6. Supported Clauses, Predicates & Aggregations Reference
+## 7. Supported Clauses, Predicates & Aggregations Reference
 
 ### `find` Projections & Aggregations
 - Logic variables: `find {id, name, salary}` or `find [id, name]`
-- Aggregations:
-  - `count(var)`
-  - `sum(var)`
-  - `min(var)`
-  - `max(var)`
-
-Non-aggregated variables in `find` automatically act as the grouping key. If all items in `find` are aggregations (e.g. `find {min(salary), max(salary), count(u)}`), the engine computes a single global aggregate row.
+- Aggregations: `count(var)`, `sum(var)`, `min(var)`, `max(var)`
 
 ### `where` Clauses
 - **Attribute unification:** `users[id].dept == dept` or `u.dept == "eng"`
-- **Key existence / non-existence:** `users[id].temp_token` or `not users[id].temp_token` (checks whether the path exists without binding a value)
-- **Secondary `Sorted_Map` index lookup:** `sorted("username->id")[name] == id`
+- **Key existence / non-existence:** `users[id].temp_token` or `not users[id].temp_token`
+- **Secondary `:sorted_map` lookup:** `sorted("username->id")[name] == id`
 - **Counted map lookup:** `counted(:users)[id].age == age`
-- **Array list / linked list unification:**
-  - `users[id].roles[idx] == role` (binds `idx` to `0..N-1` and `role` to each element)
+- **List unification:**
+  - `users[id].roles[idx] == role` (`Array_List`, binds `idx` to `0..N-1` and `role` to each element)
   - `users[id].todos[[idx]] == task` (`Linked_Array_List`)
   - `users[id].roles[^pinned_idx] == role` (point lookup at a pinned index)
 - **Set membership:**
-  - `u.flags.set_member("active")` (`%` `Hash_Set`)
-  - `u.flags.counted_set_member("active")` (`#%` `Counted_Hash_Set`)
-  - `u.tags.sorted_set_member("elixir")` (`^` `Sorted_Set`)
+  - `u.flags.set_member("active")` (`Hash_Set`)
+  - `u.flags.counted_set_member("active")` (`Counted_Hash_Set`)
+  - `u.tags.sorted_set_member("elixir")` (`Sorted_Set`)
 - **Comparisons:** `==`, `!=`, `>`, `>=`, `<`, `<=` (works between two logic variables like `new_salary > old_salary` or a variable and a literal/pinned value like `salary >= ^min_salary`)
-- **String predicates & B+Tree Pushdown:**
-  - `starts_with(var, "prefix")` — triggers an **`O(log N)` B+Tree prefix seek** when `var` is unified against a `Sorted_Map` (`sorted(...)`) or `Sorted_Set`!
-  - `var >= "lower_bound"` / `var > "lower_bound"` — also triggers an **`O(log N)` B+Tree lower-bound seek** on `Sorted_Map` / `Sorted_Set` keys!
+- **String predicates & B+Tree seek optimization:**
+  - `starts_with(var, "prefix")` — triggers an `O(log N)` B+Tree prefix seek when `var` is bound to a `:sorted_map` (`sorted(...)`) or `:sorted_set`
+  - `var >= "lower_bound"` / `var > "lower_bound"` — also triggers an `O(log N)` B+Tree lower-bound seek on `:sorted_map` / `:sorted_set` keys
   - `contains(var, "substring")`
-- **Negation:** `not <clause>` (e.g. `not u.flags.set_member("suspended")`, `not u.deleted_at`, or `not (u.role == "guest")`)
-
----
-
-## 7. Multi-Collection Join Example
-
-Logic variables shared across multiple collections automatically perform an equijoin:
-
-```elixir
-{:ok, %{rows: rows}} =
-  query db do
-    find {emp_name, dept_name, budget}
-
-    where [
-      u <- users,
-      u.name == emp_name,
-      u.dept_id == dept_id,
-      counted(:departments)[dept_id].title == dept_name,
-      counted(:departments)[dept_id].budget == budget,
-      budget >= 250_000
-    ]
-  end
-```
+- **Negation:** `not <clause>` (for example `not u.flags.set_member("suspended")`, `not u.deleted_at`, or `not (u.role == "guest")`)

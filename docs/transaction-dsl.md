@@ -1,12 +1,10 @@
-# Declarative Transaction Block DSL (`tx/2`, `tx/3`, `tx!/2`, `tx!/3`)
+# Transaction DSL
 
-While `Xitdb.transact/3` supports standard Elixir [`Access` mutations](access-and-enumerable.md) (`put_in/3`, `update_in/3`, `pop_in/2`) on a root `%Xitdb.Cursor{}`, the `Access` protocol has three inherent limitations for deep or complex mutations:
+While `Xitdb.transact/3` supports [`Access` mutations](access-and-enumerable.md) (`put_in/3`, `update_in/3`, `pop_in/2`), deep or multi-step transactions often benefit from cleaner syntax and native collection operations:
 
-1. **Intermediate NIF reads:** `put_in(root["users"][id]["profile"]["city"], "NYC")` invokes `Access.get_and_update/3` at every step, crossing the NIF boundary on each hop.
-2. **Missing intermediate paths:** If `root["users"][id]` does not exist yet, `Access.get_and_update/3` passes `nil` to the next step and raises unless intermediate maps are initialized first.
-3. **No syntax for native list/tree/metadata operations:** `Access` cannot express `xitdb`'s native `O(log N)` list `append`, `insert`, `slice`, `O(1)` zero-copy subtree `fork`, secondary index registration (`index_on`), or commit metadata (`meta`, `instant`, `savepoint`).
-
-`Xitdb.DSL.tx/2,3` and `Xitdb.DSL.tx!/2,3` solve all three problems by compiling path expressions directly into a single atomic NIF transaction batch.
+1. **Automatic intermediate map creation:** Writing `put users[new_id].profile.city, "Tokyo"` creates missing parent maps automatically without checking or initializing each level first.
+2. **Flat, readable multi-operation blocks:** Combine puts, updates, removals, list appends/inserts/slices, zero-copy `fork`s, secondary index rules, and commit metadata in a single `tx db do ... end` block.
+3. **One atomic commit:** Every operation in the `tx` block is compiled into a single atomic commit (or rolled back cleanly on `abort`).
 
 ---
 
@@ -21,15 +19,15 @@ use Xitdb.DSL
     meta :author, "ops-bot"
     meta :trace_id, "req-991"
 
-    # 2. Auto-vivifies missing intermediate maps with 0 NIF reads
+    # 2. Auto-create missing intermediate maps and set scalars
     put users["bob"].profile.city, "Tokyo"
     put users["alice"].role, "admin"
 
-    # 3. 1-arity set member additions & removals
+    # 3. Set member additions & removals (1-arity form)
     put users["alice"].flags.set_member("staff")
     rm users["alice"].flags.set_member("onboarding")
 
-    # 4. Native list, slice, zero-copy fork, and removal ops
+    # 4. List edits, slicing, zero-copy fork, and key removal
     append users["alice"].audit_log, "promoted"
     insert users["alice"].todos[[0]], "urgent-t0"
     slice users["alice"].todos, 0..3
@@ -42,18 +40,18 @@ use Xitdb.DSL
   end
 ```
 
-You can also call `Xitdb.tx/2,3` or `Xitdb.tx!/2,3` directly after `require Xitdb` without importing `Xitdb.DSL`.
+You can also call `Xitdb.tx/2,3` or `Xitdb.tx!/2,3` after `require Xitdb` without importing `Xitdb.DSL`.
 
 ---
 
 ## 2. Transaction Operations Reference
 
-All path arguments inside `tx` are compiled using [`Xitdb.DSL.path/1`](path-and-pull-dsl.md), supporting runtime variable interpolation (`users[id]`) and typed collection modifiers (`counted(:users)[id]`, `sorted(:catalog)[sku]`, `todos[[0]]`).
+All path arguments inside `tx` follow the same rules as [`path/1`](path-and-pull-dsl.md)—supporting runtime variable interpolation (`users[id]`) and collection modifiers (`counted(:users)[id]`, `sorted(:catalog)[sku]`, `todos[[0]]`). Because Elixir syntax does not allow a leading unary dot, start bare paths with the collection name (`users[id]`, `root.users[id]`, `_.users[id]`, or `:users[id]`).
 
 ### `put path, value` (and 1-Arity Set Member `put`)
-Writes a scalar, custom tagged value (`{:tagged, "dc", "19.99"}`), nested Elixir map/list, or typed `%Xitdb.Collection{}` (`Xitdb.counted_map/1`, `Xitdb.sorted_map/1`, `Xitdb.linked_list/1`, etc.) at `path`. Missing intermediate collections are created automatically with zero NIF reads.
+Writes a scalar, custom tagged value (`{:tagged, "dc", "19.99"}`), nested Elixir map/list, or typed `%Xitdb.Collection{}` (`Xitdb.counted_map/1`, `Xitdb.sorted_map/1`, `Xitdb.linked_list/1`, etc.) at `path`. Missing intermediate maps are created automatically.
 
-When adding a member to a `Hash_Set`, `Counted_Hash_Set`, or `Sorted_Set`, use the 1-arity `put` form with a set modifier (symmetrical with `rm`):
+When adding a member to a `Hash_Set`, `Counted_Hash_Set`, or `Sorted_Set`, use the 1-arity `put` form with a set modifier (matching `rm`):
 
 ```elixir
 put users[id].profile, %{"city" => "Montreal", "tier" => "pro"}
@@ -66,9 +64,9 @@ put users[id].badges.sorted_set_member("elixir")
 ```
 
 ### `update path, fun` and `update path, default, fun`
-Reads the current value at `path` (preferring any value already staged by an earlier `put`/`update`/`rm` in the same `tx` block, or falling back to `base_moment` in the database), passes it to `fun`, and stages a `put` with the returned value.
+Reads the current value at `path` (preferring any value already staged by an earlier `put`, `update`, or `rm` in the same `tx` block, or falling back to `base_moment` in the database), passes it to `fun`, and stages a `put` with the returned value.
 
-If you pass a `default` argument (`update path, default, fun`), `default` is substituted whenever the current value at `path` is `nil`:
+Passing `default` (`update path, default, fun`) substitutes `default` whenever the current value at `path` is `nil`:
 
 ```elixir
 # 3-arity form with default value (recommended when key may not exist yet):
@@ -88,14 +86,14 @@ rm users[id].flags.set_member("suspended")
 ```
 
 ### `append list_path, value`
-Appends `value` to the end of an `Array_List` or `Linked_Array_List` at `list_path`.
+Appends `value` to the end of an `:array_list` or `:linked_array_list` at `list_path`.
 
 ```elixir
 append users[id].audit_log, "logged_in"
 ```
 
 ### `insert list_path[[idx]], value` (or `insert list_path, idx, value`)
-Inserts `value` at `idx` in a `Linked_Array_List` in `O(log N)` time, shifting subsequent elements right without copying them.
+Inserts `value` at `idx` in a `:linked_array_list` in `O(log N)` time, shifting subsequent elements right without rewriting the rest of the list.
 
 ```elixir
 insert users[id].todos[[0]], "urgent-task"
@@ -104,7 +102,7 @@ insert users[id].todos, 0, "urgent-task"
 ```
 
 ### `slice list_path, first..last` (or `slice list_path, offset, size`)
-Slices a `Linked_Array_List` (arbitrary `offset` and `size` in `O(log N)`) or truncates an `Array_List` to `size`.
+Slices a `:linked_array_list` (arbitrary `offset` and `size` in `O(log N)`) or truncates an `:array_list` to `size`.
 
 ```elixir
 slice users[id].todos, 0..9
@@ -113,20 +111,20 @@ slice users[id].todos, 0, 10
 ```
 
 ### `fork from_path, to_path`
-Clones the subtree at `from_path` to `to_path` in **`O(1)` zero-copy time** by copying its 9-byte `Slot` pointer and freezing the transaction watermark so subsequent mutations in the same `tx` block trigger copy-on-write on either branch.
+Clones the subtree at `from_path` to `to_path` in `O(1)` time without copying its contents, automatically setting a savepoint so subsequent mutations in the same `tx` block copy-on-write cleanly onto either branch.
 
 ```elixir
 fork users[id], backups[id]
 ```
 
 ### `index_on source_map, field_key, index_map` (and `tx_for` / `tx_for!`)
-Registers a secondary `Sorted_Map` B+Tree index rule for the transaction, automatically indexing `source_map[record_id][field_key] -> record_id` into `index_map` and evicting stale entries when indexed fields are updated or removed.
+Registers a secondary `:sorted_map` index rule for the transaction, keeping `index_map[value] => record_id` synchronized across inserts, updates, and deletions.
 
 ```elixir
 index_on :users, :username, "username->id"
 ```
 
-When using [`Xitdb.Ash.DataLayer`](ash-and-spark.md) resources (or schema modules defining `__xitdb_indexes__/0`), prefer `tx_for/3,4` and `tx_for!/3,4` over manual `index_on` declarations—`tx_for` automatically injects all `index_on` rules configured on the given resource(s) at compile time:
+When using [`Xitdb.Ash.DataLayer`](ash-and-spark.md) resources (or plain schema modules defining `__xitdb_indexes__/0`), prefer `tx_for/3,4` and `tx_for!/3,4` so declared `index_on` rules are injected automatically at compile time:
 
 ```elixir
 {:ok, db} =
@@ -136,7 +134,7 @@ When using [`Xitdb.Ash.DataLayer`](ash-and-spark.md) resources (or schema module
 ```
 
 ### `init_col path, kind` / `reset_col path, kind`
-Initializes an empty collection at `path` (or resets an existing collection) with explicit kind (`:hash_map`, `:counted_hash_map`, `:sorted_map`, `:array_list`, `:linked_array_list`, `:hash_set`, `:counted_hash_set`, `:sorted_set`).
+Initializes an empty collection at `path` (or resets an existing collection) with an explicit kind (`:hash_map`, `:counted_hash_map`, `:sorted_map`, `:array_list`, `:linked_array_list`, `:hash_set`, `:counted_hash_set`, `:sorted_set`).
 
 ```elixir
 init_col org.departments, :counted_hash_map
@@ -144,7 +142,7 @@ reset_col cache.sessions, :hash_map
 ```
 
 ### `meta key, value` & `instant epoch_ms`
-Writes custom commit metadata into the moment's `__tx` map (`db["__tx"][key]`) and sets `__tx.tx_instant` (returned by `Xitdb.history_of/2` as `instant`):
+Writes custom commit metadata into the moment's `__tx` map (`db["__tx"][key]`) and sets `__tx.tx_instant` (returned by `Xitdb.history_of/2` as `:instant`):
 
 ```elixir
 instant System.system_time(:millisecond)
@@ -153,7 +151,7 @@ meta :request_id, "req-123"
 ```
 
 ### `savepoint()`
-Explicitly freezes all nodes written so far in the current transaction (`database_freeze`) so subsequent mutations in the same `tx` block copy-on-write rather than mutating in-place. (`fork` calls `savepoint` automatically.)
+Explicitly freezes all nodes written so far in the current transaction so subsequent edits copy-on-write rather than mutating in-place. (`fork` triggers a savepoint automatically.)
 
 ```elixir
 savepoint()
@@ -172,10 +170,10 @@ Immediately aborts the `tx` block and rolls back all staged operations, returnin
 
 ---
 
-## 3. Advanced Patterns & Cookbook Recipes
+## 3. Cookbook Recipes
 
 ### Recipe 1: Loops, Comprehensions & Conditionals Inside `tx`
-Because `tx` rewrites transaction operations across the full Elixir AST while leaving normal Elixir expressions untouched, you can use `for` comprehensions, `Enum.each/2`, `if/else`, and `case` inside a `tx` block to stage batch imports in a single atomic commit:
+Because `tx` leaves ordinary Elixir control flow intact, you can use `for` comprehensions, `Enum.each/2`, `if/else`, and `case` inside a `tx` block to commit an entire batch atomically:
 
 ```elixir
 {:ok, db} =
@@ -193,18 +191,18 @@ Because `tx` rewrites transaction operations across the full Elixir AST while le
 ```
 
 ### Recipe 2: In-Memory Read-After-Write Staging
-When you call `put` with a scalar or nested map and then call `update` on a child path in the same `tx` block, `tx` resolves the staged value directly in memory without making an extra NIF call:
+When you `put` a scalar or map and then `update` a nested path in the same `tx` block, `tx` resolves the staged value directly in memory:
 
 ```elixir
 {:ok, db} =
   tx db do
-    # Stages a nested map for "carol":
+    # Stages a nested map for "carol"
     put users["carol"], %{"login_count" => 10, "role" => "member"}
 
-    # Reads 10 from the in-memory staged map and updates it to 15:
+    # Reads 10 from the staged map and updates it to 15
     update users["carol"].login_count, &(&1 + 5)
 
-    # Conditional guard using the updated value:
+    # Guard on the updated value
     if update(users["carol"].login_count, & &1) > 100 do
       abort :rate_limit_exceeded
     end
@@ -215,22 +213,22 @@ When you call `put` with a scalar or nested map and then call `update` on a chil
 
 ## 4. Transaction Options (`tx/3` and `tx!/3`)
 
-Both `tx/3` and `tx!/3` (as well as `Xitdb.transact/3`) accept keyword options:
+Both `tx/3` and `tx!/3` (as well as `Xitdb.transact/3`) accept these keyword options:
 
-- `:doc` (`String.t()`) — Commit message stored in `__tx.doc` (inspected by `Xitdb.history_of/2`).
-- `:instant` (`integer()`) — Epoch timestamp in milliseconds stored in `__tx.tx_instant` (inspected by `Xitdb.history_of/2`).
-- `:meta` (`map() | keyword()`) — Custom key-value metadata stored in `__tx.<key>`.
+- `:doc` (`String.t()`) — Commit message stored in `__tx.doc` (returned by `Xitdb.history_of/2`).
+- `:instant` (`integer()`) — Epoch timestamp in milliseconds stored in `__tx.tx_instant`.
+- `:meta` (`map() | keyword()`) — Custom key-value metadata stored under `__tx.<key>`.
 - `:base_moment` (`integer()`, default `-1`) — Historical moment index to branch from.
-- `:index_rules` (`[{:index_on, source_map, field, index_map}]`, default `[]`) — Secondary B+Tree index rules applied during map or callback transactions.
+- `:index_rules` (`[{:index_on, source_map, field, index_map}]`, default `[]`) — Secondary `:sorted_map` index rules applied during map or callback transactions.
 
 ---
 
-## 5. Concurrency Model: Lock-Free Reads & Single-Writer Serialization
+## 5. Concurrency: Concurrent Readers & Single-Writer Serialization
 
-- **Concurrent readers never block each other:** `%Xitdb{}` and `%Xitdb.Cursor{}` handles synchronize NIF slot access with an internal `ErlNifRWLock` and read immutable historical moments, so any number of BEAM processes can query or traverse cursors concurrently.
-- **Serialize read-modify-write transactions through one writer:** While `nif_transact` atomically commits each batch under a write lock, Elixir-side read-modify-write steps (`update` inside `tx` and `Xitdb.transact/3` 1-arity callbacks) read the current moment *before* entering `nif_transact`. If two BEAM processes run read-modify-write transactions concurrently against the same `%Xitdb{}` reference, both can read moment `N` and overwrite each other's updates (TOCTOU).
+Any number of BEAM processes can read `%Xitdb{}` and `%Xitdb.Cursor{}` values concurrently without blocking each other. However, read-modify-write transactions (`update` inside `tx` and 1-arity `Xitdb.transact/3` callbacks) read the current state before committing and should be serialized through one writer process to prevent concurrent writers from overwriting each other.
 
-If you are using Ash, supervise `Xitdb.Ash.Store` (see [`docs/ash-and-spark.md`](ash-and-spark.md)). For standalone non-Ash applications, own writes in a single `GenServer` and publish the `%Xitdb{}` handle in `:persistent_term` so readers bypass the `GenServer` mailbox completely:
+- **With Ash Framework:** Use [`Xitdb.Ash.Store`](ash-and-spark.md), which handles single-writer leases and lock-free reads automatically.
+- **Without Ash:** Own writes in a single `GenServer` and publish the `%Xitdb{}` handle via `:persistent_term` so readers bypass the `GenServer` mailbox completely:
 
 ```elixir
 defmodule MyApp.Store do
@@ -238,11 +236,11 @@ defmodule MyApp.Store do
 
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
 
-  # Zero-bottleneck concurrent reads (never touches GenServer mailbox)
+  # Concurrent reads never hit the GenServer mailbox
   def handle, do: :persistent_term.get({__MODULE__, :db})
   def db, do: Xitdb.db(handle())
 
-  # Serialized atomic writes
+  # Serialized writes
   def write(fun) when is_function(fun, 1) do
     GenServer.call(__MODULE__, {:write, fun}, :infinity)
   end
@@ -267,3 +265,5 @@ defmodule MyApp.Store do
   end
 end
 ```
+
+See [Architecture, Internals & Performance](architecture-and-internals.md) for details on how transaction staging and snapshots work internally.

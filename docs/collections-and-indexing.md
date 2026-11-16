@@ -1,49 +1,32 @@
-# Collections, Data Modeling & Secondary Indexes (`Xitdb.Collection`)
+# Collections & Secondary Indexes
 
-By default, when you pass standard Elixir data structures to `Xitdb.transact/3` or `put` inside `Xitdb.DSL.tx`:
-- Plain Elixir maps (`%{}`) are stored as `:hash_map` (16-way HAMT).
-- Plain Elixir lists (`[]`) are stored as `:array_list` (16-way Radix Trie).
-- `%MapSet{}` values are stored as `:counted_hash_set` (16-way HAMT set with `O(1)` count).
+You don't have to pick storage types up front—plain Elixir data structures work automatically whenever you pass them to `Xitdb.transact/3` or `put` inside `tx`:
 
-When your workload requires **`O(1)` map cardinality**, **lexicographical B+Tree key ordering and range scans**, or **`O(log N)` middle-of-list insertions and removals**, wrap your data in `Xitdb`'s explicit collection constructors (`Xitdb.counted_map/1`, `Xitdb.sorted_map/1`, `Xitdb.linked_list/1`, etc.) or initialize them with `init_col` in `tx`.
+- Plain maps (`%{}`) are stored as `:hash_map`.
+- Plain lists (`[]`) are stored as `:array_list`.
+- `%MapSet{}` values are stored as `:counted_hash_set`.
 
----
-
-## 1. Persistent Collection Types & Complexity Matrix
-
-`xitdb` provides **8 persistent, structurally shared collection types**:
-
-| Collection Kind | Constructor | Selector Sigil | Backing Structure | `get` / `member?` | `put` / `append` | `insert` / `rm` / `slice` | `Enum.count/1` |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| `:hash_map` | `Xitdb.hash_map(map)` *(or `%{}`)* | `.key` | 16-way HAMT | `O(log_16 N)` | `O(log_16 N)` | `rm`: `O(log_16 N)` | `O(N)` scan |
-| `:counted_hash_map` | `Xitdb.counted_map(map)` | `#key` | 16-way HAMT + count slot | `O(log_16 N)` | `O(log_16 N)` | `rm`: `O(log_16 N)` | **`O(1)`** |
-| `:sorted_map` | `Xitdb.sorted_map(map)` | `$key` | Count-augmented B+Tree | `O(log N)` | `O(log N)` | `rm` & `slice`: **`O(log N)`** | **`O(1)`** |
-| `:array_list` | `Xitdb.array_list(list)` *(or `[]`)* | `[idx]` | 16-way Radix Trie | `O(log_16 N)` | `O(log_16 N)` | Tail `slice` only; no middle `insert`/`rm` | **`O(1)`** |
-| `:linked_array_list` | `Xitdb.linked_list(list)` | `[[idx]]` | Count-augmented B-Tree | `O(log N)` | `O(log N)` | Arbitrary `insert`, `rm`, `slice`: **`O(log N)`** | **`O(1)`** |
-| `:hash_set` | `Xitdb.hash_set(enum)` | `%member` | 16-way HAMT set | `O(log_16 N)` | `O(log_16 N)` | `rm`: `O(log_16 N)` | `O(N)` scan |
-| `:counted_hash_set` | `Xitdb.counted_set(enum)` *(or `MapSet`)* | `#%member` | 16-way HAMT set + count | `O(log_16 N)` | `O(log_16 N)` | `rm`: `O(log_16 N)` | **`O(1)`** |
-| `:sorted_set` | `Xitdb.sorted_set(enum)` | `^member` | Count-augmented B+Tree set | `O(log N)` | `O(log N)` | `rm` & `slice`: **`O(log N)`** | **`O(1)`** |
+When a collection needs **instant `Enum.count/1`**, **sorted key iteration and range queries**, or **middle-of-list insertions and removals**, wrap your initial value in one of `Xitdb`'s explicit constructors (`Xitdb.counted_map/1`, `Xitdb.sorted_map/1`, `Xitdb.linked_list/1`, etc.) or initialize it with `init_col` inside `tx`.
 
 ---
 
-## 2. Choosing the Right Collection Type
+## 1. Choosing a Collection by Use Case
 
 ### Maps: `hash_map` vs. `counted_map` vs. `sorted_map`
-- **Use `%{}` / `Xitdb.hash_map/1`** for entity attributes (`%{"username" => "alice", "age" => 30}`) and general key-value lookups where you don't need `Enum.count/1` or sorted key iteration.
-- **Use `Xitdb.counted_map/1`** for entity tables (`"departments"`, `"tenants"`) when you frequently call `Enum.count(db["tenants"])` and want `O(1)` cardinality without B+Tree key sorting overhead.
-- **Use `Xitdb.sorted_map/1`** for lexicographically ordered directories, time-series keys (`"2026-11-03T22:00:00Z"`), leaderboards, and secondary indexes where you need ordered iteration, `Enum.slice/2` pagination by rank, or Datalog `starts_with` / `>=` B+Tree range pushdowns.
+- **`%{}` / `Xitdb.hash_map/1`:** Default choice for entity attributes (`%{"username" => "alice", "age" => 30}`) and general key-value lookups where you don't need `Enum.count/1` or sorted iteration.
+- **`Xitdb.counted_map/1`:** Best for entity tables (`"departments"`, `"tenants"`) when you frequently call `Enum.count/1` and want `O(1)` cardinality without maintaining key sort order.
+- **`Xitdb.sorted_map/1`:** Best for lexicographically ordered directories, ISO-8601 time-series keys (`"2026-11-03T22:00:00Z"`), leaderboards, and secondary indexes where you need ordered `Enum` iteration, `Enum.slice/2` pagination by rank, or Datalog `starts_with` / `>=` prefix and range queries.
 
 ### Lists: `array_list` vs. `linked_list`
-- **Use `[]` / `Xitdb.array_list/1`** for append-only logs, fixed-order arrays, or random index reads (`roles[0]`). `Array_List` supports fast tail `append` and tail truncation (`slice list, 0, new_size`), but does **not** allow middle-of-list insertions or element deletion.
-- **Use `Xitdb.linked_list/1`** for task queues, ordered feeds, or editable lists where items are inserted at index `0` (`insert todos[[0]], "urgent"`), removed by index (`rm todos[[2]]`), or sliced at arbitrary offsets (`slice todos, 10..19`) in **`O(log N)`** time without re-indexing subsequent elements.
+- **`[]` / `Xitdb.array_list/1`:** Best for append-only logs, fixed-order arrays, and fast random index lookups (`roles[0]`). Supports fast tail `append` and tail truncation (`slice list, 0, size`), but does **not** support middle-of-list `insert` or element `rm`.
+- **`Xitdb.linked_list/1`:** Best for task queues, priority feeds, and editable ordered lists where items are inserted at arbitrary positions (`insert todos[[0]], "urgent"`), deleted by index (`rm todos[[2]]`), or sliced at arbitrary offsets (`slice todos, 10..19`) in `O(log N)` time.
 
-### Sets: `hash_set` vs. `counted_set` vs. `sorted_set`
-- **Use `Xitdb.counted_set/1` (or `MapSet.new/1`)** for user roles, permissions, or feature flags when you need `O(1)` `Enum.count/1` and `O(1)` `Enum.member?/2`.
-- **Use `Xitdb.sorted_set/1`** when set members should always iterate and slice in deterministic alphabetical order (e.g., tags or badges).
+### Sets: `counted_set` vs. `sorted_set` vs. `hash_set`
+- **`MapSet.new/1` / `Xitdb.counted_set/1`:** Best for roles, permissions, or feature flags when you need `O(1)` `Enum.count/1` and fast `Enum.member?/2` checks.
+- **`Xitdb.sorted_set/1`:** Best when unique members should always iterate and slice in deterministic alphabetical order (e.g., tags or badges).
+- **`Xitdb.hash_set/1`:** Compact uncounted membership set when you only need `Enum.member?/2` checks.
 
 ```elixir
-use Xitdb.DSL
-
 {:ok, db} = Xitdb.open(backend: :memory)
 
 {:ok, db} =
@@ -55,19 +38,36 @@ use Xitdb.DSL
   })
 
 Enum.to_list(db["tags"])
-# => ["elixir", "odin", "rust"] (lexicographically ordered!)
+# => ["elixir", "odin", "rust"]
 ```
 
 ---
 
-## 3. Secondary B+Tree Indexes (`index_on`)
+## 2. Collection Reference Table
 
-`xitdb` can automatically maintain secondary `Sorted_Map` (`$`) indexes whenever records in a source map are inserted, updated, or deleted:
+`xitdb` provides 8 persistent, structurally shared collection types:
 
-1. **Automatic population:** Writing `users[id].username = "alice"` automatically writes `"alice" -> id` into the target `Sorted_Map` index (`"username->id"`).
-2. **Automatic stale-key eviction:** Updating `users[id].username` from `"alice"` to `"alicia"`—or deleting `users[id]` via `rm users[id]`—automatically evicts the old `"alice"` key from `"username->id"` in the same atomic transaction.
+| Collection Kind | Constructor | Selector Sigil | Ordering | `Enum.count/1` | Supported Edits |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| `:hash_map` | `Xitdb.hash_map(map)` *(or `%{}`)* | `.key` | Hash order | `O(N)` scan | `put`, `rm` (`O(log_16 N)`) |
+| `:counted_hash_map` | `Xitdb.counted_map(map)` | `#key` | Hash order | **`O(1)`** | `put`, `rm` (`O(log_16 N)`) |
+| `:sorted_map` | `Xitdb.sorted_map(map)` | `$key` | Lexicographical | **`O(1)`** | `put`, `rm`, `slice` (`O(log N)`) |
+| `:array_list` | `Xitdb.array_list(list)` *(or `[]`)* | `[idx]` | Index order | **`O(1)`** | `append`, tail `slice` (`O(log_16 N)`) |
+| `:linked_array_list` | `Xitdb.linked_list(list)` | `[[idx]]` | Index order | **`O(1)`** | `append`, `insert`, `rm`, `slice` (`O(log N)`) |
+| `:hash_set` | `Xitdb.hash_set(enum)` | `%member` | Hash order | `O(N)` scan | add/remove member (`O(log_16 N)`) |
+| `:counted_hash_set` | `Xitdb.counted_set(enum)` *(or `MapSet`)* | `#%member` | Hash order | **`O(1)`** | add/remove member (`O(log_16 N)`) |
+| `:sorted_set` | `Xitdb.sorted_set(enum)` | `^member` | Lexicographical | **`O(1)`** | add/remove/slice member (`O(log N)`) |
 
-You can declare `index_on` rules either inside `Xitdb.DSL.tx` or via `index_rules:` in `Xitdb.transact/3`:
+---
+
+## 3. Automatic Secondary Indexes (`index_on`)
+
+`Xitdb` can automatically maintain secondary `:sorted_map` indexes whenever records in a source map are inserted, updated, or deleted:
+
+1. **Automatic population:** Writing `users[id].username = "alice"` automatically writes `"alice" => id` into `"username->id"`.
+2. **Automatic stale-key eviction:** Updating `users[id].username` from `"alice"` to `"alicia"`—or deleting `users[id]` with `rm users[id]`—removes the stale `"alice"` key from `"username->id"` in the same atomic transaction.
+
+Declare `index_on` rules inside `tx` (see [Transaction DSL](transaction-dsl.md)) or via `index_rules:` in `Xitdb.transact/3`:
 
 ```elixir
 use Xitdb.DSL
@@ -81,29 +81,33 @@ use Xitdb.DSL
     put users["u102"], %{"username" => "daria", "email" => "daria@acme.io"}
   end
 
-# Point lookup via the Sorted_Map secondary index:
-user_id = db["username->id"]["dan"] # => "u101"
+# Point lookup via the Sorted_Map secondary index
+db["username->id"]["dan"]
+# => "u101"
 
-# Or in a single NIF hop with path/1:
-Xitdb.select!(db, path(sorted("email->id")["daria@acme.io"])) # => "u102"
+# Or in a single call with path/1
+Xitdb.select!(db, path(sorted("email->id")["daria@acme.io"]))
+# => "u102"
 ```
+
+> If you are using Ash Framework or modules defining `__xitdb_indexes__/0`, `tx_for` / `tx_for!` automatically prepends all declared `index_on` rules at compile time so indexes never drift. See [Ash Framework & Full-Text Search](ash-and-spark.md).
 
 ---
 
-## 4. Scalar Types & Custom 2-Byte Format Tags (`{:tagged, tag, payload}`)
+## 4. Scalar Types & Custom Format Tags (`{:tagged, tag, payload}`)
 
-`xitdb` natively encodes scalars into 9-byte `Slot`s (`Short_Bytes` inline up to 8 bytes, `Bytes`, `Uint`, `Int`, `Float`):
+`Xitdb` stores standard Elixir scalars directly alongside custom 2-byte tagged binaries (`{:tagged, <<a, b>>, payload}`):
 
-| Elixir Value | `xitdb` Storage Representation | Round-Trip Value |
+| Elixir Value | Round-Trip Value | Notes |
 | :--- | :--- | :--- |
-| `"hello"` | `Tag.Short_Bytes` (`<= 8` bytes inline in `Slot`) or `Tag.Bytes` | `"hello"` |
-| `42` (non-negative `integer()`) | `Tag.Uint` (`u64`) | `42` |
-| `-42` (negative `integer()`) | `Tag.Int` (`i64`) | `-42` |
-| `3.14` (`float()`) | `Tag.Float` (`f64`) | `3.14` |
-| `true` / `false` | `Tag.Short_Bytes` with 2-byte format tag `"bl"` (`"1"` / `"0"`) | `true` / `false` |
-| `{:tagged, <<a, b>>, binary}` | `Tag.Bytes` / `Tag.Short_Bytes` with custom 2-byte `format_tag` | `{:tagged, <<a, b>>, binary}` |
+| `"hello"` | `"hello"` | Strings up to 8 bytes are inlined directly in the 9-byte slot |
+| `42` (`>= 0` integer) | `42` | Stored as `u64` |
+| `-42` (`< 0` integer) | `-42` | Stored as `i64` |
+| `3.14` (`float()`) | `3.14` | Stored as `f64` |
+| `true` / `false` | `true` / `false` | Stored with built-in `"bl"` format tag |
+| `{:tagged, <<a, b>>, binary}` | `{:tagged, <<a, b>>, binary}` | Custom 2-byte format tag for domain scalars |
 
-Custom 2-byte format tags let you store domain-typed scalars (such as UUIDs, decimals, timestamps, or CBOR/Protobuf payloads) without wrapper maps:
+Custom 2-byte format tags let you preserve domain types—such as decimals, timestamps, UUIDs, or encoded payloads—without wrapping them in extra maps:
 
 ```elixir
 use Xitdb.DSL

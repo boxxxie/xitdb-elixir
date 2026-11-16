@@ -1,45 +1,14 @@
-# Time-Travel, Structural Diffs, Lineage & Storage Lifecycle
+# Time-Travel, Diffs & Storage
 
-Because `xitdb` is an **immutable, append-only database** where every transaction appends a new root `Slot` to the top-level history `Array_List`, every committed moment is preserved with persistent structural sharing.
+In `Xitdb`, every committed transaction creates a numbered, immutable **moment** (`0`, `1`, `2`, ...) using persistent structural sharing. Updating a single user record only writes the changed path on disk while sharing the rest of the database tree with previous moments.
 
----
-
-## 1. Storage Backends & Database Lifecycle
-
-`Xitdb.open/1` supports three storage backends and two cryptographic HAMT hash algorithms (`:sha1` default, or `:sha256`):
-
-```elixir
-# 1. In-memory backend (ideal for unit tests, ephemeral caches, and sandboxed state)
-{:ok, mem_db} = Xitdb.open(backend: :memory)
-
-# 2. Buffered file backend (recommended for production disk persistence)
-{:ok, disk_db} =
-  Xitdb.open(
-    backend: :buffered_file,
-    path: "/var/lib/myapp/store.xit",
-    hash: :sha256
-  )
-
-# 3. Inspect moment count and file size in bytes
-{:ok, %{moment_count: 1, file_size: 4096}} = Xitdb.info(disk_db)
-
-# 4. Flush buffered OS writes and close
-:ok = Xitdb.sync(disk_db)
-:ok = Xitdb.close(disk_db)
-```
-
-### Choosing a Backend & Hash Algorithm
-
-- **`:memory`** — Backed by an in-memory buffer with zero filesystem I/O; ideal for `async: true` ExUnit tests, ephemeral caches, and scratchpad projections.
-- **`:buffered_file`** — Buffers node writes in user space before flushing to the OS file descriptor on commit or `Xitdb.sync/1`; recommended for production workloads because multi-node HAMT/B+Tree commits avoid per-slot `write` syscalls.
-- **`:file`** — Issues unbuffered OS file reads/writes directly against the file descriptor; useful for small CLI utilities or constrained memory environments with infrequent writes.
-- **`:sha1` vs. `:sha256`** — Controls the cryptographic digest used for HAMT key hashing (`:sha1` by default for slightly faster hashing and compact digests; `:sha256` when collision-resistance policies require SHA-2). Once a database file is created, always reopen it with the same `:hash` setting.
+That design gives you time-travel reads, structural diffs, field audit trails, speculative history branching, and instant zero-copy subtree cloning out of the box.
 
 ---
 
-## 2. Instant Time-Travel Snapshots (`Xitdb.as_of/2`)
+## 1. Reading Historical Snapshots (`Xitdb.as_of/2`)
 
-Pinning a snapshot to any historical moment index (`0..moment_count - 1`, or negative offsets from the latest commit like `-1`, `-2`) is an **`O(1)` operation** that returns a `%Xitdb.Cursor{}` bound to that moment:
+Pin a snapshot to any moment index (`0..moment_count - 1`, or negative offsets from the latest commit like `-1` and `-2`) with `Xitdb.as_of/2`:
 
 ```elixir
 use Xitdb.DSL
@@ -49,7 +18,7 @@ use Xitdb.DSL
 {:ok, db} = tx db, doc: "v1 bump" do put config.version, "2.0.0" end
 {:ok, db} = tx db, doc: "v2 bump" do put config.version, "3.0.0" end
 
-# Pin historical cursors by positive index or negative relative offset:
+# Pin historical cursors by positive index or negative relative offset
 v0 = Xitdb.as_of(db, 0)
 prev = Xitdb.as_of(db, -2)
 latest = Xitdb.db(db)
@@ -68,39 +37,9 @@ Historical cursors work everywhere a latest cursor works:
 
 ---
 
-## 3. Branching from Historical Moments (`base_moment`) & Zero-Copy `fork`
+## 2. Comparing Moments (`Xitdb.diff_moments/3`)
 
-### Branching a Transaction from a Past Moment (`base_moment`)
-
-By default, transactions build on top of the latest moment (`base_moment: -1`). Passing `base_moment: moment_idx` branches the new transaction off an earlier historical snapshot—making it trivial to revert state or explore speculative branches:
-
-```elixir
-# Roll back / branch a new commit directly from moment 0:
-{:ok, db} =
-  tx db, base_moment: 0, doc: "hotfix on top of v0" do
-    put config.version, "1.0.1"
-  end
-
-db["config"]["version"] # => "1.0.1"
-```
-
-### Zero-Copy Subtree Cloning (`fork`)
-
-Inside a transaction, `fork from_path, to_path` (or `Xitdb.fork/3`) clones any subtree—even a collection with millions of entries—in **`O(1)` time and 9 bytes** by copying its `Slot` pointer and freezing the transaction watermark (`savepoint`) so subsequent edits to either path trigger copy-on-write isolation:
-
-```elixir
-{:ok, db} =
-  tx db, doc: "snapshot production tenant into staging" do
-    fork tenants["acme_prod"], tenants["acme_staging"]
-    put tenants["acme_staging"].env, "staging"
-  end
-```
-
----
-
-## 4. Structural Diffs (`Xitdb.diff_moments/3`)
-
-Because unchanged subtrees share identical 9-byte `Slot` pointers (`tag` + byte `offset`) across moments, `Xitdb.diff_moments(db, moment_a, moment_b)` skips identical subtrees in **`O(1)` time** without traversing their children, computing the exact delta in `O(delta changed paths)`:
+Because unchanged subtrees share identical pointers across commits, `Xitdb.diff_moments/3` skips unchanged branches in `O(1)` and returns only the paths that differ between two moments:
 
 ```elixir
 {:ok, changes} = Xitdb.diff_moments(db, 0, 1)
@@ -116,9 +55,9 @@ Because unchanged subtrees share identical 9-byte `Slot` pointers (`tag` + byte 
 
 ---
 
-## 5. Attribute Lineage & Audit History (`Xitdb.history_of/2`)
+## 3. Field Audit History (`Xitdb.history_of/2`)
 
-`Xitdb.history_of(db, selector)` walks the moment history and returns every moment where the `Slot` at `selector` changed, along with the commit's `:doc` message and `:instant` timestamp (`__tx.doc` and `__tx.tx_instant`):
+`Xitdb.history_of(db, selector)` walks the database's moment timeline and returns every moment where the value at `selector` changed—automatically skipping moments that didn't touch that path—along with the commit `:doc` message and `:instant` timestamp:
 
 ```elixir
 use Xitdb.DSL
@@ -140,7 +79,7 @@ use Xitdb.DSL
     put users["alice"].role, "admin"
   end
 
-# Moment 1 is automatically skipped in O(1) because `.users.alice.role` did not change!
+# Moment 1 is skipped automatically because users["alice"].role did not change
 {:ok, lineage} = Xitdb.history_of(db, path(users["alice"].role))
 # => [
 #   %{moment_index: 0, value: "member", doc: "create alice", instant: 1_700_000_000_000},
@@ -150,13 +89,80 @@ use Xitdb.DSL
 
 ---
 
-## 6. Database Compaction (`Xitdb.compact/2`)
+## 4. Branching History (`base_moment`) & Zero-Copy Cloning (`fork`)
 
-Over time, append-only workloads accumulate historical moments and unreachable intermediate nodes. `Xitdb.compact/2` copies only the reachable nodes of the **latest moment** into a fresh, deduplicated database (either in-memory if `:path` is omitted, or to a new file path):
+### Branching a Transaction from a Past Moment (`base_moment`)
+
+By default, new transactions build on top of the latest moment (`base_moment: -1`). Passing `base_moment: moment_idx` branches the new transaction from an earlier snapshot—making it simple to revert a mistake or explore an alternative state:
+
+```elixir
+# Branch a new commit directly on top of moment 0
+{:ok, db} =
+  tx db, base_moment: 0, doc: "hotfix on top of v0" do
+    put config.version, "1.0.1"
+  end
+
+db["config"]["version"] # => "1.0.1"
+```
+
+### Zero-Copy Subtree Cloning (`fork`)
+
+Inside a transaction, `fork from_path, to_path` (or `Xitdb.fork/3`) clones any subtree—even a collection with millions of entries—in `O(1)` time by copying its root reference and isolating future edits via copy-on-write:
+
+```elixir
+{:ok, db} =
+  tx db, doc: "snapshot production tenant into staging" do
+    fork tenants["acme_prod"], tenants["acme_staging"]
+    put tenants["acme_staging"].env, "staging"
+  end
+```
+
+---
+
+## 5. Storage Backends & Lifecycle
+
+`Xitdb.open/1` supports three storage backends and two hash algorithms (`:sha1` default, or `:sha256`):
+
+```elixir
+# 1. In-memory backend (ideal for unit tests, ephemeral caches, and sandboxes)
+{:ok, mem_db} = Xitdb.open(backend: :memory)
+
+# 2. Buffered file backend (recommended for production disk persistence)
+{:ok, disk_db} =
+  Xitdb.open(
+    backend: :buffered_file,
+    path: "/var/lib/myapp/store.xit",
+    hash: :sha256
+  )
+
+# 3. Inspect moment count and file size in bytes
+{:ok, %{moment_count: 1, file_size: 4096}} = Xitdb.info(disk_db)
+
+# 4. Flush buffered writes and close
+:ok = Xitdb.sync(disk_db)
+:ok = Xitdb.close(disk_db)
+```
+
+### Choosing a Backend & Hash Algorithm
+
+- **`:memory`** — Backed by an in-memory buffer with zero disk I/O; ideal for `async: true` ExUnit tests, ephemeral caches, and scratchpad projections.
+- **`:buffered_file`** — Buffers writes in user space and flushes cleanly on commit or `Xitdb.sync/1`; recommended for production disk workloads.
+- **`:file`** — Issues unbuffered OS file reads and writes directly against the file descriptor; useful for small CLI utilities or memory-constrained environments with infrequent writes.
+- **`:sha1` vs. `:sha256`** — Selects the hash algorithm used for HAMT map/set keys (`:sha1` by default for compact keys; `:sha256` when policy requires SHA-2). Always reopen an existing `.xit` file with the same `:hash` setting it was created with.
+
+### Crash Safety Without a WAL
+
+Transactions commit by appending a checksummed trailer (`CRC-64/XZ`) and updating the file header—no separate write-ahead log (WAL) file is needed. If a process crashes mid-write, incomplete trailing bytes are ignored when reopening the file and truncated automatically on the next commit.
+
+---
+
+## 6. Reclaiming Space with Compaction (`Xitdb.compact/2`)
+
+Because commits are append-only, write-heavy databases accumulate older moments over time. `Xitdb.compact/2` copies only the reachable data from the **latest moment** into a fresh, deduplicated store (in `:memory` if `:path` is omitted, or to a new `.xit` file):
 
 ```elixir
 {:ok, compacted_db} = Xitdb.compact(disk_db, path: "/var/lib/myapp/store.compacted.xit")
 
 Xitdb.moment_count(compacted_db)
-# => 1 (latest state preserved, historical garbage reclaimed)
+# => 1 (latest state preserved, historical data reclaimed)
 ```
