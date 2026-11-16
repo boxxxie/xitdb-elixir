@@ -187,8 +187,8 @@ defmodule Xitdb.DSL do
   - `savepoint()`
   - `abort reason`
   """
-  defmacro tx(db, do: block) do
-    TxRewriter.compile_tx(db, [], block, __CALLER__)
+  defmacro tx(db, opts) when is_list(opts) do
+    compile_tx_kw(db, opts, &TxRewriter.compile_tx/4, __CALLER__)
   end
 
   defmacro tx(db, opts, do: block) do
@@ -199,12 +199,21 @@ defmodule Xitdb.DSL do
   Same as `tx/2` and `tx/3`, but returns the updated `%Xitdb{}` handle directly
   or raises `Xitdb.Error` on failure.
   """
-  defmacro tx!(db, do: block) do
-    TxRewriter.compile_tx_bang(db, [], block, __CALLER__)
+  defmacro tx!(db, opts) when is_list(opts) do
+    compile_tx_kw(db, opts, &TxRewriter.compile_tx_bang/4, __CALLER__)
   end
 
   defmacro tx!(db, opts, do: block) do
     TxRewriter.compile_tx_bang(db, opts, block, __CALLER__)
+  end
+
+  defp compile_tx_kw(db, opts, compiler, caller) do
+    if Keyword.keyword?(opts) and Keyword.has_key?(opts, :do) do
+      {block, rest_opts} = Keyword.pop!(opts, :do)
+      compiler.(db, rest_opts, block, caller)
+    else
+      raise ArgumentError, "expected a :do block in transaction options, got: #{inspect(opts)}"
+    end
   end
 
   @doc """
@@ -262,18 +271,8 @@ defmodule Xitdb.DSL do
   @doc """
   Compiles and executes a Datalog query block against `target` (`%Xitdb{}` or `%Xitdb.Cursor{}`).
   """
-  defmacro query(target, do: block) do
-    query_str_ast = DatalogCompiler.compile(block, [], __CALLER__)
-
-    quote do
-      Xitdb.query(unquote(target), unquote(query_str_ast), [])
-    end
-  end
-
-  defmacro query(target, query_str) do
-    quote do
-      Xitdb.query(unquote(target), unquote(query_str), [])
-    end
+  defmacro query(target, opts_or_query) do
+    expand_query_2(:query, target, opts_or_query, __CALLER__)
   end
 
   defmacro query(target, opts, do: block) do
@@ -296,18 +295,8 @@ defmodule Xitdb.DSL do
   @doc """
   Same as `query/2` and `query/3`, but raises `Xitdb.Error` on failure.
   """
-  defmacro query!(target, do: block) do
-    query_str_ast = DatalogCompiler.compile(block, [], __CALLER__)
-
-    quote do
-      Xitdb.query!(unquote(target), unquote(query_str_ast), [])
-    end
-  end
-
-  defmacro query!(target, query_str) do
-    quote do
-      Xitdb.query!(unquote(target), unquote(query_str), [])
-    end
+  defmacro query!(target, opts_or_query) do
+    expand_query_2(:query!, target, opts_or_query, __CALLER__)
   end
 
   defmacro query!(target, opts, do: block) do
@@ -324,6 +313,23 @@ defmodule Xitdb.DSL do
   defmacro query!(target, query_str, opts) do
     quote do
       Xitdb.query!(unquote(target), unquote(query_str), unquote(opts))
+    end
+  end
+
+  defp expand_query_2(fun, target, opts_or_query, caller) do
+    if is_list(opts_or_query) and Keyword.keyword?(opts_or_query) and
+         Keyword.has_key?(opts_or_query, :do) do
+      {block, opts} = Keyword.pop!(opts_or_query, :do)
+      {from_opt, runtime_opts} = Keyword.pop(opts, :from)
+      query_str_ast = DatalogCompiler.compile(block, [from: from_opt], caller)
+
+      quote do
+        Xitdb.unquote(fun)(unquote(target), unquote(query_str_ast), unquote(runtime_opts))
+      end
+    else
+      quote do
+        Xitdb.unquote(fun)(unquote(target), unquote(opts_or_query), [])
+      end
     end
   end
 end

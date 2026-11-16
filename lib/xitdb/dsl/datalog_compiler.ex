@@ -1,7 +1,7 @@
 defmodule Xitdb.DSL.DatalogCompiler do
   @moduledoc false
 
-  import Xitdb.Selector, only: [is_map_modifier: 1, is_set_modifier: 1, is_typed_modifier: 1]
+  import Xitdb.Selector, only: [is_set_modifier: 1, is_typed_modifier: 1]
   alias Xitdb.DSL.PathCompiler
   alias Xitdb.Selector
 
@@ -34,7 +34,11 @@ defmodule Xitdb.DSL.DatalogCompiler do
           norm_alias = normalize_var_atom(alias_var)
 
           new_binds =
-            Map.put(binds, norm_alias, build_collection_binding(source_ast2, norm_alias, caller))
+            Map.put(
+              binds,
+              norm_alias,
+              build_collection_binding(source_ast2, norm_alias, find_vars, binds, caller)
+            )
 
           {seg_acc, new_binds, counters}
 
@@ -106,10 +110,10 @@ defmodule Xitdb.DSL.DatalogCompiler do
 
   defp init_bindings(nil, _find_vars, _where_clauses, _caller), do: %{}
 
-  defp init_bindings({alias_var, col_ast}, _find_vars, _where_clauses, caller)
+  defp init_bindings({alias_var, col_ast}, find_vars, _where_clauses, caller)
        when is_atom(alias_var) do
     norm_alias = normalize_var_atom(alias_var)
-    %{norm_alias => build_collection_binding(col_ast, norm_alias, caller)}
+    %{norm_alias => build_collection_binding(col_ast, norm_alias, find_vars, %{}, caller)}
   end
 
   defp init_bindings({col_name, _, ctx} = col_ast, find_vars, where_clauses, caller)
@@ -118,18 +122,18 @@ defmodule Xitdb.DSL.DatalogCompiler do
     primary_var = select_primary_var(find_vars, where_clauses, norm_col)
 
     if primary_var == norm_col do
-      %{norm_col => build_collection_binding(col_ast, norm_col, caller)}
+      %{norm_col => build_collection_binding(col_ast, norm_col, find_vars, %{}, caller)}
     else
       %{
-        primary_var => build_collection_binding(col_ast, primary_var, caller),
-        norm_col => build_collection_binding(col_ast, :_e, caller)
+        primary_var => build_collection_binding(col_ast, primary_var, find_vars, %{}, caller),
+        norm_col => build_collection_binding(col_ast, :_e, find_vars, %{}, caller)
       }
     end
   end
 
   defp init_bindings(col_ast, find_vars, where_clauses, caller) do
     primary_var = select_primary_var(find_vars, where_clauses, nil)
-    %{primary_var => build_collection_binding(col_ast, primary_var, caller)}
+    %{primary_var => build_collection_binding(col_ast, primary_var, find_vars, %{}, caller)}
   end
 
   defp select_primary_var(find_vars, where_clauses, excluded_col) do
@@ -280,39 +284,87 @@ defmodule Xitdb.DSL.DatalogCompiler do
   defp unwrap_where_clauses!({:__block__, _, lines}), do: lines
   defp unwrap_where_clauses!(single), do: [single]
 
-  defp build_collection_binding(
-         {{:., _, [Access, :get]}, _, _} = indexed_ast,
-         _alias_var,
-         caller
-       ) do
-    compile_path_segments(indexed_ast, [], %{}, caller)
-  end
-
-  defp build_collection_binding({mod_fn, _, [arg]}, alias_var, _caller)
-       when is_map_modifier(mod_fn) do
-    [
-      PathCompiler.typed_modifier_segment(mod_fn, arg),
-      {:static, "[#{format_logic_var(alias_var)}]"}
-    ]
-  end
-
-  defp build_collection_binding({col_name, _, ctx}, alias_var, _caller)
+  defp build_collection_binding({col_name, _, ctx}, alias_var, _find_vars, binds, _caller)
        when is_atom(col_name) and is_atom(ctx) do
-    [{:static, Selector.format_step(:hash_map, col_name) <> "[#{format_logic_var(alias_var)}]"}]
+    norm_col = normalize_var_atom(col_name)
+
+    cond do
+      norm_col in [:root, :_] ->
+        [{:static, "[#{format_logic_var(alias_var)}]"}]
+
+      Map.has_key?(binds, norm_col) ->
+        Map.fetch!(binds, norm_col) ++ [{:static, "[#{format_logic_var(alias_var)}]"}]
+
+      true ->
+        [
+          {:static,
+           Selector.format_step(:hash_map, col_name) <> "[#{format_logic_var(alias_var)}]"}
+        ]
+    end
   end
 
-  defp build_collection_binding(col_name, alias_var, _caller)
+  defp build_collection_binding(col_name, alias_var, _find_vars, _binds, _caller)
        when (is_atom(col_name) and not is_nil(col_name) and not is_boolean(col_name)) or
               is_binary(col_name) do
     [{:static, Selector.format_step(:hash_map, col_name) <> "[#{format_logic_var(alias_var)}]"}]
   end
 
-  defp build_collection_binding(bad_ast, _alias_var, caller) do
+  defp build_collection_binding(path_ast, alias_var, find_vars, binds, caller)
+       when is_tuple(path_ast) do
+    if binding_path_ast?(path_ast) do
+      segs = compile_path_segments(path_ast, find_vars, binds, caller)
+
+      if ends_with_alias_step?(path_ast, alias_var) do
+        segs
+      else
+        segs ++ [{:static, "[#{format_logic_var(alias_var)}]"}]
+      end
+    else
+      compile_error!(
+        caller,
+        "Invalid collection source in Datalog `from` / `<-` binding: #{Macro.to_string(path_ast)}"
+      )
+    end
+  end
+
+  defp build_collection_binding(bad_ast, _alias_var, _find_vars, _binds, caller) do
     compile_error!(
       caller,
       "Invalid collection source in Datalog `from` / `<-` binding: #{Macro.to_string(bad_ast)}"
     )
   end
+
+  defp binding_path_ast?({{:., _, [Access, :get]}, _, _}), do: true
+  defp binding_path_ast?({:at_moment, _, [_, _]}), do: true
+
+  defp binding_path_ast?({{:., _, [_left, mod_fn]}, _, [_arg]}) when is_typed_modifier(mod_fn),
+    do: true
+
+  defp binding_path_ast?({{:., _, [_left, field]}, _, []}) when is_atom(field), do: true
+  defp binding_path_ast?({mod_fn, _, [_arg]}) when is_typed_modifier(mod_fn), do: true
+  defp binding_path_ast?(_), do: false
+
+  defp ends_with_alias_step?(
+         {{:., _, [Access, :get]}, _, [_left, {var_name, _, ctx}]},
+         alias_var
+       )
+       when is_atom(var_name) and is_atom(ctx) do
+    normalize_var_atom(var_name) == alias_var
+  end
+
+  defp ends_with_alias_step?(
+         {{:., _, [Access, :get]}, _, [_left, [{var_name, _, ctx}]]},
+         alias_var
+       )
+       when is_atom(var_name) and is_atom(ctx) do
+    normalize_var_atom(var_name) == alias_var
+  end
+
+  defp ends_with_alias_step?({:at_moment, _, [_m, inner]}, alias_var) do
+    ends_with_alias_step?(inner, alias_var)
+  end
+
+  defp ends_with_alias_step?(_ast, _alias_var), do: false
 
   defp compile_where_clause!({:not, _, [inner_clause]}, find_vars, binds, caller) do
     [{:static, "not "} | compile_where_clause!(inner_clause, find_vars, binds, caller)]
@@ -504,6 +556,7 @@ defmodule Xitdb.DSL.DatalogCompiler do
       cond do
         norm_root in [:root, :_] -> []
         Map.has_key?(binds, norm_root) -> Map.fetch!(binds, norm_root)
+        norm_root in find_vars -> [{:static, "[#{format_logic_var(norm_root)}]"}]
         true -> [{:static, Selector.format_step(:hash_map, root_name)}]
       end
 
@@ -525,6 +578,7 @@ defmodule Xitdb.DSL.DatalogCompiler do
     norm = normalize_var_atom(name)
 
     cond do
+      norm in [:root, :_] -> []
       Map.has_key?(binds, norm) -> Map.fetch!(binds, norm)
       norm in find_vars -> [{:static, "[#{format_logic_var(norm)}]"}]
       true -> [{:static, Selector.format_step(:hash_map, name)}]

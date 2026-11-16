@@ -635,12 +635,25 @@ defmodule Xitdb do
   end
 
   defp wrap_selected(db_ref, raw, moment, selector) do
-    case Cursor.unwrap_nif_value(db_ref, raw, effective_moment(moment, selector), []) do
+    eff_moment = effective_moment(moment, selector)
+
+    case Cursor.unwrap_nif_value(db_ref, raw, eff_moment, []) do
       %Cursor{} = cursor ->
+        pinned_moment = resolve_pinned_moment(db_ref, eff_moment)
+        cursor = %Cursor{cursor | moment: pinned_moment}
         if root_selector?(selector), do: %Cursor{cursor | root: true}, else: cursor
 
       other ->
         other
+    end
+  end
+
+  defp resolve_pinned_moment(_db_ref, m) when is_integer(m) and m >= 0, do: m
+
+  defp resolve_pinned_moment(db_ref, m) when is_integer(m) and m < 0 do
+    case NIF.nif_moment_slot(db_ref, m, true) do
+      {:ok, _tuple, resolved} -> resolved
+      _ -> m
     end
   end
 
@@ -738,8 +751,10 @@ defmodule Xitdb do
           do_nif_pull(cursor, single_pat)
 
         {:merge_top, wild_pat, spec_pat} ->
-          with {:ok, wild_res} <- do_nif_pull(cursor, wild_pat),
-               {:ok, spec_res} <- pull(cursor, spec_pat) do
+          pinned = pin_root_cursor_if_needed(cursor)
+
+          with {:ok, wild_res} <- do_nif_pull(pinned, wild_pat),
+               {:ok, spec_res} <- pull(pinned, spec_pat) do
             {:ok, Pull.merge_wildcard_results(wild_res, spec_res)}
           end
       end
@@ -751,6 +766,19 @@ defmodule Xitdb do
       pull(cursor, compiled)
     end
   end
+
+  defp pin_root_cursor_if_needed(%Cursor{root: true, tag_id: -1, moment: moment} = cursor)
+       when moment < 0 do
+    case NIF.nif_moment_slot(cursor.db_ref, moment, true) do
+      {:ok, tuple, resolved_moment} ->
+        %Cursor{Cursor.from_nif_tuple(cursor.db_ref, tuple, resolved_moment) | root: true}
+
+      _ ->
+        cursor
+    end
+  end
+
+  defp pin_root_cursor_if_needed(cursor), do: cursor
 
   defp do_nif_pull(
          %Cursor{
@@ -890,10 +918,31 @@ defmodule Xitdb do
   @spec at(integer()) :: Access.access_fun(Cursor.t() | list(), term())
   def at(index) when is_integer(index) do
     fn
+      :get, data, next when is_list(data) ->
+        next.(Enum.at(data, index))
+
       :get, data, next ->
         case Access.fetch(data, index) do
           {:ok, val} -> next.(val)
           :error -> next.(nil)
+        end
+
+      :get_and_update, data, next when is_list(data) ->
+        len = length(data)
+        resolved = if index < 0, do: len + index, else: index
+
+        if resolved >= 0 and resolved < len do
+          elem = Enum.at(data, resolved)
+
+          case next.(elem) do
+            {get_val, update_val} -> {get_val, List.replace_at(data, resolved, update_val)}
+            :pop -> {elem, List.delete_at(data, resolved)}
+          end
+        else
+          case next.(nil) do
+            {get_val, _update_val} -> {get_val, data}
+            :pop -> {nil, data}
+          end
         end
 
       :get_and_update, data, next ->

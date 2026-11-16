@@ -244,7 +244,7 @@ defmodule Xitdb.Selector do
         {num_str, tail} = take_until_sigil(rest)
 
         if include_moment do
-          [{:at_moment, String.to_integer(num_str)} | do_parse_steps(tail, [])]
+          [{:at_moment, parse_step_int!(num_str)} | do_parse_steps(tail, [])]
         else
           do_parse_steps(tail, [])
         end
@@ -291,23 +291,43 @@ defmodule Xitdb.Selector do
   end
 
   defp do_parse_steps(<<?[, ?[, rest::binary>>, acc) do
-    {int_str, <<?], ?], tail::binary>>} = take_until_byte(rest, ?])
-    do_parse_steps(tail, [{:linked_array_list, String.to_integer(int_str)} | acc])
+    case take_until_byte(rest, ?]) do
+      {int_str, <<?], ?], tail::binary>>} ->
+        do_parse_steps(tail, [{:linked_array_list, parse_step_int!(int_str)} | acc])
+
+      _ ->
+        raise ArgumentError, "Invalid selector syntax: unclosed '[[' index"
+    end
   end
 
   defp do_parse_steps(<<?[, ?', rest::binary>>, acc) do
-    {unescaped, <<?], tail::binary>>} = parse_single_quoted_string(rest, [])
-    do_parse_steps(tail, [{:hash_map, unescaped} | acc])
+    case parse_single_quoted_string(rest, []) do
+      {unescaped, <<?], tail::binary>>} ->
+        do_parse_steps(tail, [{:hash_map, unescaped} | acc])
+
+      _ ->
+        raise ArgumentError, "Invalid selector syntax: unclosed bracketed single-quoted key"
+    end
   end
 
   defp do_parse_steps(<<?[, ?", rest::binary>>, acc) do
-    {unescaped, <<?], tail::binary>>} = parse_quoted_string(rest, [])
-    do_parse_steps(tail, [{:hash_map, unescaped} | acc])
+    case parse_quoted_string(rest, []) do
+      {unescaped, <<?], tail::binary>>} ->
+        do_parse_steps(tail, [{:hash_map, unescaped} | acc])
+
+      _ ->
+        raise ArgumentError, "Invalid selector syntax: unclosed bracketed quoted key"
+    end
   end
 
   defp do_parse_steps(<<?[, rest::binary>>, acc) do
-    {int_str, <<?], tail::binary>>} = take_until_byte(rest, ?])
-    do_parse_steps(tail, [{:array_list, String.to_integer(int_str)} | acc])
+    case take_until_byte(rest, ?]) do
+      {int_str, <<?], tail::binary>>} ->
+        do_parse_steps(tail, [{:array_list, parse_step_int!(int_str)} | acc])
+
+      _ ->
+        raise ArgumentError, "Invalid selector syntax: unclosed '[' index"
+    end
   end
 
   defp do_parse_steps(bin, acc) do
@@ -369,7 +389,19 @@ defmodule Xitdb.Selector do
     do_take_until_sigil(rest, len + 1, orig)
   end
 
+  defp parse_step_int!(str) do
+    case Integer.parse(str) do
+      {int, ""} ->
+        int
+
+      _ ->
+        raise ArgumentError, "Invalid selector syntax: invalid integer index #{inspect(str)}"
+    end
+  end
+
   defp take_until_byte(bin, stop_byte), do: do_take_until_byte(bin, stop_byte, 0, bin)
+
+  defp do_take_until_byte(<<>>, _stop_byte, len, orig), do: {binary_part(orig, 0, len), <<>>}
 
   defp do_take_until_byte(<<b, _::binary>> = tail, b, len, orig) do
     {binary_part(orig, 0, len), tail}
@@ -378,6 +410,12 @@ defmodule Xitdb.Selector do
   defp do_take_until_byte(<<_, rest::binary>>, stop_byte, len, orig) do
     do_take_until_byte(rest, stop_byte, len + 1, orig)
   end
+
+  defp parse_single_quoted_string(<<>>, _acc),
+    do: raise(ArgumentError, "Invalid selector syntax: unclosed single-quoted key")
+
+  defp parse_single_quoted_string(<<?\\>>, _acc),
+    do: raise(ArgumentError, "Invalid selector syntax: trailing escape in single-quoted key")
 
   defp parse_single_quoted_string(<<?', tail::binary>>, acc),
     do: {IO.iodata_to_binary(:lists.reverse(acc)), tail}
@@ -399,6 +437,12 @@ defmodule Xitdb.Selector do
 
   defp parse_single_quoted_string(<<b, rest::binary>>, acc),
     do: parse_single_quoted_string(rest, [b | acc])
+
+  defp parse_quoted_string(<<>>, _acc),
+    do: raise(ArgumentError, "Invalid selector syntax: unclosed quoted key")
+
+  defp parse_quoted_string(<<?\\>>, _acc),
+    do: raise(ArgumentError, "Invalid selector syntax: trailing escape in quoted key")
 
   defp parse_quoted_string(<<?", tail::binary>>, acc),
     do: {IO.iodata_to_binary(:lists.reverse(acc)), tail}

@@ -360,9 +360,17 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
     defp dump_attribute_or_set(%Attribute{} = attr, values, true) when is_list(values) do
       case dump_attribute_value(attr, values) do
-        {:ok, dumped_list} when is_list(dumped_list) -> {:ok, Xitdb.counted_set(dumped_list)}
-        {:ok, other} -> {:ok, other}
-        {:error, _} = err -> err
+        {:ok, dumped_list} when is_list(dumped_list) ->
+          stringified =
+            Enum.map(dumped_list, fn v -> if is_nil(v), do: nil, else: to_string(v) end)
+
+          {:ok, Xitdb.counted_set(stringified)}
+
+        {:ok, other} ->
+          {:ok, other}
+
+        {:error, _} = err ->
+          err
       end
     end
 

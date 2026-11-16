@@ -182,4 +182,105 @@ defmodule Xitdb.DSL.DatalogCompilerTest do
       :ok = Xitdb.close(db)
     end
   end
+
+  test "BUG-032/033/034/055: chained <- bindings, Access.get/dot from without trailing alias, find_vars root, and inline do: options" do
+    db = Xitdb.open!(backend: :memory)
+
+    try do
+      db =
+        Xitdb.transact!(db, %{
+          "tenants" => %{
+            "acme" => %{
+              "u1" => %{
+                "email" => "ada@acme.test",
+                "todos" => %{"t1" => %{"title" => "ship"}}
+              }
+            }
+          },
+          "nodes" => %{
+            "n1" => %{"next" => "n2"},
+            "n2" => %{"next" => "n3"},
+            "n3" => %{}
+          }
+        })
+
+      tenant = "acme"
+
+      # BUG-055 & BUG-033: inline `, do:` with `from:` option + Access.get source without trailing alias
+      rows_inline =
+        query!(
+          db,
+          from: tenants[^tenant],
+          do:
+            (
+              find {u, email}
+              where u.email == email
+            )
+        ).rows
+
+      assert rows_inline == [["u1", "ada@acme.test"]]
+
+      # BUG-032: chained `<-` using previously bound variable `u`
+      chained_q =
+        datalog do
+          find {u, title}
+
+          where [
+            u <- tenants[^tenant],
+            t <- u["todos"],
+            t.title == title
+          ]
+        end
+
+      assert Xitdb.query!(db, chained_q).rows == [["u1", "ship"]]
+
+      # BUG-034: find_vars / reach_vars variable as root of Access.get path
+      find_root_q =
+        datalog do
+          find {n, nxt}
+
+          where [
+            nodes[n]["next"] == nxt,
+            n == "n1"
+          ]
+        end
+
+      assert Xitdb.query!(db, find_root_q).rows == [["n1", "n2"]]
+
+      # Also test find var as root of bracket access `u["email"]` without binding
+      user_root_q =
+        datalog do
+          find {u, e}
+
+          where [
+            tenants[^tenant][u] == _,
+            tenants[^tenant][u]["email"] == e
+          ]
+        end
+
+      assert Xitdb.query!(db, user_root_q).rows == [["u1", "ada@acme.test"]]
+
+      # Top-level find var as direct root of bracket access `n["next"]` in `reach`
+      db_graph =
+        Xitdb.transact!(db, %{
+          "a1" => %{"next" => "a2"},
+          "a2" => %{"next" => "a3"},
+          "a3" => %{}
+        })
+
+      reach_q =
+        datalog do
+          find {b}
+
+          where [
+            reach(a, b, a["next"] == b),
+            a == "a1"
+          ]
+        end
+
+      assert Enum.sort(Xitdb.query!(db_graph, reach_q).rows) == [["a2"], ["a3"]]
+    after
+      :ok = Xitdb.close(db)
+    end
+  end
 end

@@ -1113,11 +1113,15 @@ defmodule Xitdb.Cursor do
          {:clause, _, [{:var, _, arg_var}], [],
           [
             {:call, _, {:remote, _, {:atom, _, Access}, {:atom, _, :get_and_update}},
-             [{:var, _, arg_var}, key_ast, _inner_fun]}
+             [{:var, _, arg_var}, key_ast, inner_fun]}
           ]}
        ])
        when is_atom(arg_var) do
-    if erl_eval_uses_var?(key_ast, arg_var), do: :needs_current, else: :traverse
+    if erl_eval_uses_var?(key_ast, arg_var) or erl_eval_uses_var?(inner_fun, arg_var) do
+      :needs_current
+    else
+      :traverse
+    end
   end
 
   defp classify_erl_eval_clauses([
@@ -1150,6 +1154,14 @@ defmodule Xitdb.Cursor do
   defp classify_erl_eval_clauses(_clauses), do: :needs_current
 
   defp erl_eval_uses_var?({:var, _line, name}, target), do: name == target
+
+  defp erl_eval_uses_var?({:clause, _line, head_patterns, guards, body}, target) do
+    if erl_eval_uses_var?(head_patterns, target) do
+      false
+    else
+      erl_eval_uses_var?(guards, target) or erl_eval_uses_var?(body, target)
+    end
+  end
 
   defp erl_eval_uses_var?(tuple, target) when is_tuple(tuple) do
     tuple |> Tuple.to_list() |> Enum.any?(&erl_eval_uses_var?(&1, target))
@@ -1758,13 +1770,26 @@ defmodule Xitdb.Cursor do
     ov_key = canonical_override_selector(selector)
     rev_steps = ov_key |> parse_selector_steps_simple() |> :lists.reverse()
 
+    {resolved_tag, resolved_tag_id, resolved_val, resolved_full} =
+      case NIF.nif_select(cursor.db_ref, cursor.moment, ov_key) do
+        {:ok, raw} when not is_nil(raw) ->
+          case unwrap_nif_value(cursor.db_ref, raw, cursor.moment, rev_steps) do
+            %__MODULE__{tag: t, tag_id: tid, value: v, full: f} -> {t, tid, v, f}
+            _ -> {:linked_array_list, 3, 0, false}
+          end
+
+        _ ->
+          {:linked_array_list, 3, 0, false}
+      end
+
     target_cur = %__MODULE__{
       cursor
       | tx_mode: true,
         path_steps: rev_steps,
-        tag: :linked_array_list,
-        tag_id: 3,
-        value: 0
+        tag: resolved_tag,
+        tag_id: resolved_tag_id,
+        value: resolved_val,
+        full: resolved_full
     }
 
     cond do
@@ -1779,7 +1804,9 @@ defmodule Xitdb.Cursor do
         }
 
       has_descendant_keys?(cursor.staged_overrides, ov_key) or
-          has_descendant_set?(cursor.deleted_paths, ov_key) ->
+        has_descendant_set?(cursor.deleted_paths, ov_key) or
+        has_descendant_keys?(cursor.staged_list_edits, ov_key) or
+          has_descendant_aliases?(cursor.fork_aliases, ov_key) ->
         cnt =
           case staged_or_nif_count(target_cur) do
             {:ok, n} -> n
@@ -1843,6 +1870,10 @@ defmodule Xitdb.Cursor do
     Enum.any?(set, fn k -> k != prefix and selector_prefix?(k, prefix) end)
   end
 
+  defp has_descendant_aliases?(aliases, prefix) do
+    Enum.any?(aliases, fn {to_k, _from_k} -> to_k != prefix and selector_prefix?(to_k, prefix) end)
+  end
+
   defp purge_strict_descendant_map(map, _prefix) when map_size(map) == 0, do: map
 
   defp purge_strict_descendant_map(map, prefix) do
@@ -1864,10 +1895,47 @@ defmodule Xitdb.Cursor do
     from_ov = canonical_override_selector(from_selector)
     to_ov = canonical_override_selector(to_selector)
 
+    eff_from_ov =
+      case resolve_fork_alias(cursor.fork_aliases, from_ov) do
+        {:ok, resolved} -> resolved
+        :none -> from_ov
+      end
+
+    copied_nested_aliases =
+      cursor.fork_aliases
+      |> Enum.filter(fn {sub_to, _sub_from} ->
+        sub_to != from_ov and selector_prefix?(sub_to, from_ov)
+      end)
+      |> Enum.uniq_by(fn {sub_to, _sub_from} -> sub_to end)
+      |> Enum.map(fn {sub_to, sub_from} ->
+        suffix = binary_part(sub_to, byte_size(from_ov), byte_size(sub_to) - byte_size(from_ov))
+
+        resolved_sub_from =
+          case resolve_fork_alias(cursor.fork_aliases, sub_to) do
+            {:ok, resolved} -> resolved
+            :none -> sub_from
+          end
+
+        {to_ov <> suffix, resolved_sub_from}
+      end)
+
     cleared_overrides = purge_prefix_from_map(cursor.staged_overrides, to_ov)
     cleared_deleted = purge_prefix_from_set(cursor.deleted_paths, to_ov)
     cleared_list_edits = purge_prefix_from_map(cursor.staged_list_edits, to_ov)
-    cleared_aliases = purge_fork_aliases(cursor.fork_aliases, to_ov)
+
+    cleared_aliases =
+      cursor.fork_aliases
+      |> purge_fork_aliases(to_ov)
+      |> Enum.map(fn {other_to, other_from} ->
+        if selector_prefix?(other_from, to_ov) do
+          case resolve_fork_alias(cursor.fork_aliases, other_from) do
+            {:ok, resolved} -> {other_to, resolved}
+            :none -> {other_to, other_from}
+          end
+        else
+          {other_to, other_from}
+        end
+      end)
 
     copied_overrides =
       Enum.reduce(cursor.staged_overrides, cleared_overrides, fn {k, v}, acc ->
@@ -1904,7 +1972,7 @@ defmodule Xitdb.Cursor do
       | staged_overrides: copied_overrides,
         deleted_paths: copied_deleted,
         staged_list_edits: copied_list_edits,
-        fork_aliases: [{to_ov, from_ov} | cleared_aliases]
+        fork_aliases: copied_nested_aliases ++ [{to_ov, eff_from_ov} | cleared_aliases]
     }
   end
 
@@ -1984,15 +2052,13 @@ defmodule Xitdb.Cursor do
           end
         end
 
-      with_list_edits = apply_staged_list_edits_overlay(cursor, seeded_base, base_sel, base_fwd)
-
       with_forks =
         if cursor.fork_aliases == [] do
-          with_list_edits
+          seeded_base
         else
           cursor.fork_aliases
           |> Enum.reverse()
-          |> Enum.reduce(with_list_edits, fn {to_ov, _from_ov}, acc ->
+          |> Enum.reduce(seeded_base, fn {to_ov, _from_ov}, acc ->
             if to_ov != base_sel and selector_prefix?(to_ov, base_sel) and
                  not Map.has_key?(cursor.staged_overrides, to_ov) and
                  not MapSet.member?(cursor.deleted_paths, to_ov) do
@@ -2030,12 +2096,31 @@ defmodule Xitdb.Cursor do
         |> Enum.filter(fn {sel, _} -> selector_prefix?(sel, base_sel) end)
         |> Enum.map(fn {sel, v} ->
           rel_steps = Enum.drop(parse_selector_steps_simple(sel), length(base_fwd))
-          {rel_steps, materialize_staged_val(v)}
+          {sel, rel_steps, materialize_staged_val(v)}
         end)
-        |> Enum.sort_by(fn {rel_steps, _} -> length(rel_steps) end)
+        |> Enum.sort_by(fn {_sel, rel_steps, _} -> length(rel_steps) end)
+
+      {list_descendant_overrides, pre_list_overrides} =
+        if map_size(cursor.staged_list_edits) == 0 do
+          {[], matching_overrides}
+        else
+          Enum.split_with(matching_overrides, fn {sel, _rel_steps, _val} ->
+            Enum.any?(cursor.staged_list_edits, fn {list_sel, _} ->
+              sel != list_sel and selector_prefix?(sel, list_sel)
+            end)
+          end)
+        end
+
+      with_pre_overrides =
+        Enum.reduce(pre_list_overrides, with_forks, fn {_sel, rel_steps, val}, acc ->
+          put_overlay_steps(acc, rel_steps, val)
+        end)
+
+      with_list_edits =
+        apply_staged_list_edits_overlay(cursor, with_pre_overrides, base_sel, base_fwd)
 
       with_overrides =
-        Enum.reduce(matching_overrides, with_forks, fn {rel_steps, val}, acc ->
+        Enum.reduce(list_descendant_overrides, with_list_edits, fn {_sel, rel_steps, val}, acc ->
           put_overlay_steps(acc, rel_steps, val)
         end)
 
@@ -2147,7 +2232,7 @@ defmodule Xitdb.Cursor do
     Enum.reduce(
       edits,
       if(is_list(base_list), do: base_list, else: []),
-      &apply_single_list_edit(&2, &1)
+      &apply_single_list_edit(&2, materialize_staged_val_edit(&1))
     )
   end
 
