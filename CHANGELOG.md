@@ -2,6 +2,42 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.0.0] - 2026-11-16
+
+### Breaking Changes
+- **Minimum Elixir Version (`~> 1.19`):** Bumped minimum required Elixir version from `~> 1.18` to `~> 1.19` in `mix.exs`, CI, and `README.md`.
+- **Removed App-Specific Ash MDM Extension & Sync Helpers:**
+  - Removed `Xitdb.Ash.Resource`, `Xitdb.Ash.Transformers.WireChanges`, `Xitdb.Ash.Verifiers.VerifySyncProjection`, `editable_fields`/`passthru_fields` from `Xitdb.Ash.Dsl`, legacy MDM fields from `Xitdb.Ash.NestedIn`, and MDM sync-projection helpers from `Xitdb.Ash.Info`.
+  - `Xitdb.Ash` now focuses exclusively on `Xitdb.Ash.DataLayer`, `Xitdb.Ash.Dsl`, `Xitdb.Ash.Store`, `Xitdb.Ash.Search`, `Xitdb.Ash.TestSandbox`, `Xitdb.Ash.Info`, and `Xitdb.Ash.Tx`.
+
+### Added
+- **GitHub Actions CI & Badges:** Added [`.github/workflows/ci.yml`](.github/workflows/ci.yml) running `odin check` and `mix precommit` across Elixir `1.19` / `1.20` and OTP `28`, plus CI, version, and benchmark badges in `README.md`.
+- **1v1 Benchmarks `#27` & `#28` and Contention Guardrails:**
+  - Added benchmark `#27` (`Indexer: Sorted_Map B+Tree range scan + set decode (limit=16)`) and `#28` (`DSL: Pre-tokenized path_steps select(path_steps(users[id].name))`).
+  - Added `/proc/stat` CPU busy-% contention checks, `#3-#6` canary drift detection, `CV%` / `median_min_ratio` skew guardrails, `--require-clean`, and git worktree / `-dirty` tag handling in `benchmarks/compare_1v1.py`, `benchmarks/bench_client.odin`, and `benchmarks/update_readme.sh`.
+
+### Changed
+- **Virtual Write Cursors & Adaptive `Enumerable` (`Xitdb.Cursor`, `native/xitdb_nif.odin`):**
+  - Staged write-only virtual cursors during `tx_mode` `Access` updates (`put_in/3` blind writes avoid intermediate read NIF crossings) with `classify_access_fun/1` and foreign/snapshot cursor guards.
+  - Tracked intra-transaction container replacements (`Replaced_Path`) in `odin_nif_transact` and restored `Root_Header` + `core_length` atomically on `.Unexpected_Tag` retries or commit errors.
+  - Ramped `Enumerable.Xitdb.Cursor` chunks geometrically (`16 -> 64 -> 256`), added `O(1)` `count/1` and `member?/2` fast paths, propagated `:closed` errors strictly, and filtered root `"__tx"` across `pull`, `count`, and `slice`.
+- **Compact 3-Tuple Cursors & Fused B+Tree Seek (`Xitdb.Cursor`, `Xitdb.NIF`, `Xitdb.Ash.Search`, `Xitdb.Ash.Indexer`):**
+  - Shrunk NIF container cursor returns to 3-tuples `{:cursor, tag_id, slot_val}` decoded via `Cursor.from_compact_slot/4` and `unwrap_nif_value/4`.
+  - Added dirty-CPU `nif_sorted_map_seek/7` (`ERL_NIF_DIRTY_JOB_CPU_BOUND`) for fused B+Tree prefix seek and bounded child decoding in `Xitdb.Ash.Search`, while keeping `Xitdb.Ash.Indexer` range streams lazy on 6-arity seek.
+- **C Batch Step-List Unpacking & Inlined `select` (`native/nif_entry.c`, `lib/xitdb.ex`, `Xitdb.DSL.PathCompiler`):**
+  - Added `nif_unpack_step_list` (`NifRawStep`) in C for up to 16 `path_steps/1` steps plus optional `{:at_moment, m}` with bounds guards and Odin fallback.
+  - Inlined `Xitdb.select/2` and `Xitdb.select!/2` scalar unwrapping while preserving `@moment` and `root: true` semantics.
+- **Single-Pass Streaming Writers & Atomic Rollback (`native/nif_entry.c`, `native/xitdb_nif.odin`):**
+  - Streamed Elixir map entries directly via `enif_map_iterator_*` (`Nif_Map_Iter`, 32-slot `KV_Stack_Buf` fast path + checked `temp_allocator` fallback) with `MAX_WRITE_DEPTH` (64) and struct validation guards.
+  - Enforced atomic `Root_Header`, `core_set_length`, and `core_sync` rollback on mid-payload failures and adaptive retries.
+
+### Fixed
+- **Elixir 1.20 Gradual Type-Checker & 1.19+ Warnings:** Resolved gradual type-checker warnings in `Xitdb.Ash.Search`, `Xitdb.Ash.Query`, and `Xitdb.Ash.Transformers.BuildIndexPlan`, and fixed an Elixir 1.19+ `MapSet` struct-update warning.
+- **NIF, Selector & B+Tree Seek Hardening:**
+  - Hardened `.Bytes` slot offset/length bounds (`>= HEADER_LENGTH`), root `"__tx"` chunk deduplication, pure-removal validation (`%Xitdb.Collection{}` / map depth ordering), `tx_mode` non-binary key path aliasing, `MAX_FUSED_TOTAL_ENTRIES` overflow accounting, `sorted_map_tx_rank` error propagation, and `>128B` `stack_buf` reads.
+  - Fixed selector escaping and sigil handling (`#col["k"]`, `$col["k"]`, `."k.1"`, `@` rejection, quoted-tail checks), typed-modifier guards in `PathCompiler`, `{:linked_list, [idx]}` unwrapping in NIF, and `Linked_Array_List`/set support in `history_of`.
+- **Documentation & Benchmarks:** Updated stale `Xitdb.Ash.Resource` references in `docs/transaction-dsl.md`, synced workload counts (`28`) in `README.md` and `benchmarks/README.md`, and fixed `-dirty` commit matching and coverage filtering in `benchmarks/update_readme.sh`.
+
 ## [1.2.0] - 2026-11-15
 
 ### Added
