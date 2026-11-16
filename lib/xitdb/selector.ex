@@ -286,6 +286,10 @@ defmodule Xitdb.Selector do
     do_parse_steps(tail, [{:sorted_set, key} | acc])
   end
 
+  defp do_parse_steps(<<?@, _rest::binary>>, _acc) do
+    raise ArgumentError, "Invalid selector syntax: unexpected '@' mid-selector"
+  end
+
   defp do_parse_steps(<<?[, ?[, rest::binary>>, acc) do
     {int_str, <<?], ?], tail::binary>>} = take_until_byte(rest, ?])
     do_parse_steps(tail, [{:linked_array_list, String.to_integer(int_str)} | acc])
@@ -331,17 +335,33 @@ defmodule Xitdb.Selector do
     end
   end
 
-  defp parse_key_token(<<?', rest::binary>>), do: parse_single_quoted_string(rest, [])
-  defp parse_key_token(<<?", rest::binary>>), do: parse_quoted_string(rest, [])
+  defp parse_key_token(<<?', rest::binary>>) do
+    {unescaped, tail} = parse_single_quoted_string(rest, [])
+    validate_quoted_tail!(tail)
+    {unescaped, tail}
+  end
+
+  defp parse_key_token(<<?", rest::binary>>) do
+    {unescaped, tail} = parse_quoted_string(rest, [])
+    validate_quoted_tail!(tail)
+    {unescaped, tail}
+  end
 
   defp parse_key_token(bin), do: take_until_sigil(bin)
+
+  defp validate_quoted_tail!(<<>>), do: :ok
+  defp validate_quoted_tail!(<<b, _::binary>>) when b in [?., ?[, ?#, ?$, ?%, ?^], do: :ok
+
+  defp validate_quoted_tail!(tail) do
+    raise ArgumentError, "Invalid selector syntax near #{inspect(tail)}"
+  end
 
   defp take_until_sigil(bin), do: do_take_until_sigil(bin, 0, bin)
 
   defp do_take_until_sigil(<<>>, len, orig), do: {binary_part(orig, 0, len), <<>>}
 
   defp do_take_until_sigil(<<b, _::binary>> = tail, len, orig)
-       when b in [?., ?#, ?$, ?[, ?%, ?^] do
+       when b in [?., ?#, ?$, ?[, ?%, ?^, ?@] do
     {binary_part(orig, 0, len), tail}
   end
 

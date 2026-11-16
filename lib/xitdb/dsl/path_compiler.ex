@@ -77,24 +77,55 @@ defmodule Xitdb.DSL.PathCompiler do
   end
 
   def typed_modifier_segment(mod_fn, literal, :selector)
-      when mod_fn not in [:array, :array_list, :linked, :linked_list, :linked_array_list] and
+      when (is_typed_modifier(mod_fn) or mod_fn in [:hash_map, :map]) and
+             mod_fn not in [
+               :array,
+               :array_list,
+               :linked,
+               :linked_list,
+               :linked_array_list,
+               :at_moment
+             ] and
              (is_binary(literal) or
                 (is_atom(literal) and not is_nil(literal) and not is_boolean(literal))) do
     {:static, Selector.format_typed_step(mod_fn, literal)}
   end
 
   def typed_modifier_segment(mod_fn, literal, :steps)
-      when mod_fn not in [:array, :array_list, :linked, :linked_list, :linked_array_list] and
+      when (is_typed_modifier(mod_fn) or mod_fn in [:hash_map, :map]) and
+             mod_fn not in [
+               :array,
+               :array_list,
+               :linked,
+               :linked_list,
+               :linked_array_list,
+               :at_moment
+             ] and
              (is_binary(literal) or
                 (is_atom(literal) and not is_nil(literal) and not is_boolean(literal))) do
     {:static_step, static_typed_step(mod_fn, to_step_string(literal))}
   end
 
   def typed_modifier_segment(mod_fn, literal, _mode)
-      when mod_fn in [:array, :array_list, :linked, :linked_list, :linked_array_list] and
-             (is_binary(literal) or is_atom(literal)) do
+      when mod_fn in [:array, :array_list, :linked, :linked_list, :linked_array_list, :at_moment] and
+             (is_binary(literal) or is_atom(literal) or is_float(literal)) do
     raise ArgumentError,
           "Invalid typed path step {#{inspect(mod_fn)}, #{inspect(literal)}}: expected integer index"
+  end
+
+  def typed_modifier_segment(mod_fn, literal, _mode)
+      when (is_typed_modifier(mod_fn) or mod_fn in [:hash_map, :map]) and
+             mod_fn not in [
+               :array,
+               :array_list,
+               :linked,
+               :linked_list,
+               :linked_array_list,
+               :at_moment
+             ] and
+             (is_integer(literal) or is_float(literal) or is_boolean(literal) or is_nil(literal)) do
+    raise ArgumentError,
+          "Invalid typed path step {#{inspect(mod_fn)}, #{inspect(literal)}}: expected string or atom key"
   end
 
   def typed_modifier_segment(mod_fn, dynamic_ast, :selector)
@@ -315,6 +346,11 @@ defmodule Xitdb.DSL.PathCompiler do
 
   defp moment_segment({:-, _, [m]}, mode) when is_integer(m) do
     if mode == :steps, do: {:static_step, {:at_moment, -m}}, else: {:static, "@-#{m}"}
+  end
+
+  defp moment_segment(m, _mode) when is_binary(m) or is_atom(m) or is_float(m) do
+    raise ArgumentError,
+          "Invalid moment index #{inspect(m)}: expected integer moment index"
   end
 
   defp moment_segment(m_ast, :selector) do

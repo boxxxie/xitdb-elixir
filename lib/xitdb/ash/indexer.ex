@@ -1983,16 +1983,9 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           {decode_btree_key(hex_key),
            Xitdb.Cursor.from_nif_tuple(btree.db_ref, slot_tuple, btree.moment)}
 
-        {hex_key, {:cursor, _, _, _, _} = slot_tuple} ->
-          {decode_btree_key(hex_key),
-           Xitdb.Cursor.from_nif_tuple(btree.db_ref, slot_tuple, btree.moment)}
-
         {hex_key, ids} when is_list(ids) ->
           {decode_btree_key(hex_key),
            Xitdb.Cursor.unwrap_nif_entries(btree.db_ref, ids, btree.moment)}
-
-        {hex_key, %Xitdb.Cursor{} = cur} ->
-          {decode_btree_key(hex_key), cur}
 
         {hex_key, _other} ->
           {decode_btree_key(hex_key), []}

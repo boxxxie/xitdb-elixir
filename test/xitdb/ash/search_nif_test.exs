@@ -725,7 +725,12 @@ defmodule Xitdb.Ash.SearchNifTest do
              |> Enum.map(fn {t, entries} -> {t, Enum.sort_by(entries, &elem(&1, 0))} end)
 
     # BUG-02-04: closed db raises Xitdb.Error instead of silently returning []
+    lazy_idx_stream = Xitdb.Ash.Indexer.Storage.stream_index_from(db, "kdocs", "attr_k", "k1")
     :ok = Xitdb.close(db)
+
+    assert_raise Xitdb.Error, ~r/closed/, fn ->
+      Enum.to_list(lazy_idx_stream)
+    end
 
     assert_raise Xitdb.Error, ~r/closed/, fn ->
       Storage.scan_prefix_cursors(db, "kdocs", "alpha", 10)
@@ -736,8 +741,80 @@ defmodule Xitdb.Ash.SearchNifTest do
     end
 
     assert_raise Xitdb.Error, ~r/closed/, fn ->
+      Storage.scan_prefix(db, "kdocs", "alpha", 10, :elixir)
+    end
+
+    assert_raise Xitdb.Error, ~r/closed/, fn ->
       Xitdb.Ash.Indexer.Storage.stream_index_from(db, "kdocs", "attr_k", "k1")
     end
+  end
+
+  test "nif_sorted_map_seek/7 enforces MAX_FUSED_TOTAL_ENTRIES across multiple keys and uncounted hash maps" do
+    # 6 keys x 200 entries = 1200 entries (> MAX_FUSED_TOTAL_ENTRIES = 1024)
+    # Using uncounted Hash_Map children also verifies overflow entries are charged against total_fused.
+    entries_200 =
+      Map.new(1..200, fn i -> {"doc_#{String.pad_leading(Integer.to_string(i), 3, "0")}", i} end)
+
+    terms_map =
+      Map.new(1..6, fn k ->
+        {"t_#{k}", Xitdb.hash_map(entries_200)}
+      end)
+
+    db =
+      Xitdb.open!(backend: :memory)
+      |> Xitdb.transact!(%{
+        "idx" => %{
+          "search" => %{
+            "budget" => %{
+              "terms" => Xitdb.sorted_map(terms_map)
+            }
+          }
+        }
+      })
+
+    on_exit(fn -> Xitdb.close(db) end)
+
+    btree = Xitdb.db(db)["idx"]["search"]["budget"]["terms"]
+
+    assert {:ok, seek_entries, nil} =
+             Xitdb.NIF.nif_sorted_map_seek(
+               db.db_ref,
+               btree.tag_id,
+               btree.value,
+               "t_",
+               10,
+               true,
+               true
+             )
+
+    # First 5 keys fit inside 1024 (5 * 200 = 1000) and return fused 2-tuples;
+    # 6th key has remaining budget = 24, overflows during uncounted Hash_Map iteration,
+    # charges total_fused >= 1024, and falls back to a compact 3-tuple.
+    assert [
+             {"t_1", l1},
+             {"t_2", l2},
+             {"t_3", l3},
+             {"t_4", l4},
+             {"t_5", l5},
+             {"t_6", tag_id, val}
+           ] = seek_entries
+
+    assert length(l1) == 200
+    assert length(l2) == 200
+    assert length(l3) == 200
+    assert length(l4) == 200
+    assert length(l5) == 200
+    assert Xitdb.Cursor.tag_atom_for(tag_id) == :hash_map
+    assert is_integer(val) and val > 0
+
+    # Search.Storage.scan_prefix decodes all 6 keys accurately across fused + 3-tuple fallback
+    scanned = Storage.scan_prefix(db, "budget", "t_", 10, :nif)
+    assert length(scanned) == 6
+    assert Enum.all?(scanned, fn {_k, postings} -> length(postings) == 200 end)
+
+    # limit <= 0 returns [] cleanly in :elixir backend
+    assert [] = Storage.scan_prefix(db, "budget", "t_", 0, :elixir)
+    assert [] = Storage.scan_prefix(db, "budget", "t_", -5, :elixir)
   end
 
   test "BM25 search preserves >8-byte .Bytes doc IDs and >8-byte prefix-matched terms" do

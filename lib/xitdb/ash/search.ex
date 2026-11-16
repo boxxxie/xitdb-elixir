@@ -730,9 +730,6 @@ if Code.ensure_loaded?(Ash.DataLayer) do
                   {term, {:cursor, _, _} = slot_tuple} ->
                     [{term, Xitdb.Cursor.from_nif_tuple(db_ref, slot_tuple, moment)}]
 
-                  {term, {:cursor, _, _, _, _} = slot_tuple} ->
-                    [{term, Xitdb.Cursor.from_nif_tuple(db_ref, slot_tuple, moment)}]
-
                   {_term, _scalar_or_nil} ->
                     []
                 end)
@@ -792,15 +789,6 @@ if Code.ensure_loaded?(Ash.DataLayer) do
                      |> Xitdb.Cursor.from_nif_tuple(slot_tuple, moment)
                      |> Enum.to_list()}
 
-                  {term, {:cursor, _, _, _, _} = slot_tuple} ->
-                    {term,
-                     db_ref
-                     |> Xitdb.Cursor.from_nif_tuple(slot_tuple, moment)
-                     |> Enum.to_list()}
-
-                  {term, %Xitdb.Cursor{} = cur} ->
-                    {term, Enum.to_list(cur)}
-
                   {term, _other} ->
                     {term, []}
                 end)
@@ -848,7 +836,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
     defp scan_prefix_via_slot_entries_cursor(%Xitdb.Cursor{} = terms, prefix, limit) do
       case Xitdb.NIF.nif_slot_count(terms.db_ref, terms.tag_id, terms.value) do
-        {:ok, total_count} when total_count > 0 ->
+        {:ok, total_count} when total_count > 0 and limit > 0 ->
           start_idx = find_prefix_start_index(terms, prefix, 0, total_count)
           stream_prefix_from(terms, prefix, start_idx, limit)
 
@@ -909,14 +897,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
             {:cursor, c_tag_id, c_val} ->
               decode_slot_entries!(terms.db_ref, c_tag_id, c_val, terms.moment)
 
-            {:cursor, _tag, c_tag_id, c_val, _full} ->
-              decode_slot_entries!(terms.db_ref, c_tag_id, c_val, terms.moment)
-
-            %Xitdb.Cursor{} = cur ->
-              Enum.to_list(cur)
-
             list when is_list(list) ->
-              unwrap_decoded_entries(terms.db_ref, list, terms.moment)
+              Xitdb.Cursor.unwrap_nif_entries(terms.db_ref, list, terms.moment)
 
             _other ->
               []
@@ -929,22 +911,11 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     defp decode_slot_entries!(db_ref, tag_id, val, moment) do
       case Xitdb.NIF.nif_slot_entries(db_ref, tag_id, val, 0, -1) do
         {:ok, entries} ->
-          unwrap_decoded_entries(db_ref, entries, moment)
+          Xitdb.Cursor.unwrap_nif_entries(db_ref, entries, moment)
 
         {:error, reason} ->
           raise Xitdb.Error, reason: reason
       end
-    end
-
-    defp unwrap_decoded_entries(db_ref, entries, moment) do
-      Enum.map(entries, fn
-        {k, v} ->
-          {Xitdb.Cursor.unwrap_nif_value(db_ref, k, moment, []),
-           Xitdb.Cursor.unwrap_nif_value(db_ref, v, moment, [])}
-
-        item ->
-          Xitdb.Cursor.unwrap_nif_value(db_ref, item, moment, [])
-      end)
     end
 
     @spec apply_diff(term(), String.t(), String.t(), map()) :: term()

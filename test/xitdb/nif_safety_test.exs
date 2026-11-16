@@ -509,7 +509,7 @@ defmodule Xitdb.NifSafetyTest do
   test "pure-removal under existing keys, invalid collection containers, >32-key maps, and MAX_WRITE_DEPTH guard" do
     db = Xitdb.open!(backend: :memory)
 
-    # Large (>32 keys) map exercises temp_allocator fallback in extract_map_kvs
+    # Large (>32 keys) map exercises Nif_Map_Iter heap wstack traversal
     wide_map = Map.new(1..48, fn i -> {"k#{i}", i} end)
     db = Xitdb.transact!(db, %{"wide" => wide_map, "nested" => %{"a" => %{"b" => 1, "c" => 2}}})
     {:ok, info_before} = Xitdb.info(db)
@@ -632,20 +632,24 @@ defmodule Xitdb.NifSafetyTest do
     db = Xitdb.open!(backend: :memory)
     on_exit(fn -> Xitdb.close(db) end)
 
-    # Exact depth 64 scalar & nil maps succeed across :put and :merge_map (pure removal)
+    # Exact 64-container NIF argument depth succeeds across :put and :merge_map (scalar & pure removal)
+    d63_scalar = Enum.reduce(1..63, "leaf", fn i, acc -> %{"l#{i}" => acc} end)
     d64_scalar = Enum.reduce(1..64, "leaf", fn i, acc -> %{"l#{i}" => acc} end)
     d63_nil = Enum.reduce(1..63, nil, fn i, acc -> %{"l#{i}" => acc} end)
+    d64_nil = Enum.reduce(1..64, nil, fn i, acc -> %{"l#{i}" => acc} end)
 
     assert {:ok, db} = Xitdb.transact_ops(db, [{:put, ["d64"], d64_scalar}])
     assert get_in(db, ["d64" | Enum.map(64..1//-1, &"l#{&1}")]) == "leaf"
+
+    assert {:ok, db} = Xitdb.transact_ops(db, [{:merge_map, %{"d64_merge" => d63_scalar}}])
+    assert get_in(db, ["d64_merge" | Enum.map(63..1//-1, &"l#{&1}")]) == "leaf"
 
     # Valid pure-removal at exact depth 64 succeeds cleanly
     assert {:ok, db} = Xitdb.transact_ops(db, [{:merge_map, %{"absent_d64" => d63_nil}}])
     assert db["absent_d64"] == nil
 
-    # Depth 65 scalar & nil maps fail consistently across :put, :merge_map, and pure removal
+    # Exact 65-container failure boundary across :put, :merge_map, and pure removal
     d65_scalar = Enum.reduce(1..65, "leaf", fn i, acc -> %{"l#{i}" => acc} end)
-    d65_nil = Enum.reduce(1..65, nil, fn i, acc -> %{"l#{i}" => acc} end)
 
     {:ok, info_before} = Xitdb.info(db)
 
@@ -653,10 +657,10 @@ defmodule Xitdb.NifSafetyTest do
              Xitdb.transact_ops(db, [{:put, ["d65"], d65_scalar}])
 
     assert {:error, %Error{reason: :invalid_put_op}} =
-             Xitdb.transact_ops(db, [{:merge_map, %{"d65" => d65_scalar}}])
+             Xitdb.transact_ops(db, [{:merge_map, %{"d64" => d64_scalar}}])
 
     assert {:error, %Error{reason: :invalid_put_op}} =
-             Xitdb.transact_ops(db, [{:merge_map, %{"absent_d65" => d65_nil}}])
+             Xitdb.transact_ops(db, [{:merge_map, %{"absent_d64" => d64_nil}}])
 
     # BUG-04-03: Forged %MapSet{map: ...} variants are rejected cleanly
     for forged <- [
@@ -664,7 +668,7 @@ defmodule Xitdb.NifSafetyTest do
           %MapSet{map: [1, 2]},
           %MapSet{map: 123},
           Xitdb.hash_set(%MapSet{map: [1, 2]}),
-          Xitdb.counted_set(%MapSet{map: %{"ok" => []}} |> then(&%{&1 | map: [1, 2]})),
+          Xitdb.counted_set(%{__struct__: MapSet, map: [1, 2]}),
           Xitdb.sorted_set(%MapSet{map: URI.parse("https://example.com")})
         ] do
       assert {:error, %Error{reason: :invalid_put_op}} =
@@ -674,12 +678,65 @@ defmodule Xitdb.NifSafetyTest do
                Xitdb.transact_ops(db, [{:put, ["forged"], forged}, {:unknown_op}])
     end
 
-    # Wide map (>128 keys) streams cleanly via Nif_Map_Iter
+    # Wide map (>128 keys) streams cleanly via Nif_Map_Iter, and mid-stream failure cleans up heap wstack
     wide200 = Map.new(1..200, fn i -> {"w_#{i}", i} end)
     assert {:ok, db} = Xitdb.transact_ops(db, [{:put, ["wide200"], wide200}])
     assert db["wide200"]["w_200"] == 200
 
+    wide_bad =
+      1..48
+      |> Map.new(fn i -> {"k_#{i}", i} end)
+      |> Map.put("bad_leaf", {:bad, :tuple})
+
+    assert {:error, %Error{reason: :invalid_put_op}} =
+             Xitdb.transact_ops(db, [{:put, ["wide_bad"], wide_bad}])
+
+    assert {:error, %Error{reason: :invalid_put_op}} =
+             Xitdb.transact_ops(db, [{:merge_map, %{"wide_bad" => wide_bad}}])
+
+    assert db["wide_bad"] == nil
+
     {:ok, info_after} = Xitdb.info(db)
     assert info_after.moment_count == info_before.moment_count + 1
+  end
+
+  test "file-backed rollback restores root header and file length across empty-DB and mid-payload failures" do
+    tmp_dir = Path.join(System.tmp_dir!(), "xitdb_rollback_#{System.unique_integer([:positive])}")
+    File.mkdir_p!(tmp_dir)
+    path = Path.join(tmp_dir, "rollback.xit")
+
+    on_exit(fn -> File.rm_rf!(tmp_dir) end)
+
+    {:ok, db} = Xitdb.open(backend: :buffered_file, path: path)
+
+    # Empty-DB root-init rollback: nested payload writes into core before hitting invalid leaf
+    bad_nested = %{"ok" => String.duplicate("x", 256), "bad" => {:bad, :tuple}}
+
+    assert {:error, %Error{reason: :invalid_put_op}} =
+             Xitdb.transact_ops(db, [{:put, ["init"], bad_nested}])
+
+    assert {:ok, %{moment_count: 0}} = Xitdb.info(db)
+
+    # Valid commit succeeds cleanly after empty-DB rollback
+    assert {:ok, db} = Xitdb.transact(db, %{"users" => %{"alice" => "v1"}})
+    assert {:ok, %{moment_count: 1} = info_before} = Xitdb.info(db)
+
+    # Populated-DB mid-payload rollback restores file length and root header
+    assert {:error, %Error{reason: :invalid_put_op}} =
+             Xitdb.transact_ops(db, [{:merge_map, %{"users" => bad_nested}}])
+
+    assert {:ok, ^info_before} = Xitdb.info(db)
+    assert db["users"]["alice"] == "v1"
+
+    # Follow-up valid commit, sync, close, and reopen succeed cleanly
+    assert {:ok, db} = Xitdb.transact(db, %{"users" => %{"alice" => "v2"}})
+    assert :ok = Xitdb.sync(db)
+    assert :ok = Xitdb.close(db)
+
+    {:ok, reopened} = Xitdb.open(backend: :buffered_file, path: path)
+    assert {:ok, %{moment_count: 2}} = Xitdb.info(reopened)
+    assert reopened["users"]["alice"] == "v2"
+    assert Xitdb.as_of(reopened, 0)["users"]["alice"] == "v1"
+    assert :ok = Xitdb.close(reopened)
   end
 end

@@ -600,7 +600,7 @@ defmodule Xitdb do
   Resolves a canonical root-anchored `xitdb` selector string (`~x|.users["101"].todos[1]|`)
   against `db` or a committed root snapshot `%Xitdb.Cursor{}` (from `Xitdb.db/1` or `Xitdb.as_of/2`).
   """
-  @compile {:inline, select: 2, select!: 2, do_select: 3, do_select!: 3}
+  @compile {:inline, do_select: 3, do_select!: 3}
   @spec select(t() | Cursor.t(), String.t() | [term()]) :: {:ok, term()} | {:error, Error.t()}
   def select(%__MODULE__{db_ref: db_ref}, selector)
       when is_binary(selector) or is_list(selector) do
