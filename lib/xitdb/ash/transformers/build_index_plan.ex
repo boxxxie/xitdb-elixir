@@ -157,7 +157,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
              {:error,
               DslError.exception(
                 module: module,
-                path: [:xitdb, :index, name || fields],
+                path: [:xitdb, :index, name],
                 message: "index `name` cannot be blank"
               )}}
 

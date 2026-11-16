@@ -14,7 +14,6 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     """
 
     require Ash.Expr
-    require Ash.Query
     require Ash.Sort
 
     alias Xitdb.Ash.{Codec, Info}
