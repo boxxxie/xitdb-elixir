@@ -343,30 +343,9 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     end
 
     defp nested_foreign_key(resource) do
-      case fallback_nested_fk(resource) do
-        nil ->
-          if function_exported?(Info, :nested_mappings, 1) do
-            case Info.nested_mappings(resource) do
-              [%{parent_key: fk} | _] when not is_nil(fk) -> fk
-              [%{foreign_key: fk} | _] when not is_nil(fk) -> fk
-              _ -> nil
-            end
-          end
-
-        fk ->
-          fk
-      end
-    end
-
-    defp fallback_nested_fk(resource) do
-      if function_exported?(Info, :nested_in, 1) do
-        case apply(Info, :nested_in, [resource]) do
-          %{foreign_key: fk} -> fk
-          %{parent_key: fk} -> fk
-          _ -> nil
-        end
-      else
-        nil
+      case Info.nested_in(resource) do
+        %{foreign_key: fk} -> fk
+        _ -> nil
       end
     end
 

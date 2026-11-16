@@ -114,23 +114,9 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       end
     end
 
-    defmodule LegacyMdmResource do
-      use Ash.Resource,
-        domain: nil,
-        validate_domain_inclusion?: false,
-        extensions: [Xitdb.Ash.Resource]
-
-      xitdb do
-        store StoreA
-        collection :legacy_orgs
-        editable_fields [:domain]
-        indexes(domain: "domain->id")
-      end
-
-      attributes do
-        uuid_primary_key(:id)
-        attribute(:domain, :string, public?: true)
-      end
+    defmodule PlainIndexedModule do
+      def __xitdb_collection__, do: :plain_orgs
+      def __xitdb_indexes__, do: [domain: "domain->id"]
     end
 
     defmodule NonXitdbResource do
@@ -190,7 +176,6 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       assert %NestedIn{parent_collection: :events, foreign_key: :event_id, path: :sessions} =
                Info.nested_in(Session)
 
-      assert Info.nested_mappings(Session) == []
       assert Info.nested?(Session) == true
 
       assert [%Index{fields: [:event_id], name: nil}] = Info.indexes(Session)
@@ -212,21 +197,21 @@ if Code.ensure_loaded?(Ash.DataLayer) do
              ] = Info.indexes(DeduplicatedAutoFkResource)
     end
 
-    test "tx_for works seamlessly across both Xitdb.Ash.Dsl and Xitdb.Ash.Resource modules" do
+    test "tx_for works seamlessly across both Xitdb.Ash.Dsl and plain schema modules" do
       use Xitdb.DSL
 
       {:ok, db} = Xitdb.open(backend: :memory)
 
       try do
         {:ok, updated_db} =
-          tx_for db, [Event, LegacyMdmResource] do
+          tx_for db, [Event, PlainIndexedModule] do
             init_col events, :hash_map
-            init_col legacy_orgs, :hash_map
+            init_col plain_orgs, :hash_map
             put events["e1"].id, "e1"
             put events["e1"].status, "live"
             put events["e1"].title, "Forum"
-            put legacy_orgs["o1"].id, "o1"
-            put legacy_orgs["o1"].domain, "caasa.ca"
+            put plain_orgs["o1"].id, "o1"
+            put plain_orgs["o1"].domain, "caasa.ca"
           end
 
         assert updated_db["attr_status"]["live"] == "e1"
@@ -351,27 +336,6 @@ if Code.ensure_loaded?(Ash.DataLayer) do
                      end
                      """)
                    end
-
-      assert_raise DslError, ~r/unknown attribute\(s\) \[:ghost\] in `editable_fields`/, fn ->
-        Code.compile_string("""
-        defmodule Xitdb.Ash.DslTest.BadEditableAttr do
-          use Ash.Resource,
-            domain: nil,
-            validate_domain_inclusion?: false,
-            extensions: [Xitdb.Ash.Dsl]
-
-          xitdb do
-            store Xitdb.Ash.DslTest.StoreA
-            collection :bad_edit
-            editable_fields [:ghost]
-          end
-
-          attributes do
-            uuid_primary_key :id
-          end
-        end
-        """)
-      end
     end
 
     # Spark runs `Spark.Dsl.Verifier`s inside `@after_verify` via `Module.ParallelChecker`

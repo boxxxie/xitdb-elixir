@@ -726,28 +726,10 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     end
 
     defp resolve_nested_specs(resource) do
-      case resolve_single_nested_in(resource) do
-        [_ | _] = list ->
-          list
-
-        [] ->
-          if function_exported?(Info, :nested_mappings, 1) do
-            Info.nested_mappings(resource)
-          else
-            []
-          end
-      end
-    end
-
-    defp resolve_single_nested_in(resource) do
-      if function_exported?(Info, :nested_in, 1) do
-        case apply(Info, :nested_in, [resource]) do
-          nil -> []
-          list when is_list(list) -> list
-          spec -> [spec]
-        end
-      else
-        []
+      case Info.nested_in(resource) do
+        nil -> []
+        list when is_list(list) -> list
+        spec -> [spec]
       end
     end
 

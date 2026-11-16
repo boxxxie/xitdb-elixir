@@ -113,7 +113,6 @@ defmodule Xitdb.MixProject do
           Xitdb.Ash.Store,
           Xitdb.Ash.Search,
           Xitdb.Ash.TestSandbox,
-          Xitdb.Ash.Resource,
           Xitdb.Ash.Info,
           Xitdb.Ash.Tx,
           Xitdb.Ash.LeaseError,
@@ -128,8 +127,6 @@ defmodule Xitdb.MixProject do
         ],
         "Ash Spark Transformers & Verifiers": [
           Xitdb.Ash.Transformers.BuildIndexPlan,
-          Xitdb.Ash.Transformers.WireChanges,
-          Xitdb.Ash.Verifiers.VerifySyncProjection,
           Xitdb.Ash.Verifiers.VerifyNoSqlFragments,
           Xitdb.Ash.Verifiers.VerifyCrossStoreReferences
         ]

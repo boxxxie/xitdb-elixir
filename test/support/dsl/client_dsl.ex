@@ -100,26 +100,6 @@ defmodule Xitdb.TestDSL.ClientDSL do
     ClientDriver.reopen_file_database(ctx, label)
   end
 
-  def inspecting_ash_resource_info(ctx, result_key, resource_or_resources, opts \\ []) do
-    ClientDriver.inspect_ash_resource_info(ctx, result_key, resource_or_resources, opts)
-  end
-
-  def creating_ash_record(ctx, record_key, resource, action, params) do
-    ClientDriver.create_ash_record(ctx, record_key, resource, action, params)
-  end
-
-  def updating_ash_record(ctx, record_key, action, params) do
-    ClientDriver.update_ash_record(ctx, record_key, action, params)
-  end
-
-  def verifying_ash_sync_projection(ctx, result_key, resource, option_overrides \\ []) do
-    ClientDriver.verify_ash_sync_projection(ctx, result_key, resource, option_overrides)
-  end
-
-  def inspecting_nested_resource_info(ctx, result_key, resource, opts \\ []) do
-    ClientDriver.inspect_nested_resource_info(ctx, result_key, resource, opts)
-  end
-
   def evaluating_quoted_ast(ctx, result_key, quoted_ast) do
     ClientDriver.evaluate_quoted_ast(ctx, result_key, quoted_ast)
   end
@@ -303,33 +283,6 @@ defmodule Xitdb.TestDSL.ClientDSL do
         unquote(resource),
         unquote(action_name),
         unquote(expected_change_tuple)
-      )
-    end
-  end
-
-  defmacro ash_record_attribute_equals(ctx_ast, record_key, attribute, expected_value) do
-    quote line: __CALLER__.line do
-      ClientDriver.assert_ash_record_attribute(
-        unquote(ctx_ast),
-        unquote(record_key),
-        unquote(attribute),
-        unquote(expected_value)
-      )
-    end
-  end
-
-  defmacro ash_verifier_succeeded(ctx_ast, result_key) do
-    quote line: __CALLER__.line do
-      ClientDriver.assert_ash_verifier_ok(unquote(ctx_ast), unquote(result_key))
-    end
-  end
-
-  defmacro ash_verifier_failed_with(ctx_ast, result_key, expected_opts) do
-    quote line: __CALLER__.line do
-      ClientDriver.assert_ash_verifier_error(
-        unquote(ctx_ast),
-        unquote(result_key),
-        unquote(expected_opts)
       )
     end
   end
