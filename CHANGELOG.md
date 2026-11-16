@@ -2,6 +2,31 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.0.1] - 2026-11-16
+
+### Changed
+- **NIF & Cursor Performance (`native/xitdb_nif.odin`, `Xitdb`, `Xitdb.Cursor`):**
+  - Built `MapSet` terms directly inside `native/xitdb_nif.odin` on materialization and skipped the redundant Elixir unwrap pass.
+  - Deferred disk cursor resolution (`ov_key` via `NIF.nif_select/3`) in `Xitdb.Cursor.stage_list_edit/3` until materializing a list with staged descendants or fork aliases, avoiding an extra NIF call on standard `insert_at/4` and `delete_at/3` mutations.
+- **Underlying `odin-xitdb` `2.0.1`:** Updated `native/xitdb-odin` to `2.0.1` (`c444fc9`), resolving variable shadowing warnings under `odin check -vet` across `cursor.odin`, `lua.odin`, and `types.odin`.
+
+### Fixed
+- **NIF Index Merges, Base-Moment Forks, Pull & Datalog (`native/xitdb_nif.odin`):**
+  - Ran secondary index removals before insertions during merges, evicted stale indexes on non-nil overwrites/resets, and tolerated `.Key_Not_Found` in `rm_if_exists_callback`.
+  - Prioritized `fork_aliases` over `pending_tags`, honored `.None` tombstones, preserved child pending tags across `.Fork`, and recorded `.Hash_Map` for new plain maps in `merge_map`.
+  - Hid root `"__tx"` in `slot_get_key` and `bm25_search`, fixed `slot_contains` reader initialization, added adaptive step fallback in `nif_pull_cursor`, and handled unquoted escapes in pull splitters.
+  - Preserved float precision in `sum` aggregations, handled exact signed vs. unsigned Datalog integer comparisons, avoided splitting after `@moment` prefixes, propagated `check_only`, and clamped large `u64` counts.
+- **Client, Cursor, DSL, Selector & Sets (`Xitdb`, `Xitdb.Cursor`, `Xitdb.DSL`, `Xitdb.Selector`, `Xitdb.TxCompiler`, `Xitdb.Ash.Codec`):**
+  - Pinned negative/implicit moments on cursors returned by `select/2` and `pull/2`, and supported standard Elixir lists in `Xitdb.at/1`.
+  - Propagated nested/chained `fork_aliases`, applied list edits after fork aliases, materialized parent lists with disk slots when child list edits or forks exist, normalized `fetch_edited_list/2` outputs, and inspected inner `:erl_eval` closures for outer variable capture.
+  - Supported 2-arity keyword `do:` options in `tx/2`, `tx!/2`, `query/2`, and `query!/2`, threaded `find_vars`/`binds` across Datalog collection bindings, and added list-step RYOW and `:array_list` `rm_at_steps/2` recursion guards.
+  - Raised `ArgumentError` on malformed `Xitdb.Selector` syntax, validated raw set members in `Xitdb.TxCompiler`, and stringified typed `counted_set_fields` in `Xitdb.Ash.Codec`.
+- **Ash DataLayer, Mutator, Query, Search & Verifiers (`Xitdb.Ash.*`):**
+  - Bounded `Exists`/`Parent` AST scans and substitutions to the current scope, threaded target domains/context/actor across `exists` and aggregates, guarded non-Xitdb or `nil` targets, and used semantic `:min`/`:max` comparators.
+  - Passed `%Ash.Query{}` to calculation `load/3`, preserved query context in `Ash.load` and `DataLayer.with_context_db/3`, fell back to `calculate/3` on `nil`/`:unknown` expressions, and avoided boolean coercion in `DataLayer`.
+  - Staged `run_bulk_upserts/7` in a single atomic commit with intra-batch target resolution, and honored `touch_update_defaults?: false`.
+  - Cleared deleted ancestors on staged `Search` writes, overlaid descendants on staged maps, removed `TestSandbox` TOCTOU lookup, allowed `0 ms` lease timeouts, fell back on `store: nil`, and scanned `base_filter`, `default_sort`, and `:action` preparations in `VerifyNoSqlFragments`.
+
 ## [2.0.0] - 2026-11-16
 
 ### Breaking Changes
