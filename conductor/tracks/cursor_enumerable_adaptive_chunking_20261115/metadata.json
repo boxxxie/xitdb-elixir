@@ -1,0 +1,8 @@
+{
+  "track_id": "cursor_enumerable_adaptive_chunking_20261115",
+  "type": "chore",
+  "status": "completed",
+  "created_at": "2026-11-15T10:47:00Z",
+  "updated_at": "2026-11-15T11:38:00Z",
+  "description": "Adaptive Chunk Sizing in Enumerable for Xitdb.Cursor"
+}
