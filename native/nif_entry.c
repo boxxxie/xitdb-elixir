@@ -226,6 +226,10 @@ ERL_NIF_TERM nif_make_binary_slice(ErlNifEnv* env, const unsigned char* src, siz
     return term;
 }
 
+unsigned char* nif_alloc_binary_term(ErlNifEnv* env, size_t len, ERL_NIF_TERM* term_out) {
+    return enif_make_new_binary(env, len, term_out);
+}
+
 ERL_NIF_TERM nif_make_tuple2(ErlNifEnv* env, ERL_NIF_TERM e1, ERL_NIF_TERM e2) {
     return enif_make_tuple2(env, e1, e2);
 }
@@ -298,6 +302,7 @@ static ErlNifFunc nif_funcs[] = {
     {"nif_compact",          2, odin_nif_compact,          ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"nif_sorted_map_seek",  5, odin_nif_sorted_map_seek,  ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_sorted_map_seek",  6, odin_nif_sorted_map_seek,  ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_sorted_map_seek",  7, odin_nif_sorted_map_seek,  ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_bm25_search",      7, odin_nif_bm25_search,      ERL_NIF_DIRTY_JOB_CPU_BOUND}
 };
 

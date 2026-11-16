@@ -36,9 +36,40 @@ defmodule Xitdb.NIF do
   def nif_query_datalog(_db_ref, _moment_idx, _query_str), do: :erlang.nif_error(:nif_not_loaded)
   def nif_compact(_db_ref, _target_path), do: :erlang.nif_error(:nif_not_loaded)
 
+  @type seek_entry ::
+          {binary(), non_neg_integer(), integer()}
+          | {binary(), term()}
+
+  @doc """
+  Seeks into a `Sorted_Map` (B+Tree) starting at `prefix_bin` / `start_key_bin` and returns up to
+  `limit_int` entries plus a lookahead continuation key (`next_cursor_or_nil`).
+
+  Entry tuple shapes depend on `decode_children`:
+  - `nif_sorted_map_seek/5` and `/6` (and `/7` with `decode_children = false`):
+    container values are returned as compact 3-tuples `{key_bin, tag_id, slot_val}` for lazy
+    cursor construction, while scalar values are returned as 2-tuples `{key_bin, scalar_val}`.
+  - `nif_sorted_map_seek/7` with `decode_children = true`:
+    container values are eagerly decoded into lists in the same NIF call and returned as
+    2-tuples `{key_bin, children_list}` alongside scalar 2-tuples `{key_bin, scalar_val}`.
+  """
+  @spec nif_sorted_map_seek(
+          reference(),
+          non_neg_integer(),
+          integer(),
+          binary(),
+          integer()
+        ) :: {:ok, [seek_entry()], binary() | nil} | {:error, term()}
   def nif_sorted_map_seek(_db_ref, _slot_tag_id, _slot_val_int, _prefix_bin, _limit_int),
     do: :erlang.nif_error(:nif_not_loaded)
 
+  @spec nif_sorted_map_seek(
+          reference(),
+          non_neg_integer(),
+          integer(),
+          binary(),
+          integer(),
+          boolean()
+        ) :: {:ok, [seek_entry()], binary() | nil} | {:error, term()}
   def nif_sorted_map_seek(
         _db_ref,
         _slot_tag_id,
@@ -46,6 +77,26 @@ defmodule Xitdb.NIF do
         _start_key_bin,
         _limit_int,
         _prefix_only
+      ),
+      do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec nif_sorted_map_seek(
+          reference(),
+          non_neg_integer(),
+          integer(),
+          binary(),
+          integer(),
+          boolean(),
+          boolean()
+        ) :: {:ok, [seek_entry()], binary() | nil} | {:error, term()}
+  def nif_sorted_map_seek(
+        _db_ref,
+        _slot_tag_id,
+        _slot_val_int,
+        _start_key_bin,
+        _limit_int,
+        _prefix_only,
+        _decode_children
       ),
       do: :erlang.nif_error(:nif_not_loaded)
 
