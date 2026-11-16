@@ -217,6 +217,7 @@ defmodule Xitdb.DSL.PathCompilerTest do
                "staff"
 
       assert Xitdb.select!(db, [{:map, "linked"}, {:linked_list, 1}]) == "tail"
+      assert Xitdb.select!(db, [{:map, "linked"}, {:linked_list, [1]}]) == "tail"
       assert Xitdb.select!(db, ["linked", [1]]) == "tail"
       assert Xitdb.select!(db, [{:map, "hset"}, {:set_member, "ok"}]) == "ok"
       assert Xitdb.select!(db, [{:map, "cset"}, {:counted_set_member, "cok"}]) == "cok"
@@ -292,9 +293,14 @@ defmodule Xitdb.DSL.PathCompilerTest do
   end
 
   test "Slice 03 regressions: select! moment/root, adaptive history_of/select, strict sigils, and parser guards" do
+    db = Xitdb.open!(backend: :memory)
+    on_exit(fn -> Xitdb.close(db) end)
+
     db =
-      Xitdb.open!(backend: :memory)
-      |> Xitdb.transact!(%{"users" => %{"alice" => %{"n" => 1}}}, doc: "scalar-root-m0")
+      db
+      |> Xitdb.transact!(%{"users" => %{"alice" => %{"n" => 1}}, "arr" => [10, 20]},
+        doc: "scalar-root-m0"
+      )
       |> Xitdb.transact!(
         %{
           "susers" => Xitdb.sorted_map(%{"alice" => Xitdb.linked_list(["zero", "one"])}),
@@ -302,8 +308,6 @@ defmodule Xitdb.DSL.PathCompilerTest do
         },
         doc: "m1"
       )
-
-    on_exit(fn -> Xitdb.close(db) end)
 
     # BUG-03-01: select! preserves @moment and root: true
     r0 = Xitdb.select!(db, "@0")
@@ -319,16 +323,20 @@ defmodule Xitdb.DSL.PathCompilerTest do
     assert {:ok, hist} = Xitdb.history_of(db, path_steps(susers.alice[1]))
     assert Enum.map(hist, & &1.value) == ["one"]
 
-    # BUG-03-03: explicit sigils (# / [[i]]) stay strict against Hash_Map / Array_List
+    # BUG-03-03: explicit sigils (#, $, [[i]]) stay strict against Hash_Map / Array_List
     assert {:ok, nil} = Xitdb.select(db, "@0#users")
+    assert {:ok, []} = Xitdb.history_of(db, "$users.alice")
+    assert {:ok, []} = Xitdb.history_of(db, ".arr[[0]]")
 
     # BUG-03-04: history_of preserves doc/instant when path hits Unexpected_Tag at a later moment
+    db_scalar_m1 = Xitdb.open!(backend: :memory)
+    on_exit(fn -> Xitdb.close(db_scalar_m1) end)
+
     db_scalar_m1 =
-      Xitdb.open!(backend: :memory)
+      db_scalar_m1
       |> Xitdb.transact!(%{"users" => %{"alice" => 2}}, doc: "m0-doc", instant: 111)
       |> Xitdb.transact!(%{"users" => "not-a-map"}, doc: "m1-doc", instant: 222)
 
-    on_exit(fn -> Xitdb.close(db_scalar_m1) end)
     assert {:ok, [h0, h1]} = Xitdb.history_of(db_scalar_m1, ".users.alice")
     assert h0.value == 2
     assert h0.doc == "m0-doc"
@@ -337,7 +345,7 @@ defmodule Xitdb.DSL.PathCompilerTest do
     assert h1.doc == "m1-doc"
     assert h1.instant == 222
 
-    # BUG-03-05 & BUG-03-06: Selector & NIF parser preserve #users["a.b"] / .counted#alice["a.b"] and reject @ in history_of
+    # BUG-03-05 & BUG-03-06: Selector & NIF parser preserve #users["a.b"] / .counted#alice["a.b"] and reject @ / trailing junk
     assert Xitdb.Selector.parse_selector_steps(~S|#alice["a.b"]|) == [
              {:counted_hash_map, "alice"},
              {:hash_map, "a.b"}
@@ -352,6 +360,12 @@ defmodule Xitdb.DSL.PathCompilerTest do
     assert {:ok, nil} = Xitdb.select(db, ~S|#counted["a.b"]|)
     assert {:ok, "dotted"} = Xitdb.select(db, ~S|.counted#alice["a.b"]|)
 
+    for bad_sel <- [".users.@0", ".users@0", ~S|."a.b"trailing|, ~S|.'a.b'trailing|] do
+      assert_raise ArgumentError, fn ->
+        Xitdb.Selector.parse_selector_steps(bad_sel)
+      end
+    end
+
     assert {:error, %Xitdb.Error{reason: :invalid_selector}} = Xitdb.history_of(db, ".users.@0")
     assert {:error, %Xitdb.Error{reason: :invalid_selector}} = Xitdb.select(db, ".users.@0")
 
@@ -364,8 +378,20 @@ defmodule Xitdb.DSL.PathCompilerTest do
       Xitdb.Selector.format_typed_step(:bogus, "x")
     end
 
-    assert_raise ArgumentError, fn ->
-      Code.eval_quoted(quote(do: path(array("not_int"))), [], env: __ENV__)
+    for bad_expr <- [
+          quote(do: path(array("not_int"))),
+          quote(do: path(array(1.5))),
+          quote(do: path(counted(123))),
+          quote(do: path(counted(nil))),
+          quote(do: path_steps(array("not_int"))),
+          quote(do: path_steps(array(1.5))),
+          quote(do: path_steps(counted(123))),
+          quote(do: path_steps(counted(nil))),
+          quote(do: path_steps(users[{:bogus, "x"}]))
+        ] do
+      assert_raise ArgumentError, fn ->
+        Code.eval_quoted(bad_expr, [], env: __ENV__)
+      end
     end
   end
 end

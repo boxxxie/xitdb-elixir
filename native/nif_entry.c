@@ -175,36 +175,12 @@ int nif_get_map_size(ErlNifEnv* env, ERL_NIF_TERM map_term, size_t* size_out) {
     return enif_get_map_size(env, map_term, size_out);
 }
 
-int nif_map_to_kv_arrays(
-    ErlNifEnv* env,
-    ERL_NIF_TERM map_term,
-    ERL_NIF_TERM* keys_out,
-    ERL_NIF_TERM* vals_out,
-    size_t max_cnt,
-    size_t* count_out
-) {
-    ErlNifMapIterator iter;
-    if (!enif_map_iterator_create(env, map_term, &iter, ERL_NIF_MAP_ITERATOR_FIRST)) {
-        return 0;
-    }
-    size_t idx = 0;
-    ERL_NIF_TERM k, v;
-    while (idx < max_cnt && enif_map_iterator_get_pair(env, &iter, &k, &v)) {
-        keys_out[idx] = k;
-        vals_out[idx] = v;
-        idx++;
-        enif_map_iterator_next(env, &iter);
-    }
-    enif_map_iterator_destroy(env, &iter);
-    *count_out = idx;
-    return 1;
-}
-
 typedef struct {
     ErlNifMapIterator iter;
 } NifMapIter;
 
 typedef char nif_map_iter_size_check[sizeof(NifMapIter) <= 64 ? 1 : -1];
+typedef char nif_map_iter_align_check[_Alignof(NifMapIter) <= _Alignof(uint64_t) ? 1 : -1];
 
 int nif_map_iter_create(ErlNifEnv* env, ERL_NIF_TERM map_term, NifMapIter* out) {
     return enif_map_iterator_create(env, map_term, &out->iter, ERL_NIF_MAP_ITERATOR_FIRST);
@@ -226,7 +202,8 @@ int nif_can_be_pure_removal(
     ErlNifEnv* env,
     ERL_NIF_TERM term,
     ERL_NIF_TERM atom_nil,
-    ERL_NIF_TERM atom_struct
+    ERL_NIF_TERM atom_struct,
+    ERL_NIF_TERM atom_xitdb_collection_mod
 ) {
     ERL_NIF_TERM cur = term;
     for (int depth = 0; depth < 8; depth++) {
@@ -238,7 +215,7 @@ int nif_can_be_pure_removal(
         }
         ERL_NIF_TERM st;
         if (enif_get_map_value(env, cur, atom_struct, &st)) {
-            return 1;
+            return st == atom_xitdb_collection_mod ? 1 : 0;
         }
         ErlNifMapIterator iter;
         if (!enif_map_iterator_create(env, cur, &iter, ERL_NIF_MAP_ITERATOR_FIRST)) {
@@ -413,23 +390,6 @@ ERL_NIF_TERM nif_make_new_map(ErlNifEnv* env) {
 
 int nif_make_map_put(ErlNifEnv* env, ERL_NIF_TERM map_in, ERL_NIF_TERM key, ERL_NIF_TERM value, ERL_NIF_TERM* map_out) {
     return enif_make_map_put(env, map_in, key, value, map_out);
-}
-
-int nif_map_to_kv_list(ErlNifEnv* env, ERL_NIF_TERM map_term, ERL_NIF_TERM* list_out) {
-    ErlNifMapIterator iter;
-    if (!enif_map_iterator_create(env, map_term, &iter, ERL_NIF_MAP_ITERATOR_FIRST)) {
-        return 0;
-    }
-    ERL_NIF_TERM acc = enif_make_list(env, 0);
-    ERL_NIF_TERM k, v;
-    while (enif_map_iterator_get_pair(env, &iter, &k, &v)) {
-        ERL_NIF_TERM pair = enif_make_tuple2(env, k, v);
-        acc = enif_make_list_cell(env, pair, acc);
-        enif_map_iterator_next(env, &iter);
-    }
-    enif_map_iterator_destroy(env, &iter);
-    *list_out = acc;
-    return 1;
 }
 
 static ErlNifFunc nif_funcs[] = {

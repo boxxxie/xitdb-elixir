@@ -2853,9 +2853,14 @@ defimpl Enumerable, for: Xitdb.Cursor do
        )
        when tag in [:hash_map, :counted_hash_map, :sorted_map] do
     k = Cursor.unwrap_nif_value(db_ref, raw_k, moment, [])
-    child_steps = if tx_mode and is_binary(k), do: [{tag, k} | path_steps], else: []
-    unwrapped = Cursor.unwrap_nif_value(db_ref, raw_val, moment, child_steps)
-    {k, if(tx_mode, do: Cursor.inherit_staged(unwrapped, parent), else: unwrapped)}
+
+    if tx_mode and is_binary(k) do
+      child_steps = [{tag, k} | path_steps]
+      unwrapped = Cursor.unwrap_nif_value(db_ref, raw_val, moment, child_steps)
+      {k, Cursor.inherit_staged(unwrapped, parent)}
+    else
+      {k, Cursor.unwrap_nif_value(db_ref, raw_val, moment, [])}
+    end
   end
 
   defp unwrap_entry(

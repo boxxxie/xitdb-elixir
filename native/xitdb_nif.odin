@@ -59,7 +59,7 @@ foreign _ {
 	nif_map_iter_create :: proc(env: ErlNifEnv, map_term: ERL_NIF_TERM, out: ^Nif_Map_Iter) -> c.int ---
 	nif_map_iter_get_and_next :: proc(env: ErlNifEnv, it: ^Nif_Map_Iter, key_out: ^ERL_NIF_TERM, val_out: ^ERL_NIF_TERM) -> c.int ---
 	nif_map_iter_destroy :: proc(env: ErlNifEnv, it: ^Nif_Map_Iter) ---
-	nif_can_be_pure_removal :: proc(env: ErlNifEnv, term: ERL_NIF_TERM, atom_nil: ERL_NIF_TERM, atom_struct: ERL_NIF_TERM) -> c.int ---
+	nif_can_be_pure_removal :: proc(env: ErlNifEnv, term: ERL_NIF_TERM, atom_nil: ERL_NIF_TERM, atom_struct: ERL_NIF_TERM, atom_xitdb_collection_mod: ERL_NIF_TERM) -> c.int ---
 	nif_unpack_step_list :: proc(env: ErlNifEnv, list_term: ERL_NIF_TERM, out_steps: [^]Nif_Raw_Step, max_steps: c.int, count_out: ^c.int) -> c.int ---
 
 	nif_make_atom_len :: proc(env: ErlNifEnv, name: [^]u8, length: c.size_t) -> ERL_NIF_TERM ---
@@ -76,7 +76,6 @@ foreign _ {
 	nif_make_map_from_arrays :: proc(env: ErlNifEnv, keys: [^]ERL_NIF_TERM, vals: [^]ERL_NIF_TERM, cnt: c.size_t, map_out: ^ERL_NIF_TERM) -> c.int ---
 	nif_make_new_map :: proc(env: ErlNifEnv) -> ERL_NIF_TERM ---
 	nif_make_map_put :: proc(env: ErlNifEnv, map_in: ERL_NIF_TERM, key: ERL_NIF_TERM, value: ERL_NIF_TERM, map_out: ^ERL_NIF_TERM) -> c.int ---
-	nif_map_to_kv_list :: proc(env: ErlNifEnv, map_term: ERL_NIF_TERM, list_out: ^ERL_NIF_TERM) -> c.int ---
 }
 
 Db_Handle :: struct {
@@ -387,12 +386,18 @@ slot_to_term :: proc(env: ErlNifEnv, db: ^xitdb.Database, slot: xitdb.Slot) -> (
 			val_size = validate_bytes_slot_bounds(db, slot) or_return
 		}
 		if slot.full {
-			stack_buf: [128]u8 = ---
-			obj, buf_err := xitdb.cursor_read_bytes_buf(cur, stack_buf[:])
-			if buf_err != nil {
-				if buf_err != xitdb.Xitdb_Error.Stream_Too_Long {
+			obj: xitdb.Bytes
+			if slot.tag == .Short_Bytes || val_size <= 128 {
+				stack_buf: [128]u8 = ---
+				buf_obj, buf_err := xitdb.cursor_read_bytes_buf(cur, stack_buf[:])
+				if buf_err == nil {
+					obj = buf_obj
+				} else if buf_err != xitdb.Xitdb_Error.Stream_Too_Long {
 					return ATOM_NIL, buf_err
+				} else {
+					obj = xitdb.cursor_read_bytes_object(cur, 0, context.temp_allocator) or_return
 				}
+			} else {
 				obj = xitdb.cursor_read_bytes_object(cur, 0, context.temp_allocator) or_return
 			}
 			if len(obj.format_tag) == 2 && obj.format_tag[0] == 'b' && obj.format_tag[1] == 'l' {
@@ -2070,6 +2075,14 @@ decode_tagged_step_term :: proc(
 	if kind, ok_i := map_tag_term_to_idx_step_kind(kind_term); ok_i {
 		idx: i64 = 0
 		if nif_get_int64(env, val_term, &idx) == 0 {
+			if kind == .Linked_List_Idx && nif_is_list(env, val_term) != 0 {
+				inner_h, inner_t: ERL_NIF_TERM
+				if nif_get_list_cell(env, val_term, &inner_h, &inner_t) != 0 &&
+				   nif_is_empty_list(env, inner_t) != 0 &&
+				   nif_get_int64(env, inner_h, &idx) != 0 {
+					return xitdb.Path_Step{kind = kind, index = idx}, ""
+				}
+			}
 			return {}, "invalid_selector"
 		}
 		return xitdb.Path_Step{kind = kind, index = idx}, ""
@@ -2501,19 +2514,26 @@ is_valid_kv_container :: proc(env: ErlNifEnv, data_term: ERL_NIF_TERM) -> bool {
 	return false
 }
 
-is_valid_set_container :: proc(env: ErlNifEnv, data_term: ERL_NIF_TERM) -> bool {
+unwrap_set_source :: proc(env: ErlNifEnv, data_term: ERL_NIF_TERM) -> (src: ERL_NIF_TERM, is_map: bool, ok: bool) {
 	if nif_is_list(env, data_term) != 0 {
-		return true
+		return data_term, false, true
 	}
 	if nif_is_map(env, data_term) != 0 {
 		struct_term, ms_map, st_inner: ERL_NIF_TERM
-		return nif_get_map_value(env, data_term, ATOM_STRUCT, &struct_term) != 0 &&
-			struct_term == ATOM_MAPSET_MOD &&
-			nif_get_map_value(env, data_term, ATOM_MAP, &ms_map) != 0 &&
-			nif_is_map(env, ms_map) != 0 &&
-			nif_get_map_value(env, ms_map, ATOM_STRUCT, &st_inner) == 0
+		if nif_get_map_value(env, data_term, ATOM_STRUCT, &struct_term) != 0 &&
+		   struct_term == ATOM_MAPSET_MOD &&
+		   nif_get_map_value(env, data_term, ATOM_MAP, &ms_map) != 0 &&
+		   nif_is_map(env, ms_map) != 0 &&
+		   nif_get_map_value(env, ms_map, ATOM_STRUCT, &st_inner) == 0 {
+			return ms_map, true, true
+		}
 	}
-	return false
+	return 0, false, false
+}
+
+is_valid_set_container :: proc(env: ErlNifEnv, data_term: ERL_NIF_TERM) -> bool {
+	_, _, ok := unwrap_set_source(env, data_term)
+	return ok
 }
 
 write_hash_map_entries :: proc(
@@ -2638,26 +2658,17 @@ write_sorted_map_entries :: proc(
 	return nil
 }
 
-write_hash_set_entries :: proc(
+write_hash_set_source :: proc(
 	env: ErlNifEnv,
 	hs: ^xitdb.Write_Hash_Set,
-	data_term: ERL_NIF_TERM,
+	src: ERL_NIF_TERM,
+	is_map: bool,
 	validation_err: ^string,
 	err_reason: string,
 ) -> xitdb.Error {
-	if nif_is_map(env, data_term) != 0 {
-		struct_term: ERL_NIF_TERM
-		if nif_get_map_value(env, data_term, ATOM_STRUCT, &struct_term) == 0 || struct_term != ATOM_MAPSET_MOD {
-			return fail_validation(validation_err, err_reason)
-		}
-		ms_map, ms_st: ERL_NIF_TERM
-		if nif_get_map_value(env, data_term, ATOM_MAP, &ms_map) == 0 ||
-		   nif_is_map(env, ms_map) == 0 ||
-		   nif_get_map_value(env, ms_map, ATOM_STRUCT, &ms_st) != 0 {
-			return fail_validation(validation_err, err_reason)
-		}
+	if is_map {
 		it: Nif_Map_Iter = ---
-		if nif_map_iter_create(env, ms_map, &it) == 0 {
+		if nif_map_iter_create(env, src, &it) == 0 {
 			return fail_validation(validation_err, err_reason)
 		}
 		defer nif_map_iter_destroy(env, &it)
@@ -2671,11 +2682,8 @@ write_hash_set_entries :: proc(
 		}
 		return nil
 	}
-	if nif_is_list(env, data_term) == 0 {
-		return fail_validation(validation_err, err_reason)
-	}
 	head: ERL_NIF_TERM
-	tail := data_term
+	tail := src
 	for nif_is_empty_list(env, tail) == 0 {
 		if nif_get_list_cell(env, tail, &head, &tail) == 0 {
 			return fail_validation(validation_err, err_reason)
@@ -2689,26 +2697,17 @@ write_hash_set_entries :: proc(
 	return nil
 }
 
-write_sorted_set_entries :: proc(
+write_sorted_set_source :: proc(
 	env: ErlNifEnv,
 	ss: ^xitdb.Write_Sorted_Set,
-	data_term: ERL_NIF_TERM,
+	src: ERL_NIF_TERM,
+	is_map: bool,
 	validation_err: ^string,
 	err_reason: string,
 ) -> xitdb.Error {
-	if nif_is_map(env, data_term) != 0 {
-		struct_term: ERL_NIF_TERM
-		if nif_get_map_value(env, data_term, ATOM_STRUCT, &struct_term) == 0 || struct_term != ATOM_MAPSET_MOD {
-			return fail_validation(validation_err, err_reason)
-		}
-		ms_map, ms_st: ERL_NIF_TERM
-		if nif_get_map_value(env, data_term, ATOM_MAP, &ms_map) == 0 ||
-		   nif_is_map(env, ms_map) == 0 ||
-		   nif_get_map_value(env, ms_map, ATOM_STRUCT, &ms_st) != 0 {
-			return fail_validation(validation_err, err_reason)
-		}
+	if is_map {
 		it: Nif_Map_Iter = ---
-		if nif_map_iter_create(env, ms_map, &it) == 0 {
+		if nif_map_iter_create(env, src, &it) == 0 {
 			return fail_validation(validation_err, err_reason)
 		}
 		defer nif_map_iter_destroy(env, &it)
@@ -2722,11 +2721,8 @@ write_sorted_set_entries :: proc(
 		}
 		return nil
 	}
-	if nif_is_list(env, data_term) == 0 {
-		return fail_validation(validation_err, err_reason)
-	}
 	head: ERL_NIF_TERM
-	tail := data_term
+	tail := src
 	for nif_is_empty_list(env, tail) == 0 {
 		if nif_get_list_cell(env, tail, &head, &tail) == 0 {
 			return fail_validation(validation_err, err_reason)
@@ -2810,23 +2806,26 @@ write_collection_term_to_cursor :: proc(
 		}
 		return nil
 	case "hash_set":
-		if !is_valid_set_container(env, data_term) {
+		src, is_map, ok_set := unwrap_set_source(env, data_term)
+		if !ok_set {
 			return fail_validation(validation_err, err_reason)
 		}
 		hs := xitdb.write_hash_set_init(cur^) or_return
-		return write_hash_set_entries(env, &hs, data_term, validation_err, err_reason)
+		return write_hash_set_source(env, &hs, src, is_map, validation_err, err_reason)
 	case "counted_hash_set":
-		if !is_valid_set_container(env, data_term) {
+		src, is_map, ok_set := unwrap_set_source(env, data_term)
+		if !ok_set {
 			return fail_validation(validation_err, err_reason)
 		}
 		cs := xitdb.write_counted_hash_set_init(cur^) or_return
-		return write_hash_set_entries(env, &cs.write_hash_set, data_term, validation_err, err_reason)
+		return write_hash_set_source(env, &cs.write_hash_set, src, is_map, validation_err, err_reason)
 	case "sorted_set":
-		if !is_valid_set_container(env, data_term) {
+		src, is_map, ok_set := unwrap_set_source(env, data_term)
+		if !ok_set {
 			return fail_validation(validation_err, err_reason)
 		}
 		ss := xitdb.write_sorted_set_init(cur^) or_return
-		return write_sorted_set_entries(env, &ss, data_term, validation_err, err_reason)
+		return write_sorted_set_source(env, &ss, src, is_map, validation_err, err_reason)
 	}
 	return fail_validation(validation_err, err_reason)
 }
@@ -3079,11 +3078,11 @@ is_pure_removal_term :: proc(env: ErlNifEnv, term: ERL_NIF_TERM, validation_err:
 	if term == ATOM_NIL {
 		return true, nil
 	}
-	if depth >= MAX_WRITE_DEPTH {
-		return false, fail_validation(validation_err, "invalid_put_op")
-	}
 	if nif_is_map(env, term) == 0 {
 		return false, nil
+	}
+	if depth >= MAX_WRITE_DEPTH {
+		return false, fail_validation(validation_err, "invalid_put_op")
 	}
 	struct_term: ERL_NIF_TERM
 	if nif_get_map_value(env, term, ATOM_STRUCT, &struct_term) != 0 {
@@ -3396,7 +3395,7 @@ merge_kv_entry_hm :: proc(
 		return xitdb.hash_map_put(hm, k_str, wdata)
 	}
 
-	if !reset && nif_can_be_pure_removal(ms.env, val_term, ATOM_NIL, ATOM_STRUCT) != 0 {
+	if !reset && nif_can_be_pure_removal(ms.env, val_term, ATOM_NIL, ATOM_STRUCT, ATOM_XITDB_COLLECTION_MOD) != 0 {
 		exists := hm_has_key(hm, k_str) or_return
 		if !exists {
 			is_rem := is_pure_removal_term(ms.env, val_term, ms.validation_err, depth + 1) or_return
@@ -3495,7 +3494,7 @@ merge_kv_entry_sm :: proc(
 		return xitdb.sorted_map_put(sm, k_str, wdata)
 	}
 
-	if !reset && nif_can_be_pure_removal(ms.env, val_term, ATOM_NIL, ATOM_STRUCT) != 0 {
+	if !reset && nif_can_be_pure_removal(ms.env, val_term, ATOM_NIL, ATOM_STRUCT, ATOM_XITDB_COLLECTION_MOD) != 0 {
 		exists := sm_has_key(sm, k_str) or_return
 		if !exists {
 			is_rem := is_pure_removal_term(ms.env, val_term, ms.validation_err, depth + 1) or_return
@@ -3781,16 +3780,7 @@ merge_node_into_cursor :: proc(
 		if map_sz == 0 {
 			return nil
 		}
-		it: Nif_Map_Iter = ---
-		if nif_map_iter_create(ms.env, term, &it) == 0 {
-			return fail_validation(ms.validation_err, "invalid_put_op")
-		}
-		defer nif_map_iter_destroy(ms.env, &it)
-		k, v: ERL_NIF_TERM
-		for nif_map_iter_get_and_next(ms.env, &it, &k, &v) != 0 {
-			merge_kv_entry_hm(ms, &hm, k, v, eff_reset, depth, src_key, rec_key) or_return
-		}
-		return nil
+		return merge_map_entries_hm(ms, &hm, term, eff_reset, depth, src_key, rec_key)
 	}
 	return fail_validation(ms.validation_err, "invalid_put_op")
 }
@@ -3977,7 +3967,7 @@ record_term_pending_tags :: proc(
 	pending_tags: ^map[string]xitdb.Tag,
 	depth: int = 0,
 ) {
-	if depth > 64 {
+	if depth >= MAX_WRITE_DEPTH {
 		return
 	}
 	arity: c.int = 0
@@ -4463,18 +4453,13 @@ rollback_failed_tx :: proc(
 }
 
 validate_set_elements_cold :: proc(env: ErlNifEnv, data_term: ERL_NIF_TERM) -> bool {
-	if nif_is_map(env, data_term) != 0 {
-		struct_term, ms_map, ms_st: ERL_NIF_TERM
-		if nif_get_map_value(env, data_term, ATOM_STRUCT, &struct_term) == 0 || struct_term != ATOM_MAPSET_MOD {
-			return false
-		}
-		if nif_get_map_value(env, data_term, ATOM_MAP, &ms_map) == 0 ||
-		   nif_is_map(env, ms_map) == 0 ||
-		   nif_get_map_value(env, ms_map, ATOM_STRUCT, &ms_st) != 0 {
-			return false
-		}
+	src, is_map, ok_set := unwrap_set_source(env, data_term)
+	if !ok_set {
+		return false
+	}
+	if is_map {
 		it: Nif_Map_Iter = ---
-		if nif_map_iter_create(env, ms_map, &it) == 0 {
+		if nif_map_iter_create(env, src, &it) == 0 {
 			return false
 		}
 		defer nif_map_iter_destroy(env, &it)
@@ -4486,11 +4471,8 @@ validate_set_elements_cold :: proc(env: ErlNifEnv, data_term: ERL_NIF_TERM) -> b
 		}
 		return true
 	}
-	if nif_is_list(env, data_term) == 0 {
-		return false
-	}
 	head: ERL_NIF_TERM
-	tail := data_term
+	tail := src
 	for nif_is_empty_list(env, tail) == 0 {
 		if nif_get_list_cell(env, tail, &head, &tail) == 0 {
 			return false
@@ -8173,7 +8155,7 @@ decode_container_entries_term :: proc(
 		case .Sorted_Map, .Sorted_Set:
 			seek_offset := offset
 			if skip_tx && slot.tag == .Sorted_Map && offset > 0 {
-				has_tx, tx_rank, _ := sorted_map_tx_rank(cur)
+				has_tx, tx_rank := sorted_map_tx_rank(cur) or_return
 				if has_tx && offset >= tx_rank {
 					seek_offset = offset + 1
 				}
@@ -8314,7 +8296,7 @@ decode_child_container_entries_term :: proc(
 			break
 		}
 		if emitted >= max_entries {
-			return ATOM_NIL, 0, true, nil
+			return ATOM_NIL, emitted, true, nil
 		}
 
 		if is_map {
@@ -8489,8 +8471,8 @@ odin_nif_sorted_map_seek :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_
 				if c_err != nil {
 					return make_xitdb_err(env, c_err)
 				}
+				total_fused += child_cnt
 				if !exceeded {
-					total_fused += child_cnt
 					entry_term = nif_make_tuple2(env, make_binary(env, k_str), children_term)
 					fused = true
 				}

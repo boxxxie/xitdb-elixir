@@ -36,8 +36,15 @@ defmodule Xitdb.NIF do
   def nif_query_datalog(_db_ref, _moment_idx, _query_str), do: :erlang.nif_error(:nif_not_loaded)
   def nif_compact(_db_ref, _target_path), do: :erlang.nif_error(:nif_not_loaded)
 
+  @typedoc """
+  Entry shape returned by `nif_sorted_map_seek/5,6,7`:
+  - `{key_bin, tag_id, slot_val}` for lazy container slots (and oversized/overflow fallback when `decode_children = true`)
+  - `{key_bin, children_list}` for fused container entries when `decode_children = true`
+  - `{key_bin, scalar_val}` for scalar values
+  """
   @type seek_entry ::
           {binary(), non_neg_integer(), integer()}
+          | {binary(), list()}
           | {binary(), term()}
 
   @doc """
@@ -49,8 +56,11 @@ defmodule Xitdb.NIF do
     container values are returned as compact 3-tuples `{key_bin, tag_id, slot_val}` for lazy
     cursor construction, while scalar values are returned as 2-tuples `{key_bin, scalar_val}`.
   - `nif_sorted_map_seek/7` with `decode_children = true`:
-    container values are eagerly decoded into lists in the same NIF call and returned as
-    2-tuples `{key_bin, children_list}` alongside scalar 2-tuples `{key_bin, scalar_val}`.
+    container values within budget (`MAX_FUSED_CHILD_ENTRIES = 256` per child and
+    `MAX_FUSED_TOTAL_ENTRIES = 1024` across the call) are eagerly decoded into lists in the same
+    NIF call and returned as 2-tuples `{key_bin, children_list}` alongside scalar 2-tuples
+    `{key_bin, scalar_val}`. Any container exceeding either budget falls back to a compact
+    3-tuple `{key_bin, tag_id, slot_val}`, so callers must handle both 2-tuples and 3-tuples.
   """
   @spec nif_sorted_map_seek(
           reference(),
