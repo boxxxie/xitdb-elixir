@@ -14,7 +14,7 @@
 - [x] **1.1** Avoid eager intermediate NIF reads in `tx_mode: true` `Access.get_and_update/3`
   - Inspect how `Kernel.put_in/3`, `Kernel.update_in/3`, `Kernel.get_and_update_in/3`, and `Kernel.pop_in/2` invoke `Xitdb.Cursor.get_and_update/3` and `pop/2` in `lib/xitdb/cursor.ex`
   - Advance a virtual write cursor (`path_steps` accumulated without `nif_slot_get_key`/`nif_slot_get_index`) in `tx_mode: true`, lazily resolving the real slot only when a read operation (`fetch`, `materialize`, `Enum`, scalar read) actually inspects it
-  - Ensure `TxCompiler` (`lib/xitdb/tx_compiler.ex`) compiles staged operations identically for virtual and resolved cursors
+  - Ensure `Xitdb.Cursor` staged op emission and `odin_nif_transact` / `adapt_steps_for_base_moment` (`native/xitdb_nif.odin`) compile and apply staged operations identically for virtual and resolved cursors
 
 ---
 

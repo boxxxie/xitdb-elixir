@@ -7,7 +7,7 @@
 > - **Target Repository:** `elixir/xitdb`
 > - **Submodule Boundary:** `native/xitdb-odin` stays 100% untouched (zero API or wire divergence)
 > - **Primary Files:** `native/xitdb_nif.odin`, `lib/xitdb.ex`, `lib/xitdb/dsl/path_compiler.ex`, `lib/xitdb/selector.ex`, `test/features/macro_dsl_spec.exs`, `test/xitdb/dsl/path_compiler_test.exs`, `test/xitdb/selector_test.exs`, `benchmarks/README.md`, `benchmarks/slices/02_access_single_call_selector_select_users_id_name.md`, `benchmarks/slices/28_dsl_pre_tokenized_path_steps_select_path_steps_users_id_name.md`
-> - **Done When:** Duplicate head `enif_get_list_cell` decoding is eliminated in `decode_selector_term_buf`, dynamic bracket steps avoid unnecessary runtime normalization overhead, `do_select/3` fast-paths flat scalar returns without invoking `Cursor.unwrap_nif_value/4`, `select/2` on resolved snapshot cursors reuses the cached root slot when appropriate, `odin check` + `mix precommit` pass with zero warnings, and benchmarks `#2` & `#28` are refreshed.
+> - **Done When:** Duplicate head `enif_get_list_cell` decoding is eliminated in `decode_selector_term_buf`, dynamic bracket steps avoid unnecessary runtime normalization overhead, `do_select/3` fast-paths flat scalar returns without invoking `Cursor.unwrap_nif_value/4`, `odin check` + `mix precommit` pass with zero warnings, and benchmarks `#2` & `#28` are refreshed.
 
 ---
 

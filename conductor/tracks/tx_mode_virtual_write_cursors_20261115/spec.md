@@ -6,7 +6,7 @@
 > - **Type:** Chore / Performance Optimization
 > - **Target Repository:** `elixir/xitdb`
 > - **Submodule Boundary:** `native/xitdb-odin` stays 100% untouched (zero API or wire divergence)
-> - **Primary Files:** `lib/xitdb/cursor.ex`, `lib/xitdb/tx_compiler.ex`, `test/features/lazy_access_navigation_spec.exs`, `test/features/transactions_and_time_travel_spec.exs`, `test/xitdb/cursor_refactor_test.exs`, `benchmarks/README.md`, `benchmarks/slices/14_tx_incremental_put_in_nested_attribute_commit.md`
+> - **Primary Files:** `lib/xitdb/cursor.ex`, `native/xitdb_nif.odin`, `test/features/lazy_access_navigation_spec.exs`, `test/features/transactions_and_time_travel_spec.exs`, `test/xitdb/cursor_refactor_test.exs`, `benchmarks/README.md`, `benchmarks/slices/14_tx_incremental_put_in_nested_attribute_commit.md`
 > - **Done When:** `Access.get_and_update/3` on `tx_mode: true` `%Xitdb.Cursor{}` avoids eager `nif_slot_get_key` / `nif_slot_get_index` reads along intermediate write hops (lazily materializing only when a callback inspects the old value, e.g. `update_in/3` or `get_and_update_in/3`), `put_in/3` and `pop_in/2` preserve 100% identical semantics on existing and new nested paths, `mix precommit` passes with zero warnings, and benchmark `#14` + slices are updated.
 
 ---
@@ -35,7 +35,7 @@ Eliminating those unnecessary intermediate NIF read crossings cuts `~3–4 µs` 
 ## 3. Functional Requirements
 
 - Analyze `Xitdb.Cursor.get_and_update/3` and `Kernel.put_in/3` interaction in `lib/xitdb/cursor.ex`: classify access callbacks (`classify_access_fun/1` -> `:blind_write | :traverse | :needs_current`) and advance virtual write cursors via `virtual_staged_cursor/4` (`value: -2`, accumulating `path_steps`), lazily resolving via `try_resolve/1` (`nif_select`) in `invoke_virtual_or_fallback/5` only if inspected (`Access.fetch/2`, `Enumerable`, `materialize/1`, or user read inside `update_in/3`).
-- Ensure staged writes on virtual cursors feed `lib/xitdb/tx_compiler.ex` cleanly with zero extra heap or map copying.
+- Ensure staged writes on virtual cursors feed `odin_nif_transact` / `adapt_steps_for_base_moment` (`native/xitdb_nif.odin`) cleanly with zero extra heap or map copying.
 - Add comprehensive tests covering `put_in/3` (existing keys, missing intermediate keys, integer array indices, nested lists/maps), `update_in/3` (nil/existing/nested), `get_and_update_in/3`, and `pop_in/2` inside `Xitdb.transact/3` (`test/features/lazy_access_navigation_spec.exs`, `test/features/transactions_and_time_travel_spec.exs`, `test/xitdb/cursor_refactor_test.exs`).
 
 ---

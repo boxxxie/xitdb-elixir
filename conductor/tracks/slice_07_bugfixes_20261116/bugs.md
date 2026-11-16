@@ -101,9 +101,9 @@ severities:
 - **Symbols:** `Search.Storage.stream_prefix_from/4`, `Search.Storage.scan_prefix/5`, `Indexer.Storage.stream_btree_from_key/2`, `decode_child_container_entries_term`
 - **Verify With:** `rg -n 'nif_sorted_map_seek|stream_prefix_from' lib/xitdb/ash/ native/xitdb_nif.odin`
 
-**Explanation:** Both `btree_seek_*` tracks state that `Search.Storage.stream_prefix_from/4` uses `nif_sorted_map_seek` and flat 3-tuples (in reality only `scan_prefix/5` uses fused `nif_sorted_map_seek/7`, while `stream_prefix_from/4` is the `:elixir` fallback via `nif_slot_entries`). They also claim `Indexer.Storage.stream_btree_from_key/2` uses fused 7-arity `nif_sorted_map_seek` returning materialized `[String.t()]` lists—which Slice 02 (`de134a7`) reverted back to lazy 6-arity `nif_sorted_map_seek` + `Cursor.from_compact_slot/4`—and cite nonexistent Odin proc `read_slot_entries_term` instead of `decode_child_container_entries_term`.
+**Explanation:** Both `btree_seek_*` tracks state that `Search.Storage.stream_prefix_from/4` uses `nif_sorted_map_seek` and flat 3-tuples (in reality only `scan_prefix/5` uses fused `nif_sorted_map_seek/7`, while `stream_prefix_from/4` is the `:elixir` fallback via `nif_slot_entries`). They also claim `Indexer.Storage.stream_btree_from_key/2` uses fused 7-arity `nif_sorted_map_seek` returning materialized `[String.t()]` lists—which Slice 02 (`de134a7`) reverted back to lazy 7-arity `nif_sorted_map_seek` `(false, false)` + `Cursor.from_compact_slot/4`—and cite nonexistent Odin proc `read_slot_entries_term` instead of `decode_child_container_entries_term`.
 
-**Fix Hint:** Align `Search.Storage.scan_prefix/5` vs `stream_prefix_from/4`, document Slice 02 `de134a7`'s lazy 6-arity `Indexer.Storage.stream_btree_from_key/2`, and rename `read_slot_entries_term` to `decode_child_container_entries_term` / `decode_container_entries_term`.
+**Fix Hint:** Align `Search.Storage.scan_prefix/5` vs `stream_prefix_from/4`, document Slice 02 `de134a7`'s lazy 7-arity `(false, false)` `Indexer.Storage.stream_btree_from_key/2`, and rename `read_slot_entries_term` to `decode_child_container_entries_term` / `decode_container_entries_term`.
 
 ---
 
