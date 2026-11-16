@@ -1,0 +1,8 @@
+{
+  "track_id": "slice_01_bugfixes_20261116",
+  "type": "bugfix",
+  "status": "completed",
+  "created_at": "2026-11-16T04:20:00Z",
+  "updated_at": "2026-11-16T05:45:00Z",
+  "description": "Slice 01 Bugfixes: Virtual Tx Cursors, Adaptive Enumerable & Rollback (BUG-01-01..BUG-01-10)"
+}

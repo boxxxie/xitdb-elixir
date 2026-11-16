@@ -68,3 +68,38 @@ All completed tracks from **Waves 0–5** (Tracks 1–17, including split tracks
 
 - [x] **Track: Automated Host-Load, Canary & Skew Contention Guardrails in `compare_1v1.py`**
 *Link: [./tracks/bench_contention_and_canary_guardrails_20261115/](./tracks/bench_contention_and_canary_guardrails_20261115/)*
+
+---
+
+- [x] **Track: Slice 01 Bugfixes: Virtual Tx Cursors, Adaptive Enumerable & Rollback (BUG-01-01..BUG-01-10)**
+*Link: [./tracks/slice_01_bugfixes_20261116/](./tracks/slice_01_bugfixes_20261116/)*
+
+---
+
+- [x] **Track: Slice 02 Bugfixes: Compact 3-Tuple Cursors & Fused B+Tree Seek (BUG-02-01..BUG-02-07)**
+*Link: [./tracks/slice_02_bugfixes_20261116/](./tracks/slice_02_bugfixes_20261116/)*
+
+---
+
+- [x] **Track: Slice 03 Bugfixes: Batch C path_steps Unpacking & Inline Select (BUG-03-01..BUG-03-07)**
+*Link: [./tracks/slice_03_bugfixes_20261116/](./tracks/slice_03_bugfixes_20261116/)*
+
+---
+
+- [x] **Track: Slice 04 Bugfixes: Single-Pass Tx Writers & Atomic Rollback (BUG-04-01..BUG-04-04)**
+*Link: [./tracks/slice_04_bugfixes_20261116/](./tracks/slice_04_bugfixes_20261116/)*
+
+---
+
+- [x] **Track: Slice 05 Bugfixes: Benchmarks #27/#28 & Contention Guardrails (BUG-05-01..BUG-05-07)**
+*Link: [./tracks/slice_05_bugfixes_20261116/](./tracks/slice_05_bugfixes_20261116/)*
+
+---
+
+- [x] **Track: Slice 06 Bugfixes: Docs & Clean 1v1 Benchmark Baseline (BUG-06-01..BUG-06-07)**
+*Link: [./tracks/slice_06_bugfixes_20261116/](./tracks/slice_06_bugfixes_20261116/)*
+
+---
+
+- [x] **Track: Slice 07 Bugfixes: Conductor Track Schema & Spec Alignment (BUG-07-01..BUG-07-08)**
+*Link: [./tracks/slice_07_bugfixes_20261116/](./tracks/slice_07_bugfixes_20261116/)*
