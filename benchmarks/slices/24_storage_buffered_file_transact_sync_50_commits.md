@@ -2,19 +2,19 @@
 
 [← Back to Benchmarks Overview](../README.md) · [All Slices](README.md)
 
-**Group:** `queries` — #21–#26 (Pull Projections, Datalog Engine, Buffered Sync & Search)
+**Group:** `queries` — #21–#27 (Pull Projections, Datalog Engine, Buffered Sync, Search & Indexer)
 
 ## Latest 1v1 Metrics
 
 | Metric | Elixir NIF Wrapper | Raw Odin Baseline | Comparison |
 | :--- | ---: | ---: | ---: |
-| **Median (`ns/op`)** | 58.23 µs (58235.0 ns) | 52.53 µs (52527.0 ns) | **`1.11x`** NIF Ratio |
-| **Mean ± σ (CV)** | 58.31 µs ± 363.1 ns (0.6%) | 55.93 µs ± 6.49 µs (11.6%) | Welch `z` = `0.82` |
-| **p95 / Max (`ns/op`)** | 58.72 µs / 58.74 µs | 64.88 µs / 67.00 µs | `5` vs `5` pooled samples |
+| **Median (`ns/op`)** | 63.54 µs (63542.0 ns) | 51.30 µs (51301.0 ns) | **`1.24x`** NIF Ratio |
+| **Mean ± σ (CV)** | 64.31 µs ± 3.27 µs (5.1%) | 51.30 µs ± 129.3 ns (0.3%) | Welch `z` = `8.88` |
+| **p95 / Max (`ns/op`)** | 68.55 µs / 69.37 µs | 51.43 µs / 51.44 µs | `5` vs `5` pooled samples |
 
 ## Benchmark Harnesses (Elixir vs. Raw Odin)
 
-### Elixir Harness ([`bench_elixir.exs#L449-L465`](../bench_elixir.exs#L449-L465))
+### Elixir Harness ([`bench_elixir.exs#L470-L486`](../bench_elixir.exs#L470-L486))
 
 ```elixir
       {24, "Storage: Buffered_File transact + sync (50 commits)", 50,
@@ -36,7 +36,7 @@
        end},
 ```
 
-### Raw Odin Harness ([`bench_client.odin#L1277-L1296`](../bench_client.odin#L1277-L1296))
+### Raw Odin Harness ([`bench_client.odin#L1359-L1378`](../bench_client.odin#L1359-L1378))
 
 ```odin
 	// #24: Storage: Buffered_File transact + sync (50 commits)
@@ -64,7 +64,7 @@
 ## Elixir Wrapper & NIF Bridge
 
 <details>
-<summary>Elixir <code>open</code> — <a href="../../lib/xitdb.ex#L170-L192">lib/xitdb.ex#L170-L192</a></summary>
+<summary>Elixir <code>open</code> — <a href="../../lib/xitdb.ex#L170-L188">lib/xitdb.ex#L170-L188</a></summary>
 
 ```elixir
   def open(opts \\ []) do
@@ -86,10 +86,6 @@
       end
     end
   end
-
-  @doc "Same as `open/1`, but raises `Xitdb.Error` on failure."
-  @spec open!(keyword()) :: t()
-  def open!(opts \\ []), do: opts |> open() |> Error.unwrap!()
 ```
 
 </details>
@@ -138,6 +134,15 @@
 </details>
 
 <details>
+<summary>Elixir <code>info!</code> — <a href="../../lib/xitdb.ex#L214-L214">lib/xitdb.ex#L214-L214</a></summary>
+
+```elixir
+  def info!(%__MODULE__{} = db), do: db |> info() |> Error.unwrap!()
+```
+
+</details>
+
+<details>
 <summary>Elixir <code>close</code> — <a href="../../lib/xitdb.ex#L196-L198">lib/xitdb.ex#L196-L198</a></summary>
 
 ```elixir
@@ -149,7 +154,7 @@
 </details>
 
 <details>
-<summary>NIF <code>odin_nif_open</code> — <a href="../../native/xitdb_nif.odin#L627-L702">native/xitdb_nif.odin#L627-L702</a></summary>
+<summary>NIF <code>odin_nif_open</code> — <a href="../../native/xitdb_nif.odin#L715-L790">native/xitdb_nif.odin#L715-L790</a></summary>
 
 ```odin
 odin_nif_open :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {
@@ -233,7 +238,7 @@ odin_nif_open :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -
 </details>
 
 <details>
-<summary>NIF <code>odin_nif_transact</code> — <a href="../../native/xitdb_nif.odin#L3744-L4042">native/xitdb_nif.odin#L3744-L4042</a></summary>
+<summary>NIF <code>odin_nif_transact</code> — <a href="../../native/xitdb_nif.odin#L4945-L5031">native/xitdb_nif.odin#L4945-L5031</a></summary>
 
 ```odin
 odin_nif_transact :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {
@@ -273,262 +278,50 @@ odin_nif_transact :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TER
 		xitdb.tx_doc(&tx, doc_str)
 	}
 
-	head: ERL_NIF_TERM
-	tail := argv[2]
-	for nif_is_empty_list(env, tail) == 0 {
-		if nif_get_list_cell(env, tail, &head, &tail) == 0 {
-			return make_err(env, "invalid_ops_list")
+	validation_err := ""
+	has_deferred := false
+	parse_reason, parse_xerr := parse_tx_ops(env, argv[2], &tx, &validation_err, &has_deferred)
+	if parse_reason != "" || parse_xerr != nil {
+		if has_deferred {
+			if deferred_err := validate_deferred_tx_ops(&tx); deferred_err != "" {
+				return make_err(env, deferred_err)
+			}
 		}
-		arity: c.int = 0
-		elems: [^]ERL_NIF_TERM = nil
-		if nif_get_tuple(env, head, &arity, &elems) == 0 || arity < 1 {
-			return make_err(env, "invalid_op_tuple")
+		if parse_reason != "" {
+			return make_err(env, parse_reason)
 		}
-
-		op_atom := elems[0]
-
-		switch op_atom {
-		case ATOM_PUT:
-			if arity != 3 {
-				return make_err(env, "invalid_put_op")
-			}
-			steps, s_err, ok_p := decode_steps_term(env, elems[1], tx.allocator)
-			if !ok_p {
-				return make_err(env, "invalid_put_op")
-			}
-			if s_err != "" {
-				return make_err(env, s_err)
-			}
-			if val, ok_v := decode_writeable_value(env, elems[2]); ok_v {
-				if len(steps) == 0 {
-					return make_xitdb_err(env, .Invalid_Range)
-				}
-				append(&tx.ops, xitdb.Tx_Op{kind = .Put, steps = steps, val = val})
-			} else if validate_write_term(env, elems[2]) {
-				if len(steps) == 0 {
-					return make_xitdb_err(env, .Invalid_Range)
-				}
-				sc := new(Structured_Op_Ctx, tx.allocator)
-				sc^ = Structured_Op_Ctx{kind = .Put, steps = steps, env = env, term = elems[2]}
-				xitdb.tx_with_cursor(&tx, structured_op_callback, sc)
-			} else {
-				return make_err(env, "invalid_put_op")
-			}
-
-		case ATOM_APPEND:
-			if arity != 3 {
-				return make_err(env, "invalid_append_op")
-			}
-			steps, s_err, ok_p := decode_steps_term(env, elems[1], tx.allocator)
-			if !ok_p {
-				return make_err(env, "invalid_append_op")
-			}
-			if s_err != "" {
-				return make_err(env, s_err)
-			}
-			if len(steps) == 0 {
-				return make_err(env, "invalid_append_op")
-			}
-			if val, ok_v := decode_writeable_value(env, elems[2]); ok_v {
-				append(&tx.ops, xitdb.Tx_Op{kind = .Append, steps = steps, val = val})
-			} else if validate_write_term(env, elems[2]) {
-				sc := new(Structured_Op_Ctx, tx.allocator)
-				sc^ = Structured_Op_Ctx{kind = .Append, steps = steps, env = env, term = elems[2]}
-				xitdb.tx_with_cursor(&tx, structured_op_callback, sc)
-			} else {
-				return make_err(env, "invalid_append_op")
-			}
-
-		case ATOM_INSERT:
-			if arity != 4 {
-				return make_err(env, "invalid_insert_op")
-			}
-			idx_val: i64 = 0
-			ok_i := nif_get_int64(env, elems[2], &idx_val) != 0
-			steps, s_err, ok_p := decode_steps_term(env, elems[1], tx.allocator)
-			if !ok_p || !ok_i {
-				return make_err(env, "invalid_insert_op")
-			}
-			if s_err != "" {
-				return make_err(env, s_err)
-			}
-			if len(steps) == 0 {
-				return make_err(env, "invalid_insert_op")
-			}
-			if val, ok_v := decode_writeable_value(env, elems[3]); ok_v {
-				append(&tx.ops, xitdb.Tx_Op{kind = .Insert, steps = steps, offset = idx_val, val = val})
-			} else if validate_write_term(env, elems[3]) {
-				sc := new(Structured_Op_Ctx, tx.allocator)
-				sc^ = Structured_Op_Ctx{kind = .Insert, steps = steps, index = idx_val, env = env, term = elems[3]}
-				xitdb.tx_with_cursor(&tx, structured_op_callback, sc)
-			} else {
-				return make_err(env, "invalid_insert_op")
-			}
-
-		case ATOM_RM:
-			if arity != 2 {
-				return make_err(env, "invalid_rm_op")
-			}
-			steps, s_err, ok_p := decode_steps_term(env, elems[1], tx.allocator)
-			if !ok_p {
-				return make_err(env, "invalid_rm_op")
-			}
-			if s_err != "" {
-				return make_err(env, s_err)
-			}
-			append(&tx.ops, xitdb.Tx_Op{kind = .Remove, steps = steps})
-
-		case ATOM_RM_IF_EXISTS:
-			if arity != 2 {
-				return make_err(env, "invalid_rm_op")
-			}
-			steps, s_err, ok_p := decode_steps_term(env, elems[1], tx.allocator)
-			if !ok_p {
-				return make_err(env, "invalid_rm_op")
-			}
-			if s_err != "" {
-				return make_err(env, s_err)
-			}
-			rc := new(Rm_If_Exists_Ctx, tx.allocator)
-			rc^ = Rm_If_Exists_Ctx{steps = steps, tx = &tx}
-			xitdb.tx_with_cursor(&tx, rm_if_exists_callback, rc)
-
-		case ATOM_SLICE:
-			if arity != 4 {
-				return make_err(env, "invalid_slice_op")
-			}
-			offset_val: i64 = 0
-			size_val: i64 = 0
-			ok_o := nif_get_int64(env, elems[2], &offset_val) != 0
-			ok_s := nif_get_int64(env, elems[3], &size_val) != 0
-			steps, s_err, ok_p := decode_steps_term(env, elems[1], tx.allocator)
-			if !ok_p || !ok_o || !ok_s {
-				return make_err(env, "invalid_slice_op")
-			}
-			if offset_val < 0 || size_val < 0 {
-				return make_xitdb_err(env, .Invalid_Range)
-			}
-			if s_err != "" {
-				return make_err(env, s_err)
-			}
-			if len(steps) == 0 {
-				return make_xitdb_err(env, .Invalid_Range)
-			}
-			sc := new(Slice_Op_Ctx, tx.allocator)
-			sc^ = Slice_Op_Ctx{steps = steps, offset = offset_val, size = size_val}
-			xitdb.tx_with_cursor(&tx, slice_op_callback, sc)
-
-		case ATOM_FORK:
-			if arity != 3 {
-				return make_err(env, "invalid_fork_op")
-			}
-			from_steps, f_err, ok_f := decode_steps_term(env, elems[1], tx.allocator)
-			to_steps, t_err, ok_t := decode_steps_term(env, elems[2], tx.allocator)
-			if !ok_f || !ok_t {
-				return make_err(env, "invalid_fork_op")
-			}
-			if f_err != "" {
-				return make_err(env, f_err)
-			}
-			if t_err != "" {
-				return make_err(env, t_err)
-			}
-			if len(from_steps) == 0 || len(to_steps) == 0 {
-				return make_xitdb_err(env, .Invalid_Range)
-			}
-			append(&tx.ops, xitdb.Tx_Op{kind = .Fork, from_steps = from_steps, steps = to_steps})
-			if nif_is_empty_list(env, tail) == 0 {
-				xitdb.tx_savepoint(&tx)
-			}
-
-		case ATOM_INDEX_ON:
-			if arity != 4 {
-				return make_err(env, "invalid_index_on_op")
-			}
-			src_map, ok_1 := get_string_from_binary(env, elems[1])
-			field_key, ok_2 := get_string_from_binary(env, elems[2])
-			idx_map, ok_3 := get_string_from_binary(env, elems[3])
-			if !ok_1 || !ok_2 || !ok_3 {
-				return make_err(env, "invalid_index_on_op")
-			}
-			xitdb.tx_index_on(&tx, src_map, field_key, idx_map)
-
-		case ATOM_INSTANT:
-			if arity != 2 {
-				return make_err(env, "invalid_instant_op")
-			}
-			inst_val: i64 = 0
-			if nif_get_int64(env, elems[1], &inst_val) == 0 {
-				return make_err(env, "invalid_instant_op")
-			}
-			xitdb.tx_instant(&tx, inst_val)
-
-		case ATOM_META:
-			if arity != 3 {
-				return make_err(env, "invalid_meta_op")
-			}
-			key_str, ok_k := get_string_from_binary(env, elems[1])
-			if !ok_k {
-				return make_err(env, "invalid_meta_op")
-			}
-			if key_str == "tx_instant" {
-				inst_val: i64 = 0
-				if nif_get_int64(env, elems[2], &inst_val) == 0 {
-					return make_err(env, "invalid_meta_op")
-				}
-				xitdb.tx_instant(&tx, inst_val)
-			} else {
-				val, ok_v := decode_writeable_value(env, elems[2])
-				if !ok_v {
-					return make_err(env, "invalid_meta_op")
-				}
-				xitdb.tx_meta(&tx, key_str, val)
-			}
-
-		case ATOM_SAVEPOINT:
-			if arity != 1 {
-				return make_err(env, "invalid_savepoint_op")
-			}
-			xitdb.tx_savepoint(&tx)
-
-		case ATOM_INIT_COL, ATOM_RESET_COL:
-			if arity != 3 {
-				return make_err(env, "invalid_init_col_op")
-			}
-			kind_str, ok_k := get_string_from_binary(env, elems[2])
-			steps, s_err, ok_p := decode_steps_term(env, elems[1], tx.allocator)
-			if !ok_p || !ok_k || !is_supported_col_kind(kind_str) {
-				return make_err(env, "invalid_init_col_op")
-			}
-			if s_err != "" {
-				return make_err(env, s_err)
-			}
-			ic := new(Init_Col_Ctx, tx.allocator)
-			ic.steps = steps
-			ic.kind = kind_str
-			ic.reset = (op_atom == ATOM_RESET_COL)
-			xitdb.tx_with_cursor(&tx, init_col_callback, ic)
-
-		case ATOM_MERGE_MAP:
-			if arity != 2 {
-				return make_err(env, "invalid_merge_map_op")
-			}
-			if !validate_merge_map_term(env, elems[1], true) {
-				return make_err(env, "invalid_put_op")
-			}
-			mc := new(Merge_Map_Ctx, tx.allocator)
-			mc.env = env
-			mc.map_term = elems[1]
-			mc.tx = &tx
-			xitdb.tx_with_cursor(&tx, merge_map_callback, mc)
-
-		case:
-			return make_err(env, "unknown_tx_op")
-		}
+		return make_xitdb_err(env, parse_xerr)
 	}
 
-	rep, c_err := xitdb.tx_commit(&tx)
+	pre_header, pre_hdr_err := xitdb.database_read_root_header(&handle.db)
+	pre_len, pre_len_err := xitdb.core_length(handle.db.core)
+	pre_rh_bytes: [xitdb.ROOT_HEADER_LENGTH]u8 = ---
+	pre_rh_err := xitdb.core_read_exact_at(handle.db.core, xitdb.ROOT_HEADER_START, pre_rh_bytes[:])
+
+	rep: xitdb.Tx_Report
+	c_err: xitdb.Error
+	for attempt := 0; attempt < 2; attempt += 1 {
+		rep, c_err = xitdb.tx_commit(&tx)
+		if c_err == nil {
+			break
+		}
+		if rb_err := rollback_failed_tx(&handle.db, pre_header, pre_hdr_err, pre_len, pre_len_err, pre_rh_bytes, pre_rh_err); rb_err != nil {
+			return make_xitdb_err(env, rb_err)
+		}
+		if attempt == 0 && c_err == .Unexpected_Tag && len(validation_err) == 0 && adapt_tx_ops_for_base_moment(handle, &tx) {
+			continue
+		}
+		break
+	}
 	if c_err != nil {
+		if len(validation_err) == 0 && has_deferred {
+			if deferred_err := validate_deferred_tx_ops(&tx); deferred_err != "" {
+				return make_err(env, deferred_err)
+			}
+		}
+		if len(validation_err) > 0 {
+			return make_err(env, validation_err)
+		}
 		return make_xitdb_err(env, c_err)
 	}
 	moment_idx := rep.moment_index
@@ -540,7 +333,7 @@ odin_nif_transact :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TER
 </details>
 
 <details>
-<summary>NIF <code>odin_nif_sync</code> — <a href="../../native/xitdb_nif.odin#L728-L745">native/xitdb_nif.odin#L728-L745</a></summary>
+<summary>NIF <code>odin_nif_sync</code> — <a href="../../native/xitdb_nif.odin#L816-L833">native/xitdb_nif.odin#L816-L833</a></summary>
 
 ```odin
 odin_nif_sync :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {
@@ -566,7 +359,7 @@ odin_nif_sync :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -
 </details>
 
 <details>
-<summary>NIF <code>odin_nif_info</code> — <a href="../../native/xitdb_nif.odin#L748-L783">native/xitdb_nif.odin#L748-L783</a></summary>
+<summary>NIF <code>odin_nif_info</code> — <a href="../../native/xitdb_nif.odin#L836-L871">native/xitdb_nif.odin#L836-L871</a></summary>
 
 ```odin
 odin_nif_info :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {
@@ -610,7 +403,7 @@ odin_nif_info :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -
 </details>
 
 <details>
-<summary>NIF <code>odin_nif_close</code> — <a href="../../native/xitdb_nif.odin#L705-L725">native/xitdb_nif.odin#L705-L725</a></summary>
+<summary>NIF <code>odin_nif_close</code> — <a href="../../native/xitdb_nif.odin#L793-L813">native/xitdb_nif.odin#L793-L813</a></summary>
 
 ```odin
 odin_nif_close :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {
@@ -639,174 +432,374 @@ odin_nif_close :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) 
 </details>
 
 <details>
-<summary>NIF <code>decode_steps_term</code> — <a href="../../native/xitdb_nif.odin#L2067-L2083">native/xitdb_nif.odin#L2067-L2083</a></summary>
+<summary>NIF <code>parse_tx_ops</code> — <a href="../../native/xitdb_nif.odin#L4650-L4942">native/xitdb_nif.odin#L4650-L4942</a></summary>
 
 ```odin
-decode_steps_term :: proc(
+parse_tx_ops :: proc(
 	env: ErlNifEnv,
-	term: ERL_NIF_TERM,
-	allocator := context.temp_allocator,
-) -> (res: []xitdb.Path_Step, err_reason: string, term_ok: bool) {
-	stack_buf: [16]xitdb.Path_Step = ---
-	steps, er, ok_t := decode_steps_term_buf(env, term, stack_buf[:], allocator)
-	if !ok_t || er != "" || len(steps) == 0 {
-		return steps, er, ok_t
+	ops_term: ERL_NIF_TERM,
+	tx: ^xitdb.Tx,
+	validation_err: ^string,
+	has_deferred: ^bool,
+) -> (err_reason: string, xerr: xitdb.Error) {
+	head: ERL_NIF_TERM
+	tail := ops_term
+	for nif_is_empty_list(env, tail) == 0 {
+		if nif_get_list_cell(env, tail, &head, &tail) == 0 {
+			return "invalid_ops_list", nil
+		}
+		arity: c.int = 0
+		elems: [^]ERL_NIF_TERM = nil
+		if nif_get_tuple(env, head, &arity, &elems) == 0 || arity < 1 {
+			return "invalid_op_tuple", nil
+		}
+
+		op_atom := elems[0]
+
+		switch op_atom {
+		case ATOM_PUT:
+			if arity != 3 {
+				return "invalid_put_op", nil
+			}
+			steps, s_err, ok_p := decode_steps_term(env, elems[1], tx.allocator)
+			if !ok_p {
+				return "invalid_put_op", nil
+			}
+			if s_err != "" {
+				return s_err, nil
+			}
+			if val, ok_v := decode_writeable_value(env, elems[2]); ok_v {
+				if len(steps) == 0 {
+					return "", .Invalid_Range
+				}
+				append(&tx.ops, xitdb.Tx_Op{kind = .Put, steps = steps, val = val})
+			} else if is_structured_write_candidate(env, elems[2]) {
+				if len(steps) == 0 {
+					if !validate_write_term_cold(env, elems[2]) {
+						return "invalid_put_op", nil
+					}
+					return "", .Invalid_Range
+				}
+				sc := new(Structured_Op_Ctx, tx.allocator)
+				sc^ = Structured_Op_Ctx{
+					kind = .Put,
+					steps = steps,
+					env = env,
+					term = elems[2],
+					validation_err = validation_err,
+					err_reason = "invalid_put_op",
+				}
+				xitdb.tx_with_cursor(tx, structured_op_callback, sc)
+				has_deferred^ = true
+			} else {
+				return "invalid_put_op", nil
+			}
+
+		case ATOM_APPEND:
+			if arity != 3 {
+				return "invalid_append_op", nil
+			}
+			steps, s_err, ok_p := decode_steps_term(env, elems[1], tx.allocator)
+			if !ok_p {
+				return "invalid_append_op", nil
+			}
+			if s_err != "" {
+				return s_err, nil
+			}
+			if len(steps) == 0 {
+				return "invalid_append_op", nil
+			}
+			if val, ok_v := decode_writeable_value(env, elems[2]); ok_v {
+				append(&tx.ops, xitdb.Tx_Op{kind = .Append, steps = steps, val = val})
+			} else if is_structured_write_candidate(env, elems[2]) {
+				sc := new(Structured_Op_Ctx, tx.allocator)
+				sc^ = Structured_Op_Ctx{
+					kind = .Append,
+					steps = steps,
+					env = env,
+					term = elems[2],
+					validation_err = validation_err,
+					err_reason = "invalid_append_op",
+				}
+				xitdb.tx_with_cursor(tx, structured_op_callback, sc)
+				has_deferred^ = true
+			} else {
+				return "invalid_append_op", nil
+			}
+
+		case ATOM_INSERT:
+			if arity != 4 {
+				return "invalid_insert_op", nil
+			}
+			idx_val: i64 = 0
+			ok_i := nif_get_int64(env, elems[2], &idx_val) != 0
+			steps, s_err, ok_p := decode_steps_term(env, elems[1], tx.allocator)
+			if !ok_p || !ok_i {
+				return "invalid_insert_op", nil
+			}
+			if s_err != "" {
+				return s_err, nil
+			}
+			if len(steps) == 0 {
+				return "invalid_insert_op", nil
+			}
+			if val, ok_v := decode_writeable_value(env, elems[3]); ok_v {
+				append(&tx.ops, xitdb.Tx_Op{kind = .Insert, steps = steps, offset = idx_val, val = val})
+			} else if is_structured_write_candidate(env, elems[3]) {
+				sc := new(Structured_Op_Ctx, tx.allocator)
+				sc^ = Structured_Op_Ctx{
+					kind = .Insert,
+					steps = steps,
+					index = idx_val,
+					env = env,
+					term = elems[3],
+					validation_err = validation_err,
+					err_reason = "invalid_insert_op",
+				}
+				xitdb.tx_with_cursor(tx, structured_op_callback, sc)
+				has_deferred^ = true
+			} else {
+				return "invalid_insert_op", nil
+			}
+
+		case ATOM_RM:
+			if arity != 2 {
+				return "invalid_rm_op", nil
+			}
+			steps, s_err, ok_p := decode_steps_term(env, elems[1], tx.allocator)
+			if !ok_p {
+				return "invalid_rm_op", nil
+			}
+			if s_err != "" {
+				return s_err, nil
+			}
+			append(&tx.ops, xitdb.Tx_Op{kind = .Remove, steps = steps})
+
+		case ATOM_RM_IF_EXISTS:
+			if arity != 2 {
+				return "invalid_rm_op", nil
+			}
+			steps, s_err, ok_p := decode_steps_term(env, elems[1], tx.allocator)
+			if !ok_p {
+				return "invalid_rm_op", nil
+			}
+			if s_err != "" {
+				return s_err, nil
+			}
+			rc := new(Rm_If_Exists_Ctx, tx.allocator)
+			rc^ = Rm_If_Exists_Ctx{steps = steps, tx = tx}
+			xitdb.tx_with_cursor(tx, rm_if_exists_callback, rc)
+
+		case ATOM_SLICE:
+			if arity != 4 {
+				return "invalid_slice_op", nil
+			}
+			offset_val: i64 = 0
+			size_val: i64 = 0
+			ok_o := nif_get_int64(env, elems[2], &offset_val) != 0
+			ok_s := nif_get_int64(env, elems[3], &size_val) != 0
+			steps, s_err, ok_p := decode_steps_term(env, elems[1], tx.allocator)
+			if !ok_p || !ok_o || !ok_s {
+				return "invalid_slice_op", nil
+			}
+			if offset_val < 0 || size_val < 0 {
+				return "", .Invalid_Range
+			}
+			if s_err != "" {
+				return s_err, nil
+			}
+			if len(steps) == 0 {
+				return "", .Invalid_Range
+			}
+			sc := new(Slice_Op_Ctx, tx.allocator)
+			sc^ = Slice_Op_Ctx{steps = steps, offset = offset_val, size = size_val}
+			xitdb.tx_with_cursor(tx, slice_op_callback, sc)
+
+		case ATOM_FORK:
+			if arity != 3 {
+				return "invalid_fork_op", nil
+			}
+			from_steps, f_err, ok_f := decode_steps_term(env, elems[1], tx.allocator)
+			to_steps, t_err, ok_t := decode_steps_term(env, elems[2], tx.allocator)
+			if !ok_f || !ok_t {
+				return "invalid_fork_op", nil
+			}
+			if f_err != "" {
+				return f_err, nil
+			}
+			if t_err != "" {
+				return t_err, nil
+			}
+			if len(from_steps) == 0 || len(to_steps) == 0 {
+				return "", .Invalid_Range
+			}
+			append(&tx.ops, xitdb.Tx_Op{kind = .Fork, from_steps = from_steps, steps = to_steps})
+			if nif_is_empty_list(env, tail) == 0 {
+				xitdb.tx_savepoint(tx)
+			}
+
+		case ATOM_INDEX_ON:
+			if arity != 4 {
+				return "invalid_index_on_op", nil
+			}
+			src_map, ok_1 := get_string_from_binary(env, elems[1])
+			field_key, ok_2 := get_string_from_binary(env, elems[2])
+			idx_map, ok_3 := get_string_from_binary(env, elems[3])
+			if !ok_1 || !ok_2 || !ok_3 {
+				return "invalid_index_on_op", nil
+			}
+			xitdb.tx_index_on(tx, src_map, field_key, idx_map)
+
+		case ATOM_INSTANT:
+			if arity != 2 {
+				return "invalid_instant_op", nil
+			}
+			inst_val: i64 = 0
+			if nif_get_int64(env, elems[1], &inst_val) == 0 {
+				return "invalid_instant_op", nil
+			}
+			xitdb.tx_instant(tx, inst_val)
+
+		case ATOM_META:
+			if arity != 3 {
+				return "invalid_meta_op", nil
+			}
+			key_str, ok_k := get_string_from_binary(env, elems[1])
+			if !ok_k {
+				return "invalid_meta_op", nil
+			}
+			if key_str == "tx_instant" {
+				inst_val: i64 = 0
+				if nif_get_int64(env, elems[2], &inst_val) == 0 {
+					return "invalid_meta_op", nil
+				}
+				xitdb.tx_instant(tx, inst_val)
+			} else {
+				val, ok_v := decode_writeable_value(env, elems[2])
+				if !ok_v {
+					return "invalid_meta_op", nil
+				}
+				xitdb.tx_meta(tx, key_str, val)
+			}
+
+		case ATOM_SAVEPOINT:
+			if arity != 1 {
+				return "invalid_savepoint_op", nil
+			}
+			xitdb.tx_savepoint(tx)
+
+		case ATOM_INIT_COL, ATOM_RESET_COL:
+			if arity != 3 {
+				return "invalid_init_col_op", nil
+			}
+			kind_str, ok_k := get_string_from_binary(env, elems[2])
+			steps, s_err, ok_p := decode_steps_term(env, elems[1], tx.allocator)
+			if !ok_p || !ok_k || !is_supported_col_kind(kind_str) {
+				return "invalid_init_col_op", nil
+			}
+			if s_err != "" {
+				return s_err, nil
+			}
+			ic := new(Init_Col_Ctx, tx.allocator)
+			ic.steps = steps
+			ic.kind = kind_str
+			ic.reset = (op_atom == ATOM_RESET_COL)
+			xitdb.tx_with_cursor(tx, init_col_callback, ic)
+
+		case ATOM_MERGE_MAP:
+			if arity != 2 {
+				return "invalid_merge_map_op", nil
+			}
+			st: ERL_NIF_TERM = 0
+			if nif_is_map(env, elems[1]) == 0 || nif_get_map_value(env, elems[1], ATOM_STRUCT, &st) != 0 {
+				return "invalid_put_op", nil
+			}
+			mc := new(Merge_Map_Ctx, tx.allocator)
+			mc.env = env
+			mc.map_term = elems[1]
+			mc.tx = tx
+			mc.validation_err = validation_err
+			xitdb.tx_with_cursor(tx, merge_map_callback, mc)
+			has_deferred^ = true
+
+		case:
+			return "unknown_tx_op", nil
+		}
 	}
-	if raw_data(steps) == raw_data(stack_buf[:]) {
-		out := make([]xitdb.Path_Step, len(steps), allocator)
-		copy(out, steps)
-		return out, "", true
-	}
-	return steps, "", true
+	return "", nil
 }
 ```
 
 </details>
 
 <details>
-<summary>NIF <code>decode_writeable_value</code> — <a href="../../native/xitdb_nif.odin#L2176-L2226">native/xitdb_nif.odin#L2176-L2226</a></summary>
+<summary>NIF <code>validate_deferred_tx_ops</code> — <a href="../../native/xitdb_nif.odin#L4630-L4648">native/xitdb_nif.odin#L4630-L4648</a></summary>
 
 ```odin
-decode_writeable_value :: proc(env: ErlNifEnv, term: ERL_NIF_TERM) -> (xitdb.Writeable_Data, bool) {
-	if nif_is_binary(env, term) != 0 {
-		s, ok := get_string_from_binary(env, term)
-		return s, ok
-	}
-	if nif_is_atom(env, term) != 0 {
-		if term == ATOM_TRUE {
-			return xitdb.Bytes{value = transmute([]u8)string("1"), format_tag = transmute([]u8)string("bl")}, true
+validate_deferred_tx_ops :: proc(tx: ^xitdb.Tx) -> string {
+	for &op in tx.ops {
+		if op.kind != .Callback || op.user_data == nil {
+			continue
 		}
-		if term == ATOM_FALSE {
-			return xitdb.Bytes{value = transmute([]u8)string("0"), format_tag = transmute([]u8)string("bl")}, true
-		}
-		if term == ATOM_NIL {
-			return xitdb.Slot{}, true
-		}
-		buf := make([]u8, 1024, context.temp_allocator)
-		a_str, ok := get_atom_string(env, term, buf)
-		if !ok {
-			return nil, false
-		}
-		return a_str, true
-	}
-	if nif_is_tuple(env, term) != 0 {
-		arity: c.int = 0
-		elems: [^]ERL_NIF_TERM = nil
-		if nif_get_tuple(env, term, &arity, &elems) != 0 && arity == 3 && elems[0] == ATOM_TAGGED {
-			fmt_tag, ok_t := get_string_from_binary(env, elems[1])
-			payload, ok_p := get_string_from_binary(env, elems[2])
-			if ok_t && ok_p {
-				return xitdb.Bytes{
-					value      = transmute([]u8)payload,
-					format_tag = transmute([]u8)fmt_tag,
-				}, true
+		if op.callback == structured_op_callback {
+			sc := (^Structured_Op_Ctx)(op.user_data)
+			if !validate_write_term_cold(sc.env, sc.term) {
+				return sc.err_reason
+			}
+		} else if op.callback == merge_map_callback {
+			mc := (^Merge_Map_Ctx)(op.user_data)
+			if !validate_write_term_cold(mc.env, mc.map_term) {
+				return "invalid_put_op"
 			}
 		}
-		return nil, false
 	}
-
-	i_val: i64 = 0
-	if nif_get_int64(env, term, &i_val) != 0 {
-		if i_val >= 0 {
-			return u64(i_val), true
-		}
-		return i_val, true
-	}
-	f_val: f64 = 0
-	if nif_get_double(env, term, &f_val) != 0 {
-		return f_val, true
-	}
-	return nil, false
+	return ""
 }
 ```
 
 </details>
 
 <details>
-<summary>NIF <code>validate_write_term</code> — <a href="../../native/xitdb_nif.odin#L2273-L2354">native/xitdb_nif.odin#L2273-L2354</a></summary>
+<summary>NIF <code>rollback_failed_tx</code> — <a href="../../native/xitdb_nif.odin#L4426-L4463">native/xitdb_nif.odin#L4426-L4463</a></summary>
 
 ```odin
-validate_write_term :: proc(env: ErlNifEnv, term: ERL_NIF_TERM) -> bool {
-	if _, ok := decode_writeable_value(env, term); ok {
-		return true
+rollback_failed_tx :: proc(
+	db: ^xitdb.Database,
+	pre_header: xitdb.Root_Header,
+	pre_hdr_err: xitdb.Error,
+	pre_len: i64,
+	pre_len_err: xitdb.Error,
+	pre_rh_bytes: [xitdb.ROOT_HEADER_LENGTH]u8,
+	pre_rh_err: xitdb.Error,
+) -> xitdb.Error {
+	has_target_len := pre_hdr_err == nil || pre_len_err == nil
+	target_len := pre_header.file_size if pre_hdr_err == nil else pre_len
+	len_changed := false
+	if has_target_len {
+		cur_len, cur_len_err := xitdb.core_length(db.core)
+		if cur_len_err != nil || cur_len != target_len {
+			len_changed = true
+			xitdb.core_set_length(db.core, target_len) or_return
+			after_len := xitdb.core_length(db.core) or_return
+			if after_len != target_len {
+				return .Truncated_Database
+			}
+		}
 	}
-	if nif_is_tuple(env, term) != 0 {
-		arity: c.int = 0
-		elems: [^]ERL_NIF_TERM = nil
-		if nif_get_tuple(env, term, &arity, &elems) == 0 {
-			return false
-		}
-		if arity == 2 && elems[0] == ATOM_XITDB_SET {
-			return validate_set_elements_term(env, elems[1])
-		}
-		if arity == 3 && elems[0] == ATOM_XITDB_COL {
-			kind_str, ok_k := term_to_kind_string(env, elems[1])
-			if !ok_k || !is_supported_col_kind(kind_str) {
-				return false
-			}
-			return validate_collection_data_term(env, kind_str, elems[2])
-		}
-		return false
+
+	cur_rh_bytes: [xitdb.ROOT_HEADER_LENGTH]u8 = ---
+	cur_rh_err := xitdb.core_read_exact_at(db.core, xitdb.ROOT_HEADER_START, cur_rh_bytes[:])
+	hdr_changed := pre_rh_err == nil && (cur_rh_err != nil || cur_rh_bytes != pre_rh_bytes)
+	if hdr_changed {
+		rh_bytes := xitdb.root_header_to_bytes(pre_header) if pre_hdr_err == nil else pre_rh_bytes
+		xitdb.core_seek_to(db.core, xitdb.ROOT_HEADER_START) or_return
+		xitdb.core_write_all(db.core, rh_bytes[:]) or_return
+		xitdb.core_flush(db.core) or_return
+		xitdb.core_sync(db.core) or_return
+	} else if len_changed {
+		xitdb.core_flush(db.core) or_return
 	}
-	if nif_is_list(env, term) != 0 {
-		head: ERL_NIF_TERM
-		tail := term
-		for nif_is_empty_list(env, tail) == 0 {
-			if nif_get_list_cell(env, tail, &head, &tail) == 0 {
-				return false
-			}
-			if !validate_write_term(env, head) {
-				return false
-			}
-		}
-		return true
-	}
-	if nif_is_map(env, term) != 0 {
-		struct_term: ERL_NIF_TERM
-		if nif_get_map_value(env, term, ATOM_STRUCT, &struct_term) != 0 {
-			if struct_term == ATOM_XITDB_COLLECTION_MOD {
-				kind_term, data_term: ERL_NIF_TERM
-				if nif_get_map_value(env, term, ATOM_KIND, &kind_term) == 0 ||
-				   nif_get_map_value(env, term, ATOM_DATA, &data_term) == 0 {
-					return false
-				}
-				kind_str, ok_k := term_to_kind_string(env, kind_term)
-				if !ok_k || !is_supported_col_kind(kind_str) {
-					return false
-				}
-				return validate_collection_data_term(env, kind_str, data_term)
-			}
-			if struct_term == ATOM_MAPSET_MOD {
-				ms_map: ERL_NIF_TERM
-				if nif_get_map_value(env, term, ATOM_MAP, &ms_map) == 0 || nif_is_map(env, ms_map) == 0 {
-					return false
-				}
-				kv_list: ERL_NIF_TERM
-				if nif_map_to_kv_list(env, ms_map, &kv_list) == 0 {
-					return false
-				}
-				head: ERL_NIF_TERM
-				tail := kv_list
-				for nif_is_empty_list(env, tail) == 0 {
-					if nif_get_list_cell(env, tail, &head, &tail) == 0 {
-						return false
-					}
-					arity: c.int = 0
-					elems: [^]ERL_NIF_TERM = nil
-					if nif_get_tuple(env, head, &arity, &elems) == 0 || arity != 2 {
-						return false
-					}
-					if _, ok_s := term_to_key_string(env, elems[0]); !ok_s {
-						return false
-					}
-				}
-				return true
-			}
-			return false
-		}
-		return validate_kv_term(env, term)
-	}
-	return false
+	return nil
 }
 ```
 
