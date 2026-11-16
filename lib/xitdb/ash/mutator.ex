@@ -269,7 +269,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     end
 
     defp run_bulk_upserts(
-           initial_snapshot,
+           {db, moment} = initial_snapshot,
            resource,
            stream,
            upsert_keys,
@@ -277,34 +277,353 @@ if Code.ensure_loaded?(Ash.DataLayer) do
            fallback_tenant,
            opts
          ) do
-      stream
-      |> Enum.with_index()
-      |> Enum.reduce_while({:ok, initial_snapshot, []}, fn {%Ash.Changeset{} = raw_cs, idx},
-                                                           {:ok, snap, acc} ->
-        cs =
-          if is_nil(raw_cs.tenant) and fallback_tenant != nil do
-            %Ash.Changeset{raw_cs | tenant: fallback_tenant}
-          else
-            raw_cs
+      cursor_root = Xitdb.as_of(db, moment)
+      pk_fields = Ash.Resource.Info.primary_key(resource)
+      pk_attr = Ash.Resource.Info.attribute(resource, hd(pk_fields))
+
+      staged =
+        stream
+        |> Enum.with_index()
+        |> Enum.reduce_while(
+          {:ok, [], [], %{}, %{}, MapSet.new(), %{}},
+          fn {%Ash.Changeset{} = raw_cs, idx},
+             {:ok, rev_records, ops_chunks, seq_state, idx_batch_state, seen_pks, staged_records} ->
+            cs =
+              if is_nil(raw_cs.tenant) and fallback_tenant != nil do
+                %Ash.Changeset{raw_cs | tenant: fallback_tenant}
+              else
+                raw_cs
+              end
+
+            tenant = cs.tenant
+            scoped_col = Codec.scoped_collection(resource, tenant)
+
+            case stage_single_upsert(
+                   cursor_root,
+                   resource,
+                   pk_attr,
+                   scoped_col,
+                   cs,
+                   upsert_keys,
+                   identity,
+                   opts,
+                   seq_state,
+                   idx_batch_state,
+                   seen_pks,
+                   staged_records
+                 ) do
+              {:ok, :skipped, next_seq, next_idx_batch, next_seen_pks, next_staged} ->
+                {:cont,
+                 {:ok, rev_records, ops_chunks, next_seq, next_idx_batch, next_seen_pks,
+                  next_staged}}
+
+              {:ok, record, item_ops, next_seq, next_idx_batch, next_seen_pks, next_staged} ->
+                tagged = attach_bulk_metadata(record, cs, idx)
+
+                {:cont,
+                 {:ok, [tagged | rev_records], [item_ops | ops_chunks], next_seq, next_idx_batch,
+                  next_seen_pks, next_staged}}
+
+              {:error, _} = err ->
+                {:halt, err}
+            end
+          end
+        )
+
+      case staged do
+        {:ok, rev_records, ops_chunks, _seq_state, _idx_batch_state, _seen_pks, _staged_records} ->
+          all_ops = ops_chunks |> Enum.reverse() |> List.flatten()
+
+          with {:ok, final_snap} <- commit_ops(initial_snapshot, all_ops) do
+            {:ok, final_snap, Enum.reverse(rev_records)}
           end
 
-        case upsert_in_snapshot(snap, resource, cs, upsert_keys, identity, opts) do
-          {:ok, next_snap, record} ->
-            if Ash.Resource.get_metadata(record, :upsert_skipped) do
-              {:cont, {:ok, next_snap, acc}}
-            else
-              tagged = attach_bulk_metadata(record, cs, idx)
-              {:cont, {:ok, next_snap, [tagged | acc]}}
+        {:error, _} = err ->
+          err
+      end
+    end
+
+    defp stage_single_upsert(
+           cursor_root,
+           resource,
+           pk_attr,
+           scoped_col,
+           %Ash.Changeset{} = cs,
+           upsert_keys,
+           identity,
+           bulk_opts,
+           seq_state,
+           idx_batch_state,
+           seen_pks,
+           staged_records
+         ) do
+      tenant = cs.tenant
+
+      with {:ok, candidate_record} <- apply_create_record(resource, cs) do
+        case find_upsert_target_staged(
+               cursor_root,
+               staged_records,
+               resource,
+               candidate_record,
+               upsert_keys,
+               identity,
+               tenant
+             ) do
+          :none ->
+            with {:ok, after_pk, seq_ops, next_seq_state} <-
+                   Sequences.plan_pk(cursor_root, resource, candidate_record, tenant, seq_state),
+                 :ok <- verify_pk_unused(cursor_root, resource, after_pk, tenant, seen_pks),
+                 record <-
+                   resource
+                   |> finalize_loaded_record(after_pk, tenant)
+                   |> Ash.Resource.put_metadata(:upsert_action, :create),
+                 :ok <- verify_atomic_validations(record, record, resource, cs),
+                 :ok <- verify_create_filter(record, resource, cs),
+                 {:ok, index_ops, next_idx_batch} <-
+                   Indexer.plan_put_ops_batched(
+                     cursor_root,
+                     resource,
+                     nil,
+                     record,
+                     tenant,
+                     idx_batch_state
+                   )
+                   |> normalize_plan_error() do
+              doc_id = Codec.encode_pk_doc_id(pk_attr, Map.fetch!(record, pk_attr.name))
+              doc_key = {scoped_col, doc_id}
+
+              {:ok, record, seq_ops ++ index_ops, next_seq_state, next_idx_batch,
+               MapSet.put(seen_pks, doc_key), Map.put(staged_records, doc_key, record)}
             end
 
-          {:error, _} = err ->
-            {:halt, err}
+          {:ok, existing_record} ->
+            allowed_fields =
+              resolve_upsert_allowed_fields(resource, cs, upsert_keys, bulk_opts)
+
+            case build_updated_record(
+                   existing_record,
+                   resource,
+                   cs,
+                   {:upsert, allowed_fields, candidate_record}
+                 ) do
+              {:ok, updated_record} ->
+                final_record =
+                  resource
+                  |> finalize_loaded_record(updated_record, tenant)
+                  |> Ash.Resource.put_metadata(:upsert_action, :update)
+
+                with {:ok, index_ops, next_idx_batch} <-
+                       Indexer.plan_put_ops_batched(
+                         cursor_root,
+                         resource,
+                         existing_record,
+                         final_record,
+                         tenant,
+                         idx_batch_state
+                       )
+                       |> normalize_plan_error() do
+                  doc_id =
+                    Codec.encode_pk_doc_id(pk_attr, Map.fetch!(final_record, pk_attr.name))
+
+                  doc_key = {scoped_col, doc_id}
+
+                  {:ok, final_record, index_ops, seq_state, next_idx_batch,
+                   MapSet.put(seen_pks, doc_key), Map.put(staged_records, doc_key, final_record)}
+                end
+
+              :filtered_out ->
+                {:ok, :skipped, seq_state, idx_batch_state, seen_pks, staged_records}
+
+              {:error, _} = err ->
+                err
+            end
+        end
+      end
+    end
+
+    defp find_upsert_target_staged(
+           cursor_root,
+           staged_records,
+           resource,
+           candidate_record,
+           keys,
+           identity,
+           tenant
+         )
+         when map_size(staged_records) == 0 do
+      find_upsert_target(cursor_root, resource, candidate_record, keys, identity, tenant)
+    end
+
+    defp find_upsert_target_staged(
+           cursor_root,
+           staged_records,
+           resource,
+           candidate_record,
+           keys,
+           identity,
+           tenant
+         ) do
+      pk_fields = Ash.Resource.Info.primary_key(resource)
+      pk_attr = Ash.Resource.Info.attribute(resource, hd(pk_fields))
+      scoped_col = Codec.scoped_collection(resource, tenant)
+
+      resolved_identity =
+        cond do
+          match?(%Ash.Resource.Identity{}, identity) ->
+            identity
+
+          is_atom(identity) and not is_nil(identity) ->
+            Ash.Resource.Info.identity(resource, identity)
+
+          Enum.sort(keys) == Enum.sort(pk_fields) ->
+            :primary_key
+
+          true ->
+            resource
+            |> Ash.Resource.Info.identities()
+            |> Enum.find(fn id -> Enum.sort(id.keys) == Enum.sort(keys) end)
+        end
+
+      case resolved_identity do
+        :primary_key ->
+          case Map.get(candidate_record, pk_attr.name) do
+            nil ->
+              :none
+
+            pk_val ->
+              doc_id = Codec.encode_pk_doc_id(pk_attr, pk_val)
+
+              case Map.fetch(staged_records, {scoped_col, doc_id}) do
+                {:ok, staged_rec} -> {:ok, staged_rec}
+                :error -> load_existing_record(cursor_root, resource, pk_val, tenant)
+              end
+          end
+
+        %Ash.Resource.Identity{} = id_struct ->
+          case encoded_active_identity_key(resource, id_struct, candidate_record, tenant) do
+            {:ok, target_key} ->
+              staged_match =
+                find_staged_by_identity(
+                  staged_records,
+                  resource,
+                  id_struct,
+                  scoped_col,
+                  target_key
+                )
+
+              case staged_match do
+                {:ok, _} = hit ->
+                  hit
+
+                :none ->
+                  case lookup_existing_by_identity(
+                         cursor_root,
+                         resource,
+                         id_struct,
+                         candidate_record,
+                         tenant
+                       ) do
+                    {:ok, db_rec} ->
+                      guard_stale_db_target(
+                        db_rec,
+                        staged_records,
+                        resource,
+                        pk_attr,
+                        tenant,
+                        scoped_col
+                      )
+
+                    :none ->
+                      :none
+                  end
+              end
+
+            :skip ->
+              :none
+          end
+
+        nil ->
+          if Enum.any?(keys, &is_nil(Map.get(candidate_record, &1))) do
+            :none
+          else
+            case find_staged_by_keys(staged_records, resource, scoped_col, candidate_record, keys) do
+              {:ok, _} = hit ->
+                hit
+
+              :none ->
+                case find_existing_by_arbitrary_keys(
+                       cursor_root,
+                       resource,
+                       candidate_record,
+                       keys,
+                       tenant
+                     ) do
+                  {:ok, db_rec} ->
+                    guard_stale_db_target(
+                      db_rec,
+                      staged_records,
+                      resource,
+                      pk_attr,
+                      tenant,
+                      scoped_col
+                    )
+
+                  :none ->
+                    :none
+                end
+            end
+          end
+      end
+    end
+
+    defp guard_stale_db_target(db_rec, staged_records, _resource, pk_attr, _tenant, scoped_col) do
+      doc_id = Codec.encode_pk_doc_id(pk_attr, Map.fetch!(db_rec, pk_attr.name))
+
+      if Map.has_key?(staged_records, {scoped_col, doc_id}) do
+        :none
+      else
+        {:ok, db_rec}
+      end
+    end
+
+    defp encoded_active_identity_key(resource, identity, record, tenant) do
+      if candidate_matches_identity_where?(resource, record, Map.get(identity, :where), tenant) do
+        Codec.encode_identity_key(resource, identity, record, tenant)
+      else
+        :skip
+      end
+    end
+
+    defp find_staged_by_identity(staged_records, resource, identity, scoped_col, target_key) do
+      all_tenants? = Map.get(identity, :all_tenants?, false)
+
+      Enum.find_value(staged_records, :none, fn {{sc, _doc_id}, staged_rec} ->
+        if all_tenants? or sc == scoped_col do
+          rec_tenant = Ash.Resource.get_metadata(staged_rec, :tenant)
+
+          if encoded_active_identity_key(resource, identity, staged_rec, rec_tenant) ==
+               {:ok, target_key} do
+            {:ok, staged_rec}
+          end
         end
       end)
-      |> case do
-        {:ok, final_snap, rev_records} -> {:ok, final_snap, Enum.reverse(rev_records)}
-        {:error, _} = err -> err
-      end
+    end
+
+    defp find_staged_by_keys(staged_records, resource, scoped_col, candidate_record, keys) do
+      attrs = Map.new(keys, fn k -> {k, Ash.Resource.Info.attribute(resource, k)} end)
+
+      Enum.find_value(staged_records, :none, fn {{sc, _doc_id}, staged_rec} ->
+        if sc == scoped_col and
+             Enum.all?(keys, fn k ->
+               values_equal?(
+                 Map.fetch!(attrs, k),
+                 Map.get(staged_rec, k),
+                 Map.get(candidate_record, k)
+               )
+             end) do
+          {:ok, staged_rec}
+        end
+      end)
     end
 
     defp update_in_snapshot({db, moment}, resource, %Ash.Changeset{} = changeset) do
@@ -719,11 +1038,21 @@ if Code.ensure_loaded?(Ash.DataLayer) do
             explicit = Map.keys(changeset.attributes) -- defaults
             atomic_keys = Keyword.keys(Map.get(changeset, :atomics, []))
 
+            touch_defaults? =
+              case get_in(changeset.context, [:private, :touch_update_defaults?]) do
+                false -> false
+                _ -> Map.get(bulk_opts, :touch_update_defaults?, true) != false
+              end
+
             update_defaults =
-              resource
-              |> Ash.Resource.Info.attributes()
-              |> Enum.filter(&(&1.update_default != nil))
-              |> Enum.map(& &1.name)
+              if touch_defaults? do
+                resource
+                |> Ash.Resource.Info.attributes()
+                |> Enum.filter(&(&1.update_default != nil))
+                |> Enum.map(& &1.name)
+              else
+                []
+              end
 
             Enum.uniq(explicit ++ atomic_keys ++ update_defaults)
 

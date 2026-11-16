@@ -1057,17 +1057,20 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           nil
 
         Map.has_key?(root.staged_overrides, sel) ->
-          unwrap_staged(Map.fetch!(root.staged_overrides, sel))
+          base = unwrap_staged(Map.fetch!(root.staged_overrides, sel))
+          overlay_descendants_if_needed(root, full_steps, sel, base)
 
         true ->
-          case find_ancestor_override(root.staged_overrides, full_steps) do
-            {:ok, anc_val, rem_steps} ->
-              walk_overlay_steps(unwrap_staged(anc_val), rem_steps)
+          base =
+            case find_ancestor_override(root.staged_overrides, full_steps) do
+              {:ok, anc_val, rem_steps} ->
+                walk_overlay_steps(unwrap_staged(anc_val), rem_steps)
 
-            :none ->
-              base = read_path(%{root | tx_mode: false}, steps)
-              overlay_descendants_if_needed(root, full_steps, sel, base)
-          end
+              :none ->
+                read_path(%{root | tx_mode: false}, steps)
+            end
+
+          overlay_descendants_if_needed(root, full_steps, sel, base)
       end
     end
 
@@ -1099,16 +1102,11 @@ if Code.ensure_loaded?(Ash.DataLayer) do
               base
           end
 
-        is_nil(base) ->
-          synthetic = %Xitdb.Cursor{
-            root
-            | tag: :hash_map,
-              tag_id: Xitdb.Cursor.tag_id_for(:hash_map),
-              value: 0,
-              path_steps: full_steps
-          }
+        is_map(base) and not is_struct(base) ->
+          Xitdb.Cursor.apply_staged_overlay(synthetic_map_cursor(root, full_steps), base)
 
-          case Xitdb.Cursor.apply_staged_overlay(synthetic, %{}) do
+        is_nil(base) ->
+          case Xitdb.Cursor.apply_staged_overlay(synthetic_map_cursor(root, full_steps), %{}) do
             empty when empty == %{} -> nil
             non_empty -> non_empty
           end
@@ -1116,6 +1114,16 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         true ->
           base
       end
+    end
+
+    defp synthetic_map_cursor(%Xitdb.Cursor{} = root, full_steps) do
+      %Xitdb.Cursor{
+        root
+        | tag: :hash_map,
+          tag_id: Xitdb.Cursor.tag_id_for(:hash_map),
+          value: 0,
+          path_steps: full_steps
+      }
     end
 
     defp path_or_ancestor_deleted?(deleted_paths, rev_steps) do
@@ -1194,7 +1202,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       {next_overrides, next_deleted} =
         Enum.reduce(ops, {cursor.staged_overrides, cursor.deleted_paths}, fn
           {:put, path, val}, {ov, del} ->
-            {Map.put(ov, path, val), MapSet.delete(del, path)}
+            {next_ov, next_del} = clear_deleted_for_write(ov, del, path)
+            {Map.put(next_ov, path, val), next_del}
 
           {:reset_col, path, kind}, {ov, del} ->
             col_val =
@@ -1208,14 +1217,9 @@ if Code.ensure_loaded?(Ash.DataLayer) do
               ov
               |> Enum.reject(fn {k, _v} -> k == path or selector_descendant?(k, path) end)
               |> Map.new()
-              |> Map.put(path, col_val)
 
-            next_del =
-              del
-              |> Enum.reject(fn k -> k == path or selector_descendant?(k, path) end)
-              |> MapSet.new()
-
-            {next_ov, next_del}
+            {seeded_ov, next_del} = clear_deleted_for_write(next_ov, del, path)
+            {Map.put(seeded_ov, path, col_val), next_del}
 
           {:rm, path}, {ov, del} ->
             next_ov =
@@ -1238,6 +1242,21 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           staged_overrides: next_overrides,
           deleted_paths: next_deleted
       }
+    end
+
+    defp clear_deleted_for_write(ov, del, path) do
+      Enum.reduce(del, {ov, MapSet.new()}, fn k, {ov_acc, del_acc} ->
+        cond do
+          k == path or selector_descendant?(k, path) ->
+            {ov_acc, del_acc}
+
+          selector_descendant?(path, k) ->
+            {Map.put_new(ov_acc, k, %{}), del_acc}
+
+          true ->
+            {ov_acc, MapSet.put(del_acc, k)}
+        end
+      end)
     end
   end
 end

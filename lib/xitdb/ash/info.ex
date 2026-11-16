@@ -205,7 +205,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     def resolve_store(_resource, %{xitdb_store: store}) when not is_nil(store), do: store
 
     def resolve_store(resource, opts) when is_list(opts) do
-      Keyword.get_lazy(opts, :store, fn -> default_store(resource) end)
+      opts[:store] || default_store(resource)
     end
 
     def resolve_store(resource, _), do: default_store(resource)
