@@ -1,17 +1,19 @@
 defmodule Xitdb.Cursor do
   @moduledoc """
-  Clojure/Datomic-style lazy cursor representing a 9-byte `Slot` (`tag` + `value`)
-  in an immutable `xitdb` store.
+  Lazy, immutable view into a collection or moment inside a `Xitdb` database.
 
-  Because `%Xitdb.Cursor{}` holds only the NIF database resource reference and the
-  9-byte slot coordinates (`tag`, `tag_id`, `value`), it is a **pure Elixir value**:
-  - Can be passed across BEAM processes (`Task.async/1`, GenServers, ETS, LiveView assigns)
-    with zero mutexes or dangling pointer hazards.
+  Navigating into nested containers (`db["users"]["alice"]`) returns a lightweight
+  `%Xitdb.Cursor{}` without eagerly loading child entries onto the BEAM heap, while
+  navigating to a scalar returns the native Elixir value directly.
+
   - Implements `Access` (`cursor["key"]`, `cursor[0]`, `get_in/2`, `put_in/3`, `update_in/3`, `pop_in/2`).
-  - Implements `Enumerable` (`Enum.count/1` in `O(1)` on counted collections,
-    `Enum.member?/2` in `O(1)` / `O(log N)` via HAMT/B+Tree lookup,
-    `Enum.slice/2` in `O(log N)` via index seek, and `Enum.to_list/1` / `Stream.*`).
+  - Implements `Enumerable` (`Enum.count/1`, `Enum.member?/2`, `Enum.slice/2`, `Enum.to_list/1`, `Stream.*`).
   - Implements `Inspect` with a safe, bounded preview.
+  - Because cursors are pure immutable Elixir values referencing immutable database
+    moments, you can pass them freely across `Task`s, `GenServer`s, ETS, and LiveView assigns.
+
+  See [Reading & Updating with Access & Enum](docs/access-and-enumerable.md) and
+  [Architecture, Internals & Performance](docs/architecture-and-internals.md) for details.
   """
 
   @behaviour Access

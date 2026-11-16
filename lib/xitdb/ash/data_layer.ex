@@ -1,7 +1,16 @@
 if Code.ensure_loaded?(Ash.DataLayer) do
   defmodule Xitdb.Ash.DataLayer do
     @moduledoc """
-    Native lock-free Xitdb data layer for Ash Framework 3.37+.
+    Native Ash Framework 3.37+ data layer backed by immutable `.xit` stores.
+
+    Supports full Ash CRUD, atomic updates/destroys, relationships, aggregates,
+    calculations, single/composite B+Tree secondary indexes (`index`), built-in
+    BM25 + prefix search (`Xitdb.Ash.Search`), same-store foreign-key `on_delete`
+    cascades (`references`), co-located subtrees (`nested_in`), time-travel reads
+    (`Xitdb.Ash.Store.with_as_of/3`), and isolated `async: true` test sandboxes
+    (`Xitdb.Ash.TestSandbox`)—with zero SQL migrations.
+
+    See [Ash Framework & Full-Text Search](docs/ash-and-spark.md) for setup and usage.
 
     ## Telemetry
 

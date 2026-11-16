@@ -1,17 +1,23 @@
 defmodule Xitdb.DSL do
   @moduledoc """
-  Compile-time macro DSL for `Xitdb` path selectors, transaction mutation blocks,
-  structural Pull patterns, and Ecto/Datomic-style Datalog queries.
+  Compile-time Elixir DSL for `Xitdb` transactions (`tx/2,3`, `tx_for/3,4`),
+  path selectors (`path/1`, `path_steps/1`), Pull pattern pre-compilation (`pull_pattern/1`),
+  and Datalog queries (`query/2,3`, `datalog/1`).
 
-  ## Usage
+  See the guides for full details:
+  - [Transaction DSL](docs/transaction-dsl.md)
+  - [Path Selectors & Pull Projections](docs/path-and-pull-dsl.md)
+  - [Datalog & Graph Queries](docs/datalog-dsl.md)
+
+  ## Quick Example
 
       use Xitdb.DSL
 
-      # 1. Path selector macro with runtime interpolation & collection tags
+      # 1. Path selector macro with runtime interpolation & collection modifiers
       sel = path(users[user_id].todos[[idx]])
       counted_sel = path(org.counted(:departments)[dept_id].headcount)
 
-      # 2. Atomic transaction block (0 intermediate NIF reads, auto-vivifies paths)
+      # 2. Atomic transaction block (auto-creates missing paths, supports list ops & fork)
       {:ok, db} =
         tx db, doc: "promote alice" do
           put users[id].role, "admin"
@@ -20,7 +26,7 @@ defmodule Xitdb.DSL do
           slice users[id].todos, 0..9
           fork users[id], backups[id]
           rm users[id].temp_token
-          update users[id].login_count, &((&1 || 0) + 1)
+          update users[id].login_count, 0, &(&1 + 1)
         end
 
       # 3. Declarative Datalog query macro with ^var pinning

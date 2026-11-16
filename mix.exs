@@ -18,7 +18,7 @@ defmodule Xitdb.MixProject do
       aliases: aliases(),
       deps: deps(),
       description:
-        "Idiomatic Elixir client, Odin NIF wrapper, and native Ash Framework DataLayer & BM25 search engine for xitdb with lazy Access & Enumerable cursors, time-travel moments, Pull projections, and Datalog.",
+        "Embedded, immutable single-file database for Elixir with native Access/Enum navigation, built-in time-travel & diffs, Pull projections, Datalog, and an Ash Framework DataLayer with full-text search.",
       source_url: @source_url,
       homepage_url: @source_url,
       package: package(),
@@ -70,44 +70,51 @@ defmodule Xitdb.MixProject do
     [
       main: "readme",
       extras: [
-        "README.md",
-        "usage-rules.md",
-        "docs/access-and-enumerable.md",
-        "docs/collections-and-indexing.md",
-        "docs/time-travel-and-storage.md",
-        "docs/path-and-pull-dsl.md",
-        "docs/transaction-dsl.md",
-        "docs/datalog-dsl.md",
-        "docs/ash-and-spark.md",
-        "CHANGELOG.md",
-        "LICENSE"
+        "README.md": [title: "Overview"],
+        "docs/access-and-enumerable.md": [title: "Reading & Updating (Access & Enum)"],
+        "docs/collections-and-indexing.md": [title: "Collections & Secondary Indexes"],
+        "docs/time-travel-and-storage.md": [title: "Time-Travel, Diffs & Storage"],
+        "docs/transaction-dsl.md": [title: "Transaction DSL"],
+        "docs/path-and-pull-dsl.md": [title: "Path Selectors & Pull Projections"],
+        "docs/datalog-dsl.md": [title: "Datalog & Graph Queries"],
+        "docs/ash-and-spark.md": [title: "Ash Framework & Full-Text Search"],
+        "docs/architecture-and-internals.md": [title: "Architecture & Internals"],
+        "usage-rules.md": [title: "LLM & Agent Usage Rules"],
+        "CHANGELOG.md": [title: "Changelog"],
+        LICENSE: [title: "License"]
       ],
       groups_for_extras: [
-        "Core Concepts & Protocols": [
+        "Core Concepts": [
           "docs/access-and-enumerable.md",
           "docs/collections-and-indexing.md",
           "docs/time-travel-and-storage.md"
         ],
-        "Macro DSLs & Query Languages": [
-          "docs/path-and-pull-dsl.md",
+        "DSLs, Queries & Ash": [
           "docs/transaction-dsl.md",
+          "docs/path-and-pull-dsl.md",
           "docs/datalog-dsl.md",
           "docs/ash-and-spark.md"
+        ],
+        "Internals & Reference": [
+          "docs/architecture-and-internals.md",
+          "usage-rules.md",
+          "CHANGELOG.md",
+          "LICENSE"
         ]
       ],
       groups_for_modules: [
-        "Client & Lazy Cursors": [
+        "Core Client": [
           Xitdb,
           Xitdb.Cursor,
           Xitdb.Collection,
           Xitdb.Error
         ],
-        "Macro DSLs, Selectors & Pull": [
+        "DSLs, Pull & Sigils": [
           Xitdb.DSL,
           Xitdb.Pull,
           Xitdb.Sigils
         ],
-        "Ash DataLayer, Store & Search": [
+        "Ash Integration": [
           Xitdb.Ash.DataLayer,
           Xitdb.Ash.Dsl,
           Xitdb.Ash.Store,
@@ -115,7 +122,9 @@ defmodule Xitdb.MixProject do
           Xitdb.Ash.TestSandbox,
           Xitdb.Ash.Info,
           Xitdb.Ash.Tx,
-          Xitdb.Ash.LeaseError,
+          Xitdb.Ash.LeaseError
+        ],
+        "Ash DSL Entities & Internals": [
           Xitdb.Ash.Index,
           Xitdb.Ash.SearchField,
           Xitdb.Ash.Reference,
@@ -123,13 +132,16 @@ defmodule Xitdb.MixProject do
           Xitdb.Ash.Codec,
           Xitdb.Ash.Indexer,
           Xitdb.Ash.Query,
-          Xitdb.Ash.Mutator
-        ],
-        "Ash Spark Transformers & Verifiers": [
+          Xitdb.Ash.Mutator,
           Xitdb.Ash.Transformers.BuildIndexPlan,
           Xitdb.Ash.Verifiers.VerifyNoSqlFragments,
           Xitdb.Ash.Verifiers.VerifyCrossStoreReferences
         ]
+      ],
+      skip_undefined_reference_warnings_on: [
+        "CHANGELOG.md",
+        "usage-rules.md",
+        "docs/architecture-and-internals.md"
       ],
       source_ref: "v#{@version}",
       source_url: @source_url

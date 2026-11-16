@@ -1,21 +1,34 @@
 defmodule Xitdb do
   @moduledoc """
-  Idiomatic Elixir client and Odin NIF wrapper for [`xitdb`](https://github.com/xit-vcs/xitdb),
-  an embeddable, immutable, append-only database with persistent structural sharing.
+  Embedded, immutable single-file database for Elixir powered by
+  [`xitdb`](https://github.com/xit-vcs/xitdb).
 
-  `Xitdb` exposes database moments as lazy `%Xitdb.Cursor{}` handles that implement
-  Elixir's `Access`, `Enumerable`, and `Inspect` protocols—allowing you to navigate
-  and query on-disk data structures (`Hash_Map`, `Counted_Hash_Map`, `Sorted_Map`,
-  `Array_List`, `Linked_Array_List`, and sets) just like standard Elixir maps and lists.
+  `Xitdb` stores nested maps, lists, sorted B+Tree maps, and sets directly in `:memory`
+  or a single `.xit` file, committing every transaction as an immutable snapshot ("moment")
+  with structural sharing. Navigate data lazily with standard Elixir `Access`
+  (`db["users"]["alice"]["roles"][0]`) and `Enum`/`Stream`, or use `Xitdb.DSL`,
+  `Xitdb.pull/2`, Datalog `query/3`, and `Xitdb.Ash.DataLayer`.
+
+  ## Quick Example
+
+      {:ok, db} = Xitdb.open(backend: :memory)
+      {:ok, db} = Xitdb.transact(db, %{"users" => %{"alice" => %{"age" => 30}}})
+
+      v0 = Xitdb.as_of(db, 0)
+      {:ok, db} = Xitdb.transact(db, fn root -> update_in(root["users"]["alice"]["age"], &(&1 + 1)) end)
+
+      v0["users"]["alice"]["age"] # => 30
+      db["users"]["alice"]["age"] # => 31
 
   ## Guides
-  - [Lazy Cursors, `Access` & `Enumerable`](docs/access-and-enumerable.md)
-  - [Collections, Data Modeling & Secondary Indexes](docs/collections-and-indexing.md)
-  - [Path Selector & Structural Pull DSL](docs/path-and-pull-dsl.md)
-  - [Declarative Transaction Block DSL](docs/transaction-dsl.md)
-  - [Declarative Datalog Query DSL](docs/datalog-dsl.md)
-  - [Time-Travel, Structural Diffs, Lineage & Storage Lifecycle](docs/time-travel-and-storage.md)
-  - [Ash & Spark Integration](docs/ash-and-spark.md)
+  - [Reading & Updating with Access & Enum](docs/access-and-enumerable.md)
+  - [Collections & Secondary Indexes](docs/collections-and-indexing.md)
+  - [Time-Travel, Diffs & Storage](docs/time-travel-and-storage.md)
+  - [Transaction DSL](docs/transaction-dsl.md)
+  - [Path Selectors & Pull Projections](docs/path-and-pull-dsl.md)
+  - [Datalog & Graph Queries](docs/datalog-dsl.md)
+  - [Ash Framework & Full-Text Search](docs/ash-and-spark.md)
+  - [Architecture, Internals & Performance](docs/architecture-and-internals.md)
   """
 
   @behaviour Access
