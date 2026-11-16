@@ -77,28 +77,49 @@ defmodule Xitdb.DSL.PathCompiler do
   end
 
   def typed_modifier_segment(mod_fn, literal, :selector)
-      when is_binary(literal) or
-             (is_atom(literal) and not is_nil(literal) and not is_boolean(literal)) do
+      when mod_fn not in [:array, :array_list, :linked, :linked_list, :linked_array_list] and
+             (is_binary(literal) or
+                (is_atom(literal) and not is_nil(literal) and not is_boolean(literal))) do
     {:static, Selector.format_typed_step(mod_fn, literal)}
   end
 
   def typed_modifier_segment(mod_fn, literal, :steps)
-      when is_binary(literal) or
-             (is_atom(literal) and not is_nil(literal) and not is_boolean(literal)) do
+      when mod_fn not in [:array, :array_list, :linked, :linked_list, :linked_array_list] and
+             (is_binary(literal) or
+                (is_atom(literal) and not is_nil(literal) and not is_boolean(literal))) do
     {:static_step, static_typed_step(mod_fn, to_step_string(literal))}
   end
 
-  def typed_modifier_segment(mod_fn, dynamic_ast, :selector) do
+  def typed_modifier_segment(mod_fn, literal, _mode)
+      when mod_fn in [:array, :array_list, :linked, :linked_list, :linked_array_list] and
+             (is_binary(literal) or is_atom(literal)) do
+    raise ArgumentError,
+          "Invalid typed path step {#{inspect(mod_fn)}, #{inspect(literal)}}: expected integer index"
+  end
+
+  def typed_modifier_segment(mod_fn, dynamic_ast, :selector)
+      when is_typed_modifier(mod_fn) or mod_fn in [:hash_map, :map] do
     {:dynamic, quote(do: Xitdb.Selector.format_typed_step(unquote(mod_fn), unquote(dynamic_ast)))}
   end
 
   def typed_modifier_segment(mod_fn, dynamic_ast, :steps) when mod_fn in [:hash_map, :map] do
-    {:dynamic_step, quote(do: Xitdb.Selector.validate_step_key(unquote(dynamic_ast)))}
+    {:dynamic_step,
+     quote generated: true do
+       case unquote(dynamic_ast) do
+         step when is_binary(step) -> step
+         other -> Xitdb.Selector.validate_step_key(other)
+       end
+     end}
   end
 
-  def typed_modifier_segment(mod_fn, dynamic_ast, :steps) do
+  def typed_modifier_segment(mod_fn, dynamic_ast, :steps) when is_typed_modifier(mod_fn) do
     {:dynamic_step,
      quote(do: Xitdb.Selector.normalize_typed_step(unquote(mod_fn), unquote(dynamic_ast)))}
+  end
+
+  def typed_modifier_segment(mod_fn, arg, _mode) do
+    raise ArgumentError,
+          "Invalid typed path step {#{inspect(mod_fn)}, #{inspect(arg)}}"
   end
 
   defp to_step_string(s) when is_binary(s), do: s
@@ -277,7 +298,13 @@ defmodule Xitdb.DSL.PathCompiler do
   end
 
   defp extract_bracket_segment(dynamic_ast, :steps) do
-    {:dynamic_step, quote(do: Xitdb.Selector.normalize_bracket_step(unquote(dynamic_ast)))}
+    {:dynamic_step,
+     quote generated: true do
+       case unquote(dynamic_ast) do
+         step when is_binary(step) or is_integer(step) -> step
+         other -> Xitdb.Selector.normalize_bracket_step(other)
+       end
+     end}
   end
 
   defp moment_segment({:^, _, [inner]}, mode), do: moment_segment(inner, mode)

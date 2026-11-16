@@ -200,6 +200,104 @@ int nif_map_to_kv_arrays(
     return 1;
 }
 
+typedef struct {
+    uint8_t kind_code;
+    const unsigned char* key_ptr;
+    size_t key_len;
+    int64_t index_val;
+    ERL_NIF_TERM tag_term;
+    ERL_NIF_TERM val_term;
+} NifRawStep;
+
+int nif_unpack_step_list(
+    ErlNifEnv* env,
+    ERL_NIF_TERM list_term,
+    NifRawStep* out_steps,
+    int max_steps,
+    int* count_out
+) {
+    ERL_NIF_TERM cur = list_term;
+    ERL_NIF_TERM head = 0;
+    ERL_NIF_TERM tail = 0;
+    int n = 0;
+
+    while (enif_get_list_cell(env, cur, &head, &tail)) {
+        if (n >= max_steps) {
+            return -2;
+        }
+        NifRawStep* st = &out_steps[n];
+        ErlNifBinary bin;
+        ErlNifSInt64 idx = 0;
+        ERL_NIF_TERM inner_h = 0;
+        ERL_NIF_TERM inner_t = 0;
+        int arity = 0;
+        const ERL_NIF_TERM* elems = NULL;
+
+        if (enif_inspect_binary(env, head, &bin)) {
+            st->kind_code = 0;
+            st->key_ptr = bin.data;
+            st->key_len = bin.size;
+            st->index_val = 0;
+            st->tag_term = 0;
+            st->val_term = 0;
+        } else if (enif_get_int64(env, head, &idx)) {
+            st->kind_code = 1;
+            st->key_ptr = NULL;
+            st->key_len = 0;
+            st->index_val = (int64_t)idx;
+            st->tag_term = 0;
+            st->val_term = 0;
+        } else if (enif_get_list_cell(env, head, &inner_h, &inner_t)) {
+            if (enif_is_empty_list(env, inner_t) && enif_get_int64(env, inner_h, &idx)) {
+                st->kind_code = 2;
+                st->key_ptr = NULL;
+                st->key_len = 0;
+                st->index_val = (int64_t)idx;
+                st->tag_term = 0;
+                st->val_term = 0;
+            } else {
+                return -3;
+            }
+        } else if (enif_is_empty_list(env, head)) {
+            return -3;
+        } else if (enif_get_tuple(env, head, &arity, &elems) && arity == 2) {
+            st->tag_term = elems[0];
+            if (enif_inspect_binary(env, elems[1], &bin)) {
+                st->kind_code = 3;
+                st->key_ptr = bin.data;
+                st->key_len = bin.size;
+                st->index_val = 0;
+                st->val_term = 0;
+            } else if (enif_get_int64(env, elems[1], &idx)) {
+                st->kind_code = 4;
+                st->key_ptr = NULL;
+                st->key_len = 0;
+                st->index_val = (int64_t)idx;
+                st->val_term = 0;
+            } else {
+                st->kind_code = 5;
+                st->key_ptr = NULL;
+                st->key_len = 0;
+                st->index_val = 0;
+                st->val_term = elems[1];
+            }
+        } else if (enif_is_atom(env, head)) {
+            return -1;
+        } else {
+            return -3;
+        }
+
+        cur = tail;
+        n++;
+    }
+
+    if (!enif_is_empty_list(env, cur)) {
+        return -3;
+    }
+    *count_out = n;
+    return 0;
+}
+
 // Term creation helpers
 ERL_NIF_TERM nif_make_atom_len(ErlNifEnv* env, const char* name, size_t len) {
     return enif_make_atom_len(env, name, len);

@@ -15,6 +15,15 @@ import xitdb "xitdb:."
 ErlNifEnv :: distinct rawptr
 ERL_NIF_TERM :: distinct c.ulong
 
+Nif_Raw_Step :: struct {
+	kind_code: u8,
+	key_ptr:   [^]u8,
+	key_len:   c.size_t,
+	index_val: i64,
+	tag_term:  ERL_NIF_TERM,
+	val_term:  ERL_NIF_TERM,
+}
+
 @(default_calling_convention = "c")
 foreign _ {
 	nif_alloc_db_resource :: proc(size: c.size_t) -> rawptr ---
@@ -44,6 +53,7 @@ foreign _ {
 	nif_get_map_value :: proc(env: ErlNifEnv, map_term: ERL_NIF_TERM, key: ERL_NIF_TERM, val_out: ^ERL_NIF_TERM) -> c.int ---
 	nif_get_map_size :: proc(env: ErlNifEnv, map_term: ERL_NIF_TERM, size_out: ^c.size_t) -> c.int ---
 	nif_map_to_kv_arrays :: proc(env: ErlNifEnv, map_term: ERL_NIF_TERM, keys_out: [^]ERL_NIF_TERM, vals_out: [^]ERL_NIF_TERM, max_cnt: c.size_t, count_out: ^c.size_t) -> c.int ---
+	nif_unpack_step_list :: proc(env: ErlNifEnv, list_term: ERL_NIF_TERM, out_steps: [^]Nif_Raw_Step, max_steps: c.int, count_out: ^c.int) -> c.int ---
 
 	nif_make_atom_len :: proc(env: ErlNifEnv, name: [^]u8, length: c.size_t) -> ERL_NIF_TERM ---
 	nif_make_int64 :: proc(env: ErlNifEnv, val: i64) -> ERL_NIF_TERM ---
@@ -1710,7 +1720,7 @@ parse_escaped_ident_or_bracket :: proc(s: string, start_i: int, allocator: runti
 	i := start_i
 	for i < len(s) {
 		ch := s[i]
-		if ch == '.' || ch == '[' || ch == ']' || ch == '#' || ch == '$' || ch == '%' || ch == '^' || ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' {
+		if ch == '.' || ch == '[' || ch == ']' || ch == '#' || ch == '$' || ch == '%' || ch == '^' || ch == '@' || ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' {
 			break
 		}
 		i += 1
@@ -1809,6 +1819,9 @@ parse_escaped_steps_buf :: proc(
 			push_path_step(buf, &buf_len, &dyn, &using_dyn, xitdb.Path_Step{kind = .Sorted_Set_Member, key = key}, allocator)
 			i = next_i
 
+		case '@':
+			return nil, "invalid_selector"
+
 		case '[':
 			if i + 1 < len(s) && s[i + 1] == '[' {
 				i += 2
@@ -1831,19 +1844,7 @@ parse_escaped_steps_buf :: proc(
 				if er != "" {
 					return nil, er
 				}
-				step_kind := xitdb.Step_Kind.Hash_Map_Key
-				total_len := len(dyn) if using_dyn else buf_len
-				if total_len == 1 {
-					first_step := &dyn[0] if using_dyn else &buf[0]
-					if first_step.kind == .Counted_Hash_Map_Key {
-						first_step.kind = .Hash_Map_Key
-						step_kind = .Counted_Hash_Map_Key
-					} else if first_step.kind == .Sorted_Map_Key {
-						first_step.kind = .Hash_Map_Key
-						step_kind = .Sorted_Map_Key
-					}
-				}
-				push_path_step(buf, &buf_len, &dyn, &using_dyn, xitdb.Path_Step{kind = step_kind, key = key}, allocator)
+				push_path_step(buf, &buf_len, &dyn, &using_dyn, xitdb.Path_Step{kind = .Hash_Map_Key, key = key}, allocator)
 				i = next_i
 			} else {
 				i += 1
@@ -2008,68 +2009,113 @@ decode_one_step_term :: proc(
 	arity: c.int = 0
 	elems: [^]ERL_NIF_TERM = nil
 	if nif_get_tuple(env, term, &arity, &elems) != 0 && arity == 2 {
-		kind_term := elems[0]
-		val_term := elems[1]
-
-		if kind_term == ATOM_MAP || kind_term == TAG_ATOMS[u8(xitdb.Tag.Hash_Map)] {
-			key, ok_k := decode_step_key_term(env, val_term, allocator)
-			if !ok_k {
-				return {}, "invalid_selector"
-			}
-			return xitdb.Path_Step{kind = .Hash_Map_Key, key = key}, ""
-		}
-		if kind_term == ATOM_COUNTED || kind_term == ATOM_COUNTED_MAP || kind_term == TAG_ATOMS[u8(xitdb.Tag.Counted_Hash_Map)] {
-			key, ok_k := decode_step_key_term(env, val_term, allocator)
-			if !ok_k {
-				return {}, "invalid_selector"
-			}
-			return xitdb.Path_Step{kind = .Counted_Hash_Map_Key, key = key}, ""
-		}
-		if kind_term == ATOM_SORTED || kind_term == TAG_ATOMS[u8(xitdb.Tag.Sorted_Map)] {
-			key, ok_k := decode_step_key_term(env, val_term, allocator)
-			if !ok_k {
-				return {}, "invalid_selector"
-			}
-			return xitdb.Path_Step{kind = .Sorted_Map_Key, key = key}, ""
-		}
-		if kind_term == ATOM_ARRAY || kind_term == TAG_ATOMS[u8(xitdb.Tag.Array_List)] {
-			aidx: i64 = 0
-			if nif_get_int64(env, val_term, &aidx) == 0 {
-				return {}, "invalid_selector"
-			}
-			return xitdb.Path_Step{kind = .Array_List_Idx, index = aidx}, ""
-		}
-		if kind_term == ATOM_LINKED || kind_term == ATOM_LINKED_LIST || kind_term == TAG_ATOMS[u8(xitdb.Tag.Linked_Array_List)] {
-			lidx: i64 = 0
-			if nif_get_int64(env, val_term, &lidx) == 0 {
-				return {}, "invalid_selector"
-			}
-			return xitdb.Path_Step{kind = .Linked_List_Idx, index = lidx}, ""
-		}
-		if kind_term == ATOM_SET || kind_term == ATOM_SET_MEMBER || kind_term == TAG_ATOMS[u8(xitdb.Tag.Hash_Set)] {
-			key, ok_k := decode_step_key_term(env, val_term, allocator)
-			if !ok_k {
-				return {}, "invalid_selector"
-			}
-			return xitdb.Path_Step{kind = .Hash_Set_Member, key = key}, ""
-		}
-		if kind_term == ATOM_COUNTED_SET || kind_term == ATOM_COUNTED_SET_MEMBER || kind_term == TAG_ATOMS[u8(xitdb.Tag.Counted_Hash_Set)] {
-			key, ok_k := decode_step_key_term(env, val_term, allocator)
-			if !ok_k {
-				return {}, "invalid_selector"
-			}
-			return xitdb.Path_Step{kind = .Counted_Set_Member, key = key}, ""
-		}
-		if kind_term == ATOM_SORTED_SET_MEMBER || kind_term == TAG_ATOMS[u8(xitdb.Tag.Sorted_Set)] {
-			key, ok_k := decode_step_key_term(env, val_term, allocator)
-			if !ok_k {
-				return {}, "invalid_selector"
-			}
-			return xitdb.Path_Step{kind = .Sorted_Set_Member, key = key}, ""
-		}
+		return decode_tagged_step_term(env, elems[0], elems[1], allocator)
 	}
 
 	return {}, "invalid_selector"
+}
+
+map_tag_term_to_key_step_kind :: #force_inline proc(kind_term: ERL_NIF_TERM) -> (xitdb.Step_Kind, bool) {
+	if kind_term == ATOM_MAP || kind_term == TAG_ATOMS[u8(xitdb.Tag.Hash_Map)] {
+		return .Hash_Map_Key, true
+	}
+	if kind_term == ATOM_COUNTED || kind_term == ATOM_COUNTED_MAP || kind_term == TAG_ATOMS[u8(xitdb.Tag.Counted_Hash_Map)] {
+		return .Counted_Hash_Map_Key, true
+	}
+	if kind_term == ATOM_SORTED || kind_term == TAG_ATOMS[u8(xitdb.Tag.Sorted_Map)] {
+		return .Sorted_Map_Key, true
+	}
+	if kind_term == ATOM_SET || kind_term == ATOM_SET_MEMBER || kind_term == TAG_ATOMS[u8(xitdb.Tag.Hash_Set)] {
+		return .Hash_Set_Member, true
+	}
+	if kind_term == ATOM_COUNTED_SET || kind_term == ATOM_COUNTED_SET_MEMBER || kind_term == TAG_ATOMS[u8(xitdb.Tag.Counted_Hash_Set)] {
+		return .Counted_Set_Member, true
+	}
+	if kind_term == ATOM_SORTED_SET_MEMBER || kind_term == TAG_ATOMS[u8(xitdb.Tag.Sorted_Set)] {
+		return .Sorted_Set_Member, true
+	}
+	return .Hash_Map_Key, false
+}
+
+map_tag_term_to_idx_step_kind :: #force_inline proc(kind_term: ERL_NIF_TERM) -> (xitdb.Step_Kind, bool) {
+	if kind_term == ATOM_ARRAY || kind_term == TAG_ATOMS[u8(xitdb.Tag.Array_List)] {
+		return .Array_List_Idx, true
+	}
+	if kind_term == ATOM_LINKED || kind_term == ATOM_LINKED_LIST || kind_term == TAG_ATOMS[u8(xitdb.Tag.Linked_Array_List)] {
+		return .Linked_List_Idx, true
+	}
+	return .Array_List_Idx, false
+}
+
+decode_tagged_step_term :: proc(
+	env: ErlNifEnv,
+	kind_term: ERL_NIF_TERM,
+	val_term: ERL_NIF_TERM,
+	allocator := context.temp_allocator,
+) -> (step: xitdb.Path_Step, err_reason: string) {
+	if kind, ok_k := map_tag_term_to_key_step_kind(kind_term); ok_k {
+		key, ok_s := decode_step_key_term(env, val_term, allocator)
+		if !ok_s {
+			return {}, "invalid_selector"
+		}
+		return xitdb.Path_Step{kind = kind, key = key}, ""
+	}
+	if kind, ok_i := map_tag_term_to_idx_step_kind(kind_term); ok_i {
+		idx: i64 = 0
+		if nif_get_int64(env, val_term, &idx) == 0 {
+			return {}, "invalid_selector"
+		}
+		return xitdb.Path_Step{kind = kind, index = idx}, ""
+	}
+	return {}, "invalid_selector"
+}
+
+convert_raw_steps_buf :: proc(
+	env: ErlNifEnv,
+	raw_steps: []Nif_Raw_Step,
+	buf: []xitdb.Path_Step,
+	allocator := context.temp_allocator,
+) -> (res: []xitdb.Path_Step, err_reason: string) {
+	if len(raw_steps) == 0 {
+		return nil, ""
+	}
+	if len(raw_steps) > len(buf) {
+		return nil, "invalid_selector"
+	}
+	for i in 0 ..< len(raw_steps) {
+		r := raw_steps[i]
+		switch r.kind_code {
+		case 0:
+			k := "" if r.key_len == 0 else string(r.key_ptr[:r.key_len])
+			buf[i] = xitdb.Path_Step{kind = .Hash_Map_Key, key = k}
+		case 1:
+			buf[i] = xitdb.Path_Step{kind = .Array_List_Idx, index = r.index_val}
+		case 2:
+			buf[i] = xitdb.Path_Step{kind = .Linked_List_Idx, index = r.index_val}
+		case 3:
+			kind, ok_k := map_tag_term_to_key_step_kind(r.tag_term)
+			if !ok_k {
+				return nil, "invalid_selector"
+			}
+			k := "" if r.key_len == 0 else string(r.key_ptr[:r.key_len])
+			buf[i] = xitdb.Path_Step{kind = kind, key = k}
+		case 4:
+			kind, ok_i := map_tag_term_to_idx_step_kind(r.tag_term)
+			if !ok_i {
+				return nil, "invalid_selector"
+			}
+			buf[i] = xitdb.Path_Step{kind = kind, index = r.index_val}
+		case 5:
+			step, er := decode_tagged_step_term(env, r.tag_term, r.val_term, allocator)
+			if er != "" {
+				return nil, er
+			}
+			buf[i] = step
+		case:
+			return nil, "invalid_selector"
+		}
+	}
+	return buf[:len(raw_steps)], ""
 }
 
 decode_steps_list_buf :: proc(
@@ -2078,9 +2124,21 @@ decode_steps_list_buf :: proc(
 	buf: []xitdb.Path_Step,
 	allocator := context.temp_allocator,
 ) -> (res: []xitdb.Path_Step, err_reason: string) {
-	buf_len := 0
 	dyn: [dynamic]xitdb.Path_Step
-	using_dyn := false
+	return decode_steps_list_tail_buf(env, list_term, buf, 0, &dyn, false, allocator)
+}
+
+decode_steps_list_tail_buf :: proc(
+	env: ErlNifEnv,
+	list_term: ERL_NIF_TERM,
+	buf: []xitdb.Path_Step,
+	init_len: int,
+	dyn: ^[dynamic]xitdb.Path_Step,
+	using_dyn_in: bool,
+	allocator := context.temp_allocator,
+) -> (res: []xitdb.Path_Step, err_reason: string) {
+	buf_len := init_len
+	using_dyn := using_dyn_in
 
 	cur := list_term
 	head: ERL_NIF_TERM = 0
@@ -2090,7 +2148,7 @@ decode_steps_list_buf :: proc(
 		if s_err != "" {
 			return nil, s_err
 		}
-		push_path_step(buf, &buf_len, &dyn, &using_dyn, step, allocator)
+		push_path_step(buf, &buf_len, dyn, &using_dyn, step, allocator)
 		cur = tail
 	}
 	if nif_is_empty_list(env, cur) == 0 {
@@ -2098,7 +2156,7 @@ decode_steps_list_buf :: proc(
 	}
 
 	if using_dyn {
-		return dyn[:], ""
+		return dyn^[:], ""
 	}
 	if buf_len == 0 {
 		return nil, ""
@@ -2121,6 +2179,16 @@ decode_steps_term_buf :: proc(
 		return steps, er, true
 	}
 	if nif_is_list(env, term) != 0 {
+		raw_buf: [16]Nif_Raw_Step = ---
+		raw_count: c.int = 0
+		rc := nif_unpack_step_list(env, term, &raw_buf[0], 16, &raw_count)
+		if rc == -3 {
+			return nil, "invalid_selector", true
+		}
+		if rc == 0 && int(raw_count) <= len(buf) {
+			steps, er := convert_raw_steps_buf(env, raw_buf[:int(raw_count)], buf, allocator)
+			return steps, er, true
+		}
 		steps, er := decode_steps_list_buf(env, term, buf, allocator)
 		return steps, er, true
 	}
@@ -2160,24 +2228,80 @@ decode_selector_term_buf :: proc(
 		return parsed, er, true
 	}
 	if nif_is_list(env, term) != 0 {
-		cur := term
-		head: ERL_NIF_TERM = 0
-		tail: ERL_NIF_TERM = 0
-		parsed := xitdb.Parsed_Selector{}
-		if nif_get_list_cell(env, cur, &head, &tail) != 0 {
-			arity: c.int = 0
-			elems: [^]ERL_NIF_TERM = nil
-			if nif_get_tuple(env, head, &arity, &elems) != 0 && arity == 2 && elems[0] == ATOM_AT_MOMENT {
-				m_idx: i64 = 0
-				if nif_get_int64(env, elems[1], &m_idx) == 0 {
+		raw_buf: [17]Nif_Raw_Step = ---
+		raw_count: c.int = 0
+		rc := nif_unpack_step_list(env, term, &raw_buf[0], 17, &raw_count)
+		if rc == -3 {
+			return {}, "invalid_selector", true
+		}
+		if rc == 0 {
+			raw_slice := raw_buf[:int(raw_count)]
+			if len(raw_slice) == 0 {
+				return xitdb.Parsed_Selector{}, "", true
+			}
+			is_at_moment := (raw_slice[0].kind_code >= 3 && raw_slice[0].kind_code <= 5) && raw_slice[0].tag_term == ATOM_AT_MOMENT
+			if is_at_moment {
+				if raw_slice[0].kind_code != 4 {
 					return {}, "invalid_selector", true
 				}
-				parsed.has_moment = true
-				parsed.moment_index = m_idx
-				cur = tail
+				sub := raw_slice[1:]
+				if len(sub) <= len(buf) {
+					steps, er := convert_raw_steps_buf(env, sub, buf, allocator)
+					if er != "" {
+						return {}, er, true
+					}
+					return xitdb.Parsed_Selector{
+						has_moment   = true,
+						moment_index = raw_slice[0].index_val,
+						steps        = steps,
+					}, "", true
+				}
+			} else if len(raw_slice) <= len(buf) {
+				steps, er := convert_raw_steps_buf(env, raw_slice, buf, allocator)
+				if er != "" {
+					return {}, er, true
+				}
+				return xitdb.Parsed_Selector{steps = steps}, "", true
 			}
 		}
-		steps, er := decode_steps_list_buf(env, cur, buf, allocator)
+
+		head: ERL_NIF_TERM = 0
+		tail: ERL_NIF_TERM = 0
+		if nif_get_list_cell(env, term, &head, &tail) == 0 {
+			if nif_is_empty_list(env, term) != 0 {
+				return xitdb.Parsed_Selector{}, "", true
+			}
+			return {}, "invalid_selector", true
+		}
+
+		parsed := xitdb.Parsed_Selector{}
+		arity: c.int = 0
+		elems: [^]ERL_NIF_TERM = nil
+		if nif_get_tuple(env, head, &arity, &elems) != 0 && arity == 2 && elems[0] == ATOM_AT_MOMENT {
+			m_idx: i64 = 0
+			if nif_get_int64(env, elems[1], &m_idx) == 0 {
+				return {}, "invalid_selector", true
+			}
+			parsed.has_moment = true
+			parsed.moment_index = m_idx
+			steps, er := decode_steps_list_buf(env, tail, buf, allocator)
+			if er != "" {
+				return {}, er, true
+			}
+			parsed.steps = steps
+			return parsed, "", true
+		}
+
+		first_step, s_err := decode_one_step_term(env, head, allocator)
+		if s_err != "" {
+			return {}, s_err, true
+		}
+		buf_len := 0
+		dyn: [dynamic]xitdb.Path_Step
+		using_dyn := false
+		push_path_step(buf, &buf_len, &dyn, &using_dyn, first_step, allocator)
+
+		steps, er := decode_steps_list_tail_buf(env, tail, buf, buf_len, &dyn, using_dyn, allocator)
 		if er != "" {
 			return {}, er, true
 		}
@@ -5513,31 +5637,49 @@ read_prehashed_steps_slot :: proc(
 		switch step.kind {
 		case .Hash_Map_Key:
 			tag := cur.slot_ptr.slot.tag
-			if tag == .Counted_Hash_Map || tag == .Counted_Hash_Set {
-				m := xitdb.read_counted_hash_map_init(cur) or_return
-				next_maybe = xitdb.hash_map_get_cursor_by_hash(m.read_hash_map, step_hashes[i]) or_return
-			} else {
+			#partial switch tag {
+			case .Hash_Map:
 				m := xitdb.read_hash_map_init(cur) or_return
 				next_maybe = xitdb.hash_map_get_cursor_by_hash(m, step_hashes[i]) or_return
+			case .Counted_Hash_Map:
+				m := xitdb.read_counted_hash_map_init(cur) or_return
+				next_maybe = xitdb.hash_map_get_cursor_by_hash(m.read_hash_map, step_hashes[i]) or_return
+			case .Sorted_Map:
+				m := xitdb.read_sorted_map_init(cur) or_return
+				next_maybe = xitdb.sorted_map_get_cursor(m, step.key) or_return
+			case .Hash_Set:
+				s := xitdb.read_hash_set_init(cur) or_return
+				next_maybe = xitdb.hash_set_get_cursor_by_hash(s, step_hashes[i]) or_return
+			case .Counted_Hash_Set:
+				s := xitdb.read_counted_hash_set_init(cur) or_return
+				next_maybe = xitdb.hash_set_get_cursor_by_hash(s.read_hash_set, step_hashes[i]) or_return
+			case .Sorted_Set:
+				s := xitdb.read_sorted_set_init(cur) or_return
+				next_maybe = xitdb.cursor_read_path(
+					s.cursor,
+					[]xitdb.Path_Part{xitdb.Sorted_Map_Get{target = xitdb.Sorted_Map_Get_Key{key = transmute([]u8)step.key}}},
+				) or_return
+			case:
+				return xitdb.Slot{}, .Unexpected_Tag
 			}
 		case .Counted_Hash_Map_Key:
 			m := xitdb.read_counted_hash_map_init(cur) or_return
 			next_maybe = xitdb.hash_map_get_cursor_by_hash(m.read_hash_map, step_hashes[i]) or_return
 		case .Sorted_Map_Key:
-			tag := cur.slot_ptr.slot.tag
-			if tag == .Hash_Map || tag == .Hash_Set {
-				m := xitdb.read_hash_map_init(cur) or_return
-				next_maybe = xitdb.hash_map_get_cursor_by_hash(m, step_hashes[i]) or_return
-			} else if tag == .Counted_Hash_Map || tag == .Counted_Hash_Set {
-				m := xitdb.read_counted_hash_map_init(cur) or_return
-				next_maybe = xitdb.hash_map_get_cursor_by_hash(m.read_hash_map, step_hashes[i]) or_return
-			} else {
-				m := xitdb.read_sorted_map_init(cur) or_return
-				next_maybe = xitdb.sorted_map_get_cursor(m, step.key) or_return
-			}
+			m := xitdb.read_sorted_map_init(cur) or_return
+			next_maybe = xitdb.sorted_map_get_cursor(m, step.key) or_return
 		case .Array_List_Idx:
-			a := xitdb.read_array_list_init(cur) or_return
-			next_maybe = xitdb.array_list_get_cursor(a, step.index) or_return
+			tag := cur.slot_ptr.slot.tag
+			#partial switch tag {
+			case .Array_List:
+				a := xitdb.read_array_list_init(cur) or_return
+				next_maybe = xitdb.array_list_get_cursor(a, step.index) or_return
+			case .Linked_Array_List:
+				l := xitdb.read_linked_array_list_init(cur) or_return
+				next_maybe = xitdb.linked_array_list_get_cursor(l, step.index) or_return
+			case:
+				return xitdb.Slot{}, .Unexpected_Tag
+			}
 		case .Linked_List_Idx:
 			l := xitdb.read_linked_array_list_init(cur) or_return
 			next_maybe = xitdb.linked_array_list_get_cursor(l, step.index) or_return
@@ -5647,23 +5789,9 @@ odin_nif_history_of :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_T
 		if s_err != nil {
 			if s_err == .Unexpected_Tag {
 				cur_slot = xitdb.Slot{}
-				if cur_slot != prev_slot {
-					val_term, m_err := materialize_slot(env, &handle.db, cur_slot, false)
-					if m_err != nil {
-						return make_xitdb_err(env, m_err)
-					}
-					vals := [4]ERL_NIF_TERM{
-						nif_make_int64(env, m_idx),
-						val_term,
-						empty_doc_term,
-						zero_inst_term,
-					}
-					append(&items, make_map_safe(env, keys[:], vals[:]))
-					prev_slot = cur_slot
-				}
-				continue
+			} else {
+				return make_xitdb_err(env, s_err)
 			}
-			return make_xitdb_err(env, s_err)
 		}
 
 		if cur_slot != prev_slot {
