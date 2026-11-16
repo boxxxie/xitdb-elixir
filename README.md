@@ -1,4 +1,4 @@
-# Xitdb — Idiomatic Elixir Client for `xitdb`
+# Xitdb
 
 [![CI](https://github.com/boxxxie/xitdb-elixir/actions/workflows/ci.yml/badge.svg)](https://github.com/boxxxie/xitdb-elixir/actions/workflows/ci.yml)
 [![Hex.pm](https://img.shields.io/badge/hex-2.0.1-blue.svg?logo=elixir&logoColor=white)](https://hex.pm/packages/xitdb)
@@ -6,61 +6,44 @@
 [![Odin](https://img.shields.io/badge/Odin-dev--2026--09%2B-3882D2.svg)](https://odin-lang.org)
 [![Ash](https://img.shields.io/badge/Ash-3.37.2%2B-E04F5F.svg)](https://ash-hq.org)
 [![Format](https://img.shields.io/badge/xitdb-v2%20wire%20format-5C6BC0.svg)](https://github.com/xit-vcs/xitdb)
-[![Benchmarks](https://img.shields.io/badge/benchmarks-28%20workloads-orange.svg)](benchmarks/README.md)
+[![Benchmarks](https://img.shields.io/badge/benchmarks-28%20workloads-orange.svg)](https://github.com/boxxxie/xitdb-elixir/blob/master/benchmarks/README.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-`Xitdb` is an idiomatic Elixir client and Odin NIF wrapper for [`xitdb`](https://github.com/xit-vcs/xitdb) (backed by [`odin-xitdb`](https://github.com/boxxxie/odin-xitdb)), an embeddable, immutable, append-only database with persistent structural sharing.
+`Xitdb` brings [`xitdb`](https://github.com/xit-vcs/xitdb) to Elixir—an embedded, single-file database where you store nested maps, lists, sorted maps, and sets directly on disk, and every transaction commits an immutable snapshot in time.
 
-Rather than re-implementing `xitdb`'s wire format in pure Elixir or requiring query boilerplate for every read, `Xitdb` exposes database nodes as **Clojure/Datomic-style lazy `%Xitdb.Cursor{}` values** that implement Elixir's standard `Access`, `Enumerable`, and `Inspect` protocols.
-
----
-
-## Key Features
-
-- **Lazy 9-Byte `Slot` Cursors (`%Xitdb.Cursor{}`):**
-  Navigating nested structures (`db["users"]["alice"]["roles"][0]`) resolves a single 9-byte `Slot` (`tag` + `value`) per hop across the NIF boundary without eagerly deserializing surrounding subtrees into the BEAM heap.
-- **Pure-Value Process Safety:**
-  Because `%Xitdb.Cursor{}` holds only the NIF resource reference (`db_ref`) and a 9-byte `Slot` coordinate (`tag`, `tag_id`, `value`, `moment`), cursors are **pure immutable Elixir values**. Pass them across `Task.async/1`, GenServers, ETS tables, or Phoenix LiveView assigns with zero mutexes or pointer lifetimes.
-- **Standard Elixir `Access` & `Enumerable`:**
-  Use `cursor["key"]`, `cursor[idx]`, `get_in/2`, `put_in/3`, `update_in/3`, `pop_in/2`, `Enum.count/1` (`O(1)` on counted maps/sets/lists), `Enum.member?/2` (`O(1)` HAMT membership), `Enum.slice/2` (`O(log N)` index seek), and lazy `Stream.*` pipelines.
-- **Instant Time-Travel & Structural Diffs:**
-  Pin historical snapshots in `O(1)` with `Xitdb.as_of(db, moment)`, diff any two moments in `O(delta)` with `Xitdb.diff_moments/3`, and inspect attribute lineage with `Xitdb.history_of/2`.
-- **Compile-Time Validated Sigils (`~x`, `~q`), Macro DSL (`Xitdb.DSL`), Pull & Datalog:**
-  Use standard `Access` for lazy navigation or `use Xitdb.DSL` for compile-time path selectors (`path(users[id].todos[[0]])`), zero-read atomic transaction blocks (`tx db do ... end`), structural Pull patterns (`[:username, todos: 0..2]`), and Ecto-style Datalog queries with `^var` pinning.
-- **Native Ash Framework DataLayer, BM25 Search & Spark DSL (`Xitdb.Ash.DataLayer`, `Xitdb.Ash.Dsl`):**
-  Persist `Ash.Resource` domains directly in immutable `.xit` files with `data_layer: Xitdb.Ash.DataLayer`—complete with ~10ns lock-free `:persistent_term` snapshot reads (`Xitdb.Ash.Store`), single/composite B+Tree secondary indexes (`index [:status, :inserted_at]`), transactional Odin NIF BM25 + prefix search (`Xitdb.Ash.Search`), incoming/outgoing FK cascades (`references`), co-located `nested_in` subtrees, historical time-travel (`Store.with_as_of/3`), and `async: true` sandboxes (`Xitdb.Ash.TestSandbox`).
+Think **SQLite meets Elixir's immutable data structures with Git-like history built in**: there is no external database server, no SQL migrations, and no JSON-blob serialization boilerplate. You read and update nested data with standard Elixir `Access` (`db["users"]["alice"]["roles"][0]`), `Enum`, and `Stream`, or reach for `Xitdb`'s declarative transaction blocks, Pull projections, Datalog queries, and native [Ash Framework](https://ash-hq.org) integration with built-in full-text search.
 
 ---
 
-## Installation
+## What is xitdb?
 
-Add `xitdb` to your list of dependencies in `mix.exs`:
+- **Embedded & nested, not flat tables or opaque blobs:** Runs in `:memory` or a single `.xit` file like SQLite, while natively storing arbitrarily nested maps, lists, sorted B+Tree maps, and sets directly on disk.
+- **Git-like history built into every write:** Updating a value never overwrites past commits. Every transaction appends a new immutable *moment* that shares unchanged subtrees with earlier moments—giving you time-travel, diffs, and field audit history out of the box.
+- **Lazy cursors, not whole-file loads:** Accessing `db["users"]["alice"]` returns a lightweight `%Xitdb.Cursor{}` handle instead of loading the entire database into memory. Only the keys or slices you actually read are fetched, and cursors pass freely across BEAM processes, `Task`s, and LiveViews.
+
+---
+
+## Features
+
+- **Feels Like Native Elixir (`Access`, `Enum` & `Stream`):** Navigate nested maps and lists with bracket lookups, `get_in/2`, `put_in/3`, `update_in/3`, and `pop_in/2`, or pipe collections straight into `Enum.count/1`, `Enum.member?/2`, `Enum.slice/2`, and lazy `Stream` pipelines.
+- **Built-In Time-Travel, Diffs & Audit History:** Pin any past commit with `Xitdb.as_of/2`, compare any two commits with `Xitdb.diff_moments/3`, trace when and why any field changed with `Xitdb.history_of/2`, or branch new transactions from an older moment.
+- **Instant Zero-Copy Cloning (`fork`):** Duplicate an entire user, tenant, or document tree inside a transaction without copying its underlying data; subsequent edits diverge cleanly via copy-on-write.
+- **Rich Persistent Collections & Automatic Indexes:** Plain Elixir maps, lists, and `MapSet`s work out of the box, with opt-in `Xitdb.counted_map/1`, `Xitdb.sorted_map/1`, `Xitdb.linked_list/1`, and `Xitdb.sorted_set/1`, plus automatic secondary indexes (`index_on`) that stay in sync across updates and deletes.
+- **Expressive Elixir DSLs (`tx`, `pull`, & Datalog):** Stage deep multi-path writes with `tx db do ... end`, fetch shaped entity slices in one step with `Xitdb.pull/2`, and run joins, aggregations, recursive graph `reach`, and cross-moment `at_moment` queries with `query db do ... end`.
+- **Crash-Safe Single-File Storage & Compaction:** Append-only checksummed commits require no separate WAL sidecar, recover cleanly after crashes, and reclaim historical space online via `Xitdb.compact/2`.
+- **Drop-In Ash Framework DataLayer & Full-Text Search:** Persist `Ash.Resource` domains in `.xit` files (`data_layer: Xitdb.Ash.DataLayer`) with relationships, secondary indexes, ranked BM25 + prefix search (`Xitdb.Ash.Search`), foreign-key cascades, time-travel (`Xitdb.Ash.Store.with_as_of/3`), and `async: true` `Xitdb.Ash.TestSandbox` isolation—with zero SQL migrations.
+
+---
+
+## A Tour in Code
+
+### 1. Read and Update Like Plain Elixir Data
 
 ```elixir
-def deps do
-  [
-    {:xitdb, "~> 2.0"}
-  ]
-end
-```
-
-### System Requirements
-
-Building `xitdb` compiles a native C-ABI Erlang NIF bridge to the embedded Odin database engine:
-- **Odin Compiler**: `odin` must be installed and available in your `PATH` (see [Odin Getting Started](https://odin-lang.org/docs/install/)).
-- **C Compiler**: A standard C compiler (`cc` or `gcc`) for compiling the Erlang NIF C shim.
-
----
-
-## Quick Start
-
-```elixir
-import Xitdb.Sigils
-
-# 1. Open an in-memory or file-backed database
+# Open in memory (or use backend: :buffered_file, path: "app.xit" for disk persistence)
 {:ok, db} = Xitdb.open(backend: :memory)
 
-# 2. Commit a moment using standard Elixir maps, lists, and typed collection wrappers
+# Commit a nested Elixir map as moment 0
 {:ok, db} =
   Xitdb.transact(
     db,
@@ -70,95 +53,91 @@ import Xitdb.Sigils
           "username" => "alice",
           "name" => "Alice Liddell",
           "age" => 30,
-          "roles" => ["admin", "architect"],
-          "flags" => Xitdb.counted_set(["verified", "staff"])
+          "roles" => ["admin", "architect"]
         }
-      },
-      "audit_log" => Xitdb.linked_list(["init", "seed"])
+      }
     },
     doc: "Seed initial users",
     index_rules: [{:index_on, "users", "username", "username->id"}]
   )
 
-# 3. Navigate lazily with standard Elixir Access brackets & Enumerable
-root = Xitdb.db(db)
-alice = root["users"]["alice"]       # => #Xitdb.Cursor<hash_map offset: ..., preview: [...]>
-alice["name"]                        # => "Alice Liddell"
-alice["roles"][1]                    # => "architect"
-Enum.member?(alice["flags"], "staff") # => true (O(1) HAMT lookup, no list conversion!)
+# Navigate lazily with standard Access brackets and Enum
+db["users"]["alice"]["name"]      # => "Alice Liddell"
+db["users"]["alice"]["roles"][0]  # => "admin"
+Enum.to_list(db["users"]["alice"]["roles"])
+# => ["admin", "architect"]
 
-# 4. Mutate nested paths with put_in/3, update_in/3, and pop_in/2 inside Xitdb.transact/2
-snapshot_v0 = Xitdb.as_of(db, 0)
-
+# Update nested paths inside a transaction (creates moment 1)
 {:ok, db} =
-  Xitdb.transact(db, fn r ->
-    r
-    |> update_in(["users", "alice", "age"], &(&1 + 1))
-    |> Xitdb.insert_at(["audit_log"], 1, "promoted")
-  end, doc: "Increment Alice age")
-
-# 5. Historical snapshots remain immutable
-snapshot_v0["users"]["alice"]["age"] # => 30
-db["users"]["alice"]["age"]          # => 31
-
-# 6. Datomic Pull projections & Datalog queries (supports both strings and structured DSLs)
-Xitdb.pull!(alice, [:name, :age, roles: 0..1])
-# => %{"name" => "Alice Liddell", "age" => 31, "roles" => ["admin"]}
-
-Xitdb.query!(db, ~q"""
-find ?id, ?age
-where
-  $username->id[?uname] = ?id
-  starts_with(?uname, "al")
-  .users[?id].age = ?age
-""")
-# => %{vars: ["?id", "?age"], rows: [["alice", 31]]}
+  Xitdb.transact(
+    db,
+    fn root ->
+      update_in(root["users"]["alice"]["age"], &(&1 + 1))
+    end,
+    doc: "Birthday bump"
+  )
 ```
 
----
+### 2. Time-Travel, Diffs & Field History
 
-## Macro DSLs (`use Xitdb.DSL`)
+```elixir
+# Pin an immutable snapshot of moment 0 without copying data
+v0 = Xitdb.as_of(db, 0)
 
-For operations where Elixir's `Access` protocol has friction—such as auto-vivifying deep paths without intermediate NIF reads, native list `append`/`insert`/`slice`, `O(1)` subtree `fork`, typed collection selectors (`#counted`, `$sorted`, `[[linked]]`), and Datalog queries with pinned runtime variables (`^var`)—`Xitdb` provides a compile-time macro DSL:
+v0["users"]["alice"]["age"] # => 30
+db["users"]["alice"]["age"] # => 31
+
+# Diff any two moments
+Xitdb.diff_moments(db, 0, 1)
+# => {:ok, [%{op: :put, path: ".users.alice.age", old_value: 30, new_value: 31}]}
+
+# Inspect every commit that changed a field
+Xitdb.history_of(db, ".users.alice.age")
+# => {:ok, [
+#   %{moment_index: 0, value: 30, doc: "Seed initial users", instant: 0},
+#   %{moment_index: 1, value: 31, doc: "Birthday bump", instant: 0}
+# ]}
+```
+
+### 3. Declarative Transactions, Pull & Datalog
 
 ```elixir
 use Xitdb.DSL
 
-# 1. Atomic transaction block (0 intermediate NIF reads, native collection ops)
+id = "alice"
+
+# Atomic transaction block with secondary indexes, list ops & zero-copy fork
 {:ok, db} =
   tx db, doc: "promote alice" do
-    put users[id].role, "admin"
+    index_on :users, :username, "username->id"
+    put users[id].role, "principal"
     append users[id].roles, "staff"
-    insert audit_log[[1]], "promoted"
     fork users[id], backups[id]
-    update users[id].age, &((&1 || 0) + 1)
+    update users[id].age, 0, &(&1 + 1)
   end
 
-# 2. Path selector macro with runtime interpolation & collection tags
-role = Xitdb.select!(db, path(users[id].roles[0]))
+# Shape-based Pull projection with bounded list slicing
+Xitdb.pull!(db["users"]["alice"], [:name, :role, roles: 0..1])
+# => %{"name" => "Alice Liddell", "role" => "principal", "roles" => ["admin", "architect"]}
 
-# 3. Declarative Datalog query macro with ^var pinning
+# Datalog query with pinned runtime variables (^var)
 prefix = "al"
 min_age = 21
 
 {:ok, %{rows: [["alice", 32]]}} =
   query db do
-    find {id, age}
+    find {uid, age}
 
     where [
-      sorted("username->id")[uname] == id,
+      sorted("username->id")[uname] == uid,
       starts_with(uname, ^prefix),
-      users[id].age == age,
+      users[uid].age == age,
       age >= ^min_age
     ]
   end
 ```
 
----
-
-## Ash Framework Integration (`Xitdb.Ash.DataLayer` & `Xitdb.Ash.Dsl`)
-
-Use `Xitdb.Ash.DataLayer` with a supervised `Xitdb.Ash.Store` for full Ash 3.37.2+ CRUD, atomic updates, relationships, aggregates, calculations, composite B+Tree secondary indexes, same-store FK cascades, time-travel queries, and transactional Odin NIF BM25 + prefix search—with **zero SQL migrations**:
+### 4. Ash Framework & Built-In Full-Text Search
 
 ```elixir
 defmodule MyApp.Accounts.Profile do
@@ -170,10 +149,8 @@ defmodule MyApp.Accounts.Profile do
     store MyApp.Store
     collection :profiles
 
-    # Single-field and composite B+Tree (:sorted_map) secondary indexes
     index [:status, :inserted_at]
 
-    # Transactional in-Xitdb BM25 + B+Tree prefix search
     search_field :full_name, boost: 3.0
     search_field :headline, boost: 1.5
 
@@ -203,13 +180,11 @@ defmodule MyApp.Accounts.Profile do
 end
 ```
 
-Query BM25 search rankings, pin historical time-travel snapshots, and isolate `async: true` tests via `Xitdb.Ash.TestSandbox`:
+Run ranked BM25 + prefix search and time-travel reads straight through Ash:
 
 ```elixir
-# 1. Ranked BM25 + prefix search (`query/3` for `{id, score}` hits, or `ids/3` + `sort_by_rank/2` on Ash.Query):
 require Ash.Query
 
-hits = Xitdb.Ash.Search.query(MyApp.Accounts.Profile, "alice principal", limit: 25)
 ranked_ids = Xitdb.Ash.Search.ids(MyApp.Accounts.Profile, "alice principal", limit: 25)
 
 profiles =
@@ -218,77 +193,61 @@ profiles =
   |> Xitdb.Ash.Search.sort_by_rank(ranked_ids)
   |> Ash.read!()
 
-# 2. Time-travel any Ash read, aggregate, or BM25 search to an earlier moment:
+# Time-travel any Ash read, aggregate, or search to an earlier moment
 Xitdb.Ash.Store.with_as_of(MyApp.Store, moment_v0, fn ->
   Ash.read!(MyApp.Accounts.Profile)
 end)
 ```
 
-Use `tx_for` / `tx_for!` to automatically prepend a resource's configured secondary `index_on` rules at compile time when running raw `Xitdb.DSL` transactions:
+---
+
+## Installation
+
+Add `xitdb` to your dependencies in `mix.exs`:
 
 ```elixir
-use Xitdb.DSL
-alias MyApp.Accounts.Profile
-
-db =
-  tx_for! db, Profile, doc: "insert profile 101" do
-    put profiles["101"].id, "101"
-    put profiles["101"].full_name, "Alice Smith"
-    put profiles["101"].status, "active"
-  end
+def deps do
+  [
+    {:xitdb, "~> 2.0"}
+  ]
+end
 ```
+
+### System Requirements
+
+Compiling `xitdb` builds an embedded Erlang NIF wrapping the Odin database engine:
+
+- **Odin Compiler:** `odin` must be available in your `PATH` (see [Odin Getting Started](https://odin-lang.org/docs/install/)).
+- **C Compiler:** A standard C compiler (`cc` or `gcc`) for the thin NIF entry shim.
 
 ---
 
-## Documentation & Guides
+## Guides
 
-#### Core Concepts & Protocols
-- **[Lazy Cursors, `Access` & `Enumerable` (`docs/access-and-enumerable.md`)](docs/access-and-enumerable.md)** — 9-byte `Slot` cursors, bracket navigation (`db["users"]["alice"]`), `get_in`/`put_in`/`update_in`/`pop_in`, `Xitdb.at/1`, `Enumerable` fast paths (`Enum.count/1`, `Enum.member?/2`, `Enum.slice/2`), and chunked `Stream` pagination.
-- **[Collections & Secondary Indexing (`docs/collections-and-indexing.md`)](docs/collections-and-indexing.md)** — Choosing between `hash_map`, `counted_map`, `sorted_map`, `array_list`, `linked_list`, and sets, plus secondary B+Tree indexing (`index_on`).
-- **[Time-Travel, Diffs, History & Storage (`docs/time-travel-and-storage.md`)](docs/time-travel-and-storage.md)** — `O(1)` snapshots (`as_of/2`), structural moment diffs (`diff_moments/3`), attribute lineage (`history_of/2`), storage backends (`:memory`, `:file`, `:buffered_file`), and online compaction (`compact/2`).
+### Core Concepts
+- **[Reading & Updating with Access & Enum](docs/access-and-enumerable.md)** — Bracket navigation, `get_in`/`put_in`/`update_in`/`pop_in`, `Xitdb.at/1`, passing cursors across processes, and `Enum` / `Stream` pipelines.
+- **[Collections & Secondary Indexes](docs/collections-and-indexing.md)** — Choosing between maps (`hash_map`, `counted_map`, `sorted_map`), lists (`array_list`, `linked_list`), sets, custom tagged scalars, and `index_on` secondary indexes.
+- **[Time-Travel, Diffs & Storage](docs/time-travel-and-storage.md)** — Snapshots (`as_of/2`), moment diffs (`diff_moments/3`), field lineage (`history_of/2`), branching history, zero-copy `fork`, backends, and compaction.
 
-#### Macro DSLs & Query Languages
-- **[Path Selector & Structural Pull DSL (`docs/path-and-pull-dsl.md`)](docs/path-and-pull-dsl.md)** — `path/1`, typed collection modifiers (`counted`, `sorted`, `[[idx]]`), set member probes, wildcard scans (`*`), and structural `Xitdb.pull/2` patterns.
-- **[Declarative Transaction Block DSL (`docs/transaction-dsl.md`)](docs/transaction-dsl.md)** — `tx/2,3`, `tx_for/3,4`, `put` (including 1-arity set member additions), `update/2,3`, `rm`, `append`, `insert`, `slice`, `fork`, `index_on`, `meta`, `instant`, `savepoint`, and `abort`.
-- **[Declarative Datalog Query DSL (`docs/datalog-dsl.md`)](docs/datalog-dsl.md)** — `datalog/1` and `query/2,3`, `^var` pinning, entity generators (`u <- users`), set membership, transitive graph reachability (`reach/3,4`), cross-moment queries (`at_moment/2`), and aggregations.
-- **[Ash & Spark Integration (`docs/ash-and-spark.md`)](docs/ash-and-spark.md)** — Native `Xitdb.Ash.DataLayer`, `Xitdb.Ash.Dsl`, `Xitdb.Ash.Store`, `Xitdb.Ash.Search` (BM25 + prefix search), `Xitdb.Ash.TestSandbox`, `Xitdb.Ash.Info` introspection, and `tx_for` / `tx_for!`.
+### DSLs, Queries & Ash
+- **[Transaction DSL](docs/transaction-dsl.md)** — Declarative `tx` and `tx_for` blocks, automatic path creation, list edits, `fork`, metadata, savepoints, and rollbacks.
+- **[Path Selectors & Pull Projections](docs/path-and-pull-dsl.md)** — Shape-based `Xitdb.pull/2` projections, `pull_pattern/1`, `path/1`, `~x`, and automatic key escaping.
+- **[Datalog & Graph Queries](docs/datalog-dsl.md)** — `query` and `datalog` blocks, `^var` pinning, multi-collection joins, aggregations, recursive `reach`, and cross-moment `at_moment` queries.
+- **[Ash Framework & Full-Text Search](docs/ash-and-spark.md)** — `Xitdb.Ash.DataLayer`, `Xitdb.Ash.Store`, `Xitdb.Ash.Search` (BM25 + prefix search), `nested_in` subtrees, `tx_for`, and `async: true` `Xitdb.Ash.TestSandbox`.
 
----
-
-## Architecture
-
-```
-┌────────────────────────────────────────────────────────────────────────────┐
-│ Elixir Client & Ash DataLayer (lib/xitdb*.ex)                              │
-│  • %Xitdb{} + %Xitdb.Cursor{db_ref, tag, tag_id, value, full, moment, root,│
-│    tx_mode, path_steps, staged_ops, staged_overrides, deleted_paths}       │
-│  • Access, Enumerable, Inspect protocols                                   │
-│  • Xitdb.DSL + Xitdb.Pull + Xitdb.Sigils (~x, ~q)                          │
-│  • Xitdb.Ash.{DataLayer, Dsl, Store, Search, TestSandbox, Info, Tx}        │
-├────────────────────────────────────────────────────────────────────────────┤
-│ C-ABI Erlang NIF Boundary (native/nif_entry.c + native/xitdb_nif.odin)     │
-│  • ErlNifResourceType + ErlNifRWLock thread safety                         │
-│  • Coarse-grained transaction batching, B+Tree seek & BM25 search pushdown │
-├────────────────────────────────────────────────────────────────────────────┤
-│ Native Engine Submodule (native/xitdb-odin/xitdb)                          │
-│  • 16-way HAMT, Radix Trie, Counted B-Tree, B+Tree, Compactor & Datalog    │
-└────────────────────────────────────────────────────────────────────────────┘
-```
+### Under the Hood
+- **[Architecture, Internals & Performance](docs/architecture-and-internals.md)** — Storage format, 9-byte `Slot` cursors, WAL-free crash safety, NIF boundary cost model, and single-writer supervision.
 
 ---
 
-## Development, Testing & Benchmarks
+## Under the Hood & Development
+
+`Xitdb` embeds [`odin-xitdb`](https://github.com/boxxxie/odin-xitdb) in-process via a C-ABI Erlang NIF (`native/nif_entry.c` + `native/xitdb_nif.odin`), giving Elixir applications direct access to `xitdb`'s persistent tries, B+Trees, Datalog engine, and BM25 search without serialization overhead or an external daemon. See [Architecture, Internals & Performance](docs/architecture-and-internals.md) for the full technical design and [1v1 Client Benchmarks (`benchmarks/README.md`)](https://github.com/boxxxie/xitdb-elixir/blob/master/benchmarks/README.md) for latency and throughput numbers across 28 workloads.
 
 ```bash
-# 1. Run precommit checks (formatting, --warnings-as-errors, and 4-layer ATDD specs)
+# Run formatting, --warnings-as-errors compile, and tests
 mix precommit
 
-# 2. Run the 4-layer Client ATDD executable specification & property suite
+# Run the specification and property test suite with trace
 mix test --trace
-
-# 3. Run the 1v1 Client Statistical Benchmark Suite (Elixir Wrapper vs Raw Odin)
-./benchmarks/compare_1v1.py --runs 5 --warmup 1
-./benchmarks/update_readme.sh
 ```
-
-See [`benchmarks/README.md`](https://github.com/boxxxie/xitdb-elixir/blob/master/benchmarks/README.md) for full statistical latency, throughput, and NIF overhead tables, and [`usage-rules.md`](usage-rules.md) for LLM/coding agent integration rules.
