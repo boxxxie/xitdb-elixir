@@ -39,11 +39,11 @@ HISTORY_JSONL = os.path.join(BENCH_DIR, "history.jsonl")
 ALL_GROUPS = ["access", "enumerable", "transactions", "time_travel", "queries"]
 
 GROUP_RANGES = {
-    "access": "#1–#5 (Lazy Access Navigation & Point Lookups)",
+    "access": "#1–#5, #28 (Lazy Access Navigation, Point Lookups & Pre-Tokenized DSL Select)",
     "enumerable": "#6–#11 (Enumerable Protocol & Subtree Materialization)",
     "transactions": "#12–#16 (Transactions, Incremental Put, List Edit & Zero-Copy Fork)",
     "time_travel": "#17–#20 (Historical as_of, history_of, diff_moments & Compaction)",
-    "queries": "#21–#26 (Pull Projections, Datalog Engine, Buffered Sync & Search)",
+    "queries": "#21–#27 (Pull Projections, Datalog Engine, Buffered Sync, Search & Indexer)",
 }
 
 BENCHMARK_CATALOG: List[Dict[str, Any]] = [
@@ -58,7 +58,7 @@ BENCHMARK_CATALOG: List[Dict[str, Any]] = [
         "rank": 2,
         "group": "access",
         "name": "Access: Single-call selector select(.users.<id>.name)",
-        "elixir_entries": [("lib/xitdb.ex", "select!"), ("lib/xitdb.ex", "select"), ("lib/xitdb.ex", "do_select")],
+        "elixir_entries": [("lib/xitdb.ex", "select!"), ("lib/xitdb.ex", "select"), ("lib/xitdb.ex", "do_select"), ("lib/xitdb.ex", "do_select!")],
         "nif_entries": ["odin_nif_select"],
     },
     {
@@ -229,6 +229,30 @@ BENCHMARK_CATALOG: List[Dict[str, Any]] = [
         "elixir_entries": [("lib/xitdb/nif.ex", "nif_bm25_search"), ("lib/xitdb/ash/search.ex", "score_collection_nif")],
         "nif_entries": ["odin_nif_bm25_search"],
     },
+    {
+        "rank": 27,
+        "group": "queries",
+        "name": "Indexer: Sorted_Map B+Tree range scan + set decode (limit=16)",
+        "elixir_entries": [
+            ("lib/xitdb/ash/indexer.ex", "stream_btree_from_key"),
+            ("lib/xitdb/ash/search.ex", "scan_prefix"),
+            ("lib/xitdb/cursor.ex", "from_compact_slot"),
+        ],
+        "nif_entries": ["odin_nif_sorted_map_seek", "odin_nif_slot_entries"],
+    },
+    {
+        "rank": 28,
+        "group": "access",
+        "name": "DSL: Pre-tokenized path_steps select(path_steps(users[id].name))",
+        "elixir_entries": [
+            ("lib/xitdb/dsl.ex", "path_steps"),
+            ("lib/xitdb/dsl/path_compiler.ex", "compile_steps"),
+            ("lib/xitdb.ex", "select!"),
+            ("lib/xitdb.ex", "do_select"),
+            ("lib/xitdb.ex", "do_select!"),
+        ],
+        "nif_entries": ["odin_nif_select", "decode_selector_term_buf", "decode_steps_term_buf"],
+    },
 ]
 
 CATALOG_BY_RANK: Dict[int, Dict[str, Any]] = {b["rank"]: b for b in BENCHMARK_CATALOG}
@@ -316,6 +340,7 @@ def compute_pooled_stats(records: List[Dict[str, Any]]) -> Dict[str, Any]:
         variance_ns2 = 0.0
     stddev_ns = math.sqrt(variance_ns2)
     cv_pct = (stddev_ns / max(mean_ns, 1e-9)) * 100.0
+    median_min_ratio = median_ns / max(min_ns, 1e-9)
 
     ops = int(first.get("ops", 1))
     bytes_used = max(int(r.get("bytes_used", 0)) for r in records)
@@ -338,6 +363,7 @@ def compute_pooled_stats(records: List[Dict[str, Any]]) -> Dict[str, Any]:
         "stddev_ns": stddev_ns,
         "variance_ns2": variance_ns2,
         "cv_pct": cv_pct,
+        "median_min_ratio": median_min_ratio,
         "min_ns": min_ns,
         "max_ns": max_ns,
         "iqr_ns": iqr_ns,
@@ -427,8 +453,6 @@ def pool_by_lang_and_test(
             recs = [r for r in recs if r.get("commit", "unknown") == latest_for_name]
         recs = deduplicate_by_run_id(recs, latest_run=latest_run)
         stat = compute_pooled_stats(recs)
-        if not commit and overall_latest_commit != "unknown":
-            stat["commit"] = overall_latest_commit
         pooled.append(stat)
     pooled.sort(key=lambda x: x["rank"])
     return pooled
@@ -462,11 +486,51 @@ def run_cmd(cmd: List[str], label: str) -> None:
         sys.exit(proc.returncode)
 
 
-def print_1v1_comparison(odin_rows: List[Dict[str, Any]], elixir_rows: List[Dict[str, Any]]) -> None:
+def print_single_lang_summary(rows: List[Dict[str, Any]], lang: str) -> None:
+    label = "Raw Odin Baseline" if lang == "odin" else "Elixir Client Wrapper"
+    commit_tag = rows[0]["commit"]
+    samples = rows[0]["runs"]
+    invs = rows[0]["num_invocations"]
+    print()
+    print("=" * 124)
+    print(f"  Xitdb Client Statistical Summary [{label}] | Commit={commit_tag} ({samples} samples/test across {invs} run(s))")
+    print("=" * 124)
+    print(f"  {'Benchmark':<46} | {'Ops':>7} | {'Med ± σ (CV% | p95)':>32} | {'Footprint':>10}")
+    print("  " + "-" * 120)
+    for r in rows:
+        cell = f"{r['ns_per_op']:>6} ± {r['stddev_ns']:>5.1f} ({r['cv_pct']:>4.1f}%|p95:{r['p95_ns']:>6.0f})"
+        print(f"  {r['name']:<46} | {r['ops']:>7} | {cell:>32} | {fmt_kb(r['bytes_used']):>10}")
+    print("=" * 124)
+
+
+def print_1v1_comparison(
+    odin_rows: List[Dict[str, Any]],
+    elixir_rows: List[Dict[str, Any]],
+    run_lang: str = "both",
+) -> None:
+    if run_lang == "odin":
+        if not odin_rows:
+            print("ERROR: No Odin benchmark records found.", file=sys.stderr)
+            sys.exit(1)
+        print_single_lang_summary(odin_rows, "odin")
+        return
+    if run_lang == "elixir":
+        if not elixir_rows:
+            print("ERROR: No Elixir benchmark records found.", file=sys.stderr)
+            sys.exit(1)
+        print_single_lang_summary(elixir_rows, "elixir")
+        return
+
     ex_map = {r["name"]: r for r in elixir_rows}
     shared = [(o, ex_map[o["name"]]) for o in odin_rows if o["name"] in ex_map]
 
     if not shared:
+        if odin_rows and not elixir_rows:
+            print_single_lang_summary(odin_rows, "odin")
+            return
+        if elixir_rows and not odin_rows:
+            print_single_lang_summary(elixir_rows, "elixir")
+            return
         print("ERROR: No matching benchmarks found between Odin and Elixir.", file=sys.stderr)
         sys.exit(1)
 
@@ -524,6 +588,259 @@ def print_1v1_comparison(odin_rows: List[Dict[str, Any]], elixir_rows: List[Dict
         f"{sub_5x}/{len(shared)} within <=5.0x of Raw Odin | (* = Welch z>=1.96, ~ = within variance)"
     )
     print("=" * 176)
+
+
+def sample_loadavg_1m(samples: List[float]) -> None:
+    try:
+        samples.append(float(os.getloadavg()[0]))
+    except OSError:
+        pass
+
+
+def resolve_record_rank(rec: Any) -> int:
+    if not isinstance(rec, dict):
+        return 0
+    raw_rank = rec.get("rank")
+    if raw_rank is not None:
+        try:
+            r = int(raw_rank)
+            if r > 0:
+                return r
+        except (TypeError, ValueError):
+            pass
+    name = rec.get("name")
+    if isinstance(name, str) and name in CATALOG_BY_NAME:
+        return int(CATALOG_BY_NAME[name]["rank"])
+    return 0
+
+
+def safe_float(val: Any) -> Optional[float]:
+    if val is None:
+        return None
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return None
+
+
+def is_selective_run(groups_str: Optional[str], filter_str: Optional[str]) -> bool:
+    if filter_str and filter_str.strip():
+        return True
+    if not groups_str or not groups_str.strip():
+        return False
+    tokens = {tok.strip().lower() for tok in re.split(r"[,|]", groups_str) if tok.strip()}
+    if not tokens or "all" in tokens:
+        return False
+    return not set(ALL_GROUPS).issubset(tokens)
+
+
+def compute_canary_baselines(
+    history_records: List[Dict[str, Any]],
+) -> Dict[Tuple[str, str], float]:
+    by_key: Dict[Tuple[str, str], List[Tuple[str, bool, List[float], float]]] = {}
+    for rec in history_records:
+        rank = resolve_record_rank(rec)
+        if rank not in (3, 4, 5, 6):
+            continue
+        commit_tag = str(rec.get("commit") or "unknown").strip()
+        if not commit_tag or commit_tag == "unknown":
+            continue
+        lang = str(rec.get("lang") or "")
+        name = str(rec.get("name") or "")
+        if not lang or not name:
+            continue
+        raw_samples = rec.get("samples_ns")
+        samples: List[float] = []
+        if isinstance(raw_samples, list):
+            for x in raw_samples:
+                fx = safe_float(x)
+                if fx is not None:
+                    samples.append(fx)
+        med = safe_float(rec.get("median_ns"))
+        if med is None:
+            if samples:
+                med = calc_percentile(sorted(samples), 0.50)
+            else:
+                med = safe_float(rec.get("ns_per_op")) or 0.0
+        if med < 50.0:
+            continue
+        if not samples:
+            samples = [med]
+        cv = safe_float(rec.get("cv_pct")) or 0.0
+        is_clean = ("-dirty" not in commit_tag) and (cv <= 15.0)
+        by_key.setdefault((lang, name), []).append((commit_tag, is_clean, samples, med))
+
+    baselines: Dict[Tuple[str, str], float] = {}
+    for key, entries in by_key.items():
+        latest_clean_commit: Optional[str] = None
+        for commit_tag, is_clean, _samples, _med in reversed(entries):
+            if is_clean:
+                latest_clean_commit = commit_tag
+                break
+        if latest_clean_commit is not None:
+            pooled_samples: List[float] = []
+            for commit_tag, is_clean, samples, _med in entries:
+                if commit_tag == latest_clean_commit and is_clean:
+                    pooled_samples.extend(samples)
+            if pooled_samples:
+                baselines[key] = calc_percentile(sorted(pooled_samples), 0.50)
+                continue
+        recent_meds = sorted(med for _c, _cl, _s, med in entries[-10:])
+        baselines[key] = calc_percentile(recent_meds, 0.25)
+    return baselines
+
+
+def evaluate_contention_guardrails(
+    odin_rows: List[Dict[str, Any]],
+    elixir_rows: List[Dict[str, Any]],
+    history_records: List[Dict[str, Any]],
+    load_samples: List[float],
+) -> List[str]:
+    warnings: List[str] = []
+    if load_samples and max(load_samples) > 4.0:
+        warnings.append(
+            f"High host 1m loadavg sampled during run: max={max(load_samples):.2f} (> 4.00 threshold)"
+        )
+
+    canary_baseline = compute_canary_baselines(history_records)
+
+    for row in odin_rows + elixir_rows:
+        rank = resolve_record_rank(row)
+        lang = str(row.get("lang") or "?")
+        name = str(row.get("name") or "?")
+        med = safe_float(row.get("median_ns")) or 0.0
+        cv = safe_float(row.get("cv_pct")) or 0.0
+        min_ns = safe_float(row.get("min_ns"))
+        ratio = safe_float(row.get("median_min_ratio"))
+        if ratio is None:
+            ratio = med / max(min_ns if min_ns is not None else med, 1e-9)
+
+        if rank in (3, 4, 5, 6) and med >= 50.0:
+            base = canary_baseline.get((lang, name))
+            if base is not None and med / base > 1.50:
+                warnings.append(
+                    f"[{lang}] #{rank} canary slowdown: {name} "
+                    f"(median={med:.1f}ns vs clean baseline={base:.1f}ns, {med / base:.2f}x > 1.50x)"
+                )
+
+        if rank != 24 and med >= 50.0 and (cv > 15.0 or ratio > 1.25):
+            warnings.append(
+                f"[{lang}] #{rank} noise/skew: {name} "
+                f"(CV={cv:.1f}%, median/min={ratio:.2f}x, median={med:.1f}ns)"
+            )
+
+    return warnings
+
+
+def print_contention_warnings(warnings: List[str]) -> None:
+    if not warnings:
+        return
+    print()
+    print("!" * 110, file=sys.stderr)
+    print(f"  [CONTENTION WARNING] {len(warnings)} host-contention / canary guardrail(s) triggered:", file=sys.stderr)
+    for w in warnings:
+        print(f"    - {w}", file=sys.stderr)
+    print("  Tip: Re-run on an idle host or use --require-clean to avoid polluting canonical JSONL/history.", file=sys.stderr)
+    print("!" * 110, file=sys.stderr)
+
+
+def merge_jsonl_lines(
+    existing_lines: List[str],
+    new_lines: List[str],
+    append: bool,
+    selective: bool,
+) -> List[str]:
+    if append:
+        return existing_lines + new_lines
+    if selective and existing_lines:
+        by_rank: Dict[int, List[str]] = {}
+        for ln in existing_lines:
+            if not ln.strip():
+                continue
+            try:
+                rank = resolve_record_rank(json.loads(ln))
+                if rank <= 0:
+                    continue
+                by_rank.setdefault(rank, []).append(ln)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+        staged_by_rank: Dict[int, List[str]] = {}
+        for ln in new_lines:
+            if not ln.strip():
+                continue
+            try:
+                rank = resolve_record_rank(json.loads(ln))
+                if rank <= 0:
+                    continue
+                staged_by_rank.setdefault(rank, []).append(ln)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+        by_rank.update(staged_by_rank)
+        merged: List[str] = []
+        for r in sorted(by_rank):
+            merged.extend(by_rank[r])
+        return merged
+    return new_lines
+
+
+def merge_jsonl_records(
+    existing_records: List[Dict[str, Any]],
+    new_records: List[Dict[str, Any]],
+    append: bool,
+    selective: bool,
+) -> List[Dict[str, Any]]:
+    if append:
+        return existing_records + new_records
+    if selective and existing_records:
+        by_rank: Dict[int, List[Dict[str, Any]]] = {}
+        for rec in existing_records:
+            rank = resolve_record_rank(rec)
+            if rank > 0:
+                by_rank.setdefault(rank, []).append(rec)
+        staged_by_rank: Dict[int, List[Dict[str, Any]]] = {}
+        for rec in new_records:
+            rank = resolve_record_rank(rec)
+            if rank > 0:
+                staged_by_rank.setdefault(rank, []).append(rec)
+        by_rank.update(staged_by_rank)
+        merged: List[Dict[str, Any]] = []
+        for r in sorted(by_rank):
+            merged.extend(by_rank[r])
+        return merged
+    return new_records
+
+
+def persist_clean_jsonl(
+    tmp_path: str,
+    target_path: str,
+    append: bool,
+    selective: bool,
+    save_history: bool,
+) -> None:
+    if not os.path.isfile(tmp_path):
+        return
+    with open(tmp_path, "r", encoding="utf-8") as f:
+        new_lines = [ln for ln in f.read().splitlines() if ln.strip()]
+    if not new_lines:
+        return
+
+    payload = "\n".join(new_lines) + "\n"
+    if append:
+        with open(target_path, "a", encoding="utf-8") as f:
+            f.write(payload)
+    elif selective and os.path.isfile(target_path):
+        with open(target_path, "r", encoding="utf-8") as f:
+            existing_lines = [ln for ln in f.read().splitlines() if ln.strip()]
+        merged_lines = merge_jsonl_lines(existing_lines, new_lines, append=False, selective=True)
+        with open(target_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(merged_lines) + "\n")
+    else:
+        with open(target_path, "w", encoding="utf-8") as f:
+            f.write(payload)
+
+    if save_history:
+        with open(HISTORY_JSONL, "a", encoding="utf-8") as f:
+            f.write(payload)
 
 
 def compare_commits(
@@ -885,8 +1202,11 @@ def parse_elixir_lib_functions() -> Dict[Tuple[str, str], Dict[str, Any]]:
         "lib/xitdb/collection.ex",
         "lib/xitdb/nif.ex",
         "lib/xitdb/ash/search.ex",
+        "lib/xitdb/ash/indexer.ex",
+        "lib/xitdb/dsl.ex",
+        "lib/xitdb/dsl/path_compiler.ex",
     ]
-    def_re = re.compile(r"^(\s*)defp?\s+([a-zA-Z_][a-zA-Z0-9_?!]*)\b")
+    def_re = re.compile(r"^(\s*)def(?:p|macro|macrop)?\s+([a-zA-Z_][a-zA-Z0-9_?!]*)(?![a-zA-Z0-9_?!])")
     procs: Dict[Tuple[str, str], Dict[str, Any]] = {}
 
     for rel_path in target_files:
@@ -905,18 +1225,24 @@ def parse_elixir_lib_functions() -> Dict[Tuple[str, str], Dict[str, Any]]:
             start_idx = i
             j = i
             has_block = False
+            has_inline_do = False
             depth = 0
             while j < n:
-                cleaned = strip_elixir_code_line(lines[j])
-                # Inline `, do:` expression
-                if not has_block and re.search(r",\s*do:", cleaned):
-                    end_idx = j
+                if j > start_idx and not has_block and not has_inline_do and def_re.match(lines[j]):
+                    end_idx = j - 1
                     break
-                if re.search(r"(?<![A-Za-z0-9_])do(?=\s|$)", re.sub(r"\bdo:", " ", cleaned)):
-                    has_block = True
+                cleaned = strip_elixir_code_line(lines[j])
                 cleaned_no_kw = re.sub(r"\bdo:", " ", cleaned)
                 depth += len(re.findall(r"(?<![A-Za-z0-9_])(do|fn)(?=\s|$)", cleaned_no_kw))
                 depth -= len(re.findall(r"(?<![A-Za-z0-9_])end(?=\s|$|[,\}\)\.])", cleaned_no_kw))
+                if not has_block and re.search(r"(?:^|,)\s*do:", cleaned):
+                    has_inline_do = True
+                    if depth <= 0:
+                        end_idx = j
+                        break
+                    has_block = True
+                if re.search(r"(?<![A-Za-z0-9_])do(?=\s|$)", cleaned_no_kw):
+                    has_block = True
                 if has_block and depth <= 0:
                     end_idx = j
                     break
@@ -1340,7 +1666,7 @@ def generate_all_slices() -> List[Dict[str, Any]]:
 
     # Generate benchmarks/slices/README.md index
     idx_md: List[str] = [
-        "# Benchmark Code Slices (`#1–#26`)",
+        "# Benchmark Code Slices (`#1–#28`)",
         "",
         "[← Back to Benchmarks Overview](../README.md)",
         "",
@@ -1384,7 +1710,16 @@ def resolve_diff_target(git_ref: Optional[str]) -> Tuple[List[str], str]:
     if git_ref and git_ref != "auto":
         return [git_ref], git_ref
     status = subprocess.run(
-        ["git", "status", "--porcelain", "--", "lib/", "native/", "benchmarks/"],
+        [
+            "git",
+            "status",
+            "--porcelain",
+            "--",
+            "lib/",
+            "native/",
+            "benchmarks/bench_client.odin",
+            "benchmarks/bench_elixir.exs",
+        ],
         cwd=ROOT_DIR,
         capture_output=True,
         text=True,
@@ -1408,7 +1743,7 @@ def extract_enclosing_procs(rel_path: str, changed_lines: Set[int]) -> Set[str]:
                     matched.add(pname)
     elif rel_path.endswith((".ex", ".exs")):
         lines = open(abs_path, encoding="utf-8").read().splitlines()
-        def_re = re.compile(r"^\s*defp?\s+([a-zA-Z_][a-zA-Z0-9_?!]*)\b")
+        def_re = re.compile(r"^\s*def(?:p|macro|macrop)?\s+([a-zA-Z_][a-zA-Z0-9_?!]*)(?![a-zA-Z0-9_?!])")
         sorted_ln = sorted(changed_lines)
         for target_ln in sorted_ln:
             for idx in range(min(target_ln - 1, len(lines) - 1), -1, -1):
@@ -1430,7 +1765,9 @@ def extract_enclosing_procs(rel_path: str, changed_lines: Set[int]) -> Set[str]:
 
 NIF_PROC_ATTRIBUTION: Dict[str, Tuple[List[str], List[str]]] = {
     "odin_nif_slot_get_key": (["access"], ["3-hop lazy HAMT", "Sorted_Map B+Tree key"]),
-    "odin_nif_select": (["access"], ["Single-call selector"]),
+    "odin_nif_select": (["access"], ["Single-call selector", "Pre-tokenized path_steps"]),
+    "decode_selector_term_buf": (["access"], ["Single-call selector", "Pre-tokenized path_steps"]),
+    "decode_steps_term_buf": (["access"], ["Pre-tokenized path_steps"]),
     "parse_escaped_quoted": (["access"], ["Single-call selector"]),
     "parse_escaped_bracketed_string": (["access"], ["Single-call selector"]),
     "parse_escaped_ident_or_bracket": (["access"], ["Single-call selector"]),
@@ -1440,7 +1777,7 @@ NIF_PROC_ATTRIBUTION: Dict[str, Tuple[List[str], List[str]]] = {
     "odin_nif_slot_count": (["enumerable"], ["Enum.count/1"]),
     "odin_nif_slot_contains": (["enumerable"], ["Enum.member?/2"]),
     "odin_nif_slot_slice": (["enumerable"], ["Enum.slice/2"]),
-    "odin_nif_slot_entries": (["enumerable"], ["Stream.take(10)", "Enum.to_list/1"]),
+    "odin_nif_slot_entries": (["enumerable", "queries"], ["Stream.take(10)", "Enum.to_list/1", "Sorted_Map B+Tree range scan + set decode"]),
     "odin_nif_slot_materialize": (["enumerable"], ["Materialize:"]),
     "materialize_slot": (["enumerable"], ["Materialize:"]),
     "odin_nif_transact": (["transactions"], []),
@@ -1455,7 +1792,7 @@ NIF_PROC_ATTRIBUTION: Dict[str, Tuple[List[str], List[str]]] = {
     "odin_nif_close": (["queries"], ["Buffered_File"]),
     "odin_nif_sync": (["queries"], ["Buffered_File"]),
     "odin_nif_info": (["queries"], ["Buffered_File"]),
-    "odin_nif_sorted_map_seek": (["queries"], ["Sorted_Map B+Tree prefix seek"]),
+    "odin_nif_sorted_map_seek": (["queries"], ["Sorted_Map B+Tree prefix seek", "Sorted_Map B+Tree range scan + set decode"]),
     "odin_nif_bm25_search": (["queries"], ["BM25 corpus search"]),
     "collect_postings_into_map": (["queries"], ["BM25 corpus search"]),
     "bm25_heap_push": (["queries"], ["BM25 corpus search"]),
@@ -1616,7 +1953,7 @@ def map_changes_to_benchmarks(git_ref: Optional[str] = None) -> Dict[str, Any]:
         elif rel_path == "lib/xitdb/cursor.ex":
             matched_any = False
             for p in procs:
-                if p in ("fetch", "nif_slot_get", "from_nif_tuple", "unwrap_nif_value"):
+                if p in ("fetch", "nif_slot_get", "from_nif_tuple", "from_compact_slot", "unwrap_nif_value", "unwrap_nif_entries"):
                     groups_set.add("access")
                     broad_group_only.add("access")
                     matched_any = True
@@ -1643,9 +1980,9 @@ def map_changes_to_benchmarks(git_ref: Optional[str] = None) -> Dict[str, Any]:
         elif rel_path == "lib/xitdb.ex":
             matched_any = False
             for p in procs:
-                if p in ("select", "select!", "do_select"):
+                if p in ("select", "select!", "do_select", "do_select!", "wrap_selected", "root_selector?", "effective_moment"):
                     groups_set.add("access")
-                    filters_set.add("Single-call selector")
+                    filters_set.update(["Single-call selector", "Pre-tokenized path_steps"])
                     matched_any = True
                 elif p in ("materialize", "empty_cursor_default"):
                     groups_set.add("enumerable")
@@ -1685,12 +2022,18 @@ def map_changes_to_benchmarks(git_ref: Optional[str] = None) -> Dict[str, Any]:
 
         elif rel_path.startswith("lib/xitdb/ash/search") or rel_path == "lib/xitdb/ash/indexer.ex":
             groups_set.add("queries")
-            filters_set.update(["Sorted_Map B+Tree prefix seek", "BM25 corpus search"])
+            filters_set.update(
+                [
+                    "Sorted_Map B+Tree prefix seek",
+                    "Sorted_Map B+Tree range scan + set decode",
+                    "BM25 corpus search",
+                ]
+            )
             reasons.append(f"{rel_path}: search/index module")
 
         elif rel_path.startswith("lib/xitdb/dsl"):
-            groups_set.update(["transactions", "queries"])
-            broad_group_only.update(["transactions", "queries"])
+            groups_set.update(["access", "transactions", "queries"])
+            broad_group_only.update(["access", "transactions", "queries"])
             reasons.append(f"{rel_path}: DSL compiler/runtime")
 
         elif rel_path.startswith("lib/"):
@@ -1701,7 +2044,7 @@ def map_changes_to_benchmarks(git_ref: Optional[str] = None) -> Dict[str, Any]:
     if not groups_set:
         ordered_groups = list(ALL_GROUPS)
         filter_str = ""
-        reasons = ["No specific client/NIF slice matched (or clean diff) -> full client benchmark suite (#1–#26)"]
+        reasons = ["No specific client/NIF slice matched (or clean diff) -> full client benchmark suite (#1–#28)"]
     else:
         ordered_groups = [g for g in ALL_GROUPS if g in groups_set]
         # Drop narrow filter if any affected group needs full group coverage
@@ -1786,6 +2129,11 @@ def main() -> None:
     )
     parser.add_argument("--code-map-json", action="store_true", help="Print JSON mapping benchmarks to slice docs and line ranges")
     parser.add_argument("--generate-slices", action="store_true", help="Generate per-benchmark code slices in benchmarks/slices/")
+    parser.add_argument(
+        "--require-clean",
+        action="store_true",
+        help="Fail with exit status 2 without updating canonical JSONL/history if contention guardrails trigger",
+    )
 
     args = parser.parse_args()
 
@@ -1836,56 +2184,189 @@ def main() -> None:
         plan = map_changes_to_benchmarks(args.affected)
         print_benchmark_plan(plan)
         if not odin_groups:
-            odin_groups = ",".join(plan["odin_groups"])
+            odin_groups = (
+                None if set(plan["odin_groups"]) == set(ALL_GROUPS) else ",".join(plan["odin_groups"])
+            )
         if not elixir_groups:
-            elixir_groups = ",".join(plan["elixir_groups"])
+            elixir_groups = (
+                None if set(plan["elixir_groups"]) == set(ALL_GROUPS) else ",".join(plan["elixir_groups"])
+            )
         if not bench_filter and plan["filter"]:
             bench_filter = plan["filter"]
 
-    if not args.from_jsonl:
-        base_flags = [
-            "--runs", str(args.runs),
-            "--warmup", str(args.warmup),
-            "--commit", commit_sha,
-            "--run-id", run_id,
+    load_samples: List[float] = []
+    stage_tag = f"{re.sub(r'[^A-Za-z0-9_.-]+', '_', run_id)}_{os.getpid()}"
+    tmp_odin = os.path.join(BENCH_DIR, f".tmp_odin_{stage_tag}.jsonl")
+    tmp_elixir = os.path.join(BENCH_DIR, f".tmp_elixir_{stage_tag}.jsonl")
+    tmp_odin_bin = os.path.join(BENCH_DIR, f".tmp_bench_client_{stage_tag}")
+    use_staged_clean = bool(not args.from_jsonl)
+    selective_odin = is_selective_run(odin_groups, bench_filter)
+    selective_elixir = is_selective_run(elixir_groups, bench_filter)
+
+    try:
+        if use_staged_clean:
+            for p in (tmp_odin, tmp_elixir):
+                if os.path.exists(p):
+                    os.remove(p)
+
+        if not args.from_jsonl:
+            base_flags = [
+                "--runs", str(args.runs),
+                "--warmup", str(args.warmup),
+                "--commit", commit_sha,
+                "--run-id", run_id,
+            ]
+            if args.no_history or use_staged_clean:
+                base_flags.append("--no-history")
+            if bench_filter:
+                base_flags.extend(["--filter", bench_filter])
+
+            # Pre-compile outside the loadavg sampling window so parallel compilation
+            # CPU spikes do not trigger false host-contention warnings.
+            if run_lang in ("odin", "both"):
+                run_cmd(
+                    [
+                        "odin", "build", "benchmarks",
+                        "-collection:xitdb=native/xitdb-odin/xitdb",
+                        "-o:speed", "-microarch:native",
+                        f"-out:{tmp_odin_bin}",
+                    ],
+                    "Compile Raw Odin Client Benchmarks",
+                )
+            if run_lang in ("elixir", "both"):
+                run_cmd(["mix", "compile"], "Compile Elixir Wrapper & NIF")
+
+            if run_lang in ("odin", "both"):
+                odin_flags = list(base_flags)
+                if odin_groups:
+                    odin_flags.extend(["--groups", odin_groups])
+                if use_staged_clean:
+                    odin_flags.extend(["--output", tmp_odin])
+                odin_cmd = [tmp_odin_bin] + odin_flags
+                sample_loadavg_1m(load_samples)
+                run_cmd(odin_cmd, "Raw Odin Client Benchmarks")
+                sample_loadavg_1m(load_samples)
+
+            if run_lang in ("elixir", "both"):
+                elixir_flags = list(base_flags)
+                if elixir_groups:
+                    elixir_flags.extend(["--groups", elixir_groups])
+                if use_staged_clean:
+                    elixir_flags.extend(["--output", tmp_elixir])
+                elixir_cmd = ["mix", "run", "--no-compile", "benchmarks/bench_elixir.exs", "--"] + elixir_flags
+                sample_loadavg_1m(load_samples)
+                run_cmd(elixir_cmd, "Elixir Wrapper Client Benchmarks")
+                sample_loadavg_1m(load_samples)
+
+        snapshot_commit = args.commit if args.from_jsonl else None
+        analysis_run_id = args.run_id if args.from_jsonl else None
+
+        if use_staged_clean:
+            staged_odin_records: List[Dict[str, Any]] = []
+            staged_elixir_records: List[Dict[str, Any]] = []
+            if run_lang in ("odin", "both"):
+                staged_odin_records = load_jsonl_file(tmp_odin)
+                if not staged_odin_records:
+                    print(
+                        f"ERROR: Staged Odin output '{tmp_odin}' was not created or is empty (check --output support).",
+                        file=sys.stderr,
+                    )
+                    sys.exit(1)
+            if run_lang in ("elixir", "both"):
+                staged_elixir_records = load_jsonl_file(tmp_elixir)
+                if not staged_elixir_records:
+                    print(
+                        f"ERROR: Staged Elixir output '{tmp_elixir}' was not created or is empty (check --output support).",
+                        file=sys.stderr,
+                    )
+                    sys.exit(1)
+
+            odin_records = (
+                merge_jsonl_records(load_jsonl_file(ODIN_JSONL), staged_odin_records, args.append, selective_odin)
+                if run_lang in ("odin", "both")
+                else load_jsonl_file(ODIN_JSONL)
+            )
+            elixir_records = (
+                merge_jsonl_records(load_jsonl_file(ELIXIR_JSONL), staged_elixir_records, args.append, selective_elixir)
+                if run_lang in ("elixir", "both")
+                else load_jsonl_file(ELIXIR_JSONL)
+            )
+            eval_odin = pool_by_lang_and_test(staged_odin_records, "odin", None) if run_lang in ("odin", "both") else []
+            eval_elixir = pool_by_lang_and_test(staged_elixir_records, "elixir", None) if run_lang in ("elixir", "both") else []
+        else:
+            if args.commit or args.run_id:
+                hist_all = load_all_history()
+                odin_records = [r for r in hist_all if r.get("lang") == "odin"] or load_jsonl_file(ODIN_JSONL)
+                elixir_records = [r for r in hist_all if r.get("lang") == "elixir"] or load_jsonl_file(ELIXIR_JSONL)
+            else:
+                odin_records = load_jsonl_file(ODIN_JSONL)
+                elixir_records = load_jsonl_file(ELIXIR_JSONL)
+
+            if odin_groups and odin_groups.lower() != "all":
+                allowed_og = {g.strip().lower() for g in re.split(r"[,|]", odin_groups) if g.strip()}
+                odin_records = [r for r in odin_records if CATALOG_BY_NAME.get(r.get("name", ""), {}).get("group") in allowed_og]
+            if elixir_groups and elixir_groups.lower() != "all":
+                allowed_eg = {g.strip().lower() for g in re.split(r"[,|]", elixir_groups) if g.strip()}
+                elixir_records = [r for r in elixir_records if CATALOG_BY_NAME.get(r.get("name", ""), {}).get("group") in allowed_eg]
+            if bench_filter:
+                ftoks = [t.strip().lower() for t in bench_filter.split("|") if t.strip()]
+                odin_records = [r for r in odin_records if any(t in r.get("name", "").lower() for t in ftoks)]
+                elixir_records = [r for r in elixir_records if any(t in r.get("name", "").lower() for t in ftoks)]
+
+            eval_odin = (
+                pool_by_lang_and_test(odin_records, "odin", snapshot_commit, latest_run=args.latest_run, run_id=analysis_run_id)
+                if run_lang in ("odin", "both")
+                else []
+            )
+            eval_elixir = (
+                pool_by_lang_and_test(elixir_records, "elixir", snapshot_commit, latest_run=args.latest_run, run_id=analysis_run_id)
+                if run_lang in ("elixir", "both")
+                else []
+            )
+
+        odin_rows = (
+            pool_by_lang_and_test(odin_records, "odin", snapshot_commit, latest_run=args.latest_run, run_id=analysis_run_id)
+            if (not args.from_jsonl or run_lang in ("odin", "both"))
+            else []
+        )
+        elixir_rows = (
+            pool_by_lang_and_test(elixir_records, "elixir", snapshot_commit, latest_run=args.latest_run, run_id=analysis_run_id)
+            if (not args.from_jsonl or run_lang in ("elixir", "both"))
+            else []
+        )
+        print_1v1_comparison(odin_rows, elixir_rows, run_lang=run_lang)
+
+        excluded_run_ids = (
+            {str(r.get("run_id", "")) for r in eval_odin + eval_elixir if r.get("run_id")}
+            if args.from_jsonl
+            else {run_id}
+        )
+        if args.run_id:
+            excluded_run_ids.add(args.run_id)
+        prior_history = [
+            rec for rec in load_all_history()
+            if str(rec.get("run_id", "")) not in excluded_run_ids
         ]
-        if args.append:
-            base_flags.append("--append")
-        if args.no_history:
-            base_flags.append("--no-history")
-        if bench_filter:
-            base_flags.extend(["--filter", bench_filter])
+        warnings = evaluate_contention_guardrails(eval_odin, eval_elixir, prior_history, load_samples)
+        print_contention_warnings(warnings)
 
-        if run_lang in ("odin", "both"):
-            odin_flags = list(base_flags)
-            if odin_groups:
-                odin_flags.extend(["--groups", odin_groups])
-            odin_cmd = [
-                "odin", "run", "benchmarks",
-                "-collection:xitdb=native/xitdb-odin/xitdb",
-                "-o:speed", "-microarch:native",
-                "--",
-            ] + odin_flags
-            run_cmd(odin_cmd, "Raw Odin Client Benchmarks")
+        if args.require_clean and warnings:
+            if use_staged_clean:
+                print("Aborted (--require-clean): canonical odin.jsonl, elixir.jsonl, and history.jsonl were left untouched.", file=sys.stderr)
+            sys.exit(2)
 
-        if run_lang in ("elixir", "both"):
-            elixir_flags = list(base_flags)
-            if elixir_groups:
-                elixir_flags.extend(["--groups", elixir_groups])
-            elixir_cmd = ["mix", "run", "benchmarks/bench_elixir.exs", "--"] + elixir_flags
-            run_cmd(elixir_cmd, "Elixir Wrapper Client Benchmarks")
-
-    snapshot_commit = (
-        args.commit
-        if (args.from_jsonl and not args.affected and not args.groups and not args.filter)
-        else None
-    )
-    analysis_run_id = args.run_id if args.from_jsonl else None
-    odin_records = load_jsonl_file(ODIN_JSONL)
-    elixir_records = load_jsonl_file(ELIXIR_JSONL)
-    odin_rows = pool_by_lang_and_test(odin_records, "odin", snapshot_commit, latest_run=args.latest_run, run_id=analysis_run_id)
-    elixir_rows = pool_by_lang_and_test(elixir_records, "elixir", snapshot_commit, latest_run=args.latest_run, run_id=analysis_run_id)
-    print_1v1_comparison(odin_rows, elixir_rows)
+        if use_staged_clean:
+            if run_lang in ("odin", "both"):
+                persist_clean_jsonl(tmp_odin, ODIN_JSONL, args.append, selective_odin, not args.no_history)
+            if run_lang in ("elixir", "both"):
+                persist_clean_jsonl(tmp_elixir, ELIXIR_JSONL, args.append, selective_elixir, not args.no_history)
+    finally:
+        if os.path.exists(tmp_odin_bin):
+            os.remove(tmp_odin_bin)
+        if use_staged_clean:
+            for p in (tmp_odin, tmp_elixir):
+                if os.path.exists(p):
+                    os.remove(p)
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@
 
 defmodule Xitdb.ClientBench do
   alias Xitdb
+  import Xitdb.DSL, only: [path_steps: 1]
 
   @bench_meta [
     {1, :access, "Access: 3-hop lazy HAMT lookup (root[users][id][name])"},
@@ -30,7 +31,9 @@ defmodule Xitdb.ClientBench do
     {23, :queries, "Query: Datalog grouped aggregation (count + sum, N=200)"},
     {24, :queries, "Storage: Buffered_File transact + sync (50 commits)"},
     {25, :queries, "Search: Sorted_Map B+Tree prefix seek (limit=16)"},
-    {26, :queries, "Search: BM25 corpus search (N=200, 2-term prefix, limit=10)"}
+    {26, :queries, "Search: BM25 corpus search (N=200, 2-term prefix, limit=10)"},
+    {27, :queries, "Indexer: Sorted_Map B+Tree range scan + set decode (limit=16)"},
+    {28, :access, "DSL: Pre-tokenized path_steps select(path_steps(users[id].name))"}
   ]
 
   @value_flags %{
@@ -91,8 +94,12 @@ defmodule Xitdb.ClientBench do
     output_path = Keyword.get(opts, :output, "benchmarks/elixir.jsonl")
     history_path = Keyword.get(opts, :history, "benchmarks/history.jsonl")
 
-    selective_run? =
-      (groups_filter != "" and String.downcase(groups_filter) != "all") or name_filter != ""
+    all_groups_enabled? =
+      Enum.all?([:access, :enumerable, :transactions, :time_travel, :queries], fn g ->
+        should_run_bench?(g, "", groups_filter, "")
+      end)
+
+    selective_run? = not all_groups_enabled? or name_filter != ""
 
     active_ranks =
       @bench_meta
@@ -102,11 +109,15 @@ defmodule Xitdb.ClientBench do
       |> MapSet.new(fn {rank, _group, _name} -> rank end)
 
     need_main_db? =
-      Enum.any?([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 21, 25], &MapSet.member?(active_ranks, &1))
+      Enum.any?(
+        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 21, 25, 28],
+        &MapSet.member?(active_ranks, &1)
+      )
 
     need_hist_db? = Enum.any?([17, 18, 20], &MapSet.member?(active_ranks, &1))
     need_diff_db? = Enum.any?([19, 22, 23], &MapSet.member?(active_ranks, &1))
     need_search_db? = MapSet.member?(active_ranks, 26)
+    need_idx_db? = MapSet.member?(active_ranks, 27)
 
     {db, root, users_cur, sorted_cur, items_cur, linked_cur, cusers_cur, cset_cur, u0_cur} =
       if need_main_db? do
@@ -168,6 +179,16 @@ defmodule Xitdb.ClientBench do
         {:ok, sd} = Xitdb.open(backend: :memory)
         sd = seed_bm25_fixture_db(sd, 200)
         {sd, Xitdb.db(sd)}
+      else
+        {nil, nil}
+      end
+
+    {idx_db, idx_btree} =
+      if need_idx_db? do
+        {:ok, idb} = Xitdb.open(backend: :memory)
+        idb = seed_idx_fixture_db(idb, 64)
+        ir = Xitdb.db(idb)
+        {idb, Xitdb.Cursor.ensure_resolved(ir["idx_btree"])}
       else
         {nil, nil}
       end
@@ -494,6 +515,32 @@ defmodule Xitdb.ClientBench do
          end
 
          0
+       end},
+      {27, "Indexer: Sorted_Map B+Tree range scan + set decode (limit=16)", 50,
+       fn ->
+         for _ <- 1..50 do
+           {:ok, _entries, _next} =
+             Xitdb.NIF.nif_sorted_map_seek(
+               idx_db.db_ref,
+               idx_btree.tag_id,
+               idx_btree.value,
+               "k10",
+               16,
+               false,
+               true
+             )
+         end
+
+         0
+       end},
+      {28, "DSL: Pre-tokenized path_steps select(path_steps(users[id].name))", 500,
+       fn ->
+         for i <- 0..499 do
+           uid = "u#{i}"
+           _ = Xitdb.select!(db, path_steps(users[uid].name))
+         end
+
+         0
        end}
     ]
 
@@ -534,6 +581,7 @@ defmodule Xitdb.ClientBench do
     if hist_db, do: Xitdb.close(hist_db)
     if diff_db, do: Xitdb.close(diff_db)
     if search_db, do: Xitdb.close(search_db)
+    if idx_db, do: Xitdb.close(idx_db)
 
     if records != [] do
       new_lines_by_rank = Map.new(records, fn r -> {r.rank, encode_json_line(r)} end)
@@ -551,19 +599,26 @@ defmodule Xitdb.ClientBench do
               |> String.split("\n", trim: true)
               |> Enum.reduce(%{}, fn line, acc ->
                 case Regex.run(~r/"rank"\s*:\s*(\d+)/, line) do
-                  [_, r_str] -> Map.put(acc, String.to_integer(r_str), line)
-                  _ -> acc
+                  [_, r_str] ->
+                    r = String.to_integer(r_str)
+                    Map.update(acc, r, [line], &(&1 ++ [line]))
+
+                  _ ->
+                    acc
                 end
               end)
             else
               %{}
             end
 
+          grouped_new = Enum.group_by(records, & &1.rank, &Map.fetch!(new_lines_by_rank, &1.rank))
+
           merged_jsonl =
             existing_by_rank
-            |> Map.merge(new_lines_by_rank)
-            |> Enum.sort_by(fn {rank, _line} -> rank end)
-            |> Enum.map_join("\n", fn {_rank, line} -> line end)
+            |> Map.merge(grouped_new)
+            |> Enum.sort_by(fn {rank, _lines} -> rank end)
+            |> Enum.flat_map(fn {_rank, lines} -> lines end)
+            |> Enum.join("\n")
             |> Kernel.<>("\n")
 
           File.write!(output_path, merged_jsonl)
@@ -608,6 +663,8 @@ defmodule Xitdb.ClientBench do
     group_ok and name_ok
   end
 
+  defp group_alias_match?(tok, :access) when tok in ["dsl", "selector", "path"], do: true
+
   defp group_alias_match?(tok, :enumerable) when tok in ["enum", "stream", "materialize"],
     do: true
 
@@ -618,7 +675,7 @@ defmodule Xitdb.ClientBench do
        do: true
 
   defp group_alias_match?(tok, :queries)
-       when tok in ["query", "search", "storage", "datalog", "pull", "bm25"],
+       when tok in ["query", "search", "storage", "datalog", "pull", "bm25", "indexer", "index"],
        do: true
 
   defp group_alias_match?(_, _), do: false
@@ -707,6 +764,17 @@ defmodule Xitdb.ClientBench do
         }
       })
 
+    db
+  end
+
+  defp seed_idx_fixture_db(db, n) do
+    btree_entries =
+      Map.new(0..(n - 1), fn i ->
+        key = :io_lib.format("k~2..0B", [i]) |> IO.iodata_to_binary()
+        {key, Xitdb.counted_set(["doc_#{i}_a", "doc_#{i}_b"])}
+      end)
+
+    {:ok, db} = Xitdb.transact(db, %{"idx_btree" => Xitdb.sorted_map(btree_entries)})
     db
   end
 

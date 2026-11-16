@@ -1,6 +1,8 @@
 package xitdb_client_benchmarks
 
+import "base:intrinsics"
 import "base:runtime"
+import "core:c"
 import "core:fmt"
 import "core:math"
 import "core:mem"
@@ -11,6 +13,15 @@ import "core:strings"
 import "core:time"
 import "core:unicode/utf8"
 import xitdb "xitdb:."
+
+foreign import libc "system:c"
+
+@(default_calling_convention = "c")
+foreign libc {
+	popen :: proc(command: cstring, mode: cstring) -> rawptr ---
+	pclose :: proc(stream: rawptr) -> c.int ---
+	fgets :: proc(str: [^]u8, n: c.int, stream: rawptr) -> [^]u8 ---
+}
 
 MAX_RUNS        :: 64
 MAX_TOTAL_RANKS :: 32
@@ -39,42 +50,85 @@ g_records:        [dynamic]Bench_Record
 g_selective_run:  bool = false
 g_existing_lines: [MAX_TOTAL_RANKS]string
 g_updated_lines:  [MAX_TOTAL_RANKS]string
+g_bench_sink:     u64 = 0
 
 resolve_git_commit :: proc(allocator := context.allocator) -> string {
-	head_bytes, err := os.read_entire_file(".git/HEAD", allocator)
-	if err != nil {
-		return "unknown"
-	}
-	head_str := strings.trim_space(string(head_bytes))
-	if strings.has_prefix(head_str, "ref: ") {
-		ref_rel := strings.trim_space(head_str[5:])
-		ref_path := fmt.aprintf(".git/%s", ref_rel, allocator = allocator)
-		if ref_bytes, r_err := os.read_entire_file(ref_path, allocator); r_err == nil {
-			sha := strings.trim_space(string(ref_bytes))
-			if len(sha) > 12 {
-				return sha[:12]
-			}
-			return sha
-		}
-		if packed_bytes, p_err := os.read_entire_file(".git/packed-refs", allocator); p_err == nil {
-			lines := strings.split_lines(string(packed_bytes), allocator)
-			suffix := fmt.aprintf(" %s", ref_rel, allocator = allocator)
-			for line in lines {
-				trimmed := strings.trim_space(line)
-				if len(trimmed) == 0 || strings.has_prefix(trimmed, "#") || strings.has_prefix(trimmed, "^") {
-					continue
-				}
-				if strings.has_suffix(trimmed, suffix) && len(trimmed) >= 12 {
-					return trimmed[:12]
+	git_dir := ".git"
+	common_dir := ".git"
+
+	if dot_git_bytes, dg_err := os.read_entire_file(".git", allocator); dg_err == nil {
+		dg_str := strings.trim_space(string(dot_git_bytes))
+		if strings.has_prefix(dg_str, "gitdir:") {
+			gd := strings.trim_space(dg_str[len("gitdir:"):])
+			git_dir = gd
+			common_dir = gd
+			cm_path := fmt.aprintf("%s/commondir", git_dir, allocator = allocator)
+			if cm_bytes, cm_err := os.read_entire_file(cm_path, allocator); cm_err == nil {
+				cm_rel := strings.trim_space(string(cm_bytes))
+				if len(cm_rel) > 0 {
+					if strings.has_prefix(cm_rel, "/") {
+						common_dir = cm_rel
+					} else {
+						common_dir = fmt.aprintf("%s/%s", git_dir, cm_rel, allocator = allocator)
+					}
 				}
 			}
 		}
+	}
+
+	sha_short := ""
+	head_path := fmt.aprintf("%s/HEAD", git_dir, allocator = allocator)
+	if head_bytes, err := os.read_entire_file(head_path, allocator); err == nil {
+		head_str := strings.trim_space(string(head_bytes))
+		if strings.has_prefix(head_str, "ref: ") {
+			ref_rel := strings.trim_space(head_str[5:])
+			for base in ([2]string{git_dir, common_dir}) {
+				ref_path := fmt.aprintf("%s/%s", base, ref_rel, allocator = allocator)
+				if ref_bytes, r_err := os.read_entire_file(ref_path, allocator); r_err == nil {
+					sha := strings.trim_space(string(ref_bytes))
+					sha_short = sha[:min(len(sha), 12)]
+					break
+				}
+			}
+			if sha_short == "" {
+				packed_path := fmt.aprintf("%s/packed-refs", common_dir, allocator = allocator)
+				if packed_bytes, p_err := os.read_entire_file(packed_path, allocator); p_err == nil {
+					lines := strings.split_lines(string(packed_bytes), allocator)
+					suffix := fmt.aprintf(" %s", ref_rel, allocator = allocator)
+					for line in lines {
+						trimmed := strings.trim_space(line)
+						if len(trimmed) == 0 || strings.has_prefix(trimmed, "#") || strings.has_prefix(trimmed, "^") {
+							continue
+						}
+						if strings.has_suffix(trimmed, suffix) && len(trimmed) >= 12 {
+							sha_short = trimmed[:12]
+							break
+						}
+					}
+				}
+			}
+		} else if len(head_str) > 0 {
+			sha_short = head_str[:min(len(head_str), 12)]
+		}
+	}
+
+	if sha_short == "" {
 		return "unknown"
 	}
-	if len(head_str) > 12 {
-		return head_str[:12]
+
+	fp := popen(
+		"git status --porcelain --untracked-files=no -- lib native benchmarks/bench_elixir.exs benchmarks/bench_client.odin 2>/dev/null",
+		"r",
+	)
+	if fp != nil {
+		buf: [128]u8 = ---
+		is_dirty := fgets(raw_data(buf[:]), c.int(len(buf)), fp) != nil
+		pclose(fp)
+		if is_dirty {
+			return fmt.aprintf("%s-dirty", sha_short, allocator = allocator)
+		}
 	}
-	return head_str
+	return sha_short
 }
 
 parse_cli_args :: proc() {
@@ -149,12 +203,17 @@ parse_cli_args :: proc() {
 		}
 		i += 1
 	}
-	g_selective_run = (len(g_groups_filter) > 0 && g_groups_filter != "all") || len(g_name_filter) > 0
+	all_groups_enabled := should_run_group("access") &&
+		should_run_group("enumerable") &&
+		should_run_group("transactions") &&
+		should_run_group("time_travel") &&
+		should_run_group("queries")
+	g_selective_run = !all_groups_enabled || len(g_name_filter) > 0
 }
 
 rank_group :: proc(rank: int) -> string {
 	switch {
-	case rank >= 1 && rank <= 5:
+	case (rank >= 1 && rank <= 5) || rank == 28:
 		return "access"
 	case rank >= 6 && rank <= 11:
 		return "enumerable"
@@ -162,7 +221,7 @@ rank_group :: proc(rank: int) -> string {
 		return "transactions"
 	case rank >= 17 && rank <= 20:
 		return "time_travel"
-	case rank >= 21 && rank <= 26:
+	case rank >= 21 && rank <= 27:
 		return "queries"
 	case:
 		return "unknown"
@@ -180,6 +239,9 @@ should_run_group :: proc(group_name: string) -> bool {
 		if p == "all" || p == group_name {
 			return true
 		}
+		if (p == "dsl" || p == "selector" || p == "path") && group_name == "access" {
+			return true
+		}
 		if (p == "enum" || p == "stream" || p == "materialize") && group_name == "enumerable" {
 			return true
 		}
@@ -189,7 +251,7 @@ should_run_group :: proc(group_name: string) -> bool {
 		if (p == "time-travel" || p == "timetravel" || p == "history" || p == "lifecycle" || p == "compact" || p == "compaction") && group_name == "time_travel" {
 			return true
 		}
-		if (p == "query" || p == "search" || p == "storage" || p == "datalog" || p == "pull" || p == "bm25") && group_name == "queries" {
+		if (p == "query" || p == "search" || p == "storage" || p == "datalog" || p == "pull" || p == "bm25" || p == "indexer" || p == "index") && group_name == "queries" {
 			return true
 		}
 	}
@@ -537,6 +599,22 @@ seed_bm25_fixture_db :: proc(db: ^xitdb.Database, n: int) {
 	xitdb.tx_report_destroy(&rep, context.temp_allocator)
 }
 
+seed_idx_fixture_db :: proc(db: ^xitdb.Database, n: int) {
+	tx := xitdb.tx_init(db, base_moment = -1, track_changes = false, allocator = context.temp_allocator)
+	defer xitdb.tx_destroy(&tx)
+
+	for i in 0 ..< n {
+		key := fmt.tprintf("k%02d", i)
+		d1 := fmt.tprintf("doc_%d_a", i)
+		d2 := fmt.tprintf("doc_%d_b", i)
+		_ = xitdb.tx_put(&tx, fmt.tprintf(".idx_btree$%s#%s%s", key, "%", d1), d1)
+		_ = xitdb.tx_put(&tx, fmt.tprintf(".idx_btree$%s#%s%s", key, "%", d2), d2)
+	}
+
+	rep, _ := xitdb.tx_commit(&tx)
+	xitdb.tx_report_destroy(&rep, context.temp_allocator)
+}
+
 bench_raw_bm25_search :: proc(root_map: xitdb.Read_Hash_Map, collection: string, query_terms: []string, k_limit: int, allocator := context.temp_allocator) -> []Bench_BM25_Hit {
 	arena: mem.Dynamic_Arena
 	mem.dynamic_arena_init(
@@ -714,7 +792,7 @@ bench_bulk_entities_cb :: proc(moment_cur: ^xitdb.Write_Cursor, _user_data: rawp
 
 main :: proc() {
 	parse_cli_args()
-	g_records = make([dynamic]Bench_Record, 0, 26)
+	g_records = make([dynamic]Bench_Record, 0, 28)
 
 	r1 := should_run_bench(1, "Access: 3-hop lazy HAMT lookup (root[users][id][name])")
 	r2 := should_run_bench(2, "Access: Single-call selector select(.users.<id>.name)")
@@ -737,15 +815,19 @@ main :: proc() {
 	r23 := should_run_bench(23, "Query: Datalog grouped aggregation (count + sum, N=200)")
 	r25 := should_run_bench(25, "Search: Sorted_Map B+Tree prefix seek (limit=16)")
 	r26 := should_run_bench(26, "Search: BM25 corpus search (N=200, 2-term prefix, limit=10)")
+	r27 := should_run_bench(27, "Indexer: Sorted_Map B+Tree range scan + set decode (limit=16)")
+	r28 := should_run_bench(28, "DSL: Pre-tokenized path_steps select(path_steps(users[id].name))")
 
-	need_main_db := r1 || r2 || r3 || r4 || r5 || r6 || r7 || r8 || r9 || r10 || r11 || r21 || r25
+	need_main_db := r1 || r2 || r3 || r4 || r5 || r6 || r7 || r8 || r9 || r10 || r11 || r21 || r25 || r28
 	need_hist_db := r17 || r18 || r20
 	need_diff_db := r19 || r22 || r23
 	need_search_db := r26
+	need_idx_db := r27
 
 	// Shared fixture DB for read/query benchmarks (N=500)
 	core: xitdb.Core
 	db: xitdb.Database
+	m0_cur: xitdb.Read_Cursor
 	m0_map: xitdb.Read_Hash_Map
 	users_map: xitdb.Read_Hash_Map
 	sorted_map: xitdb.Read_Sorted_Map
@@ -764,7 +846,7 @@ main :: proc() {
 		rc := xitdb.database_root_cursor(&db).read_cursor
 		hist, _ := xitdb.read_array_list_init(rc)
 		m0_cur_maybe, _ := xitdb.array_list_get_cursor(hist, 0)
-		m0_cur := m0_cur_maybe.?
+		m0_cur = m0_cur_maybe.?
 		m0_map, _ = xitdb.read_hash_map_init(m0_cur)
 
 		users_cur_maybe, _ := xitdb.hash_map_get_cursor(m0_map, "users")
@@ -1297,31 +1379,36 @@ main :: proc() {
 
 	// #25: Search: Sorted_Map B+Tree prefix seek (limit=16)
 	if r25 {
-		sb_seek: [8]u8 = ---
+		sb_seek: [128]u8 = ---
+		val_buf: [128]u8 = ---
 		for r in 0 ..< (g_warmup + g_runs) {
 			t0 := time.now()
 			for _ in 0 ..< 100 {
 				it, _ := xitdb.sorted_map_iterator_from_string(sorted_map, "u4")
 				cnt := 0
-				for cnt < 16 {
+				for {
 					nm, _ := xitdb.cursor_iterator_next(&it)
 					ec, hn := nm.?
 					if !hn {
 						break
 					}
-					kv, _ := xitdb.cursor_read_kv_pair(ec, context.temp_allocator)
-					sp, _ := xitdb.cursor_resolved(kv.key_cursor)
+					key_cur, val_cur, _ := xitdb.cursor_read_kv_pair_slots(ec)
 					ks: string
-					if sp.slot.tag == .Short_Bytes && !sp.slot.full {
-						bo, _ := xitdb.cursor_read_bytes_buf(kv.key_cursor, sb_seek[:])
+					if bo, b_err := xitdb.cursor_read_bytes_buf(key_cur, sb_seek[:]); b_err == nil {
 						ks = string(bo.value)
 					} else {
-						ks, _ = xitdb.cursor_read_string(kv.key_cursor, 0, context.temp_allocator)
+						ks, _ = xitdb.cursor_read_string(key_cur, 0, context.temp_allocator)
 					}
 					if !strings.has_prefix(ks, "u4") {
 						break
 					}
-					_, _ = xitdb.cursor_slot(kv.value_cursor)
+					if cnt == 16 {
+						_ = ks
+						break
+					}
+					if _, v_err := xitdb.cursor_read_bytes_buf(val_cur, val_buf[:]); v_err != nil {
+						_, _ = xitdb.cursor_read_string(val_cur, 0, context.temp_allocator)
+					}
 					cnt += 1
 				}
 			}
@@ -1361,6 +1448,111 @@ main :: proc() {
 			free_all(context.temp_allocator)
 		}
 		record_samples(26, "Search: BM25 corpus search (N=200, 2-term prefix, limit=10)", 50, samples)
+	}
+
+	// #27: Indexer: Sorted_Map B+Tree range scan + set decode (limit=16)
+	idx_core: xitdb.Core
+	idx_db: xitdb.Database
+	defer if need_idx_db {
+		xitdb.core_destroy(&idx_core)
+	}
+	if need_idx_db {
+		idx_core = xitdb.core_memory_init()
+		idx_db, _ = xitdb.database_init(&idx_core, xitdb.sha1_hasher())
+		seed_idx_fixture_db(&idx_db, 64)
+	}
+	if r27 {
+		i_rc := xitdb.database_root_cursor(&idx_db).read_cursor
+		i_hist, _ := xitdb.read_array_list_init(i_rc)
+		i_m0_cur, _ := xitdb.array_list_get_cursor(i_hist, 0)
+		i_m0_map, _ := xitdb.read_hash_map_init(i_m0_cur.?)
+		idx_c_maybe, _ := xitdb.hash_map_get_cursor(i_m0_map, "idx_btree")
+		idx_cur := idx_c_maybe.?
+		sb_k: [128]u8 = ---
+		sb_m: [128]u8 = ---
+		acc: u64 = 0
+		for r in 0 ..< (g_warmup + g_runs) {
+			t0 := time.now()
+			for _ in 0 ..< 50 {
+				idx_sm, _ := xitdb.read_sorted_map_init(idx_cur)
+				it, _ := xitdb.sorted_map_iterator_from_string(idx_sm, "k10")
+				cnt := 0
+				for {
+					nm, _ := xitdb.cursor_iterator_next(&it)
+					ec, hn := nm.?
+					if !hn {
+						break
+					}
+					key_cur, val_cur, _ := xitdb.cursor_read_kv_pair_slots(ec)
+					ks: string
+					if bo, b_err := xitdb.cursor_read_bytes_buf(key_cur, sb_k[:]); b_err == nil {
+						ks = string(bo.value)
+					} else {
+						ks, _ = xitdb.cursor_read_string(key_cur, 0, context.temp_allocator)
+					}
+					acc += u64(len(ks))
+					if len(ks) > 0 {
+						acc += u64(ks[0])
+					}
+					if cnt == 16 {
+						break
+					}
+					mit, _ := xitdb.cursor_iterator(val_cur)
+					for {
+						mnm, _ := xitdb.cursor_iterator_next(&mit)
+						mec, mhn := mnm.?
+						if !mhn {
+							break
+						}
+						mkey_cur, _, _ := xitdb.cursor_read_kv_pair_slots(mec)
+						if mbo, m_err := xitdb.cursor_read_bytes_buf(mkey_cur, sb_m[:]); m_err == nil {
+							acc += u64(len(mbo.value))
+							if len(mbo.value) > 0 {
+								acc += u64(mbo.value[0])
+							}
+						} else {
+							ms, _ := xitdb.cursor_read_string(mkey_cur, 0, context.temp_allocator)
+							acc += u64(len(ms))
+							if len(ms) > 0 {
+								acc += u64(ms[0])
+							}
+						}
+					}
+					cnt += 1
+				}
+			}
+			if r >= g_warmup {
+				samples[r - g_warmup] = f64(time.duration_nanoseconds(time.since(t0))) / 50.0
+			}
+			free_all(context.temp_allocator)
+		}
+		intrinsics.volatile_store(&g_bench_sink, g_bench_sink + acc)
+		record_samples(27, "Indexer: Sorted_Map B+Tree range scan + set decode (limit=16)", 50, samples)
+	}
+
+	// #28: DSL: Pre-tokenized path_steps select(path_steps(users[id].name))
+	if r28 {
+		for r in 0 ..< (g_warmup + g_runs) {
+			t0 := time.now()
+			for i in 0 ..< 500 {
+				uid := fmt.tprintf("u%d", i)
+				steps := [3]xitdb.Path_Step{
+					{kind = .Hash_Map_Key, key = "users"},
+					{kind = .Hash_Map_Key, key = uid},
+					{kind = .Hash_Map_Key, key = "name"},
+				}
+				rc := xitdb.database_root_cursor(&db).read_cursor
+				hist_cur, _ := xitdb.read_array_list_init(rc)
+				mc_maybe, _ := xitdb.array_list_get_cursor(hist_cur, -1)
+				c_maybe, _ := xitdb.read_steps_cursor(mc_maybe.?, steps[:])
+				_, _ = xitdb.cursor_read_string(c_maybe.?, 0, context.temp_allocator)
+			}
+			if r >= g_warmup {
+				samples[r - g_warmup] = f64(time.duration_nanoseconds(time.since(t0))) / 500.0
+			}
+			free_all(context.temp_allocator)
+		}
+		record_samples(28, "DSL: Pre-tokenized path_steps select(path_steps(users[id].name))", 500, samples)
 	}
 
 	emit_jsonl()

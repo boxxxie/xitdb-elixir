@@ -235,16 +235,23 @@ def pool_records($recs):
     bytes_used: ([ $selected_recs[].bytes_used ] | max)
   } end;
 
+def commit_matches($rec_commit; $target):
+  ($rec_commit // "unknown") as $c |
+  ($c == $target) or ($target != "" and ($c | startswith($target)));
+
 def latest_snapshot_for_lang($all; $lang):
   ($all | map(select(.lang == $lang))) as $lang_recs |
   if ($lang_recs | length) == 0 then
     []
   elif $target_commit != "" then
     ($lang_recs
-     | map(select((.commit // "unknown") == $target_commit))
-     | group_by(.name)
-     | map(pool_records(.) | . + {commit: $target_commit, baseline_commit: $target_commit})
-     | sort_by(.rank))
+     | map(select(commit_matches(.commit; $target_commit)))
+     | if length == 0 then [] else
+         (.[0].commit // $target_commit) as $matched_sha |
+         group_by(.name)
+         | map(pool_records(.) | . + {commit: $matched_sha, baseline_commit: $matched_sha})
+         | sort_by(.rank)
+       end)
   else
     (($lang_recs | map(select((.commit // "unknown") != "unknown" and (.commit // "") != ""))) as $known |
      (if ($known | length) > 0 then $known else $lang_recs end) as $scoped |
@@ -276,15 +283,25 @@ def latest_snapshot_for_lang($all; $lang):
   end;
 
 def distinct_commits($all; $lang):
-  ($all
-   | map(select(.lang == $lang and (.commit // "unknown") != "unknown" and (.commit // "") != ""))
-   | reduce .[] as $r ([]; if index($r.commit) then . else . + [$r.commit] end)) as $commits |
+  ($all | map(select(.lang == $lang and (.commit // "unknown") != "unknown" and (.commit // "") != ""))) as $recs |
+  ($recs | reduce .[] as $r ({order: [], counts: {}};
+    ($r.commit // "unknown") as $c |
+    (if (.counts[$c] // null) == null then
+       .order += [$c] | .counts[$c] = {}
+     else . end)
+    | .counts[$c][$r.name] = true
+  )) as $by_c |
+  ([$by_c.order[] | {c: ., n: ($by_c.counts[.] | keys | length)}]) as $counts |
+  (if ($counts | length) == 0 then 0 else ([$counts[].n] | max) end) as $max_n |
+  (($max_n * 0.8) | floor) as $min_cov |
+  ([$counts[] | select(.n >= $min_cov) | .c]) as $covered |
+  (if ($covered | length) > 0 then $covered else $by_c.order end) as $commits |
   ($commits | map(select(endswith("-dirty") | not))) as $clean |
   if ($clean | length) > 0 then $clean else $commits end;
 
 def pool_commit_snapshot($all; $lang; $sha):
   ($all
-   | map(select(.lang == $lang and (.commit // "unknown") == $sha))
+   | map(select(.lang == $lang and commit_matches(.commit; $sha)))
    | group_by(.name)
    | map(pool_records(.) | .commit = $sha)
    | sort_by(.rank));
@@ -377,6 +394,9 @@ def compare_commits_table($prev_sha; $curr_sha; $prev_list; $curr_list):
 [inputs] as $all |
 latest_snapshot_for_lang($all; "odin") as $odin_list |
 latest_snapshot_for_lang($all; "elixir") as $ex_list |
+(if (($target_commit != "" or $target_run_id != "") and ($odin_list | length) == 0 and ($ex_list | length) == 0) then
+  error("No benchmark records matched filter (commit=\($target_commit), run_id=\($target_run_id))")
+ else empty end),
 (reduce $ex_list[] as $e ({}; .[$e.name] = $e)) as $ex_map |
 ($odin_list[0].latest_commit // $odin_list[0].commit // "unknown") as $odin_sha |
 ($ex_list[0].latest_commit // $ex_list[0].commit // "unknown") as $ex_sha |
@@ -395,8 +415,11 @@ single_lang_section("2"; "Raw Odin Baseline"; "odin"; "odin run benchmarks -o:sp
   compare_1v1_table($paired_sub_us; $ex_map; "ns"),
   "\n"
  else empty end),
-"#### 3.2 Multi-Microsecond Client Operations (Elixir `≥ 1 µs`, \($paired_multi_us | length) tests)\n",
-compare_1v1_table($paired_multi_us; $ex_map; "µs"),
+(if ($paired_multi_us | length) > 0 then
+  "#### 3.2 Multi-Microsecond Client Operations (Elixir `≥ 1 µs`, \($paired_multi_us | length) tests)\n",
+  compare_1v1_table($paired_multi_us; $ex_map; "µs"),
+  "\n"
+ else empty end),
 "\n### 4. Commit-vs-Commit Progression\n",
 (if ($ex_commits | length) >= 2 then
   ($ex_commits[-2]) as $prev_sha |
