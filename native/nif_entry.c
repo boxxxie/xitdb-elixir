@@ -281,6 +281,7 @@ static ErlNifFunc nif_funcs[] = {
     {"nif_sync",             1, odin_nif_sync,             ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"nif_info",             1, odin_nif_info,             0},
     {"nif_moment_slot",      2, odin_nif_moment_slot,      0},
+    {"nif_moment_slot",      3, odin_nif_moment_slot,      0},
     {"nif_slot_get_key",     4, odin_nif_slot_get_key,     0},
     {"nif_slot_get_index",   4, odin_nif_slot_get_index,   0},
     {"nif_slot_count",       3, odin_nif_slot_count,       0},

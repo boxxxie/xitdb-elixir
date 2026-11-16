@@ -398,8 +398,10 @@ defmodule Xitdb.Selector do
     end
   end
 
-  defp bare_key?(<<>>), do: false
-  defp bare_key?(bin), do: do_bare_key?(bin)
+  @doc false
+  def bare_key?(<<>>), do: false
+  def bare_key?(bin) when is_binary(bin), do: do_bare_key?(bin)
+  def bare_key?(_), do: false
 
   defp do_bare_key?(<<>>), do: true
   defp do_bare_key?(<<b, _rest::binary>>) when b in @special_bytes, do: false

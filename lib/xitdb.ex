@@ -251,9 +251,9 @@ defmodule Xitdb do
   end
 
   def as_of(%__MODULE__{db_ref: db_ref}, moment_index) when is_integer(moment_index) do
-    case NIF.nif_moment_slot(db_ref, moment_index) do
-      {:ok, tuple} ->
-        cursor = Cursor.from_nif_tuple(db_ref, tuple, moment_index)
+    case NIF.nif_moment_slot(db_ref, moment_index, true) do
+      {:ok, tuple, resolved_moment} ->
+        cursor = Cursor.from_nif_tuple(db_ref, tuple, resolved_moment)
         %Cursor{cursor | root: true}
 
       {:error, reason} ->
@@ -487,18 +487,14 @@ defmodule Xitdb do
   typed `{kind, key}` steps (`[{:counted, "users"}, "alice", "queue"]`).
   """
   @spec insert_at(Cursor.t(), String.t() | [term()], integer(), term()) :: Cursor.t()
-  def insert_at(%Cursor{staged_ops: []} = root, path_or_selector, index, value)
-      when (is_list(path_or_selector) or is_binary(path_or_selector)) and is_integer(index) do
-    %Cursor{root | staged_ops: [{:insert, path_or_selector, index, value}]}
-  end
-
   def insert_at(%Cursor{} = root, path_or_selector, index, value)
       when (is_list(path_or_selector) or is_binary(path_or_selector)) and is_integer(index) do
-    updated = Cursor.purge_staged_prefix(root, path_or_selector)
+    updated = Cursor.stage_list_insert(root, path_or_selector, index, value)
 
     %Cursor{
       updated
-      | staged_ops: [{:insert, path_or_selector, index, value} | updated.staged_ops]
+      | tx_mode: true,
+        staged_ops: [{:insert, path_or_selector, index, value} | updated.staged_ops]
     }
   end
 
@@ -516,26 +512,19 @@ defmodule Xitdb do
         path_or_selector ++ [[index]]
       end
 
-    case root do
-      %Cursor{staged_ops: []} ->
-        %Cursor{root | staged_ops: [{:rm, selector}]}
+    updated = Cursor.stage_list_delete(root, path_or_selector, index)
 
-      _ ->
-        updated = Cursor.purge_staged_prefix(root, path_or_selector)
-        %Cursor{updated | staged_ops: [{:rm, selector} | updated.staged_ops]}
-    end
+    %Cursor{
+      updated
+      | tx_mode: true,
+        staged_ops: [{:rm, selector} | updated.staged_ops]
+    }
   end
 
   @doc """
   Stages an `O(1)` zero-copy structural clone (`tx_fork`) from `from_selector` to `to_selector`.
   """
   @spec fork(Cursor.t(), String.t() | [term()], String.t() | [term()]) :: Cursor.t()
-  def fork(%Cursor{staged_ops: []} = root, from_selector, to_selector)
-      when (is_binary(from_selector) or is_list(from_selector)) and
-             (is_binary(to_selector) or is_list(to_selector)) do
-    %Cursor{root | staged_ops: [{:fork, from_selector, to_selector}]}
-  end
-
   def fork(%Cursor{} = root, from_selector, to_selector)
       when (is_binary(from_selector) or is_list(from_selector)) and
              (is_binary(to_selector) or is_list(to_selector)) do
@@ -543,7 +532,8 @@ defmodule Xitdb do
 
     %Cursor{
       updated
-      | staged_ops: [{:fork, from_selector, to_selector} | updated.staged_ops]
+      | tx_mode: true,
+        staged_ops: [{:fork, from_selector, to_selector} | updated.staged_ops]
     }
   end
 
@@ -566,6 +556,12 @@ defmodule Xitdb do
         cursor.root and cursor.tag == :none ->
           nil
 
+        cursor.root and cursor.tag_id != -1 and cursor.value == 0 ->
+          case NIF.nif_slot_materialize(cursor.db_ref, cursor.tag_id, 0, 0) do
+            {:ok, raw} -> Cursor.unwrap_nif_value(cursor.db_ref, raw, cursor.moment, [])
+            {:error, reason} -> raise Error, reason: reason
+          end
+
         cursor.root ->
           case NIF.nif_slot_materialize(cursor.db_ref, -1, cursor.moment, 0) do
             {:ok, raw} -> Cursor.unwrap_nif_value(cursor.db_ref, raw, cursor.moment, [])
@@ -573,7 +569,7 @@ defmodule Xitdb do
           end
 
         cursor.tx_mode and cursor.value == 0 ->
-          empty_cursor_default(cursor.tag)
+          Cursor.resolve_fork_disk_base(cursor) || empty_cursor_default(cursor.tag)
 
         true ->
           %Cursor{db_ref: db_ref, tag_id: tag_id, value: val, full: full, moment: moment} =
@@ -626,10 +622,59 @@ defmodule Xitdb do
 
   defp do_select(db_ref, moment, selector) do
     case NIF.nif_select(db_ref, moment, selector) do
-      {:ok, raw} -> {:ok, Cursor.unwrap_nif_value(db_ref, raw, moment, [])}
+      {:ok, raw} -> {:ok, wrap_selected(db_ref, raw, moment, selector)}
       {:error, reason} -> {:error, %Error{reason: reason, details: %{selector: selector}}}
     end
   end
+
+  defp wrap_selected(db_ref, raw, moment, selector) do
+    case Cursor.unwrap_nif_value(db_ref, raw, effective_moment(moment, selector), []) do
+      %Cursor{} = cursor ->
+        if root_selector?(selector), do: %Cursor{cursor | root: true}, else: cursor
+
+      other ->
+        other
+    end
+  end
+
+  defp root_selector?([]), do: true
+  defp root_selector?([{:at_moment, _}]), do: true
+
+  defp root_selector?(sel) when is_binary(sel) do
+    trimmed = String.trim(sel)
+
+    cond do
+      trimmed == "" ->
+        true
+
+      String.starts_with?(trimmed, "@") ->
+        case Integer.parse(binary_part(trimmed, 1, byte_size(trimmed) - 1)) do
+          {_m, tail} -> String.trim(tail) == ""
+          :error -> false
+        end
+
+      true ->
+        false
+    end
+  end
+
+  defp root_selector?(_), do: false
+
+  defp effective_moment(moment, sel) when is_binary(sel) do
+    case String.trim_leading(sel) do
+      <<"@", rest::binary>> ->
+        case Integer.parse(rest) do
+          {m, _tail} -> m
+          :error -> moment
+        end
+
+      _ ->
+        moment
+    end
+  end
+
+  defp effective_moment(_moment, [{:at_moment, m} | _]) when is_integer(m), do: m
+  defp effective_moment(moment, _selector), do: moment
 
   @doc "Same as `select/2`, but raises `Xitdb.Error` on failure."
   @spec select!(t() | Cursor.t(), String.t() | [term()]) :: term()
@@ -672,9 +717,20 @@ defmodule Xitdb do
     end
   end
 
-  defp do_nif_pull(%Cursor{root: true, tag: tag, db_ref: db_ref, moment: moment}, pattern)
+  defp do_nif_pull(
+         %Cursor{
+           root: true,
+           tag: tag,
+           tag_id: tag_id,
+           value: val,
+           db_ref: db_ref,
+           moment: moment
+         },
+         pattern
+       )
        when tag != :none do
-    db_ref |> NIF.nif_pull(-1, moment, pattern) |> Error.wrap(%{pattern: pattern})
+    {nid, nval} = if tag_id != -1 and val == 0, do: {tag_id, 0}, else: {-1, moment}
+    db_ref |> NIF.nif_pull(nid, nval, pattern) |> Error.wrap(%{pattern: pattern})
   end
 
   defp do_nif_pull(%Cursor{} = cursor, pattern) do
