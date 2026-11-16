@@ -8,13 +8,13 @@
 
 | Metric | Elixir NIF Wrapper | Raw Odin Baseline | Comparison |
 | :--- | ---: | ---: | ---: |
-| **Median (`ns/op`)** | 28.29 µs (28294.0 ns) | 19.23 µs (19228.0 ns) | **`1.47x`** NIF Ratio |
-| **Mean ± σ (CV)** | 29.35 µs ± 4.48 µs (15.3%) | 19.54 µs ± 1.14 µs (5.9%) | Welch `z` = `4.74` |
-| **p95 / Max (`ns/op`)** | 35.37 µs / 37.03 µs | 21.09 µs / 21.52 µs | `5` vs `5` pooled samples |
+| **Median (`ns/op`)** | 25.93 µs (25929.0 ns) | 18.91 µs (18915.0 ns) | **`1.37x`** NIF Ratio |
+| **Mean ± σ (CV)** | 26.63 µs ± 1.72 µs (6.4%) | 18.66 µs ± 586.2 ns (3.1%) | Welch `z` = `9.81` |
+| **p95 / Max (`ns/op`)** | 28.91 µs / 29.32 µs | 19.17 µs / 19.22 µs | `5` vs `5` pooled samples |
 
 ## Benchmark Harnesses (Elixir vs. Raw Odin)
 
-### Elixir Harness ([`bench_elixir.exs#L413-L424`](../bench_elixir.exs#L413-L424))
+### Elixir Harness ([`bench_elixir.exs#L434-L445`](../bench_elixir.exs#L434-L445))
 
 ```elixir
       {20, "Lifecycle: compact/1 100-moment database deduplication", 20,
@@ -31,7 +31,7 @@
        end},
 ```
 
-### Raw Odin Harness ([`bench_client.odin#L1194-L1214`](../bench_client.odin#L1194-L1214))
+### Raw Odin Harness ([`bench_client.odin#L1276-L1296`](../bench_client.odin#L1276-L1296))
 
 ```odin
 	// #20: compact/1 100-moment database deduplication
@@ -60,7 +60,7 @@
 ## Elixir Wrapper & NIF Bridge
 
 <details>
-<summary>Elixir <code>compact</code> — <a href="../../lib/xitdb.ex#L751-L768">lib/xitdb.ex#L751-L768</a></summary>
+<summary>Elixir <code>compact</code> — <a href="../../lib/xitdb.ex#L842-L855">lib/xitdb.ex#L842-L855</a></summary>
 
 ```elixir
   def compact(%__MODULE__{db_ref: db_ref, hash: hash}, opts \\ []) do
@@ -77,16 +77,12 @@
       end
     end
   end
-
-  @doc "Same as `compact/2`, but raises `Xitdb.Error` on failure."
-  @spec compact!(t(), keyword()) :: t()
-  def compact!(%__MODULE__{} = db, opts \\ []), do: db |> compact(opts) |> Error.unwrap!()
 ```
 
 </details>
 
 <details>
-<summary>NIF <code>odin_nif_compact</code> — <a href="../../native/xitdb_nif.odin#L6801-L6866">native/xitdb_nif.odin#L6801-L6866</a></summary>
+<summary>NIF <code>odin_nif_compact</code> — <a href="../../native/xitdb_nif.odin#L7801-L7866">native/xitdb_nif.odin#L7801-L7866</a></summary>
 
 ```odin
 odin_nif_compact :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {

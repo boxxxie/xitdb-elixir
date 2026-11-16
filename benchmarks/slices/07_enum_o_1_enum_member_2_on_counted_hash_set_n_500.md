@@ -8,13 +8,13 @@
 
 | Metric | Elixir NIF Wrapper | Raw Odin Baseline | Comparison |
 | :--- | ---: | ---: | ---: |
-| **Median (`ns/op`)** | 846.0 ns (846.0 ns) | 282.0 ns (282.0 ns) | **`3.00x`** NIF Ratio |
-| **Mean ± σ (CV)** | 836.4 ns ± 25.2 ns (3.0%) | 285.8 ns ± 16.9 ns (5.9%) | Welch `z` = `40.50` |
-| **p95 / Max (`ns/op`)** | 862.8 ns / 866.0 ns | 306.6 ns / 309.0 ns | `5` vs `5` pooled samples |
+| **Median (`ns/op`)** | 742.0 ns (742.0 ns) | 260.0 ns (260.0 ns) | **`2.85x`** NIF Ratio |
+| **Mean ± σ (CV)** | 744.8 ns ± 13.4 ns (1.8%) | 263.0 ns ± 4.8 ns (1.8%) | Welch `z` = `75.48` |
+| **p95 / Max (`ns/op`)** | 760.6 ns / 762.0 ns | 269.2 ns / 270.0 ns | `5` vs `5` pooled samples |
 
 ## Benchmark Harnesses (Elixir vs. Raw Odin)
 
-### Elixir Harness ([`bench_elixir.exs#L251-L258`](../bench_elixir.exs#L251-L258))
+### Elixir Harness ([`bench_elixir.exs#L272-L279`](../bench_elixir.exs#L272-L279))
 
 ```elixir
       {7, "Enum: O(1) Enum.member?/2 on Counted_Hash_Set (N=500)", 1000,
@@ -27,7 +27,7 @@
        end},
 ```
 
-### Raw Odin Harness ([`bench_client.odin#L886-L900`](../bench_client.odin#L886-L900))
+### Raw Odin Harness ([`bench_client.odin#L968-L982`](../bench_client.odin#L968-L982))
 
 ```odin
 	// #7: O(1) Counted_Hash_Set membership check
@@ -50,7 +50,105 @@
 ## Elixir Wrapper & NIF Bridge
 
 <details>
-<summary>NIF <code>odin_nif_slot_contains</code> — <a href="../../native/xitdb_nif.odin#L1144-L1236">native/xitdb_nif.odin#L1144-L1236</a></summary>
+<summary>Elixir <code>member?</code> — <a href="../../lib/xitdb/cursor.ex#L2598-L2687">lib/xitdb/cursor.ex#L2598-L2687</a></summary>
+
+```elixir
+  def member?(
+        %Cursor{tx_mode: false, root: false, tag_id: tag_id, db_ref: db_ref, value: val},
+        candidate
+      )
+      when tag_id in [11, 13, 15] and is_binary(candidate) do
+    case NIF.nif_slot_contains(db_ref, tag_id, val, candidate) do
+      {:ok, bool} -> {:ok, bool}
+      {:error, reason} when reason in [:uncounted, :unsupported] -> {:error, __MODULE__}
+      {:error, reason} -> raise Xitdb.Error, reason: reason
+    end
+  end
+
+  def member?(
+        %Cursor{tx_mode: false, root: false, tag_id: tag_id, db_ref: db_ref},
+        candidate
+      )
+      when tag_id in [11, 13, 15] and not is_binary(candidate) do
+    case NIF.nif_info(db_ref) do
+      {:ok, _} -> {:ok, false}
+      {:error, reason} -> raise Xitdb.Error, reason: reason
+    end
+  end
+
+  def member?(%Cursor{} = raw_cursor, candidate) do
+    if raw_cursor.tx_mode and
+         (map_size(raw_cursor.staged_overrides) > 0 or
+            MapSet.size(raw_cursor.deleted_paths) > 0 or
+            map_size(raw_cursor.staged_list_edits) > 0 or
+            raw_cursor.fork_aliases != []) do
+      {:error, __MODULE__}
+    else
+      %Cursor{db_ref: db_ref, tag: tag, tag_id: tag_id, value: val, root: root, moment: moment} =
+        cursor = Cursor.ensure_resolved(raw_cursor)
+
+      cond do
+        root and match?({"__tx", _}, candidate) ->
+          case NIF.nif_info(db_ref) do
+            {:ok, _} -> {:ok, false}
+            {:error, reason} -> raise Xitdb.Error, reason: reason
+          end
+
+        tag in [:hash_set, :counted_hash_set, :sorted_set] ->
+          if is_binary(candidate) do
+            {nid, nval} =
+              cond do
+                root and tag_id != -1 and val == 0 -> {tag_id, 0}
+                root -> {-1, moment}
+                true -> {tag_id, val}
+              end
+
+            case NIF.nif_slot_contains(db_ref, nid, nval, candidate) do
+              {:ok, bool} -> {:ok, bool}
+              {:error, reason} when reason in [:uncounted, :unsupported] -> {:error, __MODULE__}
+              {:error, reason} -> raise Xitdb.Error, reason: reason
+            end
+          else
+            case NIF.nif_info(db_ref) do
+              {:ok, _} -> {:ok, false}
+              {:error, reason} -> raise Xitdb.Error, reason: reason
+            end
+          end
+
+        tag in [:hash_map, :counted_hash_map, :sorted_map] ->
+          case candidate do
+            {k, expected_v} when is_binary(k) ->
+              fetch_cur = if root, do: raw_cursor, else: cursor
+
+              case Cursor.fetch(fetch_cur, k) do
+                {:ok, %Cursor{} = child_cur} ->
+                  {:ok, Cursor.strict_equal?(Xitdb.materialize(child_cur), expected_v)}
+
+                {:ok, actual_v} ->
+                  {:ok, Cursor.strict_equal?(actual_v, expected_v)}
+
+                :error ->
+                  {:ok, false}
+              end
+
+            _ ->
+              case NIF.nif_info(db_ref) do
+                {:ok, _} -> {:ok, false}
+                {:error, reason} -> raise Xitdb.Error, reason: reason
+              end
+          end
+
+        true ->
+          {:error, __MODULE__}
+      end
+    end
+  end
+```
+
+</details>
+
+<details>
+<summary>NIF <code>odin_nif_slot_contains</code> — <a href="../../native/xitdb_nif.odin#L1282-L1374">native/xitdb_nif.odin#L1282-L1374</a></summary>
 
 ```odin
 odin_nif_slot_contains :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {

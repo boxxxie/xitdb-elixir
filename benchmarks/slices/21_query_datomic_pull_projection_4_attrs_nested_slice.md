@@ -2,19 +2,19 @@
 
 [← Back to Benchmarks Overview](../README.md) · [All Slices](README.md)
 
-**Group:** `queries` — #21–#26 (Pull Projections, Datalog Engine, Buffered Sync & Search)
+**Group:** `queries` — #21–#27 (Pull Projections, Datalog Engine, Buffered Sync, Search & Indexer)
 
 ## Latest 1v1 Metrics
 
 | Metric | Elixir NIF Wrapper | Raw Odin Baseline | Comparison |
 | :--- | ---: | ---: | ---: |
-| **Median (`ns/op`)** | 6.47 µs (6467.0 ns) | 2.69 µs (2687.0 ns) | **`2.41x`** NIF Ratio |
-| **Mean ± σ (CV)** | 6.41 µs ± 101.8 ns (1.6%) | 2.68 µs ± 24.8 ns (0.9%) | Welch `z` = `79.62` |
-| **p95 / Max (`ns/op`)** | 6.49 µs / 6.49 µs | 2.70 µs / 2.71 µs | `5` vs `5` pooled samples |
+| **Median (`ns/op`)** | 6.51 µs (6507.0 ns) | 2.72 µs (2721.0 ns) | **`2.39x`** NIF Ratio |
+| **Mean ± σ (CV)** | 6.51 µs ± 144.2 ns (2.2%) | 2.73 µs ± 40.5 ns (1.5%) | Welch `z` = `56.49` |
+| **p95 / Max (`ns/op`)** | 6.66 µs / 6.67 µs | 2.77 µs / 2.77 µs | `5` vs `5` pooled samples |
 
 ## Benchmark Harnesses (Elixir vs. Raw Odin)
 
-### Elixir Harness ([`bench_elixir.exs#L425-L432`](../bench_elixir.exs#L425-L432))
+### Elixir Harness ([`bench_elixir.exs#L446-L453`](../bench_elixir.exs#L446-L453))
 
 ```elixir
       {21, "Query: Datomic pull projection (4 attrs + nested slice)", 200,
@@ -27,7 +27,7 @@
        end},
 ```
 
-### Raw Odin Harness ([`bench_client.odin#L1216-L1231`](../bench_client.odin#L1216-L1231))
+### Raw Odin Harness ([`bench_client.odin#L1298-L1313`](../bench_client.odin#L1298-L1313))
 
 ```odin
 	// #21: Datomic pull projection
@@ -51,7 +51,16 @@
 ## Elixir Wrapper & NIF Bridge
 
 <details>
-<summary>Elixir <code>pull</code> — <a href="../../lib/xitdb.ex#L645-L673">lib/xitdb.ex#L645-L673</a></summary>
+<summary>Elixir <code>pull!</code> — <a href="../../lib/xitdb.ex#L778-L778">lib/xitdb.ex#L778-L778</a></summary>
+
+```elixir
+  def pull!(target, pattern), do: target |> pull(pattern) |> Error.unwrap!()
+```
+
+</details>
+
+<details>
+<summary>Elixir <code>pull</code> — <a href="../../lib/xitdb.ex#L725-L753">lib/xitdb.ex#L725-L753</a></summary>
 
 ```elixir
   def pull(%__MODULE__{db_ref: db_ref}, pattern) do
@@ -88,12 +97,23 @@
 </details>
 
 <details>
-<summary>Elixir <code>do_nif_pull</code> — <a href="../../lib/xitdb.ex#L675-L683">lib/xitdb.ex#L675-L683</a></summary>
+<summary>Elixir <code>do_nif_pull</code> — <a href="../../lib/xitdb.ex#L755-L774">lib/xitdb.ex#L755-L774</a></summary>
 
 ```elixir
-  defp do_nif_pull(%Cursor{root: true, tag: tag, db_ref: db_ref, moment: moment}, pattern)
+  defp do_nif_pull(
+         %Cursor{
+           root: true,
+           tag: tag,
+           tag_id: tag_id,
+           value: val,
+           db_ref: db_ref,
+           moment: moment
+         },
+         pattern
+       )
        when tag != :none do
-    db_ref |> NIF.nif_pull(-1, moment, pattern) |> Error.wrap(%{pattern: pattern})
+    {nid, nval} = if tag_id != -1 and val == 0, do: {tag_id, 0}, else: {-1, moment}
+    db_ref |> NIF.nif_pull(nid, nval, pattern) |> Error.wrap(%{pattern: pattern})
   end
 
   defp do_nif_pull(%Cursor{} = cursor, pattern) do
@@ -105,7 +125,7 @@
 </details>
 
 <details>
-<summary>NIF <code>odin_nif_pull</code> — <a href="../../native/xitdb_nif.odin#L4609-L4663">native/xitdb_nif.odin#L4609-L4663</a></summary>
+<summary>NIF <code>odin_nif_pull</code> — <a href="../../native/xitdb_nif.odin#L5605-L5659">native/xitdb_nif.odin#L5605-L5659</a></summary>
 
 ```odin
 odin_nif_pull :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {
@@ -168,7 +188,7 @@ odin_nif_pull :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -
 </details>
 
 <details>
-<summary>NIF <code>nif_pull_cursor</code> — <a href="../../native/xitdb_nif.odin#L4408-L4603">native/xitdb_nif.odin#L4408-L4603</a></summary>
+<summary>NIF <code>nif_pull_cursor</code> — <a href="../../native/xitdb_nif.odin#L5404-L5599">native/xitdb_nif.odin#L5404-L5599</a></summary>
 
 ```odin
 nif_pull_cursor :: proc(
@@ -372,7 +392,7 @@ nif_pull_cursor :: proc(
 </details>
 
 <details>
-<summary>NIF <code>nif_pull_wildcard</code> — <a href="../../native/xitdb_nif.odin#L4238-L4330">native/xitdb_nif.odin#L4238-L4330</a></summary>
+<summary>NIF <code>nif_pull_wildcard</code> — <a href="../../native/xitdb_nif.odin#L5234-L5326">native/xitdb_nif.odin#L5234-L5326</a></summary>
 
 ```odin
 nif_pull_wildcard :: proc(
@@ -473,7 +493,7 @@ nif_pull_wildcard :: proc(
 </details>
 
 <details>
-<summary>NIF <code>split_top_level_pull_specs</code> — <a href="../../native/xitdb_nif.odin#L4126-L4168">native/xitdb_nif.odin#L4126-L4168</a></summary>
+<summary>NIF <code>split_top_level_pull_specs</code> — <a href="../../native/xitdb_nif.odin#L5122-L5164">native/xitdb_nif.odin#L5122-L5164</a></summary>
 
 ```odin
 split_top_level_pull_specs :: proc(inner: string, allocator: runtime.Allocator) -> []string {
@@ -524,7 +544,7 @@ split_top_level_pull_specs :: proc(inner: string, allocator: runtime.Allocator) 
 </details>
 
 <details>
-<summary>NIF <code>find_top_level_pull_brace</code> — <a href="../../native/xitdb_nif.odin#L4178-L4209">native/xitdb_nif.odin#L4178-L4209</a></summary>
+<summary>NIF <code>find_top_level_pull_brace</code> — <a href="../../native/xitdb_nif.odin#L5174-L5205">native/xitdb_nif.odin#L5174-L5205</a></summary>
 
 ```odin
 find_top_level_pull_brace :: proc(s: string) -> int {
@@ -564,7 +584,7 @@ find_top_level_pull_brace :: proc(s: string) -> int {
 </details>
 
 <details>
-<summary>NIF <code>find_last_unquoted_lbracket</code> — <a href="../../native/xitdb_nif.odin#L4211-L4234">native/xitdb_nif.odin#L4211-L4234</a></summary>
+<summary>NIF <code>find_last_unquoted_lbracket</code> — <a href="../../native/xitdb_nif.odin#L5207-L5230">native/xitdb_nif.odin#L5207-L5230</a></summary>
 
 ```odin
 find_last_unquoted_lbracket :: proc(s: string) -> int {
@@ -596,7 +616,7 @@ find_last_unquoted_lbracket :: proc(s: string) -> int {
 </details>
 
 <details>
-<summary>NIF <code>is_simple_hash_map_ident</code> — <a href="../../native/xitdb_nif.odin#L4332-L4346">native/xitdb_nif.odin#L4332-L4346</a></summary>
+<summary>NIF <code>is_simple_hash_map_ident</code> — <a href="../../native/xitdb_nif.odin#L5328-L5342">native/xitdb_nif.odin#L5328-L5342</a></summary>
 
 ```odin
 is_simple_hash_map_ident :: proc(s: string) -> (string, bool) {
@@ -619,7 +639,7 @@ is_simple_hash_map_ident :: proc(s: string) -> (string, bool) {
 </details>
 
 <details>
-<summary>NIF <code>parse_escaped_steps</code> — <a href="../../native/xitdb_nif.odin#L1822-L1834">native/xitdb_nif.odin#L1822-L1834</a></summary>
+<summary>NIF <code>parse_escaped_steps</code> — <a href="../../native/xitdb_nif.odin#L1893-L1905">native/xitdb_nif.odin#L1893-L1905</a></summary>
 
 ```odin
 parse_escaped_steps :: proc(path_str: string, allocator := context.temp_allocator) -> (res: []xitdb.Path_Step, err_reason: string) {
