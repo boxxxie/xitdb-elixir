@@ -138,16 +138,6 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           type: :atom,
           doc: "Logical collection & sequence key in the `.xit` store."
         ],
-        editable_fields: [
-          type: {:list, :atom},
-          default: [],
-          doc: "Steward-editable attribute list preserved for MDM governance."
-        ],
-        passthru_fields: [
-          type: {:list, :atom},
-          default: [],
-          doc: "Passthrough attribute list preserved for MDM sync compatibility."
-        ],
         counted_set_fields: [
           type: {:list, :atom},
           default: [],

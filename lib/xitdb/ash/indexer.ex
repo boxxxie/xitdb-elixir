@@ -765,48 +765,12 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     end
 
     defp resolve_nested_spec(resource) do
-      raw =
-        case fallback_nested_in(resource) do
-          nil ->
-            if function_exported?(Info, :nested_mappings, 1) do
-              case Info.nested_mappings(resource) do
-                [first | _] -> first
-                [] -> nil
-              end
-            end
-
-          spec ->
-            spec
-        end
-
-      normalize_nested_spec(raw)
-    end
-
-    defp fallback_nested_in(resource) do
-      if function_exported?(Info, :nested_in, 1) do
-        apply(Info, :nested_in, [resource])
-      else
-        nil
-      end
+      resource
+      |> Info.nested_in()
+      |> normalize_nested_spec()
     end
 
     defp normalize_nested_spec(nil), do: nil
-
-    defp normalize_nested_spec(%{
-           parent: parent,
-           as: as_slot,
-           parent_key: fk_attr,
-           cardinality: cardinality
-         })
-         when is_atom(parent) and not is_nil(parent) do
-      %{
-        parent_resource: parent,
-        parent_collection: Info.collection!(parent),
-        foreign_key: fk_attr,
-        path: Atom.to_string(as_slot),
-        cardinality: cardinality
-      }
-    end
 
     defp normalize_nested_spec(%{
            parent_collection: parent_col,

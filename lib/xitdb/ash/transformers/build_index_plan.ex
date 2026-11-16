@@ -55,7 +55,6 @@ if Code.ensure_loaded?(Ash.DataLayer) do
            {:ok, nesting_plan} <- validate_nested_in(module, nested_entries, attr_names),
            :ok <- validate_explicit_indexes(module, explicit_indexes, attr_names),
            :ok <- validate_counted_set_fields(module, dsl_state, attrs_by_name),
-           :ok <- validate_projected_fields(module, dsl_state, attr_names),
            :ok <- validate_search_fields(module, search_fields, attr_names),
            all_indexes = maybe_append_relationship_indexes(dsl_state, explicit_indexes, pk_fields),
            :ok <- validate_all_index_slots(module, all_indexes) do
@@ -278,25 +277,6 @@ if Code.ensure_loaded?(Ash.DataLayer) do
               )}}
         end
       end)
-    end
-
-    defp validate_projected_fields(module, dsl_state, attr_names) do
-      editable = Transformer.get_option(dsl_state, [:xitdb], :editable_fields, [])
-      passthru = Transformer.get_option(dsl_state, [:xitdb], :passthru_fields, [])
-
-      case Enum.reject(editable ++ passthru, &MapSet.member?(attr_names, &1)) do
-        [] ->
-          :ok
-
-        missing ->
-          {:error,
-           DslError.exception(
-             module: module,
-             path: [:xitdb, :editable_fields],
-             message:
-               "unknown attribute(s) #{inspect(Enum.uniq(missing))} in `editable_fields` / `passthru_fields` on #{inspect(module)}"
-           )}
-      end
     end
 
     defp validate_search_fields(module, search_fields, attr_names) do

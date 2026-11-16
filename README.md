@@ -27,8 +27,8 @@ Rather than re-implementing `xitdb`'s wire format in pure Elixir or requiring qu
   Pin historical snapshots in `O(1)` with `Xitdb.as_of(db, moment)`, diff any two moments in `O(delta)` with `Xitdb.diff_moments/3`, and inspect attribute lineage with `Xitdb.history_of/2`.
 - **Compile-Time Validated Sigils (`~x`, `~q`), Macro DSL (`Xitdb.DSL`), Pull & Datalog:**
   Use standard `Access` for lazy navigation or `use Xitdb.DSL` for compile-time path selectors (`path(users[id].todos[[0]])`), zero-read atomic transaction blocks (`tx db do ... end`), structural Pull patterns (`[:username, todos: 0..2]`), and Ecto-style Datalog queries with `^var` pinning.
-- **Native Ash Framework DataLayer, BM25 Search & Spark DSL (`Xitdb.Ash.DataLayer`, `Xitdb.Ash.Resource`):**
-  Persist `Ash.Resource` domains directly in immutable `.xit` files with `data_layer: Xitdb.Ash.DataLayer`—complete with ~10ns lock-free `:persistent_term` snapshot reads (`Xitdb.Ash.Store`), single/composite B+Tree secondary indexes (`index [:status, :inserted_at]`), transactional Odin NIF BM25 + prefix search (`Xitdb.Ash.Search`), incoming/outgoing FK cascades (`references`), co-located `nested_in` subtrees, historical time-travel (`Store.with_as_of/3`), and `async: true` sandboxes (`Xitdb.Ash.TestSandbox`)—or attach `extensions: [Xitdb.Ash.Resource]` as a hybrid MDM sync projection extension.
+- **Native Ash Framework DataLayer, BM25 Search & Spark DSL (`Xitdb.Ash.DataLayer`, `Xitdb.Ash.Dsl`):**
+  Persist `Ash.Resource` domains directly in immutable `.xit` files with `data_layer: Xitdb.Ash.DataLayer`—complete with ~10ns lock-free `:persistent_term` snapshot reads (`Xitdb.Ash.Store`), single/composite B+Tree secondary indexes (`index [:status, :inserted_at]`), transactional Odin NIF BM25 + prefix search (`Xitdb.Ash.Search`), incoming/outgoing FK cascades (`references`), co-located `nested_in` subtrees, historical time-travel (`Store.with_as_of/3`), and `async: true` sandboxes (`Xitdb.Ash.TestSandbox`).
 
 ---
 
@@ -156,11 +156,7 @@ min_age = 21
 
 ---
 
-## Ash Framework Integration (`Xitdb.Ash.DataLayer` & `Xitdb.Ash.Resource`)
-
-`Xitdb` supports two complementary integration modes with [`Ash`](https://hexdocs.pm/ash):
-
-### 1. Native Lock-Free Ash Storage & BM25 Search (`data_layer: Xitdb.Ash.DataLayer`)
+## Ash Framework Integration (`Xitdb.Ash.DataLayer` & `Xitdb.Ash.Dsl`)
 
 Use `Xitdb.Ash.DataLayer` with a supervised `Xitdb.Ash.Store` for full Ash 3.37.2+ CRUD, atomic updates, relationships, aggregates, calculations, composite B+Tree secondary indexes, same-store FK cascades, time-travel queries, and transactional Odin NIF BM25 + prefix search—with **zero SQL migrations**:
 
@@ -228,62 +224,18 @@ Xitdb.Ash.Store.with_as_of(MyApp.Store, moment_v0, fn ->
 end)
 ```
 
-### 2. Hybrid MDM Sync Extension (`extensions: [Xitdb.Ash.Resource]`)
-
-When pairing `Xitdb` with an external primary store (such as `AshPostgres.DataLayer`) as an immutable Master Data Management engine or secondary audit graph, add `Xitdb.Ash.Resource` to `extensions:` to configure collections, survivorship/lock fields, nested sub-collections (`nested_in`), and compile-time verified sync projections (`VerifySyncProjection`):
-
-```elixir
-defmodule MyApp.Accounts.Organization do
-  use Ash.Resource,
-    domain: MyApp.Accounts,
-    data_layer: AshPostgres.DataLayer,
-    extensions: [Xitdb.Ash.Resource]
-
-  xitdb do
-    store MyApp.MDM.Store
-    collection :organizations
-    merge_redirect_collection :org_merged_into
-    locked_ids_set :locked_org_ids
-
-    editable_fields [:name, :domain]
-    passthru_fields [:creatio_id, :parent_organization_id]
-    computed_xitdb_fields [:normalized_name]
-    field_aliases parent_organization_id: :parent_org_id
-
-    indexes(
-      domain: "domain->org_id",
-      normalized_name: "norm_name->org_id"
-    )
-  end
-
-  attributes do
-    uuid_primary_key :id
-    attribute :name, :string, allow_nil?: false, public?: true
-    attribute :domain, :string, public?: true
-    attribute :creatio_id, :string, public?: true
-    attribute :parent_organization_id, :uuid, public?: true
-  end
-end
-```
-
-Use `tx_for` / `tx_for!` to automatically prepend the resource's configured `index_on` rules at compile time, and `Xitdb.Ash.Info` for `O(1)` precompiled Pull projections:
+Use `tx_for` / `tx_for!` to automatically prepend a resource's configured secondary `index_on` rules at compile time when running raw `Xitdb.DSL` transactions:
 
 ```elixir
 use Xitdb.DSL
-alias MyApp.Accounts.Organization
+alias MyApp.Accounts.Profile
 
 db =
-  tx_for! db, Organization, doc: "upsert organization 101" do
-    put organizations["101"].id, "101"
-    put organizations["101"].name, "Northleaf Capital"
-    put organizations["101"].domain, "northleafcapital.com"
-    put organizations["101"].normalized_name, "northleaf capital"
+  tx_for! db, Profile, doc: "insert profile 101" do
+    put profiles["101"].id, "101"
+    put profiles["101"].full_name, "Alice Smith"
+    put profiles["101"].status, "active"
   end
-
-db["domain->org_id"]["northleafcapital.com"] # => "101"
-
-pattern = Xitdb.Ash.Info.pull_pattern_for(Organization)
-Xitdb.pull!(db["organizations"]["101"], pattern)
 ```
 
 ---
@@ -299,7 +251,7 @@ Xitdb.pull!(db["organizations"]["101"], pattern)
 - **[Path Selector & Structural Pull DSL (`docs/path-and-pull-dsl.md`)](docs/path-and-pull-dsl.md)** — `path/1`, typed collection modifiers (`counted`, `sorted`, `[[idx]]`), set member probes, wildcard scans (`*`), and structural `Xitdb.pull/2` patterns.
 - **[Declarative Transaction Block DSL (`docs/transaction-dsl.md`)](docs/transaction-dsl.md)** — `tx/2,3`, `tx_for/3,4`, `put` (including 1-arity set member additions), `update/2,3`, `rm`, `append`, `insert`, `slice`, `fork`, `index_on`, `meta`, `instant`, `savepoint`, and `abort`.
 - **[Declarative Datalog Query DSL (`docs/datalog-dsl.md`)](docs/datalog-dsl.md)** — `datalog/1` and `query/2,3`, `^var` pinning, entity generators (`u <- users`), set membership, transitive graph reachability (`reach/3,4`), cross-moment queries (`at_moment/2`), and aggregations.
-- **[Ash & Spark Integration (`docs/ash-and-spark.md`)](docs/ash-and-spark.md)** — Native `Xitdb.Ash.DataLayer`, `Xitdb.Ash.Store`, `Xitdb.Ash.Search` (BM25 + prefix search), `Xitdb.Ash.TestSandbox`, `Xitdb.Ash.Resource` Spark DSL extension, `Xitdb.Ash.Info` introspection, and `tx_for` / `tx_for!`.
+- **[Ash & Spark Integration (`docs/ash-and-spark.md`)](docs/ash-and-spark.md)** — Native `Xitdb.Ash.DataLayer`, `Xitdb.Ash.Dsl`, `Xitdb.Ash.Store`, `Xitdb.Ash.Search` (BM25 + prefix search), `Xitdb.Ash.TestSandbox`, `Xitdb.Ash.Info` introspection, and `tx_for` / `tx_for!`.
 
 ---
 
@@ -312,7 +264,7 @@ Xitdb.pull!(db["organizations"]["101"], pattern)
 │    tx_mode, path_steps, staged_ops, staged_overrides, deleted_paths}       │
 │  • Access, Enumerable, Inspect protocols                                   │
 │  • Xitdb.DSL + Xitdb.Pull + Xitdb.Sigils (~x, ~q)                          │
-│  • Xitdb.Ash.{DataLayer, Store, Search, TestSandbox, Resource, Info, Tx}   │
+│  • Xitdb.Ash.{DataLayer, Dsl, Store, Search, TestSandbox, Info, Tx}        │
 ├────────────────────────────────────────────────────────────────────────────┤
 │ C-ABI Erlang NIF Boundary (native/nif_entry.c + native/xitdb_nif.odin)     │
 │  • ErlNifResourceType + ErlNifRWLock thread safety                         │

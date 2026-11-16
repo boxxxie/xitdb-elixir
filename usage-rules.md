@@ -229,13 +229,13 @@ min_salary = 115
 
 ---
 
-## 8. Ash & Spark Integration (`Xitdb.Ash.DataLayer`, `Xitdb.Ash.Resource`, `Xitdb.Ash.Search`)
+## 8. Ash & Spark Integration (`Xitdb.Ash.DataLayer`, `Xitdb.Ash.Dsl`, `Xitdb.Ash.Search`)
 
 `Xitdb.Ash.DataLayer` is a native, lock-free Ash Framework 3.37.2+ storage and BM25 search engine backed by immutable copy-on-write `.xit` files.
 
 ### Resource Configuration (`xitdb do ... end`)
 
-Configure persistent Ash resources with `data_layer: Xitdb.Ash.DataLayer` (or `extensions: [Xitdb.Ash.Resource]`):
+Configure persistent Ash resources with `data_layer: Xitdb.Ash.DataLayer`:
 
 ```elixir
 defmodule MyApp.Accounts.Profile do
@@ -280,13 +280,6 @@ xitdb do
   nested_in :events, foreign_key: :event_id, path: :sessions, cardinality: :many
 end
 ```
-
-### Hybrid MDM Extension Rules (`extensions: [Xitdb.Ash.Resource]`)
-
-When attaching `Xitdb.Ash.Resource` as a secondary MDM sync extension onto an external data layer (such as `AshPostgres.DataLayer`):
-- Declare **either** top-level `collection :name` **or** `nested_in ParentResource, as: :slot, parent_key: :fk, key: :entry_key`—never both on an MDM-only `Xitdb.Ash.Resource`, and never declare `indexes` on MDM `nested_in` resources.
-- Every attribute accepted by `sync_update_action` (unless listed in `ignored_sync_attributes`) **must** appear in `editable_fields` or `passthru_fields`, or `VerifySyncProjection` raises a compile-time `Spark.Error.DslError`.
-- Set `require_atomic? false` on `lock_action` and `unlock_action` when your `lock_change` module implements `change/3` via `Ash.Changeset.get_data/2` without an `atomic/3` callback.
 
 ### Strict DO / DON'T Rules
 
@@ -366,12 +359,12 @@ Xitdb.Ash.Search.ids(MyApp.Accounts.Profile, "northleaf", as_of: prev_moment)
 - **DO** call `Xitdb.Ash.TestSandbox.init()` once in `test/test_helper.exs` before `ExUnit.start()`.
 - **DO** optionally pre-seed shared fixtures once via `Xitdb.Ash.TestSandbox.seed_template(MyApp.Store, fn db -> ... end)`, then check out isolated `:memory` stores per test in `DataCase` `setup` via `Xitdb.Ash.TestSandbox.checkout([MyApp.Store])` (with `checkin/2` or `ExUnit.Callbacks.on_exit/1`) and run tests with `async: true`. Use `Xitdb.Ash.TestSandbox.allow(MyApp.Store, self(), child_pid)` when spawned worker processes read/write the checked-out sandbox.
 - **DO** generate unique values via `System.unique_integer([:positive])` for all `identities` in `Ash.Generator` fixtures.
-- **DO** skip `Ecto.Adapters.SQL.Sandbox` for tests that only touch pure `Xitdb.Ash.DataLayer` resources; **keep** `Ecto.Adapters.SQL.Sandbox` for hybrid `AshPostgres` + `Xitdb.Ash.Resource` tests (or any test touching Postgres/Ecto tables).
+- **DO** skip `Ecto.Adapters.SQL.Sandbox` for tests that only touch `Xitdb.Ash.DataLayer` resources.
 
 ### Introspection Helpers (`Xitdb.Ash.Info`)
 
-- Use `Xitdb.Ash.Info.pull_fields(Resource)`, `Xitdb.Ash.Info.pull_pattern_for(Resource)`, `Xitdb.Ash.Info.search_fields(Resource)`, `Xitdb.Ash.Info.indexes(Resource)`, `Xitdb.Ash.Info.counted_set_fields(Resource)`, and `Xitdb.Ash.Info.resolve_store(Resource, context_or_opts)` instead of hardcoding field lists or index maps.
-- Use `Xitdb.Ash.Info.nested_in(Resource)` for `Xitdb.Ash.DataLayer` co-located subtrees (which support child secondary indexes) and `Xitdb.Ash.Info.nested_mappings(Resource)` for `Xitdb.Ash.Resource` MDM sub-collections (which forbid secondary indexes); `Xitdb.Ash.Info.nested?(Resource)` returns `true` for either.
+- Use `Xitdb.Ash.Info.search_fields(Resource)`, `Xitdb.Ash.Info.indexes(Resource)`, `Xitdb.Ash.Info.counted_set_fields(Resource)`, and `Xitdb.Ash.Info.resolve_store(Resource, context_or_opts)` instead of hardcoding field lists or index maps.
+- Use `Xitdb.Ash.Info.nested_in(Resource)` (and `Xitdb.Ash.Info.nested?(Resource)`) for `Xitdb.Ash.DataLayer` co-located subtrees (which support child secondary indexes).
 - Use `tx_for(db, Resource) do ... end` (`Xitdb.Ash.Tx`) to automatically inject all `index_on` declarations configured on resources so secondary B+Tree indexes never drift on raw transactions.
 
 ---
@@ -384,4 +377,4 @@ Xitdb.Ash.Search.ids(MyApp.Accounts.Profile, "northleaf", as_of: prev_moment)
 - [`docs/path-and-pull-dsl.md`](docs/path-and-pull-dsl.md) — `path/1`, `~x`, typed collection modifiers, wildcard scans, and structural `Xitdb.pull/2` projections.
 - [`docs/transaction-dsl.md`](docs/transaction-dsl.md) — Declarative `tx/2,3` and `tx_for/3,4` blocks, collection operations, metadata (`doc`, `instant`, `meta`), savepoints, and rollback.
 - [`docs/datalog-dsl.md`](docs/datalog-dsl.md) — Declarative `query/2,3` and `datalog/1` blocks, `^var` pinning, `reach`, `at_moment`, predicates, and aggregations.
-- [`docs/ash-and-spark.md`](docs/ash-and-spark.md) — `Xitdb.Ash.Resource` Spark DSL extension, `Xitdb.Ash.Info` introspection, `VerifySyncProjection` verifier, and `tx_for` / `tx_for!`.
+- [`docs/ash-and-spark.md`](docs/ash-and-spark.md) — `Xitdb.Ash.DataLayer`, `Xitdb.Ash.Dsl`, `Xitdb.Ash.Store`, `Xitdb.Ash.Search`, `Xitdb.Ash.Info` introspection, and `tx_for` / `tx_for!`.
