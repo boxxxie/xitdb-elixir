@@ -371,10 +371,11 @@ Xitdb.Ash.Search.ids(MyApp.Accounts.Profile, "northleaf", as_of: prev_moment)
 
 ## 9. Reference Guides (`docs/`)
 
-- [`docs/access-and-enumerable.md`](docs/access-and-enumerable.md) — Lazy 9-byte `Slot` cursors, `Access`, `Enumerable` fast paths, and `Stream` pagination.
-- [`docs/collections-and-indexing.md`](docs/collections-and-indexing.md) — Persistent data structure selection (`hash_map`, `counted_map`, `sorted_map`, `array_list`, `linked_list`, sets) and secondary B+Tree indexing (`index_on`).
-- [`docs/time-travel-and-storage.md`](docs/time-travel-and-storage.md) — Snapshots (`as_of/2`), structural diffs (`diff_moments/3`), attribute history (`history_of/2`), storage backends, and compaction.
-- [`docs/path-and-pull-dsl.md`](docs/path-and-pull-dsl.md) — `path/1`, `~x`, typed collection modifiers, wildcard scans, and structural `Xitdb.pull/2` projections.
-- [`docs/transaction-dsl.md`](docs/transaction-dsl.md) — Declarative `tx/2,3` and `tx_for/3,4` blocks, collection operations, metadata (`doc`, `instant`, `meta`), savepoints, and rollback.
+- [`docs/access-and-enumerable.md`](docs/access-and-enumerable.md) — Reading and updating with `Access`, `Enum`, and `Stream`.
+- [`docs/collections-and-indexing.md`](docs/collections-and-indexing.md) — Choosing persistent collection types and `index_on` secondary indexes.
+- [`docs/time-travel-and-storage.md`](docs/time-travel-and-storage.md) — Snapshots (`as_of/2`), diffs (`diff_moments/3`), field history (`history_of/2`), storage backends, and compaction.
+- [`docs/transaction-dsl.md`](docs/transaction-dsl.md) — Declarative `tx/2,3` and `tx_for/3,4` blocks, collection ops, metadata, savepoints, and rollback.
+- [`docs/path-and-pull-dsl.md`](docs/path-and-pull-dsl.md) — `Xitdb.pull/2` projections, `pull_pattern/1`, `path/1`, `path_steps/1`, and `~x`.
 - [`docs/datalog-dsl.md`](docs/datalog-dsl.md) — Declarative `query/2,3` and `datalog/1` blocks, `^var` pinning, `reach`, `at_moment`, predicates, and aggregations.
 - [`docs/ash-and-spark.md`](docs/ash-and-spark.md) — `Xitdb.Ash.DataLayer`, `Xitdb.Ash.Dsl`, `Xitdb.Ash.Store`, `Xitdb.Ash.Search`, `Xitdb.Ash.Info` introspection, and `tx_for` / `tx_for!`.
+- [`docs/architecture-and-internals.md`](docs/architecture-and-internals.md) — Storage layout, 9-byte `Slot` cursors, WAL-free crash safety, NIF boundary cost model, and single-writer supervision.

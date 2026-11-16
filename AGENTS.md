@@ -18,8 +18,9 @@ This document provides the architecture, build/test/benchmark commands, and deve
   - [`lib/xitdb/sigils.ex`](lib/xitdb/sigils.ex): Compile-time validated `~x` (selector) and `~q` (Datalog) sigils.
   - [`lib/xitdb/nif.ex`](lib/xitdb/nif.ex): `@on_load` loader for `priv/xitdb_nif.so`.
 - **`docs/`** — Dedicated reference guides:
-  - Core concepts & protocols: [`docs/access-and-enumerable.md`](docs/access-and-enumerable.md), [`docs/collections-and-indexing.md`](docs/collections-and-indexing.md), [`docs/time-travel-and-storage.md`](docs/time-travel-and-storage.md).
-  - Macro DSLs & query languages: [`docs/path-and-pull-dsl.md`](docs/path-and-pull-dsl.md), [`docs/transaction-dsl.md`](docs/transaction-dsl.md), [`docs/datalog-dsl.md`](docs/datalog-dsl.md), [`docs/ash-and-spark.md`](docs/ash-and-spark.md).
+  - Core concepts: [`docs/access-and-enumerable.md`](docs/access-and-enumerable.md), [`docs/collections-and-indexing.md`](docs/collections-and-indexing.md), [`docs/time-travel-and-storage.md`](docs/time-travel-and-storage.md).
+  - DSLs, queries & Ash: [`docs/transaction-dsl.md`](docs/transaction-dsl.md), [`docs/path-and-pull-dsl.md`](docs/path-and-pull-dsl.md), [`docs/datalog-dsl.md`](docs/datalog-dsl.md), [`docs/ash-and-spark.md`](docs/ash-and-spark.md).
+  - Architecture & internals: [`docs/architecture-and-internals.md`](docs/architecture-and-internals.md).
 - **`native/`** — C-ABI Erlang NIF shim & Odin NIF implementation:
   - [`native/nif_entry.c`](native/nif_entry.c): Thin C shim exporting `ERL_NIF_INIT` and wrapping `ErlNifResourceType` / `ErlNifRWLock` callbacks for Odin.
   - [`native/xitdb_nif.odin`](native/xitdb_nif.odin): Odin NIF procedures bridging `ErlNifEnv` terms to `xitdb`.
