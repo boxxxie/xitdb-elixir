@@ -571,10 +571,6 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       end
     end
 
-    defp resolve_parent_resource(_resource, %{parent_resource: parent})
-         when is_atom(parent) and not is_nil(parent),
-         do: parent
-
     defp resolve_parent_resource(resource, %{foreign_key: fk_attr}) do
       case Enum.find(
              Ash.Resource.Info.relationships(resource),
@@ -780,17 +776,11 @@ if Code.ensure_loaded?(Ash.DataLayer) do
          })
          when is_atom(parent_col) and not is_nil(parent_col) do
       %{
-        parent_resource: nil,
         parent_collection: parent_col,
         foreign_key: fk_attr,
         path: Atom.to_string(path),
         cardinality: cardinality
       }
-    end
-
-    defp resolve_parent_collection(%{parent_resource: parent}, tenant, _resource)
-         when is_atom(parent) and not is_nil(parent) do
-      Codec.scoped_collection(parent, tenant)
     end
 
     defp resolve_parent_collection(%{parent_collection: parent_col}, tenant, resource) do
@@ -864,7 +854,6 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         |> Enum.map(& &1.destination)
         |> Enum.filter(fn dest ->
           case resolve_nested_spec(dest) do
-            %{parent_resource: ^parent_resource} -> true
             %{parent_collection: ^parent_col} when not is_nil(parent_col) -> true
             _ -> false
           end
