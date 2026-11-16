@@ -530,6 +530,33 @@ make_list_from_term_buf :: proc(
 	return nif_make_list_from_array(env, raw_data(buf[:buf_len]), c.uint(buf_len))
 }
 
+make_mapset_term :: proc(env: ErlNifEnv, elems: []ERL_NIF_TERM) -> ERL_NIF_TERM {
+	inner_map: ERL_NIF_TERM
+	if len(elems) == 0 {
+		inner_map = nif_make_new_map(env)
+	} else {
+		empty_list := nif_make_list_from_array(env, nil, 0)
+		val_buf: [16]ERL_NIF_TERM = ---
+		vals: []ERL_NIF_TERM
+		if len(elems) <= len(val_buf) {
+			for i in 0 ..< len(elems) {
+				val_buf[i] = empty_list
+			}
+			vals = val_buf[:len(elems)]
+		} else {
+			dyn_vals := make([]ERL_NIF_TERM, len(elems), context.temp_allocator)
+			for i in 0 ..< len(elems) {
+				dyn_vals[i] = empty_list
+			}
+			vals = dyn_vals
+		}
+		inner_map = make_map_safe(env, elems, vals)
+	}
+	ms_keys := [2]ERL_NIF_TERM{ATOM_STRUCT, ATOM_MAP}
+	ms_vals := [2]ERL_NIF_TERM{ATOM_MAPSET_MOD, inner_map}
+	return make_map_safe(env, ms_keys[:], ms_vals[:])
+}
+
 materialize_slot :: proc(env: ErlNifEnv, db: ^xitdb.Database, slot: xitdb.Slot, is_root: bool = false) -> (res: ERL_NIF_TERM, err: xitdb.Error) {
 	if !is_container_tag(slot.tag) {
 		return slot_to_term(env, db, slot)
@@ -543,7 +570,10 @@ materialize_slot :: proc(env: ErlNifEnv, db: ^xitdb.Database, slot: xitdb.Slot, 
 	#partial switch slot.tag {
 	case .Array_List, .Linked_Array_List:
 		it := xitdb.cursor_iterator(cur) or_return
-		items := make([dynamic]ERL_NIF_TERM, 0, 16, context.temp_allocator)
+		item_buf: [16]ERL_NIF_TERM = ---
+		item_len := 0
+		item_dyn: [dynamic]ERL_NIF_TERM
+		using_dyn := false
 		for {
 			next_maybe := xitdb.cursor_iterator_next(&it) or_return
 			elem_cur, ok := next_maybe.?
@@ -552,16 +582,20 @@ materialize_slot :: proc(env: ErlNifEnv, db: ^xitdb.Database, slot: xitdb.Slot, 
 			}
 			elem_slot := xitdb.cursor_slot(elem_cur) or_return
 			term := materialize_slot(env, db, elem_slot, false) or_return
-			append(&items, term)
+			push_nif_term(item_buf[:], &item_len, &item_dyn, &using_dyn, term, context.temp_allocator)
 		}
+		items := item_dyn[:] if using_dyn else item_buf[:item_len]
 		if len(items) == 0 {
 			return nif_make_list_from_array(env, nil, 0), nil
 		}
-		return nif_make_list_from_array(env, raw_data(items[:]), c.uint(len(items))), nil
+		return nif_make_list_from_array(env, raw_data(items), c.uint(len(items))), nil
 
 	case .Hash_Set, .Counted_Hash_Set, .Sorted_Set:
 		it := xitdb.cursor_iterator(cur) or_return
-		items := make([dynamic]ERL_NIF_TERM, 0, 16, context.temp_allocator)
+		item_buf: [16]ERL_NIF_TERM = ---
+		item_len := 0
+		item_dyn: [dynamic]ERL_NIF_TERM
+		using_dyn := false
 		for {
 			next_maybe := xitdb.cursor_iterator_next(&it) or_return
 			elem_cur, ok := next_maybe.?
@@ -570,20 +604,18 @@ materialize_slot :: proc(env: ErlNifEnv, db: ^xitdb.Database, slot: xitdb.Slot, 
 			}
 			key_cur, _ := xitdb.cursor_read_kv_pair_slots(elem_cur) or_return
 			term := slot_to_term(env, db, key_cur.slot_ptr.slot) or_return
-			append(&items, term)
+			push_nif_term(item_buf[:], &item_len, &item_dyn, &using_dyn, term, context.temp_allocator)
 		}
-		list_term: ERL_NIF_TERM
-		if len(items) == 0 {
-			list_term = nif_make_list_from_array(env, nil, 0)
-		} else {
-			list_term = nif_make_list_from_array(env, raw_data(items[:]), c.uint(len(items)))
-		}
-		return nif_make_tuple2(env, ATOM_XITDB_SET, list_term), nil
+		items := item_dyn[:] if using_dyn else item_buf[:item_len]
+		return make_mapset_term(env, items), nil
 
 	case .Hash_Map, .Counted_Hash_Map, .Sorted_Map:
 		it := xitdb.cursor_iterator(cur) or_return
-		keys := make([dynamic]ERL_NIF_TERM, 0, 16, context.temp_allocator)
-		vals := make([dynamic]ERL_NIF_TERM, 0, 16, context.temp_allocator)
+		key_buf: [16]ERL_NIF_TERM = ---
+		val_buf: [16]ERL_NIF_TERM = ---
+		key_len, val_len := 0, 0
+		key_dyn, val_dyn: [dynamic]ERL_NIF_TERM
+		using_key_dyn, using_val_dyn := false, false
 		sb_buf: [128]u8 = ---
 		for {
 			next_maybe := xitdb.cursor_iterator_next(&it) or_return
@@ -598,10 +630,12 @@ materialize_slot :: proc(env: ErlNifEnv, db: ^xitdb.Database, slot: xitdb.Slot, 
 			}
 			k_term := make_binary(env, key_str)
 			v_term := materialize_slot(env, db, val_cur.slot_ptr.slot, false) or_return
-			append(&keys, k_term)
-			append(&vals, v_term)
+			push_nif_term(key_buf[:], &key_len, &key_dyn, &using_key_dyn, k_term, context.temp_allocator)
+			push_nif_term(val_buf[:], &val_len, &val_dyn, &using_val_dyn, v_term, context.temp_allocator)
 		}
-		return make_map_safe(env, keys[:], vals[:]), nil
+		keys := key_dyn[:] if using_key_dyn else key_buf[:key_len]
+		vals := val_dyn[:] if using_val_dyn else val_buf[:val_len]
+		return make_map_safe(env, keys, vals), nil
 	}
 
 	return ATOM_NIL, nil
@@ -1626,7 +1660,7 @@ odin_nif_slot_materialize :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL
 		case .Array_List, .Linked_Array_List:
 			return make_ok(env, nif_make_list_from_array(env, nil, 0))
 		case .Hash_Set, .Counted_Hash_Set, .Sorted_Set:
-			return make_ok(env, nif_make_tuple2(env, ATOM_XITDB_SET, nif_make_list_from_array(env, nil, 0)))
+			return make_ok(env, make_mapset_term(env, nil))
 		case .Hash_Map, .Counted_Hash_Map, .Sorted_Map:
 			return make_ok(env, nif_make_new_map(env))
 		case:

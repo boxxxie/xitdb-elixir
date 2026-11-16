@@ -558,13 +558,13 @@ defmodule Xitdb do
 
         cursor.root and cursor.tag_id != -1 and cursor.value == 0 ->
           case NIF.nif_slot_materialize(cursor.db_ref, cursor.tag_id, 0, 0) do
-            {:ok, raw} -> Cursor.unwrap_nif_value(cursor.db_ref, raw, cursor.moment, [])
+            {:ok, raw} -> raw
             {:error, reason} -> raise Error, reason: reason
           end
 
         cursor.root ->
           case NIF.nif_slot_materialize(cursor.db_ref, -1, cursor.moment, 0) do
-            {:ok, raw} -> Cursor.unwrap_nif_value(cursor.db_ref, raw, cursor.moment, [])
+            {:ok, raw} -> raw
             {:error, reason} -> raise Error, reason: reason
           end
 
@@ -572,13 +572,13 @@ defmodule Xitdb do
           Cursor.resolve_fork_disk_base(cursor) || empty_cursor_default(cursor.tag)
 
         true ->
-          %Cursor{db_ref: db_ref, tag_id: tag_id, value: val, full: full, moment: moment} =
+          %Cursor{db_ref: db_ref, tag_id: tag_id, value: val, full: full} =
             Cursor.ensure_resolved(cursor)
 
           full_int = if full, do: 1, else: 0
 
           case NIF.nif_slot_materialize(db_ref, tag_id, val, full_int) do
-            {:ok, raw} -> Cursor.unwrap_nif_value(db_ref, raw, moment, [])
+            {:ok, raw} -> raw
             {:error, reason} -> raise Error, reason: reason
           end
       end
