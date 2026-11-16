@@ -38,6 +38,45 @@ HISTORY_JSONL = os.path.join(BENCH_DIR, "history.jsonl")
 
 ALL_GROUPS = ["access", "enumerable", "transactions", "time_travel", "queries"]
 
+GROUP_ALIASES: Dict[str, str] = {
+    "access": "access",
+    "dsl": "access",
+    "selector": "access",
+    "path": "access",
+    "enumerable": "enumerable",
+    "enum": "enumerable",
+    "stream": "enumerable",
+    "materialize": "enumerable",
+    "transactions": "transactions",
+    "tx": "transactions",
+    "transaction": "transactions",
+    "time_travel": "time_travel",
+    "time-travel": "time_travel",
+    "timetravel": "time_travel",
+    "history": "time_travel",
+    "lifecycle": "time_travel",
+    "compact": "time_travel",
+    "compaction": "time_travel",
+    "queries": "queries",
+    "query": "queries",
+    "search": "queries",
+    "storage": "queries",
+    "datalog": "queries",
+    "pull": "queries",
+    "bm25": "queries",
+    "indexer": "queries",
+    "index": "queries",
+}
+
+
+def expand_group_tokens(groups_str: Optional[str]) -> Optional[Set[str]]:
+    if not groups_str or not groups_str.strip():
+        return None
+    tokens = [tok.strip().lower() for tok in re.split(r"[,|]", groups_str) if tok.strip()]
+    if not tokens or "all" in tokens:
+        return None
+    return {GROUP_ALIASES.get(tok, tok) for tok in tokens}
+
 GROUP_RANGES = {
     "access": "#1–#5, #28 (Lazy Access Navigation, Point Lookups & Pre-Tokenized DSL Select)",
     "enumerable": "#6–#11 (Enumerable Protocol & Subtree Materialization)",
@@ -234,11 +273,12 @@ BENCHMARK_CATALOG: List[Dict[str, Any]] = [
         "group": "queries",
         "name": "Indexer: Sorted_Map B+Tree range scan + set decode (limit=16)",
         "elixir_entries": [
-            ("lib/xitdb/ash/indexer.ex", "stream_btree_from_key"),
+            ("lib/xitdb/nif.ex", "nif_sorted_map_seek"),
             ("lib/xitdb/ash/search.ex", "scan_prefix"),
+            ("lib/xitdb/ash/indexer.ex", "stream_btree_from_key"),
             ("lib/xitdb/cursor.ex", "from_compact_slot"),
         ],
-        "nif_entries": ["odin_nif_sorted_map_seek", "odin_nif_slot_entries"],
+        "nif_entries": ["odin_nif_sorted_map_seek", "decode_child_container_entries_term"],
     },
     {
         "rank": 28,
@@ -453,6 +493,7 @@ def pool_by_lang_and_test(
             recs = [r for r in recs if r.get("commit", "unknown") == latest_for_name]
         recs = deduplicate_by_run_id(recs, latest_run=latest_run)
         stat = compute_pooled_stats(recs)
+        stat["latest_commit"] = overall_latest_commit
         pooled.append(stat)
     pooled.sort(key=lambda x: x["rank"])
     return pooled
@@ -488,7 +529,7 @@ def run_cmd(cmd: List[str], label: str) -> None:
 
 def print_single_lang_summary(rows: List[Dict[str, Any]], lang: str) -> None:
     label = "Raw Odin Baseline" if lang == "odin" else "Elixir Client Wrapper"
-    commit_tag = rows[0]["commit"]
+    commit_tag = rows[0].get("latest_commit") or rows[0]["commit"]
     samples = rows[0]["runs"]
     invs = rows[0]["num_invocations"]
     print()
@@ -534,8 +575,8 @@ def print_1v1_comparison(
         print("ERROR: No matching benchmarks found between Odin and Elixir.", file=sys.stderr)
         sys.exit(1)
 
-    o_commit = odin_rows[0]["commit"]
-    e_commit = elixir_rows[0]["commit"]
+    o_commit = odin_rows[0].get("latest_commit") or odin_rows[0]["commit"]
+    e_commit = elixir_rows[0].get("latest_commit") or elixir_rows[0]["commit"]
     o_samples = odin_rows[0]["runs"]
     e_samples = elixir_rows[0]["runs"]
 
@@ -590,11 +631,49 @@ def print_1v1_comparison(
     print("=" * 176)
 
 
-def sample_loadavg_1m(samples: List[float]) -> None:
+def read_proc_stat_cpu() -> Optional[Tuple[int, int]]:
     try:
-        samples.append(float(os.getloadavg()[0]))
+        with open("/proc/stat", "r", encoding="utf-8") as f:
+            first = f.readline().strip()
+        if not first.startswith("cpu "):
+            return None
+        fields = [int(x) for x in first.split()[1:]]
+        if len(fields) < 4:
+            return None
+        total = sum(fields)
+        idle_all = fields[3] + (fields[4] if len(fields) > 4 else 0)
+        return total - idle_all, total
+    except OSError:
+        return None
+
+
+def sample_host_window_start() -> Dict[str, Any]:
+    state: Dict[str, Any] = {"cpu": read_proc_stat_cpu()}
+    try:
+        state["load"] = float(os.getloadavg()[0])
+    except OSError:
+        state["load"] = None
+    return state
+
+
+def sample_host_window_end(start_state: Dict[str, Any], samples: List[Dict[str, float]]) -> None:
+    entry: Dict[str, float] = {}
+    end_cpu = read_proc_stat_cpu()
+    start_cpu = start_state.get("cpu")
+    if start_cpu is not None and end_cpu is not None:
+        d_busy = max(end_cpu[0] - start_cpu[0], 0)
+        d_total = end_cpu[1] - start_cpu[1]
+        if d_total > 0:
+            entry["cpu_busy_pct"] = (100.0 * d_busy) / d_total
+    try:
+        end_load = float(os.getloadavg()[0])
+        entry["load_end"] = end_load
+        if start_state.get("load") is not None:
+            entry["load_delta"] = end_load - float(start_state["load"])
     except OSError:
         pass
+    if entry:
+        samples.append(entry)
 
 
 def resolve_record_rank(rec: Any) -> int:
@@ -626,10 +705,8 @@ def safe_float(val: Any) -> Optional[float]:
 def is_selective_run(groups_str: Optional[str], filter_str: Optional[str]) -> bool:
     if filter_str and filter_str.strip():
         return True
-    if not groups_str or not groups_str.strip():
-        return False
-    tokens = {tok.strip().lower() for tok in re.split(r"[,|]", groups_str) if tok.strip()}
-    if not tokens or "all" in tokens:
+    tokens = expand_group_tokens(groups_str)
+    if not tokens:
         return False
     return not set(ALL_GROUPS).issubset(tokens)
 
@@ -694,13 +771,30 @@ def evaluate_contention_guardrails(
     odin_rows: List[Dict[str, Any]],
     elixir_rows: List[Dict[str, Any]],
     history_records: List[Dict[str, Any]],
-    load_samples: List[float],
+    host_samples: List[Dict[str, float]],
 ) -> List[str]:
     warnings: List[str] = []
-    if load_samples and max(load_samples) > 4.0:
-        warnings.append(
-            f"High host 1m loadavg sampled during run: max={max(load_samples):.2f} (> 4.00 threshold)"
-        )
+    cpu_samples = [s["cpu_busy_pct"] for s in host_samples if "cpu_busy_pct" in s]
+    ncpu = max(os.cpu_count() or 4, 1)
+    if cpu_samples:
+        # Allow 1 full benchmark core (100/ncpu %) plus 25% headroom for OS/BEAM background threads
+        max_busy = max(cpu_samples)
+        busy_limit = min(85.0, (100.0 / ncpu) + 25.0)
+        if max_busy > busy_limit:
+            warnings.append(
+                f"High host CPU utilization during benchmark window: max={max_busy:.1f}% (> {busy_limit:.1f}% on {ncpu} cores)"
+            )
+    elif host_samples:
+        load_ceiling = max(4.0, ncpu * 0.75)
+        grew = [
+            s for s in host_samples
+            if s.get("load_end", 0.0) > load_ceiling and s.get("load_delta", 0.0) > 0.25
+        ]
+        if grew:
+            peak = max(s["load_end"] for s in grew)
+            warnings.append(
+                f"Rising host 1m loadavg during run: max={peak:.2f} (> {load_ceiling:.2f} on {ncpu} cores)"
+            )
 
     canary_baseline = compute_canary_baselines(history_records)
 
@@ -710,10 +804,8 @@ def evaluate_contention_guardrails(
         name = str(row.get("name") or "?")
         med = safe_float(row.get("median_ns")) or 0.0
         cv = safe_float(row.get("cv_pct")) or 0.0
-        min_ns = safe_float(row.get("min_ns"))
-        ratio = safe_float(row.get("median_min_ratio"))
-        if ratio is None:
-            ratio = med / max(min_ns if min_ns is not None else med, 1e-9)
+        p95_ns = safe_float(row.get("p95_ns"))
+        p95_ratio = (p95_ns / max(med, 1e-9)) if p95_ns is not None else 1.0
 
         if rank in (3, 4, 5, 6) and med >= 50.0:
             base = canary_baseline.get((lang, name))
@@ -723,10 +815,14 @@ def evaluate_contention_guardrails(
                     f"(median={med:.1f}ns vs clean baseline={base:.1f}ns, {med / base:.2f}x > 1.50x)"
                 )
 
-        if rank != 24 and med >= 50.0 and (cv > 15.0 or ratio > 1.25):
+        if rank != 24 and med >= 50.0 and (
+            cv > 15.0
+            or (med >= 100.0 and p95_ratio > 1.50)
+            or (cv > 10.0 and p95_ratio > 1.35)
+        ):
             warnings.append(
                 f"[{lang}] #{rank} noise/skew: {name} "
-                f"(CV={cv:.1f}%, median/min={ratio:.2f}x, median={med:.1f}ns)"
+                f"(CV={cv:.1f}%, p95/median={p95_ratio:.2f}x, median={med:.1f}ns)"
             )
 
     return warnings
@@ -1227,6 +1323,7 @@ def parse_elixir_lib_functions() -> Dict[Tuple[str, str], Dict[str, Any]]:
             has_block = False
             has_inline_do = False
             depth = 0
+            paren_depth = 0
             while j < n:
                 if j > start_idx and not has_block and not has_inline_do and def_re.match(lines[j]):
                     end_idx = j - 1
@@ -1235,14 +1332,30 @@ def parse_elixir_lib_functions() -> Dict[Tuple[str, str], Dict[str, Any]]:
                 cleaned_no_kw = re.sub(r"\bdo:", " ", cleaned)
                 depth += len(re.findall(r"(?<![A-Za-z0-9_])(do|fn)(?=\s|$)", cleaned_no_kw))
                 depth -= len(re.findall(r"(?<![A-Za-z0-9_])end(?=\s|$|[,\}\)\.])", cleaned_no_kw))
+                paren_depth += cleaned.count("(") + cleaned.count("[") + cleaned.count("{")
+                paren_depth -= cleaned.count(")") + cleaned.count("]") + cleaned.count("}")
                 if not has_block and re.search(r"(?:^|,)\s*do:", cleaned):
                     has_inline_do = True
-                    if depth <= 0:
-                        end_idx = j
-                        break
-                    has_block = True
                 if re.search(r"(?<![A-Za-z0-9_])do(?=\s|$)", cleaned_no_kw):
                     has_block = True
+                if has_inline_do and not has_block and depth <= 0 and paren_depth <= 0:
+                    stripped = cleaned.rstrip()
+                    continues = bool(
+                        re.search(
+                            r"(?:\bdo:|\|>|,|\\|=|==|!=|<=|>=|\+\+|--|\+|-|\*|/|<>|\band\b|\bor\b|&&|\|\||->|::)\s*$",
+                            stripped,
+                        )
+                    )
+                    if not continues:
+                        next_nonblank = ""
+                        for k in range(j + 1, n):
+                            nxt = strip_elixir_code_line(lines[k]).strip()
+                            if nxt:
+                                next_nonblank = nxt
+                                break
+                        if not next_nonblank.startswith("|>"):
+                            end_idx = j
+                            break
                 if has_block and depth <= 0:
                     end_idx = j
                     break
@@ -1793,6 +1906,7 @@ NIF_PROC_ATTRIBUTION: Dict[str, Tuple[List[str], List[str]]] = {
     "odin_nif_sync": (["queries"], ["Buffered_File"]),
     "odin_nif_info": (["queries"], ["Buffered_File"]),
     "odin_nif_sorted_map_seek": (["queries"], ["Sorted_Map B+Tree prefix seek", "Sorted_Map B+Tree range scan + set decode"]),
+    "decode_child_container_entries_term": (["queries"], ["Sorted_Map B+Tree range scan + set decode"]),
     "odin_nif_bm25_search": (["queries"], ["BM25 corpus search"]),
     "collect_postings_into_map": (["queries"], ["BM25 corpus search"]),
     "bm25_heap_push": (["queries"], ["BM25 corpus search"]),
@@ -2194,7 +2308,7 @@ def main() -> None:
         if not bench_filter and plan["filter"]:
             bench_filter = plan["filter"]
 
-    load_samples: List[float] = []
+    host_samples: List[Dict[str, float]] = []
     stage_tag = f"{re.sub(r'[^A-Za-z0-9_.-]+', '_', run_id)}_{os.getpid()}"
     tmp_odin = os.path.join(BENCH_DIR, f".tmp_odin_{stage_tag}.jsonl")
     tmp_elixir = os.path.join(BENCH_DIR, f".tmp_elixir_{stage_tag}.jsonl")
@@ -2243,9 +2357,9 @@ def main() -> None:
                 if use_staged_clean:
                     odin_flags.extend(["--output", tmp_odin])
                 odin_cmd = [tmp_odin_bin] + odin_flags
-                sample_loadavg_1m(load_samples)
+                host_win = sample_host_window_start()
                 run_cmd(odin_cmd, "Raw Odin Client Benchmarks")
-                sample_loadavg_1m(load_samples)
+                sample_host_window_end(host_win, host_samples)
 
             if run_lang in ("elixir", "both"):
                 elixir_flags = list(base_flags)
@@ -2254,12 +2368,15 @@ def main() -> None:
                 if use_staged_clean:
                     elixir_flags.extend(["--output", tmp_elixir])
                 elixir_cmd = ["mix", "run", "--no-compile", "benchmarks/bench_elixir.exs", "--"] + elixir_flags
-                sample_loadavg_1m(load_samples)
+                host_win = sample_host_window_start()
                 run_cmd(elixir_cmd, "Elixir Wrapper Client Benchmarks")
-                sample_loadavg_1m(load_samples)
+                sample_host_window_end(host_win, host_samples)
 
         snapshot_commit = args.commit if args.from_jsonl else None
         analysis_run_id = args.run_id if args.from_jsonl else None
+
+        odin_records: List[Dict[str, Any]] = []
+        elixir_records: List[Dict[str, Any]] = []
 
         if use_staged_clean:
             staged_odin_records: List[Dict[str, Any]] = []
@@ -2272,6 +2389,9 @@ def main() -> None:
                         file=sys.stderr,
                     )
                     sys.exit(1)
+                odin_records = merge_jsonl_records(
+                    load_jsonl_file(ODIN_JSONL), staged_odin_records, args.append, selective_odin
+                )
             if run_lang in ("elixir", "both"):
                 staged_elixir_records = load_jsonl_file(tmp_elixir)
                 if not staged_elixir_records:
@@ -2280,38 +2400,36 @@ def main() -> None:
                         file=sys.stderr,
                     )
                     sys.exit(1)
-
-            odin_records = (
-                merge_jsonl_records(load_jsonl_file(ODIN_JSONL), staged_odin_records, args.append, selective_odin)
-                if run_lang in ("odin", "both")
-                else load_jsonl_file(ODIN_JSONL)
-            )
-            elixir_records = (
-                merge_jsonl_records(load_jsonl_file(ELIXIR_JSONL), staged_elixir_records, args.append, selective_elixir)
-                if run_lang in ("elixir", "both")
-                else load_jsonl_file(ELIXIR_JSONL)
-            )
+                elixir_records = merge_jsonl_records(
+                    load_jsonl_file(ELIXIR_JSONL), staged_elixir_records, args.append, selective_elixir
+                )
             eval_odin = pool_by_lang_and_test(staged_odin_records, "odin", None) if run_lang in ("odin", "both") else []
             eval_elixir = pool_by_lang_and_test(staged_elixir_records, "elixir", None) if run_lang in ("elixir", "both") else []
         else:
             if args.commit or args.run_id:
                 hist_all = load_all_history()
-                odin_records = [r for r in hist_all if r.get("lang") == "odin"] or load_jsonl_file(ODIN_JSONL)
-                elixir_records = [r for r in hist_all if r.get("lang") == "elixir"] or load_jsonl_file(ELIXIR_JSONL)
+                if run_lang in ("odin", "both"):
+                    odin_records = [r for r in hist_all if r.get("lang") == "odin"] or load_jsonl_file(ODIN_JSONL)
+                if run_lang in ("elixir", "both"):
+                    elixir_records = [r for r in hist_all if r.get("lang") == "elixir"] or load_jsonl_file(ELIXIR_JSONL)
             else:
-                odin_records = load_jsonl_file(ODIN_JSONL)
-                elixir_records = load_jsonl_file(ELIXIR_JSONL)
+                if run_lang in ("odin", "both"):
+                    odin_records = load_jsonl_file(ODIN_JSONL)
+                if run_lang in ("elixir", "both"):
+                    elixir_records = load_jsonl_file(ELIXIR_JSONL)
 
-            if odin_groups and odin_groups.lower() != "all":
-                allowed_og = {g.strip().lower() for g in re.split(r"[,|]", odin_groups) if g.strip()}
+            allowed_og = expand_group_tokens(odin_groups)
+            if allowed_og is not None and run_lang in ("odin", "both"):
                 odin_records = [r for r in odin_records if CATALOG_BY_NAME.get(r.get("name", ""), {}).get("group") in allowed_og]
-            if elixir_groups and elixir_groups.lower() != "all":
-                allowed_eg = {g.strip().lower() for g in re.split(r"[,|]", elixir_groups) if g.strip()}
+            allowed_eg = expand_group_tokens(elixir_groups)
+            if allowed_eg is not None and run_lang in ("elixir", "both"):
                 elixir_records = [r for r in elixir_records if CATALOG_BY_NAME.get(r.get("name", ""), {}).get("group") in allowed_eg]
             if bench_filter:
                 ftoks = [t.strip().lower() for t in bench_filter.split("|") if t.strip()]
-                odin_records = [r for r in odin_records if any(t in r.get("name", "").lower() for t in ftoks)]
-                elixir_records = [r for r in elixir_records if any(t in r.get("name", "").lower() for t in ftoks)]
+                if run_lang in ("odin", "both"):
+                    odin_records = [r for r in odin_records if any(t in r.get("name", "").lower() for t in ftoks)]
+                if run_lang in ("elixir", "both"):
+                    elixir_records = [r for r in elixir_records if any(t in r.get("name", "").lower() for t in ftoks)]
 
             eval_odin = (
                 pool_by_lang_and_test(odin_records, "odin", snapshot_commit, latest_run=args.latest_run, run_id=analysis_run_id)
@@ -2326,12 +2444,12 @@ def main() -> None:
 
         odin_rows = (
             pool_by_lang_and_test(odin_records, "odin", snapshot_commit, latest_run=args.latest_run, run_id=analysis_run_id)
-            if (not args.from_jsonl or run_lang in ("odin", "both"))
+            if run_lang in ("odin", "both")
             else []
         )
         elixir_rows = (
             pool_by_lang_and_test(elixir_records, "elixir", snapshot_commit, latest_run=args.latest_run, run_id=analysis_run_id)
-            if (not args.from_jsonl or run_lang in ("elixir", "both"))
+            if run_lang in ("elixir", "both")
             else []
         )
         print_1v1_comparison(odin_rows, elixir_rows, run_lang=run_lang)
@@ -2347,7 +2465,7 @@ def main() -> None:
             rec for rec in load_all_history()
             if str(rec.get("run_id", "")) not in excluded_run_ids
         ]
-        warnings = evaluate_contention_guardrails(eval_odin, eval_elixir, prior_history, load_samples)
+        warnings = evaluate_contention_guardrails(eval_odin, eval_elixir, prior_history, host_samples)
         print_contention_warnings(warnings)
 
         if args.require_clean and warnings:

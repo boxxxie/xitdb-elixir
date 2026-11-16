@@ -584,8 +584,8 @@ defmodule Xitdb.ClientBench do
     if idx_db, do: Xitdb.close(idx_db)
 
     if records != [] do
-      new_lines_by_rank = Map.new(records, fn r -> {r.rank, encode_json_line(r)} end)
-      new_jsonl = Enum.map_join(records, "\n", &Map.fetch!(new_lines_by_rank, &1.rank)) <> "\n"
+      grouped_new = Enum.group_by(records, & &1.rank, &encode_json_line/1)
+      new_jsonl = Enum.map_join(records, "\n", &hd(Map.fetch!(grouped_new, &1.rank))) <> "\n"
 
       cond do
         append? ->
@@ -601,17 +601,16 @@ defmodule Xitdb.ClientBench do
                 case Regex.run(~r/"rank"\s*:\s*(\d+)/, line) do
                   [_, r_str] ->
                     r = String.to_integer(r_str)
-                    Map.update(acc, r, [line], &(&1 ++ [line]))
+                    Map.update(acc, r, [line], &[line | &1])
 
                   _ ->
                     acc
                 end
               end)
+              |> Map.new(fn {r, lines} -> {r, Enum.reverse(lines)} end)
             else
               %{}
             end
-
-          grouped_new = Enum.group_by(records, & &1.rank, &Map.fetch!(new_lines_by_rank, &1.rank))
 
           merged_jsonl =
             existing_by_rank
