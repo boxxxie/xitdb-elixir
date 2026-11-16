@@ -1,12 +1,12 @@
 # Xitdb — Idiomatic Elixir Client for `xitdb`
 
 [![CI](https://github.com/boxxxie/xitdb-elixir/actions/workflows/ci.yml/badge.svg)](https://github.com/boxxxie/xitdb-elixir/actions/workflows/ci.yml)
-[![Hex.pm](https://img.shields.io/badge/hex-1.2.0-blue.svg?logo=elixir&logoColor=white)](https://hex.pm/packages/xitdb)
+[![Hex.pm](https://img.shields.io/badge/hex-2.0.0-blue.svg?logo=elixir&logoColor=white)](https://hex.pm/packages/xitdb)
 [![Elixir](https://img.shields.io/badge/Elixir-~%3E%201.19-4B275F.svg?logo=elixir&logoColor=white)](https://elixir-lang.org)
 [![Odin](https://img.shields.io/badge/Odin-dev--2026--09%2B-3882D2.svg)](https://odin-lang.org)
 [![Ash](https://img.shields.io/badge/Ash-3.37.2%2B-E04F5F.svg)](https://ash-hq.org)
 [![Format](https://img.shields.io/badge/xitdb-v1%20wire%20format-5C6BC0.svg)](https://github.com/xit-vcs/xitdb)
-[![Benchmarks](https://img.shields.io/badge/benchmarks-26%20workloads-orange.svg)](benchmarks/README.md)
+[![Benchmarks](https://img.shields.io/badge/benchmarks-28%20workloads-orange.svg)](benchmarks/README.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 `Xitdb` is an idiomatic Elixir client and Odin NIF wrapper for [`xitdb`](https://github.com/xit-vcs/xitdb) (backed by [`odin-xitdb`](https://github.com/boxxxie/odin-xitdb)), an embeddable, immutable, append-only database with persistent structural sharing.
@@ -39,7 +39,7 @@ Add `xitdb` to your list of dependencies in `mix.exs`:
 ```elixir
 def deps do
   [
-    {:xitdb, "~> 1.1"}
+    {:xitdb, "~> 2.0"}
   ]
 end
 ```

@@ -126,7 +126,7 @@ Registers a secondary `Sorted_Map` B+Tree index rule for the transaction, automa
 index_on :users, :username, "username->id"
 ```
 
-When using [`Xitdb.Ash.Resource`](ash-and-spark.md) (or schema modules defining `__xitdb_indexes__/0`), prefer `tx_for/3,4` and `tx_for!/3,4` over manual `index_on` declarations—`tx_for` automatically injects all `index_on` rules configured on the given resource(s) at compile time:
+When using [`Xitdb.Ash.DataLayer`](ash-and-spark.md) resources (or schema modules defining `__xitdb_indexes__/0`), prefer `tx_for/3,4` and `tx_for!/3,4` over manual `index_on` declarations—`tx_for` automatically injects all `index_on` rules configured on the given resource(s) at compile time:
 
 ```elixir
 {:ok, db} =
