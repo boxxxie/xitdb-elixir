@@ -1,0 +1,8 @@
+{
+  "track_id": "cursor_member_and_step_list_fast_paths_20261115",
+  "type": "chore",
+  "status": "completed",
+  "created_at": "2026-11-15T13:35:00Z",
+  "updated_at": "2026-11-15T14:20:00Z",
+  "description": "Direct Enumerable.Xitdb.Cursor Fast-Path Heads & Batch C Step-List Unpacking for path_steps/1"
+}
