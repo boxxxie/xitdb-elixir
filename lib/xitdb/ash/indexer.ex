@@ -1442,8 +1442,14 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         nil ->
           []
 
-        %Xitdb.Cursor{} = btree ->
+        %Xitdb.Cursor{tag: :sorted_map} = btree ->
           stream_btree_from_key(btree, start_hex)
+
+        %Xitdb.Cursor{tag: :none, value: 0} ->
+          []
+
+        %Xitdb.Cursor{tag: other} ->
+          raise Xitdb.Error, reason: {:unsupported_index_tag, other}
       end
     end
 
@@ -1943,41 +1949,53 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     end
 
     defp stream_btree_from_key(btree, start_hex) do
-      Stream.unfold(start_hex, fn
-        nil ->
+      Stream.unfold({start_hex, 16}, fn
+        {nil, _limit} ->
           nil
 
-        cursor_key ->
+        {cursor_key, page_limit} ->
           case Xitdb.NIF.nif_sorted_map_seek(
                  btree.db_ref,
                  btree.tag_id,
                  btree.value,
                  cursor_key,
-                 64,
+                 page_limit,
+                 false,
                  false
                ) do
-            {:ok, [], _next} -> nil
-            {:ok, chunk, next_cursor} -> {chunk, next_cursor}
-            _ -> nil
+            {:ok, [], _next} ->
+              nil
+
+            {:ok, chunk, next_cursor} ->
+              {chunk, {next_cursor, 64}}
+
+            {:error, reason} ->
+              raise Xitdb.Error, reason: reason
           end
       end)
       |> Stream.flat_map(& &1)
-      |> Stream.map(fn {hex_key, raw_set} ->
-        ids =
-          case raw_set do
-            {:cursor, _tag, _tag_id, _val, _full} = c_tuple ->
-              btree.db_ref
-              |> Xitdb.Cursor.from_nif_tuple(c_tuple, btree.moment)
-              |> Enum.to_list()
+      |> Stream.map(fn
+        {hex_key, set_tag_id, set_val} when is_integer(set_tag_id) and is_integer(set_val) ->
+          {decode_btree_key(hex_key),
+           Xitdb.Cursor.from_compact_slot(btree.db_ref, set_tag_id, set_val, btree.moment)}
 
-            %Xitdb.Cursor{} = cur ->
-              Enum.to_list(cur)
+        {hex_key, {:cursor, _, _} = slot_tuple} ->
+          {decode_btree_key(hex_key),
+           Xitdb.Cursor.from_nif_tuple(btree.db_ref, slot_tuple, btree.moment)}
 
-            list when is_list(list) ->
-              list
-          end
+        {hex_key, {:cursor, _, _, _, _} = slot_tuple} ->
+          {decode_btree_key(hex_key),
+           Xitdb.Cursor.from_nif_tuple(btree.db_ref, slot_tuple, btree.moment)}
 
-        {decode_btree_key(hex_key), ids}
+        {hex_key, ids} when is_list(ids) ->
+          {decode_btree_key(hex_key),
+           Xitdb.Cursor.unwrap_nif_entries(btree.db_ref, ids, btree.moment)}
+
+        {hex_key, %Xitdb.Cursor{} = cur} ->
+          {decode_btree_key(hex_key), cur}
+
+        {hex_key, _other} ->
+          {decode_btree_key(hex_key), []}
       end)
     end
 

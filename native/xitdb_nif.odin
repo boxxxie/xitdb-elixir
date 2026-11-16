@@ -50,6 +50,7 @@ foreign _ {
 	nif_make_uint64 :: proc(env: ErlNifEnv, val: u64) -> ERL_NIF_TERM ---
 	nif_make_double :: proc(env: ErlNifEnv, val: f64) -> ERL_NIF_TERM ---
 	nif_make_binary_slice :: proc(env: ErlNifEnv, src: [^]u8, length: c.size_t) -> ERL_NIF_TERM ---
+	nif_alloc_binary_term :: proc(env: ErlNifEnv, length: c.size_t, term_out: ^ERL_NIF_TERM) -> [^]u8 ---
 	nif_make_tuple2 :: proc(env: ErlNifEnv, e1, e2: ERL_NIF_TERM) -> ERL_NIF_TERM ---
 	nif_make_tuple3 :: proc(env: ErlNifEnv, e1, e2, e3: ERL_NIF_TERM) -> ERL_NIF_TERM ---
 	nif_make_tuple4 :: proc(env: ErlNifEnv, e1, e2, e3, e4: ERL_NIF_TERM) -> ERL_NIF_TERM ---
@@ -314,20 +315,37 @@ is_container_tag :: proc(tag: xitdb.Tag) -> bool {
 	return false
 }
 
+validate_bytes_slot_bounds :: proc(db: ^xitdb.Database, slot: xitdb.Slot) -> (val_size: i64, err: xitdb.Error) {
+	if slot.value < xitdb.HEADER_LENGTH {
+		return 0, xitdb.Xitdb_Error.Invalid_Offset
+	}
+	core_len := xitdb.core_length(db.core) or_return
+	if slot.value > core_len - 8 {
+		return 0, xitdb.Xitdb_Error.Unexpected_EOF
+	}
+	val_size = xitdb.core_read_long_at(db.core, slot.value) or_return
+	if val_size < 0 {
+		return 0, xitdb.Xitdb_Error.Invalid_Offset
+	}
+	extra: i64 = 2 if slot.full else 0
+	if slot.value + 8 > core_len - extra || val_size > core_len - (slot.value + 8 + extra) || val_size > i64(max(int)) {
+		return 0, xitdb.Xitdb_Error.Unexpected_EOF
+	}
+	return val_size, nil
+}
+
 slot_to_term :: proc(env: ErlNifEnv, db: ^xitdb.Database, slot: xitdb.Slot) -> (res: ERL_NIF_TERM, err: xitdb.Error) {
 	if slot.tag == .None && !slot.full {
 		return ATOM_NIL, nil
 	}
 	if is_container_tag(slot.tag) {
 		tag_u8 := u8(slot.tag)
-		// Return {:cursor, tag_atom, tag_int, slot_value, full_int}
-		return nif_make_tuple5(
+		// Return compact {:cursor, tag_id, slot_val}
+		return nif_make_tuple3(
 			env,
 			ATOM_CURSOR,
-			TAG_ATOMS[tag_u8],
 			nif_make_int64(env, i64(tag_u8)),
 			nif_make_int64(env, slot.value),
-			nif_make_int64(env, 1 if slot.full else 0),
 		), nil
 	}
 
@@ -347,8 +365,19 @@ slot_to_term :: proc(env: ErlNifEnv, db: ^xitdb.Database, slot: xitdb.Slot) -> (
 		f := xitdb.cursor_read_float(cur) or_return
 		return nif_make_double(env, f), nil
 	case .Short_Bytes, .Bytes:
+		val_size: i64 = 0
+		if slot.tag == .Bytes {
+			val_size = validate_bytes_slot_bounds(db, slot) or_return
+		}
 		if slot.full {
-			obj := xitdb.cursor_read_bytes_object(cur, 0, context.temp_allocator) or_return
+			stack_buf: [128]u8 = ---
+			obj, buf_err := xitdb.cursor_read_bytes_buf(cur, stack_buf[:])
+			if buf_err != nil {
+				if buf_err != xitdb.Xitdb_Error.Stream_Too_Long {
+					return ATOM_NIL, buf_err
+				}
+				obj = xitdb.cursor_read_bytes_object(cur, 0, context.temp_allocator) or_return
+			}
 			if len(obj.format_tag) == 2 && obj.format_tag[0] == 'b' && obj.format_tag[1] == 'l' {
 				if len(obj.value) == 1 && obj.value[0] == '1' {
 					return ATOM_TRUE, nil
@@ -367,19 +396,61 @@ slot_to_term :: proc(env: ErlNifEnv, db: ^xitdb.Database, slot: xitdb.Slot) -> (
 			b_obj := xitdb.cursor_read_bytes_buf(cur, sb_buf[:]) or_return
 			return make_bytes_binary(env, b_obj.value), nil
 		}
-		b := xitdb.cursor_read_bytes(cur, 0, context.temp_allocator) or_return
-		return make_bytes_binary(env, b), nil
+		if val_size == 0 {
+			return nif_make_binary_slice(env, nil, 0), nil
+		}
+		term: ERL_NIF_TERM
+		dst := nif_alloc_binary_term(env, c.size_t(val_size), &term)
+		if dst == nil {
+			return ATOM_NIL, xitdb.Xitdb_Error.Invalid_Offset
+		}
+		xitdb.core_read_exact_at(db.core, slot.value + 8, dst[:int(val_size)]) or_return
+		return term, nil
 	}
 
 	return ATOM_NIL, nil
 }
 
+// Reads a map key cursor into `sb_buf` when it fits, avoiding `context.temp_allocator` churn.
+// WARNING: When the key fits in `sb_buf`, the returned string aliases `sb_buf` and is overwritten
+// on the next call reusing `sb_buf`. Callers retaining keys across iterations must copy or use
+// `read_arena_string`.
 read_key_cursor_string :: proc(cur: xitdb.Read_Cursor, sb_buf: []u8) -> (s: string, err: xitdb.Error) {
-	if cur.slot_ptr.slot.tag == .Short_Bytes && !cur.slot_ptr.slot.full {
-		b_obj := xitdb.cursor_read_bytes_buf(cur, sb_buf) or_return
-		return string(b_obj.value), nil
+	slot := cur.slot_ptr.slot
+	if slot.tag == .Bytes {
+		val_size := validate_bytes_slot_bounds(cur.db, slot) or_return
+		if !slot.full {
+			if val_size == 0 {
+				return "", nil
+			}
+			if val_size <= i64(len(sb_buf)) {
+				dst := sb_buf[:int(val_size)]
+				xitdb.core_read_exact_at(cur.db.core, slot.value + 8, dst) or_return
+				return string(dst), nil
+			}
+			dst := make([]u8, int(val_size), context.temp_allocator)
+			xitdb.core_read_exact_at(cur.db.core, slot.value + 8, dst) or_return
+			return string(dst), nil
+		}
 	}
-	return xitdb.cursor_read_string(cur, 0, context.temp_allocator)
+	if !slot.full && slot.tag == .Short_Bytes {
+		if len(sb_buf) >= 8 {
+			b_obj := xitdb.cursor_read_bytes_buf(cur, sb_buf) or_return
+			return string(b_obj.value), nil
+		}
+		tmp_buf: [8]u8 = ---
+		b_obj := xitdb.cursor_read_bytes_buf(cur, tmp_buf[:]) or_return
+		return strings.clone(string(b_obj.value), context.temp_allocator), nil
+	}
+	return safe_cursor_read_string(cur, context.temp_allocator)
+}
+
+safe_cursor_read_string :: proc(cur: xitdb.Read_Cursor, allocator: mem.Allocator) -> (s: string, err: xitdb.Error) {
+	slot_ptr := xitdb.cursor_resolved(cur) or_return
+	if slot_ptr.slot.tag == .Bytes {
+		_ = validate_bytes_slot_bounds(cur.db, slot_ptr.slot) or_return
+	}
+	return xitdb.cursor_read_string(cur, 0, allocator)
 }
 
 make_map_safe :: proc(env: ErlNifEnv, keys: []ERL_NIF_TERM, vals: []ERL_NIF_TERM) -> ERL_NIF_TERM {
@@ -491,7 +562,7 @@ materialize_slot :: proc(env: ErlNifEnv, db: ^xitdb.Database, slot: xitdb.Slot, 
 		it := xitdb.cursor_iterator(cur) or_return
 		keys := make([dynamic]ERL_NIF_TERM, 0, 16, context.temp_allocator)
 		vals := make([dynamic]ERL_NIF_TERM, 0, 16, context.temp_allocator)
-		sb_buf: [8]u8 = ---
+		sb_buf: [128]u8 = ---
 		for {
 			next_maybe := xitdb.cursor_iterator_next(&it) or_return
 			elem_cur, ok := next_maybe.?
@@ -919,12 +990,10 @@ odin_nif_moment_slot :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_
 		}
 	}
 	if is_empty {
-		empty_term := nif_make_tuple5(
+		empty_term := nif_make_tuple3(
 			env,
 			ATOM_CURSOR,
-			TAG_ATOMS[u8(xitdb.Tag.Hash_Map)],
 			nif_make_int64(env, i64(u8(xitdb.Tag.Hash_Map))),
-			nif_make_int64(env, 0),
 			nif_make_int64(env, 0),
 		)
 		if with_index {
@@ -1481,120 +1550,19 @@ odin_nif_slot_entries :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF
 		return make_ok(env, nif_make_list_from_array(env, nil, 0))
 	}
 
-	cur := xitdb.Read_Cursor{
-		slot_ptr = xitdb.Slot_Pointer{position = nil, slot = slot},
-		db       = &handle.db,
+	list_term, dec_err := decode_container_entries_term(
+		env,
+		&handle.db,
+		slot,
+		offset,
+		limit,
+		is_root,
+		context.temp_allocator,
+	)
+	if dec_err != nil {
+		return make_xitdb_err(env, dec_err)
 	}
-
-	it: xitdb.Cursor_Iterator
-	err: xitdb.Error = nil
-	direct_seek := false
-
-	#partial switch slot.tag {
-	case .Array_List:
-		it, err = xitdb.cursor_iterator_array_list_from_index(cur, offset)
-		direct_seek = true
-	case .Linked_Array_List:
-		it, err = xitdb.cursor_iterator_linked_array_list_from_index(cur, offset)
-		direct_seek = true
-	case .Sorted_Map, .Sorted_Set:
-		seek_offset := offset
-		if is_root && slot.tag == .Sorted_Map && offset > 0 {
-			has_tx, tx_rank, tx_err := sorted_map_tx_rank(cur)
-			if tx_err != nil {
-				return make_xitdb_err(env, tx_err)
-			}
-			if has_tx && offset >= tx_rank {
-				seek_offset = offset + 1
-			}
-		}
-		it, err = xitdb.cursor_iterator_sorted_from_index(cur, seek_offset)
-		direct_seek = true
-	case:
-		it, err = xitdb.cursor_iterator(cur)
-	}
-	if err != nil {
-		return make_xitdb_err(env, err)
-	}
-
-	cap_hint := min(int(limit), 256) if limit > 0 else 64
-	items := make([dynamic]ERL_NIF_TERM, 0, cap_hint, context.temp_allocator)
-	seen: i64 = offset if direct_seek else 0
-	emitted: i64 = 0
-	sb_buf: [8]u8 = ---
-
-	for {
-		if limit > 0 && emitted >= limit {
-			break
-		}
-		next_maybe, n_err := xitdb.cursor_iterator_next(&it)
-		if n_err != nil {
-			return make_xitdb_err(env, n_err)
-		}
-		elem_cur, has_next := next_maybe.?
-		if !has_next {
-			break
-		}
-
-		#partial switch slot.tag {
-		case .Array_List, .Linked_Array_List:
-			if seen >= offset {
-				s, s_err := xitdb.cursor_slot(elem_cur)
-				if s_err != nil {
-					return make_xitdb_err(env, s_err)
-				}
-				t, t_err := slot_to_term(env, &handle.db, s)
-				if t_err != nil {
-					return make_xitdb_err(env, t_err)
-				}
-				append(&items, t)
-				emitted += 1
-			}
-			seen += 1
-
-		case .Hash_Set, .Counted_Hash_Set, .Sorted_Set:
-			if seen >= offset {
-				key_cur, _, kv_err := xitdb.cursor_read_kv_pair_slots(elem_cur)
-				if kv_err != nil {
-					return make_xitdb_err(env, kv_err)
-				}
-				t, t_err := slot_to_term(env, &handle.db, key_cur.slot_ptr.slot)
-				if t_err != nil {
-					return make_xitdb_err(env, t_err)
-				}
-				append(&items, t)
-				emitted += 1
-			}
-			seen += 1
-
-		case .Hash_Map, .Counted_Hash_Map, .Sorted_Map:
-			key_cur, val_cur, kv_err := xitdb.cursor_read_kv_pair_slots(elem_cur)
-			if kv_err != nil {
-				return make_xitdb_err(env, kv_err)
-			}
-			k_str, k_err := read_key_cursor_string(key_cur, sb_buf[:])
-			if k_err != nil {
-				return make_xitdb_err(env, k_err)
-			}
-			if is_root && k_str == "__tx" {
-				continue
-			}
-			if seen >= offset {
-				vt, vt_err := slot_to_term(env, &handle.db, val_cur.slot_ptr.slot)
-				if vt_err != nil {
-					return make_xitdb_err(env, vt_err)
-				}
-				append(&items, nif_make_tuple2(env, make_binary(env, k_str), vt))
-				emitted += 1
-			}
-			seen += 1
-		}
-	}
-
-	if len(items) == 0 {
-		return make_ok(env, nif_make_list_from_array(env, nil, 0))
-	}
-	return make_ok(env, nif_make_list_from_array(env, raw_data(items[:]), c.uint(len(items))))
+	return make_ok(env, list_term)
 }
 
 @(export)
@@ -4875,14 +4843,15 @@ odin_nif_select :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM)
 		if len(parsed.steps) > 0 {
 			return make_ok(env, ATOM_NIL)
 		}
-		return make_ok(env, nif_make_tuple5(
+		return make_ok(
 			env,
-			ATOM_CURSOR,
-			TAG_ATOMS[u8(xitdb.Tag.Hash_Map)],
-			nif_make_int64(env, i64(u8(xitdb.Tag.Hash_Map))),
-			nif_make_int64(env, 0),
-			nif_make_int64(env, 0),
-		))
+			nif_make_tuple3(
+				env,
+				ATOM_CURSOR,
+				nif_make_int64(env, i64(u8(xitdb.Tag.Hash_Map))),
+				nif_make_int64(env, 0),
+			),
+		)
 	}
 
 	m_cur := xitdb.Read_Cursor{
@@ -7749,6 +7718,9 @@ read_arena_string :: proc(cur: xitdb.Read_Cursor, arena_alloc: mem.Allocator) ->
 		b_obj := xitdb.cursor_read_bytes_buf(cur, sb_buf[:]) or_return
 		return strings.clone(string(b_obj.value), arena_alloc), nil
 	}
+	if slot_ptr.slot.tag == .Bytes {
+		_ = validate_bytes_slot_bounds(cur.db, slot_ptr.slot) or_return
+	}
 	return xitdb.cursor_read_string(cur, 0, arena_alloc)
 }
 
@@ -7936,9 +7908,213 @@ collect_postings_into_map :: proc(
 	return nil
 }
 
+decode_container_entries_term :: proc(
+	env: ErlNifEnv,
+	db: ^xitdb.Database,
+	slot: xitdb.Slot,
+	offset: i64,
+	limit: i64,
+	skip_tx: bool,
+	arena_alloc: mem.Allocator,
+) -> (res: ERL_NIF_TERM, err: xitdb.Error) {
+	if slot.tag == .None || (is_container_tag(slot.tag) && slot.value == 0) || limit == 0 {
+		return nif_make_list_from_array(env, nil, 0), nil
+	}
+
+	cur := xitdb.Read_Cursor{
+		slot_ptr = xitdb.Slot_Pointer{position = nil, slot = slot},
+		db       = db,
+	}
+
+	it: xitdb.Cursor_Iterator
+	direct_seek := false
+	if offset > 0 {
+		#partial switch slot.tag {
+		case .Array_List:
+			it = xitdb.cursor_iterator_array_list_from_index(cur, offset) or_return
+			direct_seek = true
+		case .Linked_Array_List:
+			it = xitdb.cursor_iterator_linked_array_list_from_index(cur, offset) or_return
+			direct_seek = true
+		case .Sorted_Map, .Sorted_Set:
+			seek_offset := offset
+			if skip_tx && slot.tag == .Sorted_Map && offset > 0 {
+				has_tx, tx_rank, _ := sorted_map_tx_rank(cur)
+				if has_tx && offset >= tx_rank {
+					seek_offset = offset + 1
+				}
+			}
+			it = xitdb.cursor_iterator_sorted_from_index(cur, seek_offset) or_return
+			direct_seek = true
+		case:
+			it = xitdb.cursor_iterator(cur) or_return
+		}
+	} else {
+		it = xitdb.cursor_iterator(cur) or_return
+	}
+
+	is_map := slot.tag == .Hash_Map || slot.tag == .Counted_Hash_Map || slot.tag == .Sorted_Map
+	is_set := slot.tag == .Hash_Set || slot.tag == .Counted_Hash_Set || slot.tag == .Sorted_Set
+
+	stack_buf: [32]ERL_NIF_TERM = ---
+	dyn_items: [dynamic]ERL_NIF_TERM
+	buf_len := 0
+	using_dyn := false
+	defer if using_dyn {
+		delete(dyn_items)
+	}
+	sb_buf: [128]u8 = ---
+	seen: i64 = offset if direct_seek else 0
+	emitted: i64 = 0
+
+	for {
+		if limit > 0 && emitted >= limit {
+			break
+		}
+		next_maybe := xitdb.cursor_iterator_next(&it) or_return
+		elem_cur, has_e := next_maybe.?
+		if !has_e {
+			break
+		}
+
+		if is_map {
+			key_cur, val_cur := xitdb.cursor_read_kv_pair_slots(elem_cur) or_return
+			key_slot := key_cur.slot_ptr.slot
+			k_term: ERL_NIF_TERM
+			if !key_slot.full && (key_slot.tag == .Short_Bytes || key_slot.tag == .Bytes) {
+				k_str := read_key_cursor_string(key_cur, sb_buf[:]) or_return
+				if skip_tx && k_str == "__tx" {
+					continue
+				}
+				if seen < offset {
+					seen += 1
+					continue
+				}
+				k_term = make_binary(env, k_str)
+			} else {
+				if seen < offset {
+					seen += 1
+					continue
+				}
+				k_term = slot_to_term(env, db, key_slot) or_return
+			}
+			val_term := slot_to_term(env, db, val_cur.slot_ptr.slot) or_return
+			pair := nif_make_tuple2(env, k_term, val_term)
+			push_nif_term(stack_buf[:], &buf_len, &dyn_items, &using_dyn, pair, arena_alloc)
+			emitted += 1
+			seen += 1
+		} else if is_set {
+			if seen >= offset {
+				key_cur, _ := xitdb.cursor_read_kv_pair_slots(elem_cur) or_return
+				elem_term := slot_to_term(env, db, key_cur.slot_ptr.slot) or_return
+				push_nif_term(stack_buf[:], &buf_len, &dyn_items, &using_dyn, elem_term, arena_alloc)
+				emitted += 1
+			}
+			seen += 1
+		} else {
+			if seen >= offset {
+				elem_slot := xitdb.cursor_slot(elem_cur) or_return
+				elem_term := slot_to_term(env, db, elem_slot) or_return
+				push_nif_term(stack_buf[:], &buf_len, &dyn_items, &using_dyn, elem_term, arena_alloc)
+				emitted += 1
+			}
+			seen += 1
+		}
+	}
+
+	return make_list_from_term_buf(env, stack_buf[:], buf_len, dyn_items, using_dyn), nil
+}
+
+MAX_FUSED_CHILD_ENTRIES :: 256
+MAX_FUSED_TOTAL_ENTRIES :: 1024
+
+decode_child_container_entries_term :: proc(
+	env: ErlNifEnv,
+	db: ^xitdb.Database,
+	slot: xitdb.Slot,
+	max_entries: i64,
+	arena_alloc: mem.Allocator,
+) -> (res: ERL_NIF_TERM, count: i64, exceeded: bool, err: xitdb.Error) {
+	if slot.tag == .None || slot.value == 0 {
+		return nif_make_list_from_array(env, nil, 0), 0, false, nil
+	}
+	if max_entries <= 0 {
+		return ATOM_NIL, 0, true, nil
+	}
+
+	cur := xitdb.Read_Cursor{
+		slot_ptr = xitdb.Slot_Pointer{position = nil, slot = slot},
+		db       = db,
+	}
+
+	#partial switch slot.tag {
+	case .Array_List, .Linked_Array_List, .Counted_Hash_Map, .Counted_Hash_Set, .Sorted_Map, .Sorted_Set:
+		cnt, c_err := xitdb.cursor_count(cur)
+		if c_err != nil {
+			return ATOM_NIL, 0, false, c_err
+		}
+		if cnt > max_entries {
+			return ATOM_NIL, 0, true, nil
+		}
+	}
+
+	it := xitdb.cursor_iterator(cur) or_return
+
+	is_map := slot.tag == .Hash_Map || slot.tag == .Counted_Hash_Map || slot.tag == .Sorted_Map
+	is_set := slot.tag == .Hash_Set || slot.tag == .Counted_Hash_Set || slot.tag == .Sorted_Set
+
+	stack_buf: [32]ERL_NIF_TERM = ---
+	dyn_items: [dynamic]ERL_NIF_TERM
+	buf_len := 0
+	using_dyn := false
+	defer if using_dyn {
+		delete(dyn_items)
+	}
+	sb_buf: [128]u8 = ---
+	emitted: i64 = 0
+
+	for {
+		next_maybe := xitdb.cursor_iterator_next(&it) or_return
+		elem_cur, has_e := next_maybe.?
+		if !has_e {
+			break
+		}
+		if emitted >= max_entries {
+			return ATOM_NIL, 0, true, nil
+		}
+
+		if is_map {
+			key_cur, val_cur := xitdb.cursor_read_kv_pair_slots(elem_cur) or_return
+			key_slot := key_cur.slot_ptr.slot
+			k_term: ERL_NIF_TERM
+			if !key_slot.full && (key_slot.tag == .Short_Bytes || key_slot.tag == .Bytes) {
+				k_str := read_key_cursor_string(key_cur, sb_buf[:]) or_return
+				k_term = make_binary(env, k_str)
+			} else {
+				k_term = slot_to_term(env, db, key_slot) or_return
+			}
+			val_term := slot_to_term(env, db, val_cur.slot_ptr.slot) or_return
+			pair := nif_make_tuple2(env, k_term, val_term)
+			push_nif_term(stack_buf[:], &buf_len, &dyn_items, &using_dyn, pair, arena_alloc)
+		} else if is_set {
+			key_cur, _ := xitdb.cursor_read_kv_pair_slots(elem_cur) or_return
+			elem_term := slot_to_term(env, db, key_cur.slot_ptr.slot) or_return
+			push_nif_term(stack_buf[:], &buf_len, &dyn_items, &using_dyn, elem_term, arena_alloc)
+		} else {
+			elem_slot := xitdb.cursor_slot(elem_cur) or_return
+			elem_term := slot_to_term(env, db, elem_slot) or_return
+			push_nif_term(stack_buf[:], &buf_len, &dyn_items, &using_dyn, elem_term, arena_alloc)
+		}
+		emitted += 1
+	}
+
+	return make_list_from_term_buf(env, stack_buf[:], buf_len, dyn_items, using_dyn), emitted, false, nil
+}
+
 // `nif_sorted_map_seek(db_ref, slot_tag_id, slot_val_int, prefix_bin, limit_int)` or
-// `nif_sorted_map_seek(db_ref, slot_tag_id, slot_val_int, start_key_bin, limit_int, prefix_only_bool)` ->
-// `{:ok, [{term_bin, slot_tuple}, ...], next_cursor_or_nil} | {:error, reason}`
+// `nif_sorted_map_seek(db_ref, slot_tag_id, slot_val_int, start_key_bin, limit_int, prefix_only_bool)` or
+// `nif_sorted_map_seek(db_ref, slot_tag_id, slot_val_int, start_key_bin, limit_int, prefix_only_bool, decode_children_bool)` ->
+// `{:ok, [{key_bin, tag_id, slot_val} | {key_bin, decoded_val}, ...], next_cursor_or_nil} | {:error, reason}`
 @(export)
 odin_nif_sorted_map_seek :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {
 	context = runtime.default_context()
@@ -7946,16 +8122,27 @@ odin_nif_sorted_map_seek :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_
 	arena_alloc := context.temp_allocator
 	context.allocator = arena_alloc
 
-	if argc != 5 && argc != 6 {
+	if argc != 5 && argc != 6 && argc != 7 {
 		return make_err(env, "badarg")
 	}
 
 	prefix_only := true
-	if argc == 6 {
+	if argc >= 6 {
 		if argv[5] == ATOM_TRUE {
 			prefix_only = true
 		} else if argv[5] == ATOM_FALSE {
 			prefix_only = false
+		} else {
+			return make_err(env, "badarg")
+		}
+	}
+
+	decode_children := false
+	if argc == 7 {
+		if argv[6] == ATOM_TRUE {
+			decode_children = true
+		} else if argv[6] == ATOM_FALSE {
+			decode_children = false
 		} else {
 			return make_err(env, "badarg")
 		}
@@ -7975,34 +8162,27 @@ odin_nif_sorted_map_seek :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_
 		return make_err(env, "badarg")
 	}
 
-	if tag_int < 0 || tag_int > i64(xitdb.MAX_TAG_VALUE) {
-		return make_err(env, "invalid_slot")
-	}
-	tag := xitdb.Tag(u8(tag_int))
-	if tag != .Sorted_Map && tag != .None {
-		return make_err(env, "unsupported")
-	}
-
 	handle, ok := acquire_rlock(env, argv[0])
 	if !ok {
 		return make_err(env, "closed")
 	}
 	defer nif_rwlock_runlock(handle.rwlock)
 
-	if val_int == 0 || tag == .None || limit_int <= 0 {
-		if val_int < 0 {
-			return make_err(env, "invalid_slot")
-		}
-		empty_list := nif_make_list_from_array(env, nil, 0)
-		return nif_make_tuple3(env, ATOM_OK, empty_list, ATOM_NIL)
-	}
-
-	slot, _, _, r_err, err_reason := resolve_slot_arg(handle, tag_int, val_int)
+	slot, _, is_empty, r_err, err_reason := resolve_slot_arg(handle, tag_int, val_int)
 	if r_err != nil {
 		return make_xitdb_err(env, r_err)
 	}
 	if err_reason != "" {
 		return make_err(env, err_reason)
+	}
+
+	if slot.tag != .Sorted_Map && slot.tag != .None {
+		return make_err(env, "unsupported")
+	}
+
+	if is_empty || slot.tag == .None || limit_int <= 0 {
+		empty_list := nif_make_list_from_array(env, nil, 0)
+		return nif_make_tuple3(env, ATOM_OK, empty_list, ATOM_NIL)
 	}
 
 	cur := xitdb.Read_Cursor{
@@ -8024,9 +8204,13 @@ odin_nif_sorted_map_seek :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_
 	item_len := 0
 	item_dyn: [dynamic]ERL_NIF_TERM
 	using_dyn := false
+	defer if using_dyn {
+		delete(item_dyn)
+	}
 	next_cursor_term: ERL_NIF_TERM = ATOM_NIL
 	emitted: i64 = 0
-	sb_buf: [8]u8 = ---
+	total_fused: i64 = 0
+	sb_buf: [128]u8 = ---
 
 	for {
 		next_maybe, n_err := xitdb.cursor_iterator_next(&it)
@@ -8055,9 +8239,42 @@ odin_nif_sorted_map_seek :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_
 			break
 		}
 
-		val_term, vt_err := slot_to_term(env, &handle.db, val_cur.slot_ptr.slot)
-		if vt_err != nil {
-			return make_xitdb_err(env, vt_err)
+		val_slot := val_cur.slot_ptr.slot
+		entry_term: ERL_NIF_TERM
+		if is_container_tag(val_slot.tag) {
+			fused := false
+			if decode_children && total_fused < MAX_FUSED_TOTAL_ENTRIES {
+				budget := min(i64(MAX_FUSED_CHILD_ENTRIES), i64(MAX_FUSED_TOTAL_ENTRIES) - total_fused)
+				children_term, child_cnt, exceeded, c_err := decode_child_container_entries_term(
+					env,
+					&handle.db,
+					val_slot,
+					budget,
+					arena_alloc,
+				)
+				if c_err != nil {
+					return make_xitdb_err(env, c_err)
+				}
+				if !exceeded {
+					total_fused += child_cnt
+					entry_term = nif_make_tuple2(env, make_binary(env, k_str), children_term)
+					fused = true
+				}
+			}
+			if !fused {
+				entry_term = nif_make_tuple3(
+					env,
+					make_binary(env, k_str),
+					nif_make_int64(env, i64(u8(val_slot.tag))),
+					nif_make_int64(env, val_slot.value),
+				)
+			}
+		} else {
+			val_term, vt_err := slot_to_term(env, &handle.db, val_slot)
+			if vt_err != nil {
+				return make_xitdb_err(env, vt_err)
+			}
+			entry_term = nif_make_tuple2(env, make_binary(env, k_str), val_term)
 		}
 
 		push_nif_term(
@@ -8065,7 +8282,7 @@ odin_nif_sorted_map_seek :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_
 			&item_len,
 			&item_dyn,
 			&using_dyn,
-			nif_make_tuple2(env, make_binary(env, k_str), val_term),
+			entry_term,
 			arena_alloc,
 		)
 		emitted += 1
@@ -8254,7 +8471,7 @@ odin_nif_bm25_search :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_
 	num_tokens := len(query_terms)
 	token_postings := make([]map[string]f64, num_tokens, arena_alloc)
 	idfs := make([]f64, num_tokens, arena_alloc)
-	sb_buf: [8]u8 = ---
+	sb_buf: [128]u8 = ---
 
 	for q_tok, tok_idx in query_terms {
 		merged := make(map[string]f64, 32, arena_alloc)

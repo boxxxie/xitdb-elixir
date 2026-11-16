@@ -123,11 +123,6 @@ defmodule Xitdb.Cursor do
     }
   end
 
-  def from_nif_tuple(db_ref, {tag_id, val}, moment, path_steps)
-      when is_integer(tag_id) and is_integer(val) do
-    from_compact_slot(db_ref, tag_id, val, moment, path_steps)
-  end
-
   @doc false
   def from_compact_slot(db_ref, tag_id, val, moment, path_steps \\ [])
       when is_integer(tag_id) and is_integer(val) do
@@ -167,6 +162,35 @@ defmodule Xitdb.Cursor do
   end
 
   def unwrap_nif_value(_db_ref, scalar, _moment, _path_steps), do: scalar
+
+  @doc false
+  def unwrap_nif_entries(db_ref, entries, moment) when is_list(entries) do
+    if entries_need_unwrap?(entries) do
+      Enum.map(entries, fn
+        {k, v} ->
+          {unwrap_nif_value(db_ref, k, moment, []), unwrap_nif_value(db_ref, v, moment, [])}
+
+        item ->
+          unwrap_nif_value(db_ref, item, moment, [])
+      end)
+    else
+      entries
+    end
+  end
+
+  defp entries_need_unwrap?([]), do: false
+
+  defp entries_need_unwrap?([item | rest])
+       when is_binary(item) or is_number(item) or is_boolean(item) or is_nil(item) do
+    entries_need_unwrap?(rest)
+  end
+
+  defp entries_need_unwrap?([{k, v} | rest])
+       when is_binary(k) and (is_binary(v) or is_number(v) or is_boolean(v) or is_nil(v)) do
+    entries_need_unwrap?(rest)
+  end
+
+  defp entries_need_unwrap?(_), do: true
 
   # ============================================================================
   # Access Behaviour (`cursor["key"]`, `cursor[idx]`, `get_in`, `put_in`, `pop_in`)
@@ -2824,11 +2848,12 @@ defimpl Enumerable, for: Xitdb.Cursor do
            tag: tag
          } =
            parent,
-         {k, raw_val},
+         {raw_k, raw_val},
          _elem_idx
        )
-       when is_binary(k) do
-    child_steps = if tx_mode, do: [{tag, k} | path_steps], else: []
+       when tag in [:hash_map, :counted_hash_map, :sorted_map] do
+    k = Cursor.unwrap_nif_value(db_ref, raw_k, moment, [])
+    child_steps = if tx_mode and is_binary(k), do: [{tag, k} | path_steps], else: []
     unwrapped = Cursor.unwrap_nif_value(db_ref, raw_val, moment, child_steps)
     {k, if(tx_mode, do: Cursor.inherit_staged(unwrapped, parent), else: unwrapped)}
   end

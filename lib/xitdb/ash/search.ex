@@ -712,19 +712,35 @@ if Code.ensure_loaded?(Ash.DataLayer) do
             {[{String.t(), Xitdb.Cursor.t()}], String.t() | nil}
     def scan_prefix_cursors(db, collection, prefix, limit) do
       case get_in_search(db, collection, "terms") do
-        %Xitdb.Cursor{db_ref: db_ref, tag_id: tag_id, value: val, moment: moment}
+        %Xitdb.Cursor{
+          db_ref: db_ref,
+          tag: :sorted_map,
+          tag_id: tag_id,
+          value: val,
+          moment: moment
+        }
         when tag_id > 0 ->
           case Xitdb.NIF.nif_sorted_map_seek(db_ref, tag_id, val, prefix, limit) do
             {:ok, entries, next_cursor} ->
               cursors =
-                Enum.map(entries, fn {term, slot_tuple} ->
-                  {term, Xitdb.Cursor.from_nif_tuple(db_ref, slot_tuple, moment)}
+                Enum.flat_map(entries, fn
+                  {term, p_tag_id, p_val} when is_integer(p_tag_id) and is_integer(p_val) ->
+                    [{term, Xitdb.Cursor.from_compact_slot(db_ref, p_tag_id, p_val, moment)}]
+
+                  {term, {:cursor, _, _} = slot_tuple} ->
+                    [{term, Xitdb.Cursor.from_nif_tuple(db_ref, slot_tuple, moment)}]
+
+                  {term, {:cursor, _, _, _, _} = slot_tuple} ->
+                    [{term, Xitdb.Cursor.from_nif_tuple(db_ref, slot_tuple, moment)}]
+
+                  {_term, _scalar_or_nil} ->
+                    []
                 end)
 
               {cursors, next_cursor}
 
-            _ ->
-              {[], nil}
+            {:error, reason} ->
+              raise Xitdb.Error, reason: reason
           end
 
         _ ->
@@ -739,7 +755,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
     def scan_prefix(db, collection, prefix, limit, :elixir) do
       case get_in_search(db, collection, "terms") do
-        %Xitdb.Cursor{tx_mode: false} = terms ->
+        %Xitdb.Cursor{tx_mode: false, tag: :sorted_map} = terms ->
           scan_prefix_via_slot_entries_cursor(terms, prefix, limit)
 
         other ->
@@ -749,12 +765,51 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
     def scan_prefix(db, collection, prefix, limit, _backend) do
       case get_in_search(db, collection, "terms") do
-        %Xitdb.Cursor{tx_mode: false} = terms ->
-          if function_exported?(Xitdb.NIF, :nif_sorted_map_seek, 5) do
-            {cursor_entries, _next} = scan_prefix_cursors(db, collection, prefix, limit)
-            Enum.map(cursor_entries, fn {term, cur} -> {term, Enum.to_list(cur)} end)
+        %Xitdb.Cursor{
+          db_ref: db_ref,
+          tag: :sorted_map,
+          tag_id: tag_id,
+          value: val,
+          moment: moment,
+          tx_mode: false
+        } ->
+          if tag_id > 0 do
+            case Xitdb.NIF.nif_sorted_map_seek(db_ref, tag_id, val, prefix, limit, true, true) do
+              {:ok, entries, _next} ->
+                Enum.map(entries, fn
+                  {term, postings} when is_list(postings) ->
+                    {term, Xitdb.Cursor.unwrap_nif_entries(db_ref, postings, moment)}
+
+                  {term, p_tag_id, p_val} when is_integer(p_tag_id) and is_integer(p_val) ->
+                    {term,
+                     db_ref
+                     |> Xitdb.Cursor.from_compact_slot(p_tag_id, p_val, moment)
+                     |> Enum.to_list()}
+
+                  {term, {:cursor, _, _} = slot_tuple} ->
+                    {term,
+                     db_ref
+                     |> Xitdb.Cursor.from_nif_tuple(slot_tuple, moment)
+                     |> Enum.to_list()}
+
+                  {term, {:cursor, _, _, _, _} = slot_tuple} ->
+                    {term,
+                     db_ref
+                     |> Xitdb.Cursor.from_nif_tuple(slot_tuple, moment)
+                     |> Enum.to_list()}
+
+                  {term, %Xitdb.Cursor{} = cur} ->
+                    {term, Enum.to_list(cur)}
+
+                  {term, _other} ->
+                    {term, []}
+                end)
+
+              {:error, reason} ->
+                raise Xitdb.Error, reason: reason
+            end
           else
-            scan_prefix_via_slot_entries_cursor(terms, prefix, limit)
+            []
           end
 
         other ->
@@ -797,8 +852,11 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           start_idx = find_prefix_start_index(terms, prefix, 0, total_count)
           stream_prefix_from(terms, prefix, start_idx, limit)
 
-        _ ->
+        {:ok, _} ->
           []
+
+        {:error, reason} ->
+          raise Xitdb.Error, reason: reason
       end
     end
 
@@ -813,8 +871,11 @@ if Code.ensure_loaded?(Ash.DataLayer) do
             find_prefix_start_index(terms, prefix, low, mid)
           end
 
-        _ ->
+        {:ok, _} ->
           low
+
+        {:error, reason} ->
+          raise Xitdb.Error, reason: reason
       end
     end
 
@@ -835,8 +896,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           {:ok, chunk} ->
             {chunk, idx + length(chunk)}
 
-          _ ->
-            nil
+          {:error, reason} ->
+            raise Xitdb.Error, reason: reason
         end
       end)
       |> Stream.flat_map(& &1)
@@ -845,19 +906,44 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       |> Enum.map(fn {term, raw_postings} ->
         postings =
           case raw_postings do
-            {:cursor, _tag, _tag_id, _val, _full} = c_tuple ->
-              terms.db_ref
-              |> Xitdb.Cursor.from_nif_tuple(c_tuple, terms.moment)
-              |> Enum.to_list()
+            {:cursor, c_tag_id, c_val} ->
+              decode_slot_entries!(terms.db_ref, c_tag_id, c_val, terms.moment)
+
+            {:cursor, _tag, c_tag_id, c_val, _full} ->
+              decode_slot_entries!(terms.db_ref, c_tag_id, c_val, terms.moment)
 
             %Xitdb.Cursor{} = cur ->
               Enum.to_list(cur)
 
             list when is_list(list) ->
-              list
+              unwrap_decoded_entries(terms.db_ref, list, terms.moment)
+
+            _other ->
+              []
           end
 
         {term, postings}
+      end)
+    end
+
+    defp decode_slot_entries!(db_ref, tag_id, val, moment) do
+      case Xitdb.NIF.nif_slot_entries(db_ref, tag_id, val, 0, -1) do
+        {:ok, entries} ->
+          unwrap_decoded_entries(db_ref, entries, moment)
+
+        {:error, reason} ->
+          raise Xitdb.Error, reason: reason
+      end
+    end
+
+    defp unwrap_decoded_entries(db_ref, entries, moment) do
+      Enum.map(entries, fn
+        {k, v} ->
+          {Xitdb.Cursor.unwrap_nif_value(db_ref, k, moment, []),
+           Xitdb.Cursor.unwrap_nif_value(db_ref, v, moment, [])}
+
+        item ->
+          Xitdb.Cursor.unwrap_nif_value(db_ref, item, moment, [])
       end)
     end
 
