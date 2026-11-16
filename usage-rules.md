@@ -14,11 +14,12 @@
    - Elixir's built-in `Access.at/1` guards `is_list(data)` and raises on structs. When navigating `Array_List` or `Linked_Array_List` cursors with `get_in/2` or `put_in/3`, either pass integer keys directly in the path list (`get_in(root, ["users", "alice", "roles", 1])`) or use `Xitdb.at(1)`.
 3. **Never Eagerly Materialize Large Subtrees Unless Needed**:
    - Never call `Xitdb.materialize(db)` on the entire database root in hot paths. Prefer lazy navigation (`cursor["key"]`, `cursor[0]`), `Xitdb.pull/2` projections, `Enum.count/1`, `Enum.member?/2`, `Enum.slice/2`, or `Stream` pipelines, or navigate to the leaf entity first (`user = db["users"][id]`) before calling `Xitdb.materialize(user)`.
-4. **Understand the `~255 ns` NIF Boundary Cost Model**:
-   - Each RW-locked NIF crossing (`enif_get_resource` + `enif_rwlock_rlock` + `resolve_slot_coord` + `enif_make_*`) carries a fixed `~170–290 ns` (`~255 ns` median) overhead.
+4. **Understand the `~150–250 ns` NIF Boundary Cost Model**:
+   - Each RW-locked NIF crossing (`enif_get_resource` + `enif_rwlock_rlock` + `resolve_slot_coord` + `enif_make_*`) carries a fixed `~150–250 ns` overhead (`~155–199 ns` `O(1)` `Enum.count/1`; `~340–580 ns` single-hop lookups).
    - Use lazy `Access` (`cursor[key]`) for shallow 1–2 hop reads or when passing `%Xitdb.Cursor{}` handles across functions/processes.
-   - Use `Xitdb.select!/2` (`path(...)` / `~x`) for deep 3+ hop scalar reads and `Xitdb.pull!/2` when reading multiple fields or bounded slices from the same entity in a single NIF call.
-   - Prefer `Xitdb.DSL.tx` (`put users[id].field, val`) or batched map `Xitdb.transact/3` over deep `put_in/3` chains in write-heavy loops to avoid `Access.get_and_update/3` read-before-write NIF hops.
+   - Use `Xitdb.select!/2` for deep 3+ hop scalar reads (`~1.99–2.08 µs`): prefer compile-time `Xitdb.DSL.path_steps/1` (`use Xitdb.DSL`) over string `path(...)` when interpolating runtime variables in hot `select/2`, `select!/2`, and `history_of/2` loops (eliminates Elixir string formatting and Odin selector parsing via C `decode_steps_term_buf`; `Xitdb.DSL.tx` blocks already compile bare path expressions directly), use `~x` for static literal paths, and use `Xitdb.pull!/2` (`~6.28–6.49 µs`) when reading multiple fields or bounded slices from the same entity in a single NIF call.
+   - For `Sorted_Map` B+Tree prefix/range scans whose values are child containers, `Xitdb.NIF.nif_sorted_map_seek/7` with `decode_children: true` (`Xitdb.Ash.Search.Storage.scan_prefix/5`) fuses B+Tree traversal and bounded child container decoding inside Odin in 1 NIF crossing, while `decode_children: false` (`Xitdb.Ash.Search.Storage.scan_prefix_cursors/4` and `Xitdb.Ash.Indexer.Storage.stream_index_from/4`) returns lazy `%Xitdb.Cursor{}` handles.
+   - Inside `Xitdb.transact/3`, `put_in/3` stages virtual write cursors in `tx_mode` without intermediate read NIF hops (`~13.9–14.2 µs` for a 3-hop commit); prefer `Xitdb.DSL.tx` (`put users[id].field, val`) or map `Xitdb.transact/3` in write-heavy loops to avoid Elixir struct/closure staging overhead as well.
 
 ---
 
@@ -145,7 +146,7 @@ page = Enum.slice(root["linked_queue"], 10..19)
 top_two = root["leaderboard"] |> Stream.take(2) |> Enum.to_list()
 ```
 
-### Path Selectors (`path/1` and `~x`)
+### Path Selectors (`path/1`, `path_steps/1`, and `~x`)
 
 ```elixir
 use Xitdb.DSL
@@ -154,10 +155,15 @@ use Xitdb.DSL
 selector = path(org.counted(:departments)[dept_id].sorted(:directory)[user_id].todos[[0]])
 todo = Xitdb.select!(db, selector)
 
+# Pre-tokenized step list for hot loops with dynamic keys (avoids selector string formatting & parsing)
+steps = path_steps(org.counted(:departments)[dept_id].sorted(:directory)[user_id].todos[[0]])
+todo = Xitdb.select!(db, steps)
+
 # Static compile-time validated sigil
 todo = Xitdb.select!(db, ~x|.users["101"].todos[1]|)
 ```
 
+- Prefer `Xitdb.DSL.path_steps/1` over string `path/1` when interpolating runtime variables in `select/2`, `select!/2`, or `history_of/2` (`tx` blocks already compile bare path expressions directly); keep `path/1` when you need a string selector and `~x` for static literals.
 - `Xitdb.select/2` only accepts `%Xitdb{}` or a root snapshot cursor (`Xitdb.db/1`, `Xitdb.as_of/2`), never a nested child cursor (`db["users"]`).
 
 ### Datomic-Style Pull Projections (`Xitdb.pull/2`)
