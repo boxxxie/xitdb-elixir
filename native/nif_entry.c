@@ -201,6 +201,61 @@ int nif_map_to_kv_arrays(
 }
 
 typedef struct {
+    ErlNifMapIterator iter;
+} NifMapIter;
+
+typedef char nif_map_iter_size_check[sizeof(NifMapIter) <= 64 ? 1 : -1];
+
+int nif_map_iter_create(ErlNifEnv* env, ERL_NIF_TERM map_term, NifMapIter* out) {
+    return enif_map_iterator_create(env, map_term, &out->iter, ERL_NIF_MAP_ITERATOR_FIRST);
+}
+
+int nif_map_iter_get_and_next(ErlNifEnv* env, NifMapIter* it, ERL_NIF_TERM* key_out, ERL_NIF_TERM* val_out) {
+    if (!enif_map_iterator_get_pair(env, &it->iter, key_out, val_out)) {
+        return 0;
+    }
+    enif_map_iterator_next(env, &it->iter);
+    return 1;
+}
+
+void nif_map_iter_destroy(ErlNifEnv* env, NifMapIter* it) {
+    enif_map_iterator_destroy(env, &it->iter);
+}
+
+int nif_can_be_pure_removal(
+    ErlNifEnv* env,
+    ERL_NIF_TERM term,
+    ERL_NIF_TERM atom_nil,
+    ERL_NIF_TERM atom_struct
+) {
+    ERL_NIF_TERM cur = term;
+    for (int depth = 0; depth < 8; depth++) {
+        if (cur == atom_nil) {
+            return 1;
+        }
+        if (!enif_is_map(env, cur)) {
+            return 0;
+        }
+        ERL_NIF_TERM st;
+        if (enif_get_map_value(env, cur, atom_struct, &st)) {
+            return 1;
+        }
+        ErlNifMapIterator iter;
+        if (!enif_map_iterator_create(env, cur, &iter, ERL_NIF_MAP_ITERATOR_FIRST)) {
+            return 0;
+        }
+        ERL_NIF_TERM k, v;
+        int has_first = enif_map_iterator_get_pair(env, &iter, &k, &v);
+        enif_map_iterator_destroy(env, &iter);
+        if (!has_first) {
+            return 0;
+        }
+        cur = v;
+    }
+    return 1;
+}
+
+typedef struct {
     uint8_t kind_code;
     const unsigned char* key_ptr;
     size_t key_len;
