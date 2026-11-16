@@ -29,7 +29,8 @@ All notable changes to this project will be documented in this file.
   - Inlined `Xitdb.select/2` and `Xitdb.select!/2` scalar unwrapping while preserving `@moment` and `root: true` semantics.
 - **Single-Pass Streaming Writers & Atomic Rollback (`native/nif_entry.c`, `native/xitdb_nif.odin`):**
   - Streamed Elixir map entries directly via `enif_map_iterator_*` (`Nif_Map_Iter`, 32-slot `KV_Stack_Buf` fast path + checked `temp_allocator` fallback) with `MAX_WRITE_DEPTH` (64) and struct validation guards.
-  - Enforced atomic `Root_Header`, `core_set_length`, and `core_sync` rollback on mid-payload failures and adaptive retries.
+  - **Underlying `odin-xitdb` `2.0.0` (`v2` Wire Format):** Updated `native/xitdb-odin` to `2.0.0` (`2dd638f`, adopting the 8-byte aligned v2 root header while preserving v1 read/write backward compatibility) and updated `rollback_failed_tx` in `native/xitdb_nif.odin` to restore the version-aware `database_file_size_start` 8-byte offset across both v1 and v2 databases.
+  - Enforced atomic `file_size`, `core_set_length`, and `core_sync` rollback on mid-payload failures and adaptive retries.
 
 ### Fixed
 - **Elixir 1.20 Gradual Type-Checker & 1.19+ Warnings:** Resolved gradual type-checker warnings in `Xitdb.Ash.Search`, `Xitdb.Ash.Query`, and `Xitdb.Ash.Transformers.BuildIndexPlan`, and fixed an Elixir 1.19+ `MapSet` struct-update warning.

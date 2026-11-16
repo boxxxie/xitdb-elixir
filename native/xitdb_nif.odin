@@ -4419,8 +4419,8 @@ rollback_failed_tx :: proc(
 	pre_hdr_err: xitdb.Error,
 	pre_len: i64,
 	pre_len_err: xitdb.Error,
-	pre_rh_bytes: [xitdb.ROOT_HEADER_LENGTH]u8,
-	pre_rh_err: xitdb.Error,
+	pre_fs_bytes: [8]u8,
+	pre_fs_err: xitdb.Error,
 ) -> xitdb.Error {
 	has_target_len := pre_hdr_err == nil || pre_len_err == nil
 	target_len := pre_header.file_size if pre_hdr_err == nil else pre_len
@@ -4437,13 +4437,14 @@ rollback_failed_tx :: proc(
 		}
 	}
 
-	cur_rh_bytes: [xitdb.ROOT_HEADER_LENGTH]u8 = ---
-	cur_rh_err := xitdb.core_read_exact_at(db.core, xitdb.ROOT_HEADER_START, cur_rh_bytes[:])
-	hdr_changed := pre_rh_err == nil && (cur_rh_err != nil || cur_rh_bytes != pre_rh_bytes)
+	file_size_start := xitdb.database_file_size_start(db.header.version)
+	cur_fs_bytes: [8]u8 = ---
+	cur_fs_err := xitdb.core_read_exact_at(db.core, file_size_start, cur_fs_bytes[:])
+	hdr_changed := pre_fs_err == nil && (cur_fs_err != nil || cur_fs_bytes != pre_fs_bytes)
 	if hdr_changed {
-		rh_bytes := xitdb.root_header_to_bytes(pre_header) if pre_hdr_err == nil else pre_rh_bytes
-		xitdb.core_seek_to(db.core, xitdb.ROOT_HEADER_START) or_return
-		xitdb.core_write_all(db.core, rh_bytes[:]) or_return
+		fs_bytes := pre_fs_bytes
+		xitdb.core_seek_to(db.core, file_size_start) or_return
+		xitdb.core_write_all(db.core, fs_bytes[:]) or_return
 		xitdb.core_flush(db.core) or_return
 		xitdb.core_sync(db.core) or_return
 	} else if len_changed {
@@ -4978,8 +4979,9 @@ odin_nif_transact :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TER
 
 	pre_header, pre_hdr_err := xitdb.database_read_root_header(&handle.db)
 	pre_len, pre_len_err := xitdb.core_length(handle.db.core)
-	pre_rh_bytes: [xitdb.ROOT_HEADER_LENGTH]u8 = ---
-	pre_rh_err := xitdb.core_read_exact_at(handle.db.core, xitdb.ROOT_HEADER_START, pre_rh_bytes[:])
+	file_size_start := xitdb.database_file_size_start(handle.db.header.version)
+	pre_fs_bytes: [8]u8 = ---
+	pre_fs_err := xitdb.core_read_exact_at(handle.db.core, file_size_start, pre_fs_bytes[:])
 
 	rep: xitdb.Tx_Report
 	c_err: xitdb.Error
@@ -4988,7 +4990,7 @@ odin_nif_transact :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TER
 		if c_err == nil {
 			break
 		}
-		if rb_err := rollback_failed_tx(&handle.db, pre_header, pre_hdr_err, pre_len, pre_len_err, pre_rh_bytes, pre_rh_err); rb_err != nil {
+		if rb_err := rollback_failed_tx(&handle.db, pre_header, pre_hdr_err, pre_len, pre_len_err, pre_fs_bytes, pre_fs_err); rb_err != nil {
 			return make_xitdb_err(env, rb_err)
 		}
 		if attempt == 0 && c_err == .Unexpected_Tag && len(validation_err) == 0 && adapt_tx_ops_for_base_moment(handle, &tx) {

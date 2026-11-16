@@ -5,7 +5,7 @@
 [![Elixir](https://img.shields.io/badge/Elixir-~%3E%201.19-4B275F.svg?logo=elixir&logoColor=white)](https://elixir-lang.org)
 [![Odin](https://img.shields.io/badge/Odin-dev--2026--09%2B-3882D2.svg)](https://odin-lang.org)
 [![Ash](https://img.shields.io/badge/Ash-3.37.2%2B-E04F5F.svg)](https://ash-hq.org)
-[![Format](https://img.shields.io/badge/xitdb-v1%20wire%20format-5C6BC0.svg)](https://github.com/xit-vcs/xitdb)
+[![Format](https://img.shields.io/badge/xitdb-v2%20wire%20format-5C6BC0.svg)](https://github.com/xit-vcs/xitdb)
 [![Benchmarks](https://img.shields.io/badge/benchmarks-28%20workloads-orange.svg)](benchmarks/README.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
