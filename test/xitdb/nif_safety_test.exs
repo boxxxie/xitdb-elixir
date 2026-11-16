@@ -385,4 +385,301 @@ defmodule Xitdb.NifSafetyTest do
     assert db["sorted"]["b"] == nil
     assert db["sorted"]["c"] == 30
   end
+
+  test "single-pass :merge_map, :put, :append, and :insert roll back atomically on mid-payload errors" do
+    empty_db = Xitdb.open!(backend: :memory)
+    empty_info = Xitdb.info(empty_db)
+    empty_mat = Xitdb.materialize(empty_db)
+
+    # Empty DB: mid-map failure in :merge_map and post-savepoint :put must roll back root init
+    assert {:error, %Error{reason: :invalid_put_op}} =
+             Xitdb.transact_ops(empty_db, [
+               {:merge_map, %{"valid" => "v", "nested" => %{"ok" => 1, "bad" => {:tuple, 1}}}}
+             ])
+
+    assert Xitdb.info(empty_db) == empty_info
+    assert Xitdb.materialize(empty_db) == empty_mat
+    assert empty_db["valid"] == nil
+
+    assert {:error, %Error{reason: :invalid_put_op}} =
+             Xitdb.transact_ops(empty_db, [
+               {:put, ["valid"], "written"},
+               {:savepoint},
+               {:put, ["bad_list"], [1, 2, {:bad, 3}]}
+             ])
+
+    assert Xitdb.info(empty_db) == empty_info
+    assert Xitdb.materialize(empty_db) == empty_mat
+
+    assert {:ok, db} =
+             Xitdb.transact_ops(empty_db, [
+               {:put, ["keep"], "v1"},
+               {:put, ["list"], ["a", "b"]},
+               {:put, ["linked"], Xitdb.linked_list(["a", "b"])}
+             ])
+
+    info_before = Xitdb.info(db)
+
+    # Populated DB: mid-payload validation errors across :merge_map, :put, :append, :insert
+    assert {:error, %Error{reason: :invalid_put_op}} =
+             Xitdb.transact_ops(db, [
+               {:merge_map, %{"keep" => "mutated", "sub" => %{"a" => 1, "bad" => self()}}}
+             ])
+
+    assert {:error, %Error{reason: :invalid_put_op}} =
+             Xitdb.transact_ops(db, [
+               {:put, ["keep"], "mutated"},
+               {:savepoint},
+               {:put, ["sub"], Xitdb.sorted_map(a: 1, bad: {:tuple, 2})}
+             ])
+
+    assert {:error, %Error{reason: :invalid_put_op}} =
+             Xitdb.transact_ops(db, [
+               {:put, ["set"], Xitdb.hash_set(["ok", {:bad, :member}])}
+             ])
+
+    assert {:error, %Error{reason: :invalid_append_op}} =
+             Xitdb.transact_ops(db, [
+               {:append, ["list"], %{"ok" => 1, "bad" => {:a, :b}}}
+             ])
+
+    assert {:error, %Error{reason: :invalid_insert_op}} =
+             Xitdb.transact_ops(db, [
+               {:insert, ["linked"], 1, %{"ok" => 1, "bad" => {:a, :b}}}
+             ])
+
+    assert {:error, %Error{reason: :invalid_insert_op}} =
+             Xitdb.transact_ops(db, [
+               {:insert, ["list"], 1, %{"ok" => 1, "bad" => {:a, :b}}}
+             ])
+
+    assert {:error, %Error{reason: "Unexpected_Tag"}} =
+             Xitdb.transact_ops(db, [
+               {:insert, ["list"], 1, %{"ok" => 1}}
+             ])
+
+    assert Xitdb.info(db) == info_before
+    assert db["keep"] == "v1"
+    assert db["sub"] == nil
+    assert Enum.to_list(db["list"]) == ["a", "b"]
+    assert Enum.to_list(db["linked"]) == ["a", "b"]
+    Xitdb.close(db)
+  end
+
+  test "streaming lazy is_pure_removal_term skips absent parents and still validates keys" do
+    db = Xitdb.open!(backend: :memory)
+    db = Xitdb.transact!(db, %{"present" => %{"keep" => 1, "drop" => 2}})
+    {:ok, info_before} = Xitdb.info(db)
+
+    # Pure-removal update removes existing nested key while leaving absent parents unmaterialized
+    assert {:ok, db} =
+             Xitdb.transact_ops(db, [
+               {:merge_map,
+                %{
+                  "missing" => %{"deep" => %{"k" => nil}},
+                  "missing_cm" => Xitdb.counted_map(%{"k" => nil}),
+                  "present" => %{"drop" => nil}
+                }}
+             ])
+
+    assert db["present"]["keep"] == 1
+    assert db["present"]["drop"] == nil
+    assert db["missing"] == nil
+    assert db["missing_cm"] == nil
+
+    # Invalid key inside pure-removal map targeting absent parent still fails with :invalid_put_op
+    assert {:error, %Error{reason: :invalid_put_op}} =
+             Xitdb.transact_ops(db, [{:merge_map, %{"missing" => %{true => nil}}}])
+
+    assert {:error, %Error{reason: :invalid_put_op}} =
+             Xitdb.transact_ops(db, [{:merge_map, %{"missing" => %{{:bad, :key} => nil}}}])
+
+    # Non-removal invalid leaf mixed with nil under absent parent fails and rolls back
+    assert {:error, %Error{reason: :invalid_put_op}} =
+             Xitdb.transact_ops(db, [
+               {:merge_map, %{"missing" => %{"a" => nil, "bad" => {:x, :y}}}}
+             ])
+
+    {:ok, info_after} = Xitdb.info(db)
+    assert info_after.moment_count == info_before.moment_count + 1
+    assert db["present"]["keep"] == 1
+    Xitdb.close(db)
+  end
+
+  test "pure-removal under existing keys, invalid collection containers, >32-key maps, and MAX_WRITE_DEPTH guard" do
+    db = Xitdb.open!(backend: :memory)
+
+    # Large (>32 keys) map exercises temp_allocator fallback in extract_map_kvs
+    wide_map = Map.new(1..48, fn i -> {"k#{i}", i} end)
+    db = Xitdb.transact!(db, %{"wide" => wide_map, "nested" => %{"a" => %{"b" => 1, "c" => 2}}})
+    {:ok, info_before} = Xitdb.info(db)
+    assert db["wide"]["k48"] == 48
+
+    # Pure-removal targeting existing nested key removes leaf cleanly
+    assert {:ok, db} =
+             Xitdb.transact_ops(db, [
+               {:merge_map, %{"nested" => %{"a" => %{"b" => nil}}}}
+             ])
+
+    assert db["nested"]["a"]["b"] == nil
+    assert db["nested"]["a"]["c"] == 2
+
+    # Invalid leaf mixed under existing key still fails and rolls back
+    assert {:error, %Error{reason: :invalid_put_op}} =
+             Xitdb.transact_ops(db, [
+               {:merge_map, %{"nested" => %{"a" => %{"c" => nil, "bad" => {:x, :y}}}}}
+             ])
+
+    assert db["nested"]["a"]["c"] == 2
+
+    # Invalid collection data containers fail pre-validation cleanly
+    for bad_col <- [
+          %Xitdb.Collection{kind: :hash_map, data: 123},
+          %Xitdb.Collection{kind: :counted_hash_map, data: :not_a_map},
+          %Xitdb.Collection{kind: :sorted_map, data: 123},
+          %Xitdb.Collection{kind: :hash_set, data: 123},
+          %Xitdb.Collection{kind: :counted_hash_set, data: %{a: 1}},
+          %Xitdb.Collection{kind: :sorted_set, data: "bad"}
+        ] do
+      assert {:error, %Error{reason: :invalid_put_op}} =
+               Xitdb.transact_ops(db, [{:put, ["bad_col"], bad_col}])
+
+      assert {:error, %Error{reason: :invalid_put_op}} =
+               Xitdb.transact_ops(db, [{:merge_map, %{"nested" => bad_col}}])
+    end
+
+    # Nesting deeper than MAX_WRITE_DEPTH (64) is rejected cleanly without stack overflow
+    too_deep = Enum.reduce(1..70, 1, fn i, acc -> %{"l#{i}" => acc} end)
+    too_deep_nil = Enum.reduce(1..70, nil, fn i, acc -> %{"l#{i}" => acc} end)
+
+    assert {:error, %Error{reason: :invalid_put_op}} =
+             Xitdb.transact_ops(db, [{:put, ["too_deep"], too_deep}])
+
+    assert {:error, %Error{reason: :invalid_put_op}} =
+             Xitdb.transact_ops(db, [{:merge_map, %{"too_deep" => too_deep}}])
+
+    assert {:error, %Error{reason: :invalid_put_op}} =
+             Xitdb.transact_ops(db, [{:merge_map, %{"absent_deep" => too_deep_nil}}])
+
+    # Within MAX_WRITE_DEPTH (60) succeeds cleanly
+    within_depth = Enum.reduce(1..60, "leaf", fn i, acc -> %{"l#{i}" => acc} end)
+    assert {:ok, db} = Xitdb.transact_ops(db, [{:put, ["within_depth"], within_depth}])
+    assert get_in(db, ["within_depth" | Enum.map(60..1//-1, &"l#{&1}")]) == "leaf"
+
+    {:ok, info_after} = Xitdb.info(db)
+    assert info_after.moment_count == info_before.moment_count + 2
+    Xitdb.close(db)
+  end
+
+  test "error precedence: invalid payloads take priority over tag mismatch, empty steps, and later malformed ops" do
+    db = Xitdb.open!(backend: :memory)
+    db = Xitdb.transact!(db, %{"scalar" => "alice", "list" => [1, 2]})
+    info_before = Xitdb.info(db)
+
+    # Finding 1: invalid nested payloads overwriting a scalar or mismatched container return :invalid_put_op
+    assert {:error, %Error{reason: :invalid_put_op}} =
+             Xitdb.transact_ops(db, [{:merge_map, %{"scalar" => %{true => "bad_key"}}}])
+
+    assert {:error, %Error{reason: :invalid_put_op}} =
+             Xitdb.transact_ops(db, [{:merge_map, %{"scalar" => %{"a" => {:bad_tuple, 1}}}}])
+
+    assert {:error, %Error{reason: :invalid_put_op}} =
+             Xitdb.transact_ops(db, [{:merge_map, %{"list" => %{{:bad, :key} => "bad_key"}}}])
+
+    assert {:error, %Error{reason: :invalid_put_op}} =
+             Xitdb.transact_ops(db, [{:put, ["scalar", "child"], %{true => "bad_key"}}])
+
+    # Valid payload against scalar parent still returns "Unexpected_Tag"
+    assert {:error, %Error{reason: "Unexpected_Tag"}} =
+             Xitdb.transact_ops(db, [{:put, ["scalar", "child"], %{"ok" => 1}}])
+
+    # Finding 2: empty steps with unsupported struct or invalid map returns :invalid_put_op, not "Invalid_Range"
+    assert {:error, %Error{reason: :invalid_put_op}} =
+             Xitdb.transact_ops(db, [{:put, [], URI.parse("https://example.com")}])
+
+    assert {:error, %Error{reason: :invalid_put_op}} =
+             Xitdb.transact_ops(db, [{:put, [], %{true => "bad_key"}}])
+
+    assert {:error, %Error{reason: "Invalid_Range"}} =
+             Xitdb.transact_ops(db, [{:put, [], %{"ok" => 1}}])
+
+    # Finding 3: multi-op error precedence preserves Op 1's validation error ahead of Op 2's parse error
+    assert {:error, %Error{reason: :invalid_put_op}} =
+             Xitdb.transact_ops(db, [
+               {:put, ["a"], %{"bad" => {:tuple, 1}}},
+               {:put, ["b"], {:bad_scalar_tuple, 2}}
+             ])
+
+    assert {:error, %Error{reason: :invalid_put_op}} =
+             Xitdb.transact_ops(db, [
+               {:put, ["a"], %{"bad" => {:tuple, 1}}},
+               {:unknown_op}
+             ])
+
+    assert {:error, %Error{reason: :invalid_append_op}} =
+             Xitdb.transact_ops(db, [
+               {:append, ["list"], %{"bad" => {:tuple, 1}}},
+               {:unknown_op}
+             ])
+
+    assert Xitdb.info(db) == info_before
+    assert db["scalar"] == "alice"
+    assert Enum.to_list(db["list"]) == [1, 2]
+    Xitdb.close(db)
+  end
+
+  test "Slice 04 regressions: exact MAX_WRITE_DEPTH 64/65 boundary, forged MapSet rejection, and wide streaming maps" do
+    db = Xitdb.open!(backend: :memory)
+    on_exit(fn -> Xitdb.close(db) end)
+
+    # Exact depth 64 scalar & nil maps succeed across :put and :merge_map (pure removal)
+    d64_scalar = Enum.reduce(1..64, "leaf", fn i, acc -> %{"l#{i}" => acc} end)
+    d63_nil = Enum.reduce(1..63, nil, fn i, acc -> %{"l#{i}" => acc} end)
+
+    assert {:ok, db} = Xitdb.transact_ops(db, [{:put, ["d64"], d64_scalar}])
+    assert get_in(db, ["d64" | Enum.map(64..1//-1, &"l#{&1}")]) == "leaf"
+
+    # Valid pure-removal at exact depth 64 succeeds cleanly
+    assert {:ok, db} = Xitdb.transact_ops(db, [{:merge_map, %{"absent_d64" => d63_nil}}])
+    assert db["absent_d64"] == nil
+
+    # Depth 65 scalar & nil maps fail consistently across :put, :merge_map, and pure removal
+    d65_scalar = Enum.reduce(1..65, "leaf", fn i, acc -> %{"l#{i}" => acc} end)
+    d65_nil = Enum.reduce(1..65, nil, fn i, acc -> %{"l#{i}" => acc} end)
+
+    {:ok, info_before} = Xitdb.info(db)
+
+    assert {:error, %Error{reason: :invalid_put_op}} =
+             Xitdb.transact_ops(db, [{:put, ["d65"], d65_scalar}])
+
+    assert {:error, %Error{reason: :invalid_put_op}} =
+             Xitdb.transact_ops(db, [{:merge_map, %{"d65" => d65_scalar}}])
+
+    assert {:error, %Error{reason: :invalid_put_op}} =
+             Xitdb.transact_ops(db, [{:merge_map, %{"absent_d65" => d65_nil}}])
+
+    # BUG-04-03: Forged %MapSet{map: ...} variants are rejected cleanly
+    for forged <- [
+          %MapSet{map: URI.parse("https://example.com")},
+          %MapSet{map: [1, 2]},
+          %MapSet{map: 123},
+          Xitdb.hash_set(%MapSet{map: [1, 2]}),
+          Xitdb.counted_set(%MapSet{map: %{"ok" => []}} |> then(&%{&1 | map: [1, 2]})),
+          Xitdb.sorted_set(%MapSet{map: URI.parse("https://example.com")})
+        ] do
+      assert {:error, %Error{reason: :invalid_put_op}} =
+               Xitdb.transact_ops(db, [{:put, ["forged"], forged}])
+
+      assert {:error, %Error{reason: :invalid_put_op}} =
+               Xitdb.transact_ops(db, [{:put, ["forged"], forged}, {:unknown_op}])
+    end
+
+    # Wide map (>128 keys) streams cleanly via Nif_Map_Iter
+    wide200 = Map.new(1..200, fn i -> {"w_#{i}", i} end)
+    assert {:ok, db} = Xitdb.transact_ops(db, [{:put, ["wide200"], wide200}])
+    assert db["wide200"]["w_200"] == 200
+
+    {:ok, info_after} = Xitdb.info(db)
+    assert info_after.moment_count == info_before.moment_count + 1
+  end
 end

@@ -15,6 +15,10 @@ import xitdb "xitdb:."
 ErlNifEnv :: distinct rawptr
 ERL_NIF_TERM :: distinct c.ulong
 
+Nif_Map_Iter :: struct {
+	_opaque: [8]u64,
+}
+
 Nif_Raw_Step :: struct {
 	kind_code: u8,
 	key_ptr:   [^]u8,
@@ -52,7 +56,10 @@ foreign _ {
 	nif_is_map :: proc(env: ErlNifEnv, term: ERL_NIF_TERM) -> c.int ---
 	nif_get_map_value :: proc(env: ErlNifEnv, map_term: ERL_NIF_TERM, key: ERL_NIF_TERM, val_out: ^ERL_NIF_TERM) -> c.int ---
 	nif_get_map_size :: proc(env: ErlNifEnv, map_term: ERL_NIF_TERM, size_out: ^c.size_t) -> c.int ---
-	nif_map_to_kv_arrays :: proc(env: ErlNifEnv, map_term: ERL_NIF_TERM, keys_out: [^]ERL_NIF_TERM, vals_out: [^]ERL_NIF_TERM, max_cnt: c.size_t, count_out: ^c.size_t) -> c.int ---
+	nif_map_iter_create :: proc(env: ErlNifEnv, map_term: ERL_NIF_TERM, out: ^Nif_Map_Iter) -> c.int ---
+	nif_map_iter_get_and_next :: proc(env: ErlNifEnv, it: ^Nif_Map_Iter, key_out: ^ERL_NIF_TERM, val_out: ^ERL_NIF_TERM) -> c.int ---
+	nif_map_iter_destroy :: proc(env: ErlNifEnv, it: ^Nif_Map_Iter) ---
+	nif_can_be_pure_removal :: proc(env: ErlNifEnv, term: ERL_NIF_TERM, atom_nil: ERL_NIF_TERM, atom_struct: ERL_NIF_TERM) -> c.int ---
 	nif_unpack_step_list :: proc(env: ErlNifEnv, list_term: ERL_NIF_TERM, out_steps: [^]Nif_Raw_Step, max_steps: c.int, count_out: ^c.int) -> c.int ---
 
 	nif_make_atom_len :: proc(env: ErlNifEnv, name: [^]u8, length: c.size_t) -> ERL_NIF_TERM ---
@@ -2457,432 +2464,407 @@ is_supported_col_kind :: proc(kind: string) -> bool {
 	return false
 }
 
-validate_write_term :: proc(env: ErlNifEnv, term: ERL_NIF_TERM) -> bool {
-	if _, ok := decode_writeable_value(env, term); ok {
-		return true
+fail_validation :: #force_inline proc(validation_err: ^string, reason: string) -> xitdb.Error {
+	if validation_err != nil && len(validation_err^) == 0 {
+		validation_err^ = reason
 	}
-	if nif_is_tuple(env, term) != 0 {
-		arity: c.int = 0
-		elems: [^]ERL_NIF_TERM = nil
-		if nif_get_tuple(env, term, &arity, &elems) == 0 {
-			return false
-		}
-		if arity == 2 && elems[0] == ATOM_XITDB_SET {
-			return validate_set_elements_term(env, elems[1])
-		}
-		if arity == 3 && elems[0] == ATOM_XITDB_COL {
-			kind_str, ok_k := term_to_kind_string(env, elems[1])
-			if !ok_k || !is_supported_col_kind(kind_str) {
-				return false
-			}
-			return validate_collection_data_term(env, kind_str, elems[2])
-		}
-		return false
-	}
+	return .Unexpected_Tag
+}
+
+is_structured_write_candidate :: proc(env: ErlNifEnv, term: ERL_NIF_TERM) -> bool {
 	if nif_is_list(env, term) != 0 {
-		head: ERL_NIF_TERM
-		tail := term
-		for nif_is_empty_list(env, tail) == 0 {
-			if nif_get_list_cell(env, tail, &head, &tail) == 0 {
-				return false
-			}
-			if !validate_write_term(env, head) {
-				return false
-			}
-		}
 		return true
 	}
 	if nif_is_map(env, term) != 0 {
 		struct_term: ERL_NIF_TERM
 		if nif_get_map_value(env, term, ATOM_STRUCT, &struct_term) != 0 {
-			if struct_term == ATOM_XITDB_COLLECTION_MOD {
-				kind_term, data_term: ERL_NIF_TERM
-				if nif_get_map_value(env, term, ATOM_KIND, &kind_term) == 0 ||
-				   nif_get_map_value(env, term, ATOM_DATA, &data_term) == 0 {
-					return false
-				}
-				kind_str, ok_k := term_to_kind_string(env, kind_term)
-				if !ok_k || !is_supported_col_kind(kind_str) {
-					return false
-				}
-				return validate_collection_data_term(env, kind_str, data_term)
-			}
-			if struct_term == ATOM_MAPSET_MOD {
-				ms_map: ERL_NIF_TERM
-				if nif_get_map_value(env, term, ATOM_MAP, &ms_map) == 0 || nif_is_map(env, ms_map) == 0 {
-					return false
-				}
-				kv_list: ERL_NIF_TERM
-				if nif_map_to_kv_list(env, ms_map, &kv_list) == 0 {
-					return false
-				}
-				head: ERL_NIF_TERM
-				tail := kv_list
-				for nif_is_empty_list(env, tail) == 0 {
-					if nif_get_list_cell(env, tail, &head, &tail) == 0 {
-						return false
-					}
-					arity: c.int = 0
-					elems: [^]ERL_NIF_TERM = nil
-					if nif_get_tuple(env, head, &arity, &elems) == 0 || arity != 2 {
-						return false
-					}
-					if _, ok_s := term_to_key_string(env, elems[0]); !ok_s {
-						return false
-					}
-				}
-				return true
-			}
-			return false
+			return struct_term == ATOM_XITDB_COLLECTION_MOD || struct_term == ATOM_MAPSET_MOD
 		}
-		return validate_kv_term(env, term)
+		return true
+	}
+	arity: c.int = 0
+	elems: [^]ERL_NIF_TERM = nil
+	if nif_get_tuple(env, term, &arity, &elems) != 0 {
+		return (arity == 2 && elems[0] == ATOM_XITDB_SET) || (arity == 3 && elems[0] == ATOM_XITDB_COL)
 	}
 	return false
 }
 
-validate_set_elements_term :: proc(env: ErlNifEnv, data_term: ERL_NIF_TERM) -> bool {
+is_valid_kv_container :: proc(env: ErlNifEnv, data_term: ERL_NIF_TERM) -> bool {
+	if nif_is_list(env, data_term) != 0 {
+		return true
+	}
 	if nif_is_map(env, data_term) != 0 {
-		struct_term: ERL_NIF_TERM
-		if nif_get_map_value(env, data_term, ATOM_STRUCT, &struct_term) != 0 && struct_term == ATOM_MAPSET_MOD {
-			return validate_write_term(env, data_term)
+		st: ERL_NIF_TERM
+		return nif_get_map_value(env, data_term, ATOM_STRUCT, &st) == 0
+	}
+	return false
+}
+
+is_valid_set_container :: proc(env: ErlNifEnv, data_term: ERL_NIF_TERM) -> bool {
+	if nif_is_list(env, data_term) != 0 {
+		return true
+	}
+	if nif_is_map(env, data_term) != 0 {
+		struct_term, ms_map, st_inner: ERL_NIF_TERM
+		return nif_get_map_value(env, data_term, ATOM_STRUCT, &struct_term) != 0 &&
+			struct_term == ATOM_MAPSET_MOD &&
+			nif_get_map_value(env, data_term, ATOM_MAP, &ms_map) != 0 &&
+			nif_is_map(env, ms_map) != 0 &&
+			nif_get_map_value(env, ms_map, ATOM_STRUCT, &st_inner) == 0
+	}
+	return false
+}
+
+write_hash_map_entries :: proc(
+	env: ErlNifEnv,
+	hm: ^xitdb.Write_Hash_Map,
+	data_term: ERL_NIF_TERM,
+	validation_err: ^string,
+	err_reason: string,
+	depth: int = 0,
+) -> xitdb.Error {
+	if nif_is_map(env, data_term) != 0 {
+		st: ERL_NIF_TERM
+		if nif_get_map_value(env, data_term, ATOM_STRUCT, &st) != 0 {
+			return fail_validation(validation_err, err_reason)
 		}
-		return false
+		it: Nif_Map_Iter = ---
+		if nif_map_iter_create(env, data_term, &it) == 0 {
+			return fail_validation(validation_err, err_reason)
+		}
+		defer nif_map_iter_destroy(env, &it)
+		k, v: ERL_NIF_TERM
+		for nif_map_iter_get_and_next(env, &it, &k, &v) != 0 {
+			k_str, ok_k := term_to_key_string(env, k)
+			if !ok_k {
+				return fail_validation(validation_err, err_reason)
+			}
+			if wdata, ok_s := decode_writeable_value(env, v); ok_s {
+				xitdb.hash_map_put(hm, k_str, wdata) or_return
+			} else {
+				v_cur := xitdb.hash_map_put_cursor(hm, k_str) or_return
+				write_term_to_cursor(env, &v_cur, v, validation_err, err_reason, depth + 1) or_return
+			}
+		}
+		return nil
 	}
 	if nif_is_list(env, data_term) == 0 {
-		return false
+		return fail_validation(validation_err, err_reason)
 	}
 	head: ERL_NIF_TERM
 	tail := data_term
 	for nif_is_empty_list(env, tail) == 0 {
 		if nif_get_list_cell(env, tail, &head, &tail) == 0 {
-			return false
-		}
-		if _, ok_s := term_to_key_string(env, head); !ok_s {
-			return false
-		}
-	}
-	return true
-}
-
-validate_kv_term :: proc(env: ErlNifEnv, data_term: ERL_NIF_TERM) -> bool {
-	kv_list: ERL_NIF_TERM
-	if nif_is_map(env, data_term) != 0 {
-		if nif_map_to_kv_list(env, data_term, &kv_list) == 0 {
-			return false
-		}
-	} else if nif_is_list(env, data_term) != 0 {
-		kv_list = data_term
-	} else {
-		return false
-	}
-	head: ERL_NIF_TERM
-	tail := kv_list
-	for nif_is_empty_list(env, tail) == 0 {
-		if nif_get_list_cell(env, tail, &head, &tail) == 0 {
-			return false
+			return fail_validation(validation_err, err_reason)
 		}
 		arity: c.int = 0
 		elems: [^]ERL_NIF_TERM = nil
 		if nif_get_tuple(env, head, &arity, &elems) == 0 || arity != 2 {
-			return false
-		}
-		if _, ok_k := term_to_key_string(env, elems[0]); !ok_k {
-			return false
-		}
-		if !validate_write_term(env, elems[1]) {
-			return false
-		}
-	}
-	return true
-}
-
-validate_collection_data_term :: proc(env: ErlNifEnv, kind_str: string, data_term: ERL_NIF_TERM) -> bool {
-	switch kind_str {
-	case "hash_map", "counted_hash_map", "sorted_map":
-		return validate_kv_term(env, data_term)
-	case "array_list", "linked_array_list":
-		return validate_write_term(env, data_term) && nif_is_list(env, data_term) != 0
-	case "hash_set", "counted_hash_set", "sorted_set":
-		return validate_set_elements_term(env, data_term)
-	}
-	return false
-}
-
-write_hash_map_entries :: proc(env: ErlNifEnv, hm: ^xitdb.Write_Hash_Map, kv_list: ERL_NIF_TERM) -> (ok: bool, err: xitdb.Error) {
-	head: ERL_NIF_TERM
-	tail := kv_list
-	for nif_is_empty_list(env, tail) == 0 {
-		if nif_get_list_cell(env, tail, &head, &tail) == 0 {
-			return false, nil
-		}
-		arity: c.int = 0
-		elems: [^]ERL_NIF_TERM = nil
-		if nif_get_tuple(env, head, &arity, &elems) == 0 || arity != 2 {
-			return false, nil
+			return fail_validation(validation_err, err_reason)
 		}
 		k_str, ok_k := term_to_key_string(env, elems[0])
 		if !ok_k {
-			return false, nil
+			return fail_validation(validation_err, err_reason)
 		}
 		if wdata, ok_s := decode_writeable_value(env, elems[1]); ok_s {
 			xitdb.hash_map_put(hm, k_str, wdata) or_return
 		} else {
 			v_cur := xitdb.hash_map_put_cursor(hm, k_str) or_return
-			w_ok, w_err := write_term_to_cursor(env, &v_cur, elems[1])
-			if w_err != nil {
-				return true, w_err
-			}
-			if !w_ok {
-				return false, nil
-			}
+			write_term_to_cursor(env, &v_cur, elems[1], validation_err, err_reason, depth + 1) or_return
 		}
 	}
-	return true, nil
+	return nil
 }
 
-write_sorted_map_entries :: proc(env: ErlNifEnv, sm: ^xitdb.Write_Sorted_Map, kv_list: ERL_NIF_TERM) -> (ok: bool, err: xitdb.Error) {
+write_sorted_map_entries :: proc(
+	env: ErlNifEnv,
+	sm: ^xitdb.Write_Sorted_Map,
+	data_term: ERL_NIF_TERM,
+	validation_err: ^string,
+	err_reason: string,
+	depth: int = 0,
+) -> xitdb.Error {
+	if nif_is_map(env, data_term) != 0 {
+		st: ERL_NIF_TERM
+		if nif_get_map_value(env, data_term, ATOM_STRUCT, &st) != 0 {
+			return fail_validation(validation_err, err_reason)
+		}
+		it: Nif_Map_Iter = ---
+		if nif_map_iter_create(env, data_term, &it) == 0 {
+			return fail_validation(validation_err, err_reason)
+		}
+		defer nif_map_iter_destroy(env, &it)
+		k, v: ERL_NIF_TERM
+		for nif_map_iter_get_and_next(env, &it, &k, &v) != 0 {
+			k_str, ok_k := term_to_key_string(env, k)
+			if !ok_k {
+				return fail_validation(validation_err, err_reason)
+			}
+			if wdata, ok_s := decode_writeable_value(env, v); ok_s {
+				xitdb.sorted_map_put(sm, k_str, wdata) or_return
+			} else {
+				v_cur := xitdb.sorted_map_put_cursor(sm, k_str) or_return
+				write_term_to_cursor(env, &v_cur, v, validation_err, err_reason, depth + 1) or_return
+			}
+		}
+		return nil
+	}
+	if nif_is_list(env, data_term) == 0 {
+		return fail_validation(validation_err, err_reason)
+	}
 	head: ERL_NIF_TERM
-	tail := kv_list
+	tail := data_term
 	for nif_is_empty_list(env, tail) == 0 {
 		if nif_get_list_cell(env, tail, &head, &tail) == 0 {
-			return false, nil
+			return fail_validation(validation_err, err_reason)
 		}
 		arity: c.int = 0
 		elems: [^]ERL_NIF_TERM = nil
 		if nif_get_tuple(env, head, &arity, &elems) == 0 || arity != 2 {
-			return false, nil
+			return fail_validation(validation_err, err_reason)
 		}
 		k_str, ok_k := term_to_key_string(env, elems[0])
 		if !ok_k {
-			return false, nil
+			return fail_validation(validation_err, err_reason)
 		}
 		if wdata, ok_s := decode_writeable_value(env, elems[1]); ok_s {
 			xitdb.sorted_map_put(sm, k_str, wdata) or_return
 		} else {
 			v_cur := xitdb.sorted_map_put_cursor(sm, k_str) or_return
-			w_ok, w_err := write_term_to_cursor(env, &v_cur, elems[1])
-			if w_err != nil {
-				return true, w_err
-			}
-			if !w_ok {
-				return false, nil
-			}
+			write_term_to_cursor(env, &v_cur, elems[1], validation_err, err_reason, depth + 1) or_return
 		}
 	}
-	return true, nil
+	return nil
 }
 
-write_hash_set_entries :: proc(env: ErlNifEnv, hs: ^xitdb.Write_Hash_Set, data_term: ERL_NIF_TERM) -> (ok: bool, err: xitdb.Error) {
+write_hash_set_entries :: proc(
+	env: ErlNifEnv,
+	hs: ^xitdb.Write_Hash_Set,
+	data_term: ERL_NIF_TERM,
+	validation_err: ^string,
+	err_reason: string,
+) -> xitdb.Error {
 	if nif_is_map(env, data_term) != 0 {
-		ms_map: ERL_NIF_TERM
-		if nif_get_map_value(env, data_term, ATOM_MAP, &ms_map) == 0 {
-			return false, nil
+		struct_term: ERL_NIF_TERM
+		if nif_get_map_value(env, data_term, ATOM_STRUCT, &struct_term) == 0 || struct_term != ATOM_MAPSET_MOD {
+			return fail_validation(validation_err, err_reason)
 		}
-		kv_list: ERL_NIF_TERM
-		if nif_map_to_kv_list(env, ms_map, &kv_list) == 0 {
-			return false, nil
+		ms_map, ms_st: ERL_NIF_TERM
+		if nif_get_map_value(env, data_term, ATOM_MAP, &ms_map) == 0 ||
+		   nif_is_map(env, ms_map) == 0 ||
+		   nif_get_map_value(env, ms_map, ATOM_STRUCT, &ms_st) != 0 {
+			return fail_validation(validation_err, err_reason)
 		}
-		head: ERL_NIF_TERM
-		tail := kv_list
-		for nif_is_empty_list(env, tail) == 0 {
-			if nif_get_list_cell(env, tail, &head, &tail) == 0 {
-				return false, nil
-			}
-			arity: c.int = 0
-			elems: [^]ERL_NIF_TERM = nil
-			if nif_get_tuple(env, head, &arity, &elems) == 0 || arity != 2 {
-				return false, nil
-			}
-			k_str, ok_k := term_to_key_string(env, elems[0])
+		it: Nif_Map_Iter = ---
+		if nif_map_iter_create(env, ms_map, &it) == 0 {
+			return fail_validation(validation_err, err_reason)
+		}
+		defer nif_map_iter_destroy(env, &it)
+		k, v: ERL_NIF_TERM
+		for nif_map_iter_get_and_next(env, &it, &k, &v) != 0 {
+			k_str, ok_k := term_to_key_string(env, k)
 			if !ok_k {
-				return false, nil
+				return fail_validation(validation_err, err_reason)
 			}
 			xitdb.hash_set_put(hs, k_str) or_return
 		}
-		return true, nil
+		return nil
+	}
+	if nif_is_list(env, data_term) == 0 {
+		return fail_validation(validation_err, err_reason)
 	}
 	head: ERL_NIF_TERM
 	tail := data_term
 	for nif_is_empty_list(env, tail) == 0 {
 		if nif_get_list_cell(env, tail, &head, &tail) == 0 {
-			return false, nil
+			return fail_validation(validation_err, err_reason)
 		}
 		k_str, ok_k := term_to_key_string(env, head)
 		if !ok_k {
-			return false, nil
+			return fail_validation(validation_err, err_reason)
 		}
 		xitdb.hash_set_put(hs, k_str) or_return
 	}
-	return true, nil
+	return nil
 }
 
-write_sorted_set_entries :: proc(env: ErlNifEnv, ss: ^xitdb.Write_Sorted_Set, data_term: ERL_NIF_TERM) -> (ok: bool, err: xitdb.Error) {
+write_sorted_set_entries :: proc(
+	env: ErlNifEnv,
+	ss: ^xitdb.Write_Sorted_Set,
+	data_term: ERL_NIF_TERM,
+	validation_err: ^string,
+	err_reason: string,
+) -> xitdb.Error {
 	if nif_is_map(env, data_term) != 0 {
-		ms_map: ERL_NIF_TERM
-		if nif_get_map_value(env, data_term, ATOM_MAP, &ms_map) == 0 {
-			return false, nil
+		struct_term: ERL_NIF_TERM
+		if nif_get_map_value(env, data_term, ATOM_STRUCT, &struct_term) == 0 || struct_term != ATOM_MAPSET_MOD {
+			return fail_validation(validation_err, err_reason)
 		}
-		kv_list: ERL_NIF_TERM
-		if nif_map_to_kv_list(env, ms_map, &kv_list) == 0 {
-			return false, nil
+		ms_map, ms_st: ERL_NIF_TERM
+		if nif_get_map_value(env, data_term, ATOM_MAP, &ms_map) == 0 ||
+		   nif_is_map(env, ms_map) == 0 ||
+		   nif_get_map_value(env, ms_map, ATOM_STRUCT, &ms_st) != 0 {
+			return fail_validation(validation_err, err_reason)
 		}
-		head: ERL_NIF_TERM
-		tail := kv_list
-		for nif_is_empty_list(env, tail) == 0 {
-			if nif_get_list_cell(env, tail, &head, &tail) == 0 {
-				return false, nil
-			}
-			arity: c.int = 0
-			elems: [^]ERL_NIF_TERM = nil
-			if nif_get_tuple(env, head, &arity, &elems) == 0 || arity != 2 {
-				return false, nil
-			}
-			k_str, ok_k := term_to_key_string(env, elems[0])
+		it: Nif_Map_Iter = ---
+		if nif_map_iter_create(env, ms_map, &it) == 0 {
+			return fail_validation(validation_err, err_reason)
+		}
+		defer nif_map_iter_destroy(env, &it)
+		k, v: ERL_NIF_TERM
+		for nif_map_iter_get_and_next(env, &it, &k, &v) != 0 {
+			k_str, ok_k := term_to_key_string(env, k)
 			if !ok_k {
-				return false, nil
+				return fail_validation(validation_err, err_reason)
 			}
 			xitdb.sorted_set_put(ss, k_str) or_return
 		}
-		return true, nil
+		return nil
+	}
+	if nif_is_list(env, data_term) == 0 {
+		return fail_validation(validation_err, err_reason)
 	}
 	head: ERL_NIF_TERM
 	tail := data_term
 	for nif_is_empty_list(env, tail) == 0 {
 		if nif_get_list_cell(env, tail, &head, &tail) == 0 {
-			return false, nil
+			return fail_validation(validation_err, err_reason)
 		}
 		k_str, ok_k := term_to_key_string(env, head)
 		if !ok_k {
-			return false, nil
+			return fail_validation(validation_err, err_reason)
 		}
 		xitdb.sorted_set_put(ss, k_str) or_return
 	}
-	return true, nil
+	return nil
 }
 
-write_collection_term_to_cursor :: proc(env: ErlNifEnv, cur: ^xitdb.Write_Cursor, kind_str: string, data_term: ERL_NIF_TERM) -> (ok: bool, err: xitdb.Error) {
-	kv_list := data_term
-	if nif_is_map(env, data_term) != 0 && (kind_str == "hash_map" || kind_str == "counted_hash_map" || kind_str == "sorted_map") {
-		if nif_map_to_kv_list(env, data_term, &kv_list) == 0 {
-			return false, nil
-		}
+write_collection_term_to_cursor :: proc(
+	env: ErlNifEnv,
+	cur: ^xitdb.Write_Cursor,
+	kind_str: string,
+	data_term: ERL_NIF_TERM,
+	validation_err: ^string,
+	err_reason: string,
+	depth: int = 0,
+) -> xitdb.Error {
+	if depth >= MAX_WRITE_DEPTH {
+		return fail_validation(validation_err, err_reason)
 	}
-
 	switch kind_str {
 	case "hash_map":
-		hm, init_err := xitdb.write_hash_map_init(cur^)
-		if init_err != nil {
-			return true, init_err
+		if !is_valid_kv_container(env, data_term) {
+			return fail_validation(validation_err, err_reason)
 		}
-		return write_hash_map_entries(env, &hm, kv_list)
+		hm := xitdb.write_hash_map_init(cur^) or_return
+		return write_hash_map_entries(env, &hm, data_term, validation_err, err_reason, depth)
 	case "counted_hash_map":
-		chm, init_err := xitdb.write_counted_hash_map_init(cur^)
-		if init_err != nil {
-			return true, init_err
+		if !is_valid_kv_container(env, data_term) {
+			return fail_validation(validation_err, err_reason)
 		}
-		return write_hash_map_entries(env, &chm.write_hash_map, kv_list)
+		chm := xitdb.write_counted_hash_map_init(cur^) or_return
+		return write_hash_map_entries(env, &chm.write_hash_map, data_term, validation_err, err_reason, depth)
 	case "sorted_map":
-		sm, init_err := xitdb.write_sorted_map_init(cur^)
-		if init_err != nil {
-			return true, init_err
+		if !is_valid_kv_container(env, data_term) {
+			return fail_validation(validation_err, err_reason)
 		}
-		return write_sorted_map_entries(env, &sm, kv_list)
+		sm := xitdb.write_sorted_map_init(cur^) or_return
+		return write_sorted_map_entries(env, &sm, data_term, validation_err, err_reason, depth)
 	case "array_list":
-		al, init_err := xitdb.write_array_list_init(cur^)
-		if init_err != nil {
-			return true, init_err
+		if nif_is_list(env, data_term) == 0 {
+			return fail_validation(validation_err, err_reason)
 		}
+		al := xitdb.write_array_list_init(cur^) or_return
 		head: ERL_NIF_TERM
 		tail := data_term
 		for nif_is_empty_list(env, tail) == 0 {
 			if nif_get_list_cell(env, tail, &head, &tail) == 0 {
-				return false, nil
+				return fail_validation(validation_err, err_reason)
 			}
 			if wdata, ok_s := decode_writeable_value(env, head); ok_s {
 				xitdb.array_list_append(&al, wdata) or_return
 			} else {
 				elem_cur := xitdb.array_list_append_cursor(&al) or_return
-				w_ok, w_err := write_term_to_cursor(env, &elem_cur, head)
-				if w_err != nil {
-					return true, w_err
-				}
-				if !w_ok {
-					return false, nil
-				}
+				write_term_to_cursor(env, &elem_cur, head, validation_err, err_reason, depth + 1) or_return
 			}
 		}
-		return true, nil
+		return nil
 	case "linked_array_list":
-		ll, init_err := xitdb.write_linked_array_list_init(cur^)
-		if init_err != nil {
-			return true, init_err
+		if nif_is_list(env, data_term) == 0 {
+			return fail_validation(validation_err, err_reason)
 		}
+		ll := xitdb.write_linked_array_list_init(cur^) or_return
 		head: ERL_NIF_TERM
 		tail := data_term
 		for nif_is_empty_list(env, tail) == 0 {
 			if nif_get_list_cell(env, tail, &head, &tail) == 0 {
-				return false, nil
+				return fail_validation(validation_err, err_reason)
 			}
 			if wdata, ok_s := decode_writeable_value(env, head); ok_s {
 				xitdb.linked_array_list_append(&ll, wdata) or_return
 			} else {
 				elem_cur := xitdb.linked_array_list_append_cursor(&ll) or_return
-				w_ok, w_err := write_term_to_cursor(env, &elem_cur, head)
-				if w_err != nil {
-					return true, w_err
-				}
-				if !w_ok {
-					return false, nil
-				}
+				write_term_to_cursor(env, &elem_cur, head, validation_err, err_reason, depth + 1) or_return
 			}
 		}
-		return true, nil
+		return nil
 	case "hash_set":
-		hs, init_err := xitdb.write_hash_set_init(cur^)
-		if init_err != nil {
-			return true, init_err
+		if !is_valid_set_container(env, data_term) {
+			return fail_validation(validation_err, err_reason)
 		}
-		return write_hash_set_entries(env, &hs, data_term)
+		hs := xitdb.write_hash_set_init(cur^) or_return
+		return write_hash_set_entries(env, &hs, data_term, validation_err, err_reason)
 	case "counted_hash_set":
-		cs, init_err := xitdb.write_counted_hash_set_init(cur^)
-		if init_err != nil {
-			return true, init_err
+		if !is_valid_set_container(env, data_term) {
+			return fail_validation(validation_err, err_reason)
 		}
-		return write_hash_set_entries(env, &cs.write_hash_set, data_term)
+		cs := xitdb.write_counted_hash_set_init(cur^) or_return
+		return write_hash_set_entries(env, &cs.write_hash_set, data_term, validation_err, err_reason)
 	case "sorted_set":
-		ss, init_err := xitdb.write_sorted_set_init(cur^)
-		if init_err != nil {
-			return true, init_err
+		if !is_valid_set_container(env, data_term) {
+			return fail_validation(validation_err, err_reason)
 		}
-		return write_sorted_set_entries(env, &ss, data_term)
+		ss := xitdb.write_sorted_set_init(cur^) or_return
+		return write_sorted_set_entries(env, &ss, data_term, validation_err, err_reason)
 	}
-	return false, nil
+	return fail_validation(validation_err, err_reason)
 }
 
-write_term_to_cursor :: proc(env: ErlNifEnv, cur: ^xitdb.Write_Cursor, term: ERL_NIF_TERM) -> (ok: bool, err: xitdb.Error) {
+write_term_to_cursor :: proc(
+	env: ErlNifEnv,
+	cur: ^xitdb.Write_Cursor,
+	term: ERL_NIF_TERM,
+	validation_err: ^string,
+	err_reason: string,
+	depth: int = 0,
+) -> xitdb.Error {
 	if wdata, ok_s := decode_writeable_value(env, term); ok_s {
-		return true, xitdb.cursor_write(cur, wdata)
+		return xitdb.cursor_write(cur, wdata)
+	}
+	if depth >= MAX_WRITE_DEPTH {
+		return fail_validation(validation_err, err_reason)
 	}
 	if nif_is_tuple(env, term) != 0 {
 		arity: c.int = 0
 		elems: [^]ERL_NIF_TERM = nil
 		if nif_get_tuple(env, term, &arity, &elems) == 0 {
-			return false, nil
+			return fail_validation(validation_err, err_reason)
 		}
 		if arity == 2 && elems[0] == ATOM_XITDB_SET {
-			return write_collection_term_to_cursor(env, cur, "hash_set", elems[1])
+			return write_collection_term_to_cursor(env, cur, "hash_set", elems[1], validation_err, err_reason, depth)
 		}
 		if arity == 3 && elems[0] == ATOM_XITDB_COL {
 			kind_str, ok_k := term_to_kind_string(env, elems[1])
-			if !ok_k {
-				return false, nil
+			if !ok_k || !is_supported_col_kind(kind_str) {
+				return fail_validation(validation_err, err_reason)
 			}
-			return write_collection_term_to_cursor(env, cur, kind_str, elems[2])
+			return write_collection_term_to_cursor(env, cur, kind_str, elems[2], validation_err, err_reason, depth)
 		}
-		return false, nil
+		return fail_validation(validation_err, err_reason)
 	}
 	if nif_is_list(env, term) != 0 {
-		return write_collection_term_to_cursor(env, cur, "array_list", term)
+		return write_collection_term_to_cursor(env, cur, "array_list", term, validation_err, err_reason, depth)
 	}
 	if nif_is_map(env, term) != 0 {
 		struct_term: ERL_NIF_TERM
@@ -2891,22 +2873,22 @@ write_term_to_cursor :: proc(env: ErlNifEnv, cur: ^xitdb.Write_Cursor, term: ERL
 				kind_term, data_term: ERL_NIF_TERM
 				if nif_get_map_value(env, term, ATOM_KIND, &kind_term) == 0 ||
 				   nif_get_map_value(env, term, ATOM_DATA, &data_term) == 0 {
-					return false, nil
+					return fail_validation(validation_err, err_reason)
 				}
 				kind_str, ok_k := term_to_kind_string(env, kind_term)
-				if !ok_k {
-					return false, nil
+				if !ok_k || !is_supported_col_kind(kind_str) {
+					return fail_validation(validation_err, err_reason)
 				}
-				return write_collection_term_to_cursor(env, cur, kind_str, data_term)
+				return write_collection_term_to_cursor(env, cur, kind_str, data_term, validation_err, err_reason, depth)
 			}
 			if struct_term == ATOM_MAPSET_MOD {
-				return write_collection_term_to_cursor(env, cur, "counted_hash_set", term)
+				return write_collection_term_to_cursor(env, cur, "counted_hash_set", term, validation_err, err_reason, depth)
 			}
-			return false, nil
+			return fail_validation(validation_err, err_reason)
 		}
-		return write_collection_term_to_cursor(env, cur, "hash_map", term)
+		return write_collection_term_to_cursor(env, cur, "hash_map", term, validation_err, err_reason, depth)
 	}
-	return false, nil
+	return fail_validation(validation_err, err_reason)
 }
 
 Structured_Op_Kind :: enum u8 {
@@ -2916,71 +2898,46 @@ Structured_Op_Kind :: enum u8 {
 }
 
 Structured_Op_Ctx :: struct {
-	kind:  Structured_Op_Kind,
-	steps: []xitdb.Path_Step,
-	index: i64,
-	env:   ErlNifEnv,
-	term:  ERL_NIF_TERM,
+	kind:           Structured_Op_Kind,
+	steps:          []xitdb.Path_Step,
+	index:          i64,
+	env:            ErlNifEnv,
+	term:           ERL_NIF_TERM,
+	validation_err: ^string,
+	err_reason:     string,
 }
 
 structured_op_callback :: proc(moment_cur: ^xitdb.Write_Cursor, user_data: rawptr) -> xitdb.Error {
 	sc := (^Structured_Op_Ctx)(user_data)
-	target_cur := xitdb.write_steps_cursor(moment_cur^, sc.steps) or_return
 
 	switch sc.kind {
 	case .Put:
 		// Reset prior slot before writing nested collection cleanly
 		xitdb.put_at_steps(moment_cur^, sc.steps, xitdb.Slot{}) or_return
-		target_cur = xitdb.write_steps_cursor(moment_cur^, sc.steps) or_return
-		ok, err := write_term_to_cursor(sc.env, &target_cur, sc.term)
-		if err != nil {
-			return err
-		}
-		if !ok {
-			return .Unexpected_Tag
-		}
-		return nil
+		target_cur := xitdb.write_steps_cursor(moment_cur^, sc.steps) or_return
+		return write_term_to_cursor(sc.env, &target_cur, sc.term, sc.validation_err, sc.err_reason)
 
 	case .Append:
+		target_cur := xitdb.write_steps_cursor(moment_cur^, sc.steps) or_return
 		slot_ptr := xitdb.cursor_resolved(target_cur.read_cursor) or_return
 		#partial switch slot_ptr.slot.tag {
 		case .None, .Array_List:
 			al := xitdb.write_array_list_init(target_cur) or_return
 			elem_cur := xitdb.array_list_append_cursor(&al) or_return
-			ok, err := write_term_to_cursor(sc.env, &elem_cur, sc.term)
-			if err != nil {
-				return err
-			}
-			if !ok {
-				return .Unexpected_Tag
-			}
-			return nil
+			return write_term_to_cursor(sc.env, &elem_cur, sc.term, sc.validation_err, sc.err_reason)
 		case .Linked_Array_List:
 			ll := xitdb.write_linked_array_list_init(target_cur) or_return
 			elem_cur := xitdb.linked_array_list_append_cursor(&ll) or_return
-			ok, err := write_term_to_cursor(sc.env, &elem_cur, sc.term)
-			if err != nil {
-				return err
-			}
-			if !ok {
-				return .Unexpected_Tag
-			}
-			return nil
+			return write_term_to_cursor(sc.env, &elem_cur, sc.term, sc.validation_err, sc.err_reason)
 		case:
 			return .Unexpected_Tag
 		}
 
 	case .Insert:
+		target_cur := xitdb.write_steps_cursor(moment_cur^, sc.steps) or_return
 		ll := xitdb.write_linked_array_list_init(target_cur) or_return
 		elem_cur := xitdb.linked_array_list_insert_cursor(&ll, sc.index) or_return
-		ok, err := write_term_to_cursor(sc.env, &elem_cur, sc.term)
-		if err != nil {
-			return err
-		}
-		if !ok {
-			return .Unexpected_Tag
-		}
-		return nil
+		return write_term_to_cursor(sc.env, &elem_cur, sc.term, sc.validation_err, sc.err_reason)
 	}
 	return nil
 }
@@ -3116,184 +3073,17 @@ rm_if_exists_callback :: proc(moment_cur: ^xitdb.Write_Cursor, user_data: rawptr
 	return nil
 }
 
-KV_Stack_Buf :: struct {
-	keys_buf: [16]ERL_NIF_TERM,
-	vals_buf: [16]ERL_NIF_TERM,
-}
+MAX_WRITE_DEPTH :: 64
 
-extract_map_kvs :: proc(env: ErlNifEnv, map_term: ERL_NIF_TERM, sb: ^KV_Stack_Buf) -> (keys: []ERL_NIF_TERM, vals: []ERL_NIF_TERM, ok: bool) {
-	sz: c.size_t = 0
-	if nif_get_map_size(env, map_term, &sz) == 0 {
-		return nil, nil, false
-	}
-	if sz == 0 {
-		return nil, nil, true
-	}
-	n := int(sz)
-	if n <= len(sb.keys_buf) {
-		keys = sb.keys_buf[:n]
-		vals = sb.vals_buf[:n]
-	} else {
-		keys = make([]ERL_NIF_TERM, n, context.temp_allocator)
-		vals = make([]ERL_NIF_TERM, n, context.temp_allocator)
-	}
-	cnt: c.size_t = 0
-	if nif_map_to_kv_arrays(env, map_term, raw_data(keys), raw_data(vals), sz, &cnt) == 0 {
-		return nil, nil, false
-	}
-	return keys[:int(cnt)], vals[:int(cnt)], true
-}
-
-validate_merge_collection_data :: proc(env: ErlNifEnv, kind_str: string, data_term: ERL_NIF_TERM) -> bool {
-	switch kind_str {
-	case "hash_map", "counted_hash_map", "sorted_map":
-		st: ERL_NIF_TERM
-		if nif_is_map(env, data_term) != 0 && nif_get_map_value(env, data_term, ATOM_STRUCT, &st) == 0 {
-			sb: KV_Stack_Buf = ---
-			keys, vals, ok := extract_map_kvs(env, data_term, &sb)
-			if !ok {
-				return false
-			}
-			for i in 0 ..< len(keys) {
-				if _, ok_k := term_to_key_string(env, keys[i]); !ok_k {
-					return false
-				}
-				if !validate_merge_map_term(env, vals[i], false) {
-					return false
-				}
-			}
-			return true
-		}
-		if nif_is_list(env, data_term) != 0 {
-			head: ERL_NIF_TERM
-			tail := data_term
-			for nif_is_empty_list(env, tail) == 0 {
-				if nif_get_list_cell(env, tail, &head, &tail) == 0 {
-					return false
-				}
-				arity: c.int = 0
-				elems: [^]ERL_NIF_TERM = nil
-				if nif_get_tuple(env, head, &arity, &elems) == 0 || arity != 2 {
-					return false
-				}
-				if _, ok_k := term_to_key_string(env, elems[0]); !ok_k {
-					return false
-				}
-				if !validate_merge_map_term(env, elems[1], false) {
-					return false
-				}
-			}
-			return true
-		}
-		return false
-	case "array_list", "linked_array_list":
-		return nif_is_list(env, data_term) != 0 && validate_merge_map_term(env, data_term, false)
-	case "hash_set", "counted_hash_set", "sorted_set":
-		return validate_set_elements_term(env, data_term)
-	}
-	return false
-}
-
-validate_merge_map_term :: proc(env: ErlNifEnv, term: ERL_NIF_TERM, is_root: bool = true) -> bool {
-	if !is_root {
-		if _, ok := decode_writeable_value(env, term); ok {
-			return true
-		}
-		if nif_is_tuple(env, term) != 0 {
-			arity: c.int = 0
-			elems: [^]ERL_NIF_TERM = nil
-			if nif_get_tuple(env, term, &arity, &elems) == 0 {
-				return false
-			}
-			if arity == 2 && elems[0] == ATOM_XITDB_SET {
-				return validate_set_elements_term(env, elems[1])
-			}
-			if arity == 3 && elems[0] == ATOM_XITDB_COL {
-				kind_str, ok_k := term_to_kind_string(env, elems[1])
-				if !ok_k || !is_supported_col_kind(kind_str) {
-					return false
-				}
-				return validate_collection_data_term(env, kind_str, elems[2])
-			}
-			return false
-		}
-		if nif_is_list(env, term) != 0 {
-			head: ERL_NIF_TERM
-			tail := term
-			for nif_is_empty_list(env, tail) == 0 {
-				if nif_get_list_cell(env, tail, &head, &tail) == 0 {
-					return false
-				}
-				if !validate_merge_map_term(env, head, false) {
-					return false
-				}
-			}
-			return true
-		}
-	}
-
-	if nif_is_map(env, term) == 0 {
-		return false
-	}
-	struct_term: ERL_NIF_TERM
-	if nif_get_map_value(env, term, ATOM_STRUCT, &struct_term) != 0 {
-		if is_root {
-			return false
-		}
-		if struct_term == ATOM_XITDB_COLLECTION_MOD {
-			kind_term, data_term: ERL_NIF_TERM
-			if nif_get_map_value(env, term, ATOM_KIND, &kind_term) == 0 ||
-			   nif_get_map_value(env, term, ATOM_DATA, &data_term) == 0 {
-				return false
-			}
-			kind_str, ok_k := term_to_kind_string(env, kind_term)
-			if !ok_k || !is_supported_col_kind(kind_str) {
-				return false
-			}
-			return validate_merge_collection_data(env, kind_str, data_term)
-		}
-		if struct_term == ATOM_MAPSET_MOD {
-			ms_map: ERL_NIF_TERM
-			if nif_get_map_value(env, term, ATOM_MAP, &ms_map) == 0 || nif_is_map(env, ms_map) == 0 {
-				return false
-			}
-			sb: KV_Stack_Buf = ---
-			keys, _, ok := extract_map_kvs(env, ms_map, &sb)
-			if !ok {
-				return false
-			}
-			for k in keys {
-				if _, ok_s := term_to_key_string(env, k); !ok_s {
-					return false
-				}
-			}
-			return true
-		}
-		return false
-	}
-
-	sb: KV_Stack_Buf = ---
-	keys, vals, ok := extract_map_kvs(env, term, &sb)
-	if !ok {
-		return false
-	}
-	for i in 0 ..< len(keys) {
-		if _, ok_k := term_to_key_string(env, keys[i]); !ok_k {
-			return false
-		}
-		if !validate_merge_map_term(env, vals[i], false) {
-			return false
-		}
-	}
-	return true
-}
-
-is_pure_removal_term :: proc(env: ErlNifEnv, term: ERL_NIF_TERM) -> bool {
+is_pure_removal_term :: proc(env: ErlNifEnv, term: ERL_NIF_TERM, validation_err: ^string, depth: int = 0) -> (bool, xitdb.Error) {
 	if term == ATOM_NIL {
-		return true
+		return true, nil
+	}
+	if depth >= MAX_WRITE_DEPTH {
+		return false, fail_validation(validation_err, "invalid_put_op")
 	}
 	if nif_is_map(env, term) == 0 {
-		return false
+		return false, nil
 	}
 	struct_term: ERL_NIF_TERM
 	if nif_get_map_value(env, term, ATOM_STRUCT, &struct_term) != 0 {
@@ -3301,61 +3091,89 @@ is_pure_removal_term :: proc(env: ErlNifEnv, term: ERL_NIF_TERM) -> bool {
 			kind_term, data_term: ERL_NIF_TERM
 			if nif_get_map_value(env, term, ATOM_KIND, &kind_term) == 0 ||
 			   nif_get_map_value(env, term, ATOM_DATA, &data_term) == 0 {
-				return false
+				return false, nil
 			}
 			kind_str, ok_k := term_to_kind_string(env, kind_term)
 			if !ok_k || (kind_str != "hash_map" && kind_str != "counted_hash_map" && kind_str != "sorted_map") {
-				return false
+				return false, nil
 			}
 			st2: ERL_NIF_TERM
 			if nif_is_map(env, data_term) != 0 && nif_get_map_value(env, data_term, ATOM_STRUCT, &st2) == 0 {
-				sb: KV_Stack_Buf = ---
-				_, vals, ok := extract_map_kvs(env, data_term, &sb)
-				if !ok || len(vals) == 0 {
-					return false
+				it: Nif_Map_Iter = ---
+				if nif_map_iter_create(env, data_term, &it) == 0 {
+					return false, nil
 				}
-				for v in vals {
-					if !is_pure_removal_term(env, v) {
-						return false
+				defer nif_map_iter_destroy(env, &it)
+				k, v: ERL_NIF_TERM
+				cnt := 0
+				for nif_map_iter_get_and_next(env, &it, &k, &v) != 0 {
+					cnt += 1
+					if _, ok_k2 := term_to_key_string(env, k); !ok_k2 {
+						return false, fail_validation(validation_err, "invalid_put_op")
+					}
+					rem, rem_err := is_pure_removal_term(env, v, validation_err, depth + 1)
+					if rem_err != nil {
+						return false, rem_err
+					}
+					if !rem {
+						return false, nil
 					}
 				}
-				return true
+				return cnt > 0, nil
 			}
 			if nif_is_list(env, data_term) != 0 {
 				if nif_is_empty_list(env, data_term) != 0 {
-					return false
+					return false, nil
 				}
 				head: ERL_NIF_TERM
 				tail := data_term
 				for nif_is_empty_list(env, tail) == 0 {
 					if nif_get_list_cell(env, tail, &head, &tail) == 0 {
-						return false
+						return false, fail_validation(validation_err, "invalid_put_op")
 					}
 					arity: c.int = 0
 					elems: [^]ERL_NIF_TERM = nil
 					if nif_get_tuple(env, head, &arity, &elems) == 0 || arity != 2 {
-						return false
+						return false, nil
 					}
-					if !is_pure_removal_term(env, elems[1]) {
-						return false
+					if _, ok_k2 := term_to_key_string(env, elems[0]); !ok_k2 {
+						return false, fail_validation(validation_err, "invalid_put_op")
+					}
+					rem, rem_err := is_pure_removal_term(env, elems[1], validation_err, depth + 1)
+					if rem_err != nil {
+						return false, rem_err
+					}
+					if !rem {
+						return false, nil
 					}
 				}
-				return true
+				return true, nil
 			}
 		}
-		return false
+		return false, nil
 	}
-	sb: KV_Stack_Buf = ---
-	_, vals, ok := extract_map_kvs(env, term, &sb)
-	if !ok || len(vals) == 0 {
-		return false
+
+	it: Nif_Map_Iter = ---
+	if nif_map_iter_create(env, term, &it) == 0 {
+		return false, nil
 	}
-	for v in vals {
-		if !is_pure_removal_term(env, v) {
-			return false
+	defer nif_map_iter_destroy(env, &it)
+	k, v: ERL_NIF_TERM
+	cnt := 0
+	for nif_map_iter_get_and_next(env, &it, &k, &v) != 0 {
+		cnt += 1
+		if _, ok_k := term_to_key_string(env, k); !ok_k {
+			return false, fail_validation(validation_err, "invalid_put_op")
+		}
+		rem, rem_err := is_pure_removal_term(env, v, validation_err, depth + 1)
+		if rem_err != nil {
+			return false, rem_err
+		}
+		if !rem {
+			return false, nil
 		}
 	}
-	return true
+	return cnt > 0, nil
 }
 
 Pending_Index_Op :: struct {
@@ -3373,6 +3191,7 @@ Merge_State :: struct {
 	has_indexes:      bool,
 	adapt_containers: bool,
 	pending_idx:      [dynamic]Pending_Index_Op,
+	validation_err:   ^string,
 }
 
 Merge_Map_Ctx :: struct {
@@ -3380,6 +3199,7 @@ Merge_Map_Ctx :: struct {
 	map_term:         ERL_NIF_TERM,
 	tx:               ^xitdb.Tx,
 	adapt_containers: bool,
+	validation_err:   ^string,
 }
 
 read_cur_string_if_bytes :: proc(cur: xitdb.Read_Cursor) -> (s: string, ok: bool, err: xitdb.Error) {
@@ -3523,7 +3343,7 @@ merge_kv_entry_hm :: proc(
 ) -> xitdb.Error {
 	k_str, ok_k := term_to_key_string(ms.env, key_term)
 	if !ok_k {
-		return .Unexpected_Tag
+		return fail_validation(ms.validation_err, "invalid_put_op")
 	}
 
 	if val_term == ATOM_NIL {
@@ -3576,10 +3396,13 @@ merge_kv_entry_hm :: proc(
 		return xitdb.hash_map_put(hm, k_str, wdata)
 	}
 
-	if !reset && is_pure_removal_term(ms.env, val_term) {
+	if !reset && nif_can_be_pure_removal(ms.env, val_term, ATOM_NIL, ATOM_STRUCT) != 0 {
 		exists := hm_has_key(hm, k_str) or_return
 		if !exists {
-			return nil
+			is_rem := is_pure_removal_term(ms.env, val_term, ms.validation_err, depth + 1) or_return
+			if is_rem {
+				return nil
+			}
 		}
 	}
 
@@ -3619,7 +3442,7 @@ merge_kv_entry_sm :: proc(
 ) -> xitdb.Error {
 	k_str, ok_k := term_to_key_string(ms.env, key_term)
 	if !ok_k {
-		return .Unexpected_Tag
+		return fail_validation(ms.validation_err, "invalid_put_op")
 	}
 
 	if val_term == ATOM_NIL {
@@ -3672,10 +3495,13 @@ merge_kv_entry_sm :: proc(
 		return xitdb.sorted_map_put(sm, k_str, wdata)
 	}
 
-	if !reset && is_pure_removal_term(ms.env, val_term) {
+	if !reset && nif_can_be_pure_removal(ms.env, val_term, ATOM_NIL, ATOM_STRUCT) != 0 {
 		exists := sm_has_key(sm, k_str) or_return
 		if !exists {
-			return nil
+			is_rem := is_pure_removal_term(ms.env, val_term, ms.validation_err, depth + 1) or_return
+			if is_rem {
+				return nil
+			}
 		}
 	}
 
@@ -3712,13 +3538,14 @@ merge_map_entries_hm :: proc(
 	src_key: string,
 	rec_key: string,
 ) -> xitdb.Error {
-	sb: KV_Stack_Buf = ---
-	keys, vals, ok := extract_map_kvs(ms.env, map_term, &sb)
-	if !ok {
-		return .Unexpected_Tag
+	it: Nif_Map_Iter = ---
+	if nif_map_iter_create(ms.env, map_term, &it) == 0 {
+		return fail_validation(ms.validation_err, "invalid_put_op")
 	}
-	for i in 0 ..< len(keys) {
-		merge_kv_entry_hm(ms, hm, keys[i], vals[i], reset, depth, src_key, rec_key) or_return
+	defer nif_map_iter_destroy(ms.env, &it)
+	k, v: ERL_NIF_TERM
+	for nif_map_iter_get_and_next(ms.env, &it, &k, &v) != 0 {
+		merge_kv_entry_hm(ms, hm, k, v, reset, depth, src_key, rec_key) or_return
 	}
 	return nil
 }
@@ -3732,13 +3559,14 @@ merge_map_entries_sm :: proc(
 	src_key: string,
 	rec_key: string,
 ) -> xitdb.Error {
-	sb: KV_Stack_Buf = ---
-	keys, vals, ok := extract_map_kvs(ms.env, map_term, &sb)
-	if !ok {
-		return .Unexpected_Tag
+	it: Nif_Map_Iter = ---
+	if nif_map_iter_create(ms.env, map_term, &it) == 0 {
+		return fail_validation(ms.validation_err, "invalid_put_op")
 	}
-	for i in 0 ..< len(keys) {
-		merge_kv_entry_sm(ms, sm, keys[i], vals[i], reset, depth, src_key, rec_key) or_return
+	defer nif_map_iter_destroy(ms.env, &it)
+	k, v: ERL_NIF_TERM
+	for nif_map_iter_get_and_next(ms.env, &it, &k, &v) != 0 {
+		merge_kv_entry_sm(ms, sm, k, v, reset, depth, src_key, rec_key) or_return
 	}
 	return nil
 }
@@ -3753,8 +3581,15 @@ merge_kv_collection_into_cursor :: proc(
 	src_key: string,
 	rec_key: string,
 ) -> xitdb.Error {
+	if depth >= MAX_WRITE_DEPTH {
+		return fail_validation(ms.validation_err, "invalid_put_op")
+	}
 	st: ERL_NIF_TERM
 	is_map_data := nif_is_map(ms.env, data_term) != 0 && nif_get_map_value(ms.env, data_term, ATOM_STRUCT, &st) == 0
+	is_list_data := nif_is_list(ms.env, data_term) != 0
+	if !is_map_data && !is_list_data {
+		return fail_validation(ms.validation_err, "invalid_put_op")
+	}
 
 	if reset {
 		xitdb.cursor_write(cur, xitdb.Slot{}) or_return
@@ -3776,12 +3611,12 @@ merge_kv_collection_into_cursor :: proc(
 		tail := data_term
 		for nif_is_empty_list(ms.env, tail) == 0 {
 			if nif_get_list_cell(ms.env, tail, &head, &tail) == 0 {
-				return .Unexpected_Tag
+				return fail_validation(ms.validation_err, "invalid_put_op")
 			}
 			arity: c.int = 0
 			elems: [^]ERL_NIF_TERM = nil
 			if nif_get_tuple(ms.env, head, &arity, &elems) == 0 || arity != 2 {
-				return .Unexpected_Tag
+				return fail_validation(ms.validation_err, "invalid_put_op")
 			}
 			merge_kv_entry_hm(ms, &hm, elems[0], elems[1], false, depth, src_key, rec_key) or_return
 		}
@@ -3796,18 +3631,18 @@ merge_kv_collection_into_cursor :: proc(
 		tail := data_term
 		for nif_is_empty_list(ms.env, tail) == 0 {
 			if nif_get_list_cell(ms.env, tail, &head, &tail) == 0 {
-				return .Unexpected_Tag
+				return fail_validation(ms.validation_err, "invalid_put_op")
 			}
 			arity: c.int = 0
 			elems: [^]ERL_NIF_TERM = nil
 			if nif_get_tuple(ms.env, head, &arity, &elems) == 0 || arity != 2 {
-				return .Unexpected_Tag
+				return fail_validation(ms.validation_err, "invalid_put_op")
 			}
 			merge_kv_entry_sm(ms, &sm, elems[0], elems[1], false, depth, src_key, rec_key) or_return
 		}
 		return nil
 	}
-	return .Unexpected_Tag
+	return fail_validation(ms.validation_err, "invalid_put_op")
 }
 
 merge_list_into_cursor :: proc(
@@ -3819,6 +3654,12 @@ merge_list_into_cursor :: proc(
 	src_key: string,
 	rec_key: string,
 ) -> xitdb.Error {
+	if depth >= MAX_WRITE_DEPTH {
+		return fail_validation(ms.validation_err, "invalid_put_op")
+	}
+	if nif_is_list(ms.env, list_term) == 0 {
+		return fail_validation(ms.validation_err, "invalid_put_op")
+	}
 	xitdb.cursor_write(cur, xitdb.Slot{}) or_return
 	if kind_str == "linked_array_list" {
 		ll := xitdb.write_linked_array_list_init(cur^) or_return
@@ -3826,7 +3667,7 @@ merge_list_into_cursor :: proc(
 		tail := list_term
 		for nif_is_empty_list(ms.env, tail) == 0 {
 			if nif_get_list_cell(ms.env, tail, &head, &tail) == 0 {
-				return .Unexpected_Tag
+				return fail_validation(ms.validation_err, "invalid_put_op")
 			}
 			if wdata, ok_s := decode_writeable_value(ms.env, head); ok_s {
 				xitdb.linked_array_list_append(&ll, wdata) or_return
@@ -3843,7 +3684,7 @@ merge_list_into_cursor :: proc(
 	tail := list_term
 	for nif_is_empty_list(ms.env, tail) == 0 {
 		if nif_get_list_cell(ms.env, tail, &head, &tail) == 0 {
-			return .Unexpected_Tag
+			return fail_validation(ms.validation_err, "invalid_put_op")
 		}
 		if wdata, ok_s := decode_writeable_value(ms.env, head); ok_s {
 			xitdb.array_list_append(&al, wdata) or_return
@@ -3867,13 +3708,15 @@ merge_node_into_cursor :: proc(
 	if wdata, ok_s := decode_writeable_value(ms.env, term); ok_s {
 		return xitdb.cursor_write(cur, wdata)
 	}
+	if depth >= MAX_WRITE_DEPTH {
+		return fail_validation(ms.validation_err, "invalid_put_op")
+	}
 	if nif_is_tuple(ms.env, term) != 0 {
-		xitdb.cursor_write(cur, xitdb.Slot{}) or_return
-		w_ok, w_err := write_term_to_cursor(ms.env, cur, term)
-		if w_err != nil {
-			return w_err
+		if !is_structured_write_candidate(ms.env, term) {
+			return fail_validation(ms.validation_err, "invalid_put_op")
 		}
-		return nil if w_ok else .Unexpected_Tag
+		xitdb.cursor_write(cur, xitdb.Slot{}) or_return
+		return write_term_to_cursor(ms.env, cur, term, ms.validation_err, "invalid_put_op", depth)
 	}
 	if nif_is_list(ms.env, term) != 0 {
 		return merge_list_into_cursor(ms, cur, "array_list", term, depth, src_key, rec_key)
@@ -3885,11 +3728,11 @@ merge_node_into_cursor :: proc(
 				kind_term, data_term: ERL_NIF_TERM
 				if nif_get_map_value(ms.env, term, ATOM_KIND, &kind_term) == 0 ||
 				   nif_get_map_value(ms.env, term, ATOM_DATA, &data_term) == 0 {
-					return .Unexpected_Tag
+					return fail_validation(ms.validation_err, "invalid_put_op")
 				}
 				kind_str, ok_k := term_to_kind_string(ms.env, kind_term)
 				if !ok_k {
-					return .Unexpected_Tag
+					return fail_validation(ms.validation_err, "invalid_put_op")
 				}
 				switch kind_str {
 				case "hash_map", "counted_hash_map", "sorted_map":
@@ -3897,31 +3740,29 @@ merge_node_into_cursor :: proc(
 				case "array_list", "linked_array_list":
 					return merge_list_into_cursor(ms, cur, kind_str, data_term, depth, src_key, rec_key)
 				case "hash_set", "counted_hash_set", "sorted_set":
-					xitdb.cursor_write(cur, xitdb.Slot{}) or_return
-					w_ok, w_err := write_collection_term_to_cursor(ms.env, cur, kind_str, data_term)
-					if w_err != nil {
-						return w_err
+					if !is_valid_set_container(ms.env, data_term) {
+						return fail_validation(ms.validation_err, "invalid_put_op")
 					}
-					return nil if w_ok else .Unexpected_Tag
+					xitdb.cursor_write(cur, xitdb.Slot{}) or_return
+					return write_collection_term_to_cursor(ms.env, cur, kind_str, data_term, ms.validation_err, "invalid_put_op", depth)
 				}
-				return .Unexpected_Tag
+				return fail_validation(ms.validation_err, "invalid_put_op")
 			}
 			if struct_term == ATOM_MAPSET_MOD {
-				xitdb.cursor_write(cur, xitdb.Slot{}) or_return
-				w_ok, w_err := write_collection_term_to_cursor(ms.env, cur, "counted_hash_set", term)
-				if w_err != nil {
-					return w_err
+				if !is_valid_set_container(ms.env, term) {
+					return fail_validation(ms.validation_err, "invalid_put_op")
 				}
-				return nil if w_ok else .Unexpected_Tag
+				xitdb.cursor_write(cur, xitdb.Slot{}) or_return
+				return write_collection_term_to_cursor(ms.env, cur, "counted_hash_set", term, ms.validation_err, "invalid_put_op", depth)
 			}
-			return .Unexpected_Tag
+			return fail_validation(ms.validation_err, "invalid_put_op")
 		}
 
-		sz: c.size_t = 0
-		if nif_get_map_size(ms.env, term, &sz) == 0 {
-			return .Unexpected_Tag
+		map_sz: c.size_t = 0
+		if nif_get_map_size(ms.env, term, &map_sz) == 0 {
+			return fail_validation(ms.validation_err, "invalid_put_op")
 		}
-		eff_reset := reset || sz == 0
+		eff_reset := reset || map_sz == 0
 		if eff_reset {
 			xitdb.cursor_write(cur, xitdb.Slot{}) or_return
 		}
@@ -3937,22 +3778,30 @@ merge_node_into_cursor :: proc(
 			}
 		}
 		hm := xitdb.write_hash_map_init(cur^) or_return
-		if sz == 0 {
+		if map_sz == 0 {
 			return nil
 		}
-		return merge_map_entries_hm(ms, &hm, term, eff_reset, depth, src_key, rec_key)
+		it: Nif_Map_Iter = ---
+		if nif_map_iter_create(ms.env, term, &it) == 0 {
+			return fail_validation(ms.validation_err, "invalid_put_op")
+		}
+		defer nif_map_iter_destroy(ms.env, &it)
+		k, v: ERL_NIF_TERM
+		for nif_map_iter_get_and_next(ms.env, &it, &k, &v) != 0 {
+			merge_kv_entry_hm(ms, &hm, k, v, eff_reset, depth, src_key, rec_key) or_return
+		}
+		return nil
 	}
-	return .Unexpected_Tag
+	return fail_validation(ms.validation_err, "invalid_put_op")
 }
 
 merge_map_callback :: proc(moment_cur: ^xitdb.Write_Cursor, user_data: rawptr) -> xitdb.Error {
 	mc := (^Merge_Map_Ctx)(user_data)
-	sb: KV_Stack_Buf = ---
-	keys, vals, ok := extract_map_kvs(mc.env, mc.map_term, &sb)
-	if !ok {
-		return .Unexpected_Tag
+	map_sz: c.size_t = 0
+	if nif_get_map_size(mc.env, mc.map_term, &map_sz) == 0 {
+		return fail_validation(mc.validation_err, "invalid_put_op")
 	}
-	if len(keys) == 0 {
+	if map_sz == 0 {
 		return nil
 	}
 	ms := Merge_State{
@@ -3960,13 +3809,20 @@ merge_map_callback :: proc(moment_cur: ^xitdb.Write_Cursor, user_data: rawptr) -
 		tx               = mc.tx,
 		has_indexes      = mc.tx != nil && len(mc.tx.index_rules) > 0,
 		adapt_containers = mc.adapt_containers,
+		validation_err   = mc.validation_err,
 	}
 	if ms.has_indexes {
 		ms.pending_idx = make([dynamic]Pending_Index_Op, 0, 8, context.temp_allocator)
 	}
 	moment_hm := xitdb.write_hash_map_init(moment_cur^) or_return
-	for i in 0 ..< len(keys) {
-		merge_kv_entry_hm(&ms, &moment_hm, keys[i], vals[i], false, 0, "", "") or_return
+	it: Nif_Map_Iter = ---
+	if nif_map_iter_create(mc.env, mc.map_term, &it) == 0 {
+		return fail_validation(mc.validation_err, "invalid_put_op")
+	}
+	defer nif_map_iter_destroy(mc.env, &it)
+	k, v: ERL_NIF_TERM
+	for nif_map_iter_get_and_next(mc.env, &it, &k, &v) != 0 {
+		merge_kv_entry_hm(&ms, &moment_hm, k, v, false, 0, "", "") or_return
 		if ms.has_indexes && len(ms.pending_idx) > 0 {
 			flush_pending_indexes(&ms, &moment_hm) or_return
 		}
@@ -4182,13 +4038,14 @@ record_term_pending_tags :: proc(
 		if len(prefix) > 0 {
 			pending_tags[prefix] = .Hash_Map
 		}
-		sb: KV_Stack_Buf = ---
-		keys, vals, ok := extract_map_kvs(env, term, &sb)
-		if ok {
-			for i in 0 ..< len(keys) {
-				if k_str, ok_k := term_to_key_string(env, keys[i]); ok_k {
+		it: Nif_Map_Iter = ---
+		if nif_map_iter_create(env, term, &it) != 0 {
+			defer nif_map_iter_destroy(env, &it)
+			k, v: ERL_NIF_TERM
+			for nif_map_iter_get_and_next(env, &it, &k, &v) != 0 {
+				if k_str, ok_k := term_to_key_string(env, k); ok_k {
 					child_key := fmt.tprintf("%s.%d:%s", prefix, len(k_str), k_str)
-					record_term_pending_tags(env, child_key, vals[i], pending_tags, depth + 1)
+					record_term_pending_tags(env, child_key, v, pending_tags, depth + 1)
 				}
 			}
 		}
@@ -4203,19 +4060,20 @@ record_nested_collection_tags :: proc(
 	pending_tags: ^map[string]xitdb.Tag,
 	depth: int,
 ) {
-	if depth > 64 {
+	if depth >= MAX_WRITE_DEPTH {
 		return
 	}
 	#partial switch tag {
 	case .Hash_Map, .Counted_Hash_Map, .Sorted_Map:
 		if nif_is_map(env, data_term) != 0 {
-			sb: KV_Stack_Buf = ---
-			keys, vals, ok := extract_map_kvs(env, data_term, &sb)
-			if ok {
-				for i in 0 ..< len(keys) {
-					if k_str, ok_k := term_to_key_string(env, keys[i]); ok_k {
+			it: Nif_Map_Iter = ---
+			if nif_map_iter_create(env, data_term, &it) != 0 {
+				defer nif_map_iter_destroy(env, &it)
+				k, v: ERL_NIF_TERM
+				for nif_map_iter_get_and_next(env, &it, &k, &v) != 0 {
+					if k_str, ok_k := term_to_key_string(env, k); ok_k {
 						child_key := fmt.tprintf("%s.%d:%s", prefix, len(k_str), k_str)
-						record_term_pending_tags(env, child_key, vals[i], pending_tags, depth + 1)
+						record_term_pending_tags(env, child_key, v, pending_tags, depth + 1)
 					}
 				}
 			}
@@ -4259,21 +4117,21 @@ record_merge_map_pending_tags :: proc(
 	fork_aliases: ^map[string][]xitdb.Path_Step,
 	depth: int = 0,
 ) {
-	if depth > 64 {
+	if depth >= MAX_WRITE_DEPTH {
 		return
 	}
-	sb: KV_Stack_Buf = ---
-	keys, vals, ok := extract_map_kvs(env, map_term, &sb)
-	if !ok {
+	it: Nif_Map_Iter = ---
+	if nif_map_iter_create(env, map_term, &it) == 0 {
 		return
 	}
-	for i in 0 ..< len(keys) {
-		k_str, ok_k := term_to_key_string(env, keys[i])
+	defer nif_map_iter_destroy(env, &it)
+	k, val: ERL_NIF_TERM
+	for nif_map_iter_get_and_next(env, &it, &k, &val) != 0 {
+		k_str, ok_k := term_to_key_string(env, k)
 		if !ok_k {
 			continue
 		}
 		append(prefix_steps, xitdb.hm(k_str))
-		val := vals[i]
 		p_key := pending_path_key(prefix_steps[:])
 
 		is_plain_nonempty_map := false
@@ -4604,6 +4462,485 @@ rollback_failed_tx :: proc(
 	return nil
 }
 
+validate_set_elements_cold :: proc(env: ErlNifEnv, data_term: ERL_NIF_TERM) -> bool {
+	if nif_is_map(env, data_term) != 0 {
+		struct_term, ms_map, ms_st: ERL_NIF_TERM
+		if nif_get_map_value(env, data_term, ATOM_STRUCT, &struct_term) == 0 || struct_term != ATOM_MAPSET_MOD {
+			return false
+		}
+		if nif_get_map_value(env, data_term, ATOM_MAP, &ms_map) == 0 ||
+		   nif_is_map(env, ms_map) == 0 ||
+		   nif_get_map_value(env, ms_map, ATOM_STRUCT, &ms_st) != 0 {
+			return false
+		}
+		it: Nif_Map_Iter = ---
+		if nif_map_iter_create(env, ms_map, &it) == 0 {
+			return false
+		}
+		defer nif_map_iter_destroy(env, &it)
+		k, v: ERL_NIF_TERM
+		for nif_map_iter_get_and_next(env, &it, &k, &v) != 0 {
+			if _, ok_k := term_to_key_string(env, k); !ok_k {
+				return false
+			}
+		}
+		return true
+	}
+	if nif_is_list(env, data_term) == 0 {
+		return false
+	}
+	head: ERL_NIF_TERM
+	tail := data_term
+	for nif_is_empty_list(env, tail) == 0 {
+		if nif_get_list_cell(env, tail, &head, &tail) == 0 {
+			return false
+		}
+		if _, ok_k := term_to_key_string(env, head); !ok_k {
+			return false
+		}
+	}
+	return true
+}
+
+validate_col_data_cold :: proc(env: ErlNifEnv, kind_str: string, data_term: ERL_NIF_TERM, depth: int) -> bool {
+	if depth >= MAX_WRITE_DEPTH {
+		return false
+	}
+	switch kind_str {
+	case "hash_map", "counted_hash_map", "sorted_map":
+		if nif_is_map(env, data_term) != 0 {
+			st: ERL_NIF_TERM
+			if nif_get_map_value(env, data_term, ATOM_STRUCT, &st) != 0 {
+				return false
+			}
+			it: Nif_Map_Iter = ---
+			if nif_map_iter_create(env, data_term, &it) == 0 {
+				return false
+			}
+			defer nif_map_iter_destroy(env, &it)
+			k, v: ERL_NIF_TERM
+			for nif_map_iter_get_and_next(env, &it, &k, &v) != 0 {
+				if _, ok_k := term_to_key_string(env, k); !ok_k {
+					return false
+				}
+				if !validate_write_term_cold(env, v, depth + 1) {
+					return false
+				}
+			}
+			return true
+		}
+		if nif_is_list(env, data_term) == 0 {
+			return false
+		}
+		head: ERL_NIF_TERM
+		tail := data_term
+		for nif_is_empty_list(env, tail) == 0 {
+			if nif_get_list_cell(env, tail, &head, &tail) == 0 {
+				return false
+			}
+			arity: c.int = 0
+			elems: [^]ERL_NIF_TERM = nil
+			if nif_get_tuple(env, head, &arity, &elems) == 0 || arity != 2 {
+				return false
+			}
+			if _, ok_k := term_to_key_string(env, elems[0]); !ok_k {
+				return false
+			}
+			if !validate_write_term_cold(env, elems[1], depth + 1) {
+				return false
+			}
+		}
+		return true
+
+	case "array_list", "linked_array_list":
+		if nif_is_list(env, data_term) == 0 {
+			return false
+		}
+		head: ERL_NIF_TERM
+		tail := data_term
+		for nif_is_empty_list(env, tail) == 0 {
+			if nif_get_list_cell(env, tail, &head, &tail) == 0 {
+				return false
+			}
+			if !validate_write_term_cold(env, head, depth + 1) {
+				return false
+			}
+		}
+		return true
+
+	case "hash_set", "counted_hash_set", "sorted_set":
+		return validate_set_elements_cold(env, data_term)
+	}
+	return false
+}
+
+validate_write_term_cold :: proc(env: ErlNifEnv, term: ERL_NIF_TERM, depth: int = 0) -> bool {
+	if _, ok := decode_writeable_value(env, term); ok {
+		return true
+	}
+	if depth >= MAX_WRITE_DEPTH {
+		return false
+	}
+	if nif_is_tuple(env, term) != 0 {
+		arity: c.int = 0
+		elems: [^]ERL_NIF_TERM = nil
+		if nif_get_tuple(env, term, &arity, &elems) == 0 {
+			return false
+		}
+		if arity == 2 && elems[0] == ATOM_XITDB_SET {
+			return validate_set_elements_cold(env, elems[1])
+		}
+		if arity == 3 && elems[0] == ATOM_XITDB_COL {
+			kind_str, ok_k := term_to_kind_string(env, elems[1])
+			if !ok_k || !is_supported_col_kind(kind_str) {
+				return false
+			}
+			return validate_col_data_cold(env, kind_str, elems[2], depth)
+		}
+		return false
+	}
+	if nif_is_list(env, term) != 0 {
+		return validate_col_data_cold(env, "array_list", term, depth)
+	}
+	if nif_is_map(env, term) != 0 {
+		struct_term: ERL_NIF_TERM
+		if nif_get_map_value(env, term, ATOM_STRUCT, &struct_term) != 0 {
+			if struct_term == ATOM_XITDB_COLLECTION_MOD {
+				kind_term, data_term: ERL_NIF_TERM
+				if nif_get_map_value(env, term, ATOM_KIND, &kind_term) == 0 ||
+				   nif_get_map_value(env, term, ATOM_DATA, &data_term) == 0 {
+					return false
+				}
+				kind_str, ok_k := term_to_kind_string(env, kind_term)
+				if !ok_k || !is_supported_col_kind(kind_str) {
+					return false
+				}
+				return validate_col_data_cold(env, kind_str, data_term, depth)
+			}
+			if struct_term == ATOM_MAPSET_MOD {
+				return validate_set_elements_cold(env, term)
+			}
+			return false
+		}
+		return validate_col_data_cold(env, "hash_map", term, depth)
+	}
+	return false
+}
+
+validate_deferred_tx_ops :: proc(tx: ^xitdb.Tx) -> string {
+	for &op in tx.ops {
+		if op.kind != .Callback || op.user_data == nil {
+			continue
+		}
+		if op.callback == structured_op_callback {
+			sc := (^Structured_Op_Ctx)(op.user_data)
+			if !validate_write_term_cold(sc.env, sc.term) {
+				return sc.err_reason
+			}
+		} else if op.callback == merge_map_callback {
+			mc := (^Merge_Map_Ctx)(op.user_data)
+			if !validate_write_term_cold(mc.env, mc.map_term) {
+				return "invalid_put_op"
+			}
+		}
+	}
+	return ""
+}
+
+parse_tx_ops :: proc(
+	env: ErlNifEnv,
+	ops_term: ERL_NIF_TERM,
+	tx: ^xitdb.Tx,
+	validation_err: ^string,
+	has_deferred: ^bool,
+) -> (err_reason: string, xerr: xitdb.Error) {
+	head: ERL_NIF_TERM
+	tail := ops_term
+	for nif_is_empty_list(env, tail) == 0 {
+		if nif_get_list_cell(env, tail, &head, &tail) == 0 {
+			return "invalid_ops_list", nil
+		}
+		arity: c.int = 0
+		elems: [^]ERL_NIF_TERM = nil
+		if nif_get_tuple(env, head, &arity, &elems) == 0 || arity < 1 {
+			return "invalid_op_tuple", nil
+		}
+
+		op_atom := elems[0]
+
+		switch op_atom {
+		case ATOM_PUT:
+			if arity != 3 {
+				return "invalid_put_op", nil
+			}
+			steps, s_err, ok_p := decode_steps_term(env, elems[1], tx.allocator)
+			if !ok_p {
+				return "invalid_put_op", nil
+			}
+			if s_err != "" {
+				return s_err, nil
+			}
+			if val, ok_v := decode_writeable_value(env, elems[2]); ok_v {
+				if len(steps) == 0 {
+					return "", .Invalid_Range
+				}
+				append(&tx.ops, xitdb.Tx_Op{kind = .Put, steps = steps, val = val})
+			} else if is_structured_write_candidate(env, elems[2]) {
+				if len(steps) == 0 {
+					if !validate_write_term_cold(env, elems[2]) {
+						return "invalid_put_op", nil
+					}
+					return "", .Invalid_Range
+				}
+				sc := new(Structured_Op_Ctx, tx.allocator)
+				sc^ = Structured_Op_Ctx{
+					kind = .Put,
+					steps = steps,
+					env = env,
+					term = elems[2],
+					validation_err = validation_err,
+					err_reason = "invalid_put_op",
+				}
+				xitdb.tx_with_cursor(tx, structured_op_callback, sc)
+				has_deferred^ = true
+			} else {
+				return "invalid_put_op", nil
+			}
+
+		case ATOM_APPEND:
+			if arity != 3 {
+				return "invalid_append_op", nil
+			}
+			steps, s_err, ok_p := decode_steps_term(env, elems[1], tx.allocator)
+			if !ok_p {
+				return "invalid_append_op", nil
+			}
+			if s_err != "" {
+				return s_err, nil
+			}
+			if len(steps) == 0 {
+				return "invalid_append_op", nil
+			}
+			if val, ok_v := decode_writeable_value(env, elems[2]); ok_v {
+				append(&tx.ops, xitdb.Tx_Op{kind = .Append, steps = steps, val = val})
+			} else if is_structured_write_candidate(env, elems[2]) {
+				sc := new(Structured_Op_Ctx, tx.allocator)
+				sc^ = Structured_Op_Ctx{
+					kind = .Append,
+					steps = steps,
+					env = env,
+					term = elems[2],
+					validation_err = validation_err,
+					err_reason = "invalid_append_op",
+				}
+				xitdb.tx_with_cursor(tx, structured_op_callback, sc)
+				has_deferred^ = true
+			} else {
+				return "invalid_append_op", nil
+			}
+
+		case ATOM_INSERT:
+			if arity != 4 {
+				return "invalid_insert_op", nil
+			}
+			idx_val: i64 = 0
+			ok_i := nif_get_int64(env, elems[2], &idx_val) != 0
+			steps, s_err, ok_p := decode_steps_term(env, elems[1], tx.allocator)
+			if !ok_p || !ok_i {
+				return "invalid_insert_op", nil
+			}
+			if s_err != "" {
+				return s_err, nil
+			}
+			if len(steps) == 0 {
+				return "invalid_insert_op", nil
+			}
+			if val, ok_v := decode_writeable_value(env, elems[3]); ok_v {
+				append(&tx.ops, xitdb.Tx_Op{kind = .Insert, steps = steps, offset = idx_val, val = val})
+			} else if is_structured_write_candidate(env, elems[3]) {
+				sc := new(Structured_Op_Ctx, tx.allocator)
+				sc^ = Structured_Op_Ctx{
+					kind = .Insert,
+					steps = steps,
+					index = idx_val,
+					env = env,
+					term = elems[3],
+					validation_err = validation_err,
+					err_reason = "invalid_insert_op",
+				}
+				xitdb.tx_with_cursor(tx, structured_op_callback, sc)
+				has_deferred^ = true
+			} else {
+				return "invalid_insert_op", nil
+			}
+
+		case ATOM_RM:
+			if arity != 2 {
+				return "invalid_rm_op", nil
+			}
+			steps, s_err, ok_p := decode_steps_term(env, elems[1], tx.allocator)
+			if !ok_p {
+				return "invalid_rm_op", nil
+			}
+			if s_err != "" {
+				return s_err, nil
+			}
+			append(&tx.ops, xitdb.Tx_Op{kind = .Remove, steps = steps})
+
+		case ATOM_RM_IF_EXISTS:
+			if arity != 2 {
+				return "invalid_rm_op", nil
+			}
+			steps, s_err, ok_p := decode_steps_term(env, elems[1], tx.allocator)
+			if !ok_p {
+				return "invalid_rm_op", nil
+			}
+			if s_err != "" {
+				return s_err, nil
+			}
+			rc := new(Rm_If_Exists_Ctx, tx.allocator)
+			rc^ = Rm_If_Exists_Ctx{steps = steps, tx = tx}
+			xitdb.tx_with_cursor(tx, rm_if_exists_callback, rc)
+
+		case ATOM_SLICE:
+			if arity != 4 {
+				return "invalid_slice_op", nil
+			}
+			offset_val: i64 = 0
+			size_val: i64 = 0
+			ok_o := nif_get_int64(env, elems[2], &offset_val) != 0
+			ok_s := nif_get_int64(env, elems[3], &size_val) != 0
+			steps, s_err, ok_p := decode_steps_term(env, elems[1], tx.allocator)
+			if !ok_p || !ok_o || !ok_s {
+				return "invalid_slice_op", nil
+			}
+			if offset_val < 0 || size_val < 0 {
+				return "", .Invalid_Range
+			}
+			if s_err != "" {
+				return s_err, nil
+			}
+			if len(steps) == 0 {
+				return "", .Invalid_Range
+			}
+			sc := new(Slice_Op_Ctx, tx.allocator)
+			sc^ = Slice_Op_Ctx{steps = steps, offset = offset_val, size = size_val}
+			xitdb.tx_with_cursor(tx, slice_op_callback, sc)
+
+		case ATOM_FORK:
+			if arity != 3 {
+				return "invalid_fork_op", nil
+			}
+			from_steps, f_err, ok_f := decode_steps_term(env, elems[1], tx.allocator)
+			to_steps, t_err, ok_t := decode_steps_term(env, elems[2], tx.allocator)
+			if !ok_f || !ok_t {
+				return "invalid_fork_op", nil
+			}
+			if f_err != "" {
+				return f_err, nil
+			}
+			if t_err != "" {
+				return t_err, nil
+			}
+			if len(from_steps) == 0 || len(to_steps) == 0 {
+				return "", .Invalid_Range
+			}
+			append(&tx.ops, xitdb.Tx_Op{kind = .Fork, from_steps = from_steps, steps = to_steps})
+			if nif_is_empty_list(env, tail) == 0 {
+				xitdb.tx_savepoint(tx)
+			}
+
+		case ATOM_INDEX_ON:
+			if arity != 4 {
+				return "invalid_index_on_op", nil
+			}
+			src_map, ok_1 := get_string_from_binary(env, elems[1])
+			field_key, ok_2 := get_string_from_binary(env, elems[2])
+			idx_map, ok_3 := get_string_from_binary(env, elems[3])
+			if !ok_1 || !ok_2 || !ok_3 {
+				return "invalid_index_on_op", nil
+			}
+			xitdb.tx_index_on(tx, src_map, field_key, idx_map)
+
+		case ATOM_INSTANT:
+			if arity != 2 {
+				return "invalid_instant_op", nil
+			}
+			inst_val: i64 = 0
+			if nif_get_int64(env, elems[1], &inst_val) == 0 {
+				return "invalid_instant_op", nil
+			}
+			xitdb.tx_instant(tx, inst_val)
+
+		case ATOM_META:
+			if arity != 3 {
+				return "invalid_meta_op", nil
+			}
+			key_str, ok_k := get_string_from_binary(env, elems[1])
+			if !ok_k {
+				return "invalid_meta_op", nil
+			}
+			if key_str == "tx_instant" {
+				inst_val: i64 = 0
+				if nif_get_int64(env, elems[2], &inst_val) == 0 {
+					return "invalid_meta_op", nil
+				}
+				xitdb.tx_instant(tx, inst_val)
+			} else {
+				val, ok_v := decode_writeable_value(env, elems[2])
+				if !ok_v {
+					return "invalid_meta_op", nil
+				}
+				xitdb.tx_meta(tx, key_str, val)
+			}
+
+		case ATOM_SAVEPOINT:
+			if arity != 1 {
+				return "invalid_savepoint_op", nil
+			}
+			xitdb.tx_savepoint(tx)
+
+		case ATOM_INIT_COL, ATOM_RESET_COL:
+			if arity != 3 {
+				return "invalid_init_col_op", nil
+			}
+			kind_str, ok_k := get_string_from_binary(env, elems[2])
+			steps, s_err, ok_p := decode_steps_term(env, elems[1], tx.allocator)
+			if !ok_p || !ok_k || !is_supported_col_kind(kind_str) {
+				return "invalid_init_col_op", nil
+			}
+			if s_err != "" {
+				return s_err, nil
+			}
+			ic := new(Init_Col_Ctx, tx.allocator)
+			ic.steps = steps
+			ic.kind = kind_str
+			ic.reset = (op_atom == ATOM_RESET_COL)
+			xitdb.tx_with_cursor(tx, init_col_callback, ic)
+
+		case ATOM_MERGE_MAP:
+			if arity != 2 {
+				return "invalid_merge_map_op", nil
+			}
+			st: ERL_NIF_TERM = 0
+			if nif_is_map(env, elems[1]) == 0 || nif_get_map_value(env, elems[1], ATOM_STRUCT, &st) != 0 {
+				return "invalid_put_op", nil
+			}
+			mc := new(Merge_Map_Ctx, tx.allocator)
+			mc.env = env
+			mc.map_term = elems[1]
+			mc.tx = tx
+			mc.validation_err = validation_err
+			xitdb.tx_with_cursor(tx, merge_map_callback, mc)
+			has_deferred^ = true
+
+		case:
+			return "unknown_tx_op", nil
+		}
+	}
+	return "", nil
+}
+
 @(export)
 odin_nif_transact :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {
 	context = runtime.default_context()
@@ -4642,258 +4979,19 @@ odin_nif_transact :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TER
 		xitdb.tx_doc(&tx, doc_str)
 	}
 
-	head: ERL_NIF_TERM
-	tail := argv[2]
-	for nif_is_empty_list(env, tail) == 0 {
-		if nif_get_list_cell(env, tail, &head, &tail) == 0 {
-			return make_err(env, "invalid_ops_list")
+	validation_err := ""
+	has_deferred := false
+	parse_reason, parse_xerr := parse_tx_ops(env, argv[2], &tx, &validation_err, &has_deferred)
+	if parse_reason != "" || parse_xerr != nil {
+		if has_deferred {
+			if deferred_err := validate_deferred_tx_ops(&tx); deferred_err != "" {
+				return make_err(env, deferred_err)
+			}
 		}
-		arity: c.int = 0
-		elems: [^]ERL_NIF_TERM = nil
-		if nif_get_tuple(env, head, &arity, &elems) == 0 || arity < 1 {
-			return make_err(env, "invalid_op_tuple")
+		if parse_reason != "" {
+			return make_err(env, parse_reason)
 		}
-
-		op_atom := elems[0]
-
-		switch op_atom {
-		case ATOM_PUT:
-			if arity != 3 {
-				return make_err(env, "invalid_put_op")
-			}
-			steps, s_err, ok_p := decode_steps_term(env, elems[1], tx.allocator)
-			if !ok_p {
-				return make_err(env, "invalid_put_op")
-			}
-			if s_err != "" {
-				return make_err(env, s_err)
-			}
-			if val, ok_v := decode_writeable_value(env, elems[2]); ok_v {
-				if len(steps) == 0 {
-					return make_xitdb_err(env, .Invalid_Range)
-				}
-				append(&tx.ops, xitdb.Tx_Op{kind = .Put, steps = steps, val = val})
-			} else if validate_write_term(env, elems[2]) {
-				if len(steps) == 0 {
-					return make_xitdb_err(env, .Invalid_Range)
-				}
-				sc := new(Structured_Op_Ctx, tx.allocator)
-				sc^ = Structured_Op_Ctx{kind = .Put, steps = steps, env = env, term = elems[2]}
-				xitdb.tx_with_cursor(&tx, structured_op_callback, sc)
-			} else {
-				return make_err(env, "invalid_put_op")
-			}
-
-		case ATOM_APPEND:
-			if arity != 3 {
-				return make_err(env, "invalid_append_op")
-			}
-			steps, s_err, ok_p := decode_steps_term(env, elems[1], tx.allocator)
-			if !ok_p {
-				return make_err(env, "invalid_append_op")
-			}
-			if s_err != "" {
-				return make_err(env, s_err)
-			}
-			if len(steps) == 0 {
-				return make_err(env, "invalid_append_op")
-			}
-			if val, ok_v := decode_writeable_value(env, elems[2]); ok_v {
-				append(&tx.ops, xitdb.Tx_Op{kind = .Append, steps = steps, val = val})
-			} else if validate_write_term(env, elems[2]) {
-				sc := new(Structured_Op_Ctx, tx.allocator)
-				sc^ = Structured_Op_Ctx{kind = .Append, steps = steps, env = env, term = elems[2]}
-				xitdb.tx_with_cursor(&tx, structured_op_callback, sc)
-			} else {
-				return make_err(env, "invalid_append_op")
-			}
-
-		case ATOM_INSERT:
-			if arity != 4 {
-				return make_err(env, "invalid_insert_op")
-			}
-			idx_val: i64 = 0
-			ok_i := nif_get_int64(env, elems[2], &idx_val) != 0
-			steps, s_err, ok_p := decode_steps_term(env, elems[1], tx.allocator)
-			if !ok_p || !ok_i {
-				return make_err(env, "invalid_insert_op")
-			}
-			if s_err != "" {
-				return make_err(env, s_err)
-			}
-			if len(steps) == 0 {
-				return make_err(env, "invalid_insert_op")
-			}
-			if val, ok_v := decode_writeable_value(env, elems[3]); ok_v {
-				append(&tx.ops, xitdb.Tx_Op{kind = .Insert, steps = steps, offset = idx_val, val = val})
-			} else if validate_write_term(env, elems[3]) {
-				sc := new(Structured_Op_Ctx, tx.allocator)
-				sc^ = Structured_Op_Ctx{kind = .Insert, steps = steps, index = idx_val, env = env, term = elems[3]}
-				xitdb.tx_with_cursor(&tx, structured_op_callback, sc)
-			} else {
-				return make_err(env, "invalid_insert_op")
-			}
-
-		case ATOM_RM:
-			if arity != 2 {
-				return make_err(env, "invalid_rm_op")
-			}
-			steps, s_err, ok_p := decode_steps_term(env, elems[1], tx.allocator)
-			if !ok_p {
-				return make_err(env, "invalid_rm_op")
-			}
-			if s_err != "" {
-				return make_err(env, s_err)
-			}
-			append(&tx.ops, xitdb.Tx_Op{kind = .Remove, steps = steps})
-
-		case ATOM_RM_IF_EXISTS:
-			if arity != 2 {
-				return make_err(env, "invalid_rm_op")
-			}
-			steps, s_err, ok_p := decode_steps_term(env, elems[1], tx.allocator)
-			if !ok_p {
-				return make_err(env, "invalid_rm_op")
-			}
-			if s_err != "" {
-				return make_err(env, s_err)
-			}
-			rc := new(Rm_If_Exists_Ctx, tx.allocator)
-			rc^ = Rm_If_Exists_Ctx{steps = steps, tx = &tx}
-			xitdb.tx_with_cursor(&tx, rm_if_exists_callback, rc)
-
-		case ATOM_SLICE:
-			if arity != 4 {
-				return make_err(env, "invalid_slice_op")
-			}
-			offset_val: i64 = 0
-			size_val: i64 = 0
-			ok_o := nif_get_int64(env, elems[2], &offset_val) != 0
-			ok_s := nif_get_int64(env, elems[3], &size_val) != 0
-			steps, s_err, ok_p := decode_steps_term(env, elems[1], tx.allocator)
-			if !ok_p || !ok_o || !ok_s {
-				return make_err(env, "invalid_slice_op")
-			}
-			if offset_val < 0 || size_val < 0 {
-				return make_xitdb_err(env, .Invalid_Range)
-			}
-			if s_err != "" {
-				return make_err(env, s_err)
-			}
-			if len(steps) == 0 {
-				return make_xitdb_err(env, .Invalid_Range)
-			}
-			sc := new(Slice_Op_Ctx, tx.allocator)
-			sc^ = Slice_Op_Ctx{steps = steps, offset = offset_val, size = size_val}
-			xitdb.tx_with_cursor(&tx, slice_op_callback, sc)
-
-		case ATOM_FORK:
-			if arity != 3 {
-				return make_err(env, "invalid_fork_op")
-			}
-			from_steps, f_err, ok_f := decode_steps_term(env, elems[1], tx.allocator)
-			to_steps, t_err, ok_t := decode_steps_term(env, elems[2], tx.allocator)
-			if !ok_f || !ok_t {
-				return make_err(env, "invalid_fork_op")
-			}
-			if f_err != "" {
-				return make_err(env, f_err)
-			}
-			if t_err != "" {
-				return make_err(env, t_err)
-			}
-			if len(from_steps) == 0 || len(to_steps) == 0 {
-				return make_xitdb_err(env, .Invalid_Range)
-			}
-			append(&tx.ops, xitdb.Tx_Op{kind = .Fork, from_steps = from_steps, steps = to_steps})
-			if nif_is_empty_list(env, tail) == 0 {
-				xitdb.tx_savepoint(&tx)
-			}
-
-		case ATOM_INDEX_ON:
-			if arity != 4 {
-				return make_err(env, "invalid_index_on_op")
-			}
-			src_map, ok_1 := get_string_from_binary(env, elems[1])
-			field_key, ok_2 := get_string_from_binary(env, elems[2])
-			idx_map, ok_3 := get_string_from_binary(env, elems[3])
-			if !ok_1 || !ok_2 || !ok_3 {
-				return make_err(env, "invalid_index_on_op")
-			}
-			xitdb.tx_index_on(&tx, src_map, field_key, idx_map)
-
-		case ATOM_INSTANT:
-			if arity != 2 {
-				return make_err(env, "invalid_instant_op")
-			}
-			inst_val: i64 = 0
-			if nif_get_int64(env, elems[1], &inst_val) == 0 {
-				return make_err(env, "invalid_instant_op")
-			}
-			xitdb.tx_instant(&tx, inst_val)
-
-		case ATOM_META:
-			if arity != 3 {
-				return make_err(env, "invalid_meta_op")
-			}
-			key_str, ok_k := get_string_from_binary(env, elems[1])
-			if !ok_k {
-				return make_err(env, "invalid_meta_op")
-			}
-			if key_str == "tx_instant" {
-				inst_val: i64 = 0
-				if nif_get_int64(env, elems[2], &inst_val) == 0 {
-					return make_err(env, "invalid_meta_op")
-				}
-				xitdb.tx_instant(&tx, inst_val)
-			} else {
-				val, ok_v := decode_writeable_value(env, elems[2])
-				if !ok_v {
-					return make_err(env, "invalid_meta_op")
-				}
-				xitdb.tx_meta(&tx, key_str, val)
-			}
-
-		case ATOM_SAVEPOINT:
-			if arity != 1 {
-				return make_err(env, "invalid_savepoint_op")
-			}
-			xitdb.tx_savepoint(&tx)
-
-		case ATOM_INIT_COL, ATOM_RESET_COL:
-			if arity != 3 {
-				return make_err(env, "invalid_init_col_op")
-			}
-			kind_str, ok_k := get_string_from_binary(env, elems[2])
-			steps, s_err, ok_p := decode_steps_term(env, elems[1], tx.allocator)
-			if !ok_p || !ok_k || !is_supported_col_kind(kind_str) {
-				return make_err(env, "invalid_init_col_op")
-			}
-			if s_err != "" {
-				return make_err(env, s_err)
-			}
-			ic := new(Init_Col_Ctx, tx.allocator)
-			ic.steps = steps
-			ic.kind = kind_str
-			ic.reset = (op_atom == ATOM_RESET_COL)
-			xitdb.tx_with_cursor(&tx, init_col_callback, ic)
-
-		case ATOM_MERGE_MAP:
-			if arity != 2 {
-				return make_err(env, "invalid_merge_map_op")
-			}
-			if !validate_merge_map_term(env, elems[1], true) {
-				return make_err(env, "invalid_put_op")
-			}
-			mc := new(Merge_Map_Ctx, tx.allocator)
-			mc.env = env
-			mc.map_term = elems[1]
-			mc.tx = &tx
-			xitdb.tx_with_cursor(&tx, merge_map_callback, mc)
-
-		case:
-			return make_err(env, "unknown_tx_op")
-		}
+		return make_xitdb_err(env, parse_xerr)
 	}
 
 	pre_header, pre_hdr_err := xitdb.database_read_root_header(&handle.db)
@@ -4911,12 +5009,20 @@ odin_nif_transact :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TER
 		if rb_err := rollback_failed_tx(&handle.db, pre_header, pre_hdr_err, pre_len, pre_len_err, pre_rh_bytes, pre_rh_err); rb_err != nil {
 			return make_xitdb_err(env, rb_err)
 		}
-		if attempt == 0 && c_err == .Unexpected_Tag && adapt_tx_ops_for_base_moment(handle, &tx) {
+		if attempt == 0 && c_err == .Unexpected_Tag && len(validation_err) == 0 && adapt_tx_ops_for_base_moment(handle, &tx) {
 			continue
 		}
 		break
 	}
 	if c_err != nil {
+		if len(validation_err) == 0 && has_deferred {
+			if deferred_err := validate_deferred_tx_ops(&tx); deferred_err != "" {
+				return make_err(env, deferred_err)
+			}
+		}
+		if len(validation_err) > 0 {
+			return make_err(env, validation_err)
+		}
 		return make_xitdb_err(env, c_err)
 	}
 	moment_idx := rep.moment_index
