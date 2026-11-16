@@ -1768,29 +1768,6 @@ defmodule Xitdb.Cursor do
 
   defp stage_list_edit(%__MODULE__{} = cursor, selector, edit) do
     ov_key = canonical_override_selector(selector)
-    rev_steps = ov_key |> parse_selector_steps_simple() |> :lists.reverse()
-
-    {resolved_tag, resolved_tag_id, resolved_val, resolved_full} =
-      case NIF.nif_select(cursor.db_ref, cursor.moment, ov_key) do
-        {:ok, raw} when not is_nil(raw) ->
-          case unwrap_nif_value(cursor.db_ref, raw, cursor.moment, rev_steps) do
-            %__MODULE__{tag: t, tag_id: tid, value: v, full: f} -> {t, tid, v, f}
-            _ -> {:linked_array_list, 3, 0, false}
-          end
-
-        _ ->
-          {:linked_array_list, 3, 0, false}
-      end
-
-    target_cur = %__MODULE__{
-      cursor
-      | tx_mode: true,
-        path_steps: rev_steps,
-        tag: resolved_tag,
-        tag_id: resolved_tag_id,
-        value: resolved_val,
-        full: resolved_full
-    }
 
     cond do
       Map.has_key?(cursor.staged_overrides, ov_key) ->
@@ -1807,6 +1784,30 @@ defmodule Xitdb.Cursor do
         has_descendant_set?(cursor.deleted_paths, ov_key) or
         has_descendant_keys?(cursor.staged_list_edits, ov_key) or
           has_descendant_aliases?(cursor.fork_aliases, ov_key) ->
+        rev_steps = ov_key |> parse_selector_steps_simple() |> :lists.reverse()
+
+        {resolved_tag, resolved_tag_id, resolved_val, resolved_full} =
+          case NIF.nif_select(cursor.db_ref, cursor.moment, ov_key) do
+            {:ok, raw} when not is_nil(raw) ->
+              case unwrap_nif_value(cursor.db_ref, raw, cursor.moment, rev_steps) do
+                %__MODULE__{tag: t, tag_id: tid, value: v, full: f} -> {t, tid, v, f}
+                _ -> {:linked_array_list, 3, 0, false}
+              end
+
+            _ ->
+              {:linked_array_list, 3, 0, false}
+          end
+
+        target_cur = %__MODULE__{
+          cursor
+          | tx_mode: true,
+            path_steps: rev_steps,
+            tag: resolved_tag,
+            tag_id: resolved_tag_id,
+            value: resolved_val,
+            full: resolved_full
+        }
+
         cnt =
           case staged_or_nif_count(target_cur) do
             {:ok, n} -> n
