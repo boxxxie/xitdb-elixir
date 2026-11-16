@@ -88,8 +88,8 @@ defmodule Xitdb.TxCompiler do
     acc = [{:reset_col, prefix, k_str} | acc]
 
     Enum.reduce(member_list, acc, fn m, a ->
-      member_str = to_string(m)
-      [{:put, prefix <> Selector.format_step(kind, member_str), member_str} | a]
+      step = Selector.format_step(kind, m)
+      [{:put, prefix <> step, to_string(m)} | a]
     end)
   end
 

@@ -93,4 +93,43 @@ defmodule Xitdb.DSL.TxRewriterAndRuntimeTest do
              "tier" => "gold"
            }
   end
+
+  test "BUG-035/036/055: negative/positive list index RYOW, array_list rm RYOW, and tx inline options" do
+    use Xitdb.DSL
+
+    db = Xitdb.open!(backend: :memory)
+    db = Xitdb.transact!(db, %{"items" => ["a", "b", "c"], "k" => "old"})
+
+    # BUG-055: tx! 2-arity with keyword option + inline do:
+    db = tx!(db, meta: %{src: "inline"}, do: put(k, "new"))
+    assert db["k"] == "new"
+
+    # BUG-035: put via negative index then update via positive index (and vice versa)
+    db =
+      tx! db do
+        put items[-1], "Z"
+        update items[2], &String.downcase/1
+        put items[0], "A"
+        update items[-3], &(&1 <> "!")
+      end
+
+    assert Enum.to_list(db["items"]) == ["A!", "b", "z"]
+
+    # BUG-036: rm on :array_list element followed by update/fork does not raise FunctionClauseError in rm_at_steps/2
+    res =
+      tx db do
+        rm items[1]
+
+        update items, fn list ->
+          send(self(), {:ryow_after_rm, list})
+          list ++ ["tail"]
+        end
+
+        fork items, backup_items
+      end
+
+    assert_received {:ryow_after_rm, ["A!", "z"]}
+    assert {:error, %Xitdb.Error{reason: "Write_Not_Allowed"}} = res
+    :ok = Xitdb.close(db)
+  end
 end

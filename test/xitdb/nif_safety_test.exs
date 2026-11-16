@@ -739,4 +739,339 @@ defmodule Xitdb.NifSafetyTest do
     assert Xitdb.as_of(reopened, 0)["users"]["alice"] == "v1"
     assert :ok = Xitdb.close(reopened)
   end
+
+  test "BUG-015/016/047: secondary index swap, overwrite eviction, and missing field rm_if_exists" do
+    idx_rules = [{:index_on, :users, :email, "idx_email"}]
+    db = Xitdb.open!(backend: :memory)
+
+    db =
+      Xitdb.transact!(
+        db,
+        %{
+          "users" => %{
+            "u1" => %{"email" => "a@x", "name" => "One"},
+            "u2" => %{"email" => "b@x", "name" => "Two"}
+          }
+        },
+        index_rules: idx_rules
+      )
+
+    # BUG-015: swapping values in a single merge keeps both index entries intact
+    {:ok, db} =
+      Xitdb.transact_ops(
+        db,
+        [
+          {:merge_map, %{"users" => %{"u1" => %{"email" => "b@x"}, "u2" => %{"email" => "a@x"}}}}
+        ],
+        index_rules: idx_rules
+      )
+
+    assert db["idx_email"]["a@x"] == "u2"
+    assert db["idx_email"]["b@x"] == "u1"
+
+    # BUG-047: rm_if_exists on record lacking indexed field succeeds cleanly
+    {:ok, db} =
+      Xitdb.transact_ops(
+        db,
+        [
+          {:put, ["users", "u3"], %{"name" => "NoEmail"}},
+          {:rm_if_exists, ["users", "u3"]}
+        ],
+        index_rules: idx_rules
+      )
+
+    assert db["users"]["u3"] == nil
+
+    # BUG-016: overwriting record with %{}, scalar, or list evicts old secondary index
+    {:ok, db} =
+      Xitdb.transact_ops(
+        db,
+        [{:merge_map, %{"users" => %{"u1" => %{}}}}],
+        index_rules: idx_rules
+      )
+
+    assert db["idx_email"]["b@x"] == nil
+    assert db["idx_email"]["a@x"] == "u2"
+
+    {:ok, db} =
+      Xitdb.transact_ops(
+        db,
+        [{:merge_map, %{"users" => %{"u2" => "scalar_wiped"}}}],
+        index_rules: idx_rules
+      )
+
+    assert db["idx_email"]["a@x"] == nil
+
+    # Clearing source_map_key at depth 0 evicts remaining entries
+    {:ok, db} =
+      Xitdb.transact_ops(
+        db,
+        [{:merge_map, %{"users" => %{"u4" => %{"email" => "d@x"}}}}],
+        index_rules: idx_rules
+      )
+
+    assert db["idx_email"]["d@x"] == "u4"
+
+    {:ok, db} =
+      Xitdb.transact_ops(
+        db,
+        [{:merge_map, %{"users" => %{}}}],
+        index_rules: idx_rules
+      )
+
+    assert db["idx_email"]["d@x"] == nil
+    :ok = Xitdb.close(db)
+  end
+
+  test "BUG-017/018/020/048: adapt_tx_ops_for_base_moment handles fork aliases, merge_map tags, and init_col" do
+    db = Xitdb.open!(backend: :memory)
+
+    db =
+      Xitdb.transact!(db, %{
+        "src" => Xitdb.counted_map(%{"nested" => Xitdb.sorted_map(%{"init" => 0})}),
+        "users" => Xitdb.sorted_map(%{"seed" => 1}),
+        "a" => %{"b" => Xitdb.counted_map(%{"seed" => 1})}
+      })
+
+    # BUG-017 & BUG-018: fork + child tag update & fork of base container after nested write
+    {:ok, db} =
+      Xitdb.transact_ops(db, [
+        {:put, ["src", "sub"], Xitdb.sorted_map(%{"x" => 1})},
+        {:fork, ["src"], ["dst"]},
+        {:put, ["dst", "nested", "k"], "val"},
+        {:put, ["dst", "sub", "y"], 2},
+        {:put, ["dst", "direct"], 3}
+      ])
+
+    assert db["dst"]["nested"]["k"] == "val"
+    assert db["dst"]["sub"]["x"] == 1
+    assert db["dst"]["sub"]["y"] == 2
+    assert db["dst"]["direct"] == 3
+
+    # BUG-020: new nested map in merge_map + rm + recreate + follow-up put
+    {:ok, db} =
+      Xitdb.transact_ops(db, [
+        {:merge_map, %{"new_map" => %{"sub" => Xitdb.counted_map(%{"a" => 1})}}},
+        {:put, ["new_map", "sub", "b"], 2},
+        {:rm, ["users"]},
+        {:merge_map, %{"users" => %{"alice" => 1}}},
+        {:put, ["users", "bob"], 2}
+      ])
+
+    assert Enum.count(db["new_map"]["sub"]) == 2
+    assert db["new_map"]["sub"]["b"] == 2
+    assert db["users"]["alice"] == 1
+    assert db["users"]["bob"] == 2
+
+    # BUG-048: overwriting ancestor then init_col with reset: false
+    {:ok, db} =
+      Xitdb.transact_ops(db, [
+        {:put, ["a"], %{}},
+        {:init_col, ["a", "b"], "sorted_map"},
+        {:put, ["a", "b", "k"], 99}
+      ])
+
+    assert db["a"]["b"]["k"] == 99
+    :ok = Xitdb.close(db)
+  end
+
+  test "BUG-021/022/023: select pins moments, pull merges pinned root, and Xitdb.at supports Elixir lists" do
+    db = Xitdb.open!(backend: :memory)
+
+    db =
+      Xitdb.transact!(db, %{"v" => 1, "profile" => %{"city" => "NYC"}, "users" => %{"a" => 10}})
+
+    snap_root = Xitdb.select!(db, "")
+    snap_neg = Xitdb.select!(db, "@-1")
+    snap_sub = Xitdb.select!(db, "@-1.profile")
+
+    db = Xitdb.transact!(db, %{"v" => 2, "profile" => %{"city" => "SF"}, "users" => %{"a" => 99}})
+
+    assert snap_root.moment == 0
+    assert snap_neg.moment == 0
+    assert snap_sub.moment == 0
+    assert Xitdb.materialize(snap_root)["v"] == 1
+
+    assert Xitdb.pull!(snap_neg, [:v, profile: [:city]]) == %{
+             "v" => 1,
+             "profile" => %{"city" => "NYC"}
+           }
+
+    assert snap_sub["city"] == "NYC"
+    assert Xitdb.query!(snap_root, "find ?a where users[?u] = ?a").rows == [[10]]
+
+    # BUG-022: pull with wildcard + explicit spec on %Xitdb{}
+    assert {:ok, pulled} = Xitdb.pull(db, [:*, profile: [:city]])
+    assert pulled["v"] == 2
+    assert pulled["profile"] == %{"city" => "SF"}
+
+    # BUG-023: Xitdb.at works on standard Elixir lists across Access ops
+    list_doc = %{"items" => [10, 20, 30]}
+    assert get_in(list_doc, ["items", Xitdb.at(1)]) == 20
+    assert put_in(list_doc, ["items", Xitdb.at(-1)], 99) == %{"items" => [10, 20, 99]}
+    {popped, after_pop} = pop_in(list_doc, ["items", Xitdb.at(0)])
+    assert popped == 10
+    assert after_pop == %{"items" => [20, 30]}
+    :ok = Xitdb.close(db)
+  end
+
+  test "BUG-006/007/030/031/044: Cursor staged fork overlay, list edits, erl_eval inner capture, and fetch_edited_list" do
+    db = Xitdb.open!(backend: :memory)
+
+    db =
+      Xitdb.transact!(db, %{
+        "a" => %{"v" => "from_a", "nums" => Xitdb.linked_list([1, 2])},
+        "outer" => Xitdb.linked_list([%{"inner" => Xitdb.linked_list(["x"])}]),
+        "src" => %{"k" => "origin"}
+      })
+
+    # BUG-006 & BUG-007: nested forks + fork + list edit materialize cleanly from root
+    {:ok, db} =
+      Xitdb.transact(db, fn root ->
+        root = Xitdb.fork(root, ["a"], ["b", "sub"])
+        root = Xitdb.fork(root, ["b"], ["c"])
+        root = Xitdb.insert_at(root, ["c", "sub", "nums"], 1, 99)
+
+        root = Xitdb.fork(root, ["src"], ["d", "sub"])
+        root = Xitdb.fork(root, ["d", "sub"], ["d"])
+
+        root_mat = Xitdb.materialize(root)
+        assert root_mat["c"]["sub"]["v"] == "from_a"
+        assert root_mat["c"]["sub"]["nums"] == [1, 99, 2]
+        assert root_mat["d"]["k"] == "origin"
+        root
+      end)
+
+    assert Xitdb.materialize(db["c"]["sub"]) == %{"v" => "from_a", "nums" => [1, 99, 2]}
+    assert Xitdb.materialize(db["d"]) == %{"k" => "origin"}
+
+    # BUG-031 & BUG-044: child list edit preserved on parent list edit & fetch_edited_list normalizes collections
+    {:ok, db} =
+      Xitdb.transact(db, fn root ->
+        root = Xitdb.insert_at(root, ".outer[[0]].inner", 0, %{"m" => Xitdb.counted_map(%{a: 1})})
+        root = Xitdb.insert_at(root, ".outer", 0, %{"second" => true})
+
+        assert Xitdb.materialize(root["outer"][0]) == %{"second" => true}
+        edited_inner = Enum.to_list(root["outer"][1]["inner"])
+        assert edited_inner == [%{"m" => %{"a" => 1}}, "x"]
+        root
+      end)
+
+    assert Xitdb.materialize(db["outer"][1]["inner"]) == [%{"m" => %{"a" => 1}}, "x"]
+
+    # BUG-030: :erl_eval get_and_update inner closure inspecting outer cursor var
+    {:ok, _db} =
+      Xitdb.transact(db, fn root ->
+        {quoted_result, _binding} =
+          Code.eval_quoted(
+            quote do
+              Access.get_and_update(var!(r), "src", fn outer_cur ->
+                Access.get_and_update(outer_cur, "k", fn _inner ->
+                  marker = if is_nil(outer_cur), do: "was_nil", else: "seen:#{outer_cur.tag}"
+                  {marker, marker}
+                end)
+              end)
+            end,
+            r: root
+          )
+
+        {marker, updated_root} = quoted_result
+        assert marker == "seen:hash_map"
+        assert updated_root["src"]["k"] == "seen:hash_map"
+        updated_root
+      end)
+
+    :ok = Xitdb.close(db)
+  end
+
+  test "BUG-037/045/046/049/050/051/056/057/059/060: NIF slot, pull, datalog sum/whitespace, selector errors, and set validation" do
+    db = Xitdb.open!(backend: :memory)
+
+    db =
+      Xitdb.transact!(db, %{
+        "sm" => Xitdb.sorted_map(%{"field" => "ok", "nested" => Xitdb.counted_map(%{"x" => 7})}),
+        "hs" => Xitdb.hash_set(["alpha"]),
+        "chs" => Xitdb.counted_set(["beta"]),
+        "ss" => Xitdb.sorted_set(["gamma"]),
+        "hm" => %{"k" => 1},
+        "chm" => Xitdb.counted_map(%{"k" => 2}),
+        "a\\,b" => "comma",
+        "a\\\"b" => "qval",
+        "c" => "plain",
+        "vals" => [%{"n" => 1.5}, %{"n" => -2}],
+        "users" => %{"u1" => %{"name" => "Ada"}},
+        "idx" => %{
+          "search" => %{
+            "items" => %{
+              "meta" => %{"doc_count" => 1, "total_len" => 1},
+              "docs" => %{"1" => %{"len" => 1, "terms" => %{"hello" => 100}}},
+              "terms" => Xitdb.sorted_map(%{"__tx" => "meta_slot", "hello" => %{"1" => 100}})
+            }
+          }
+        }
+      })
+
+    # BUG-045: root "__tx" hidden by slot_get_key
+    assert :error = NIF.nif_slot_get_key(db.db_ref, -1, 0, "__tx")
+
+    # BUG-046: slot_contains across all 6 map/set container types
+    for {sel, present, absent} <- [
+          {"sm", "field", "nope"},
+          {"hm", "k", "nope"},
+          {"chm", "k", "nope"},
+          {"hs", "alpha", "nope"},
+          {"chs", "beta", "nope"},
+          {"ss", "gamma", "nope"}
+        ] do
+      cur = Xitdb.select!(db, sel)
+      assert NIF.nif_slot_contains(db.db_ref, cur.tag_id, cur.value, present) == {:ok, true}
+      assert NIF.nif_slot_contains(db.db_ref, cur.tag_id, cur.value, absent) == {:ok, false}
+    end
+
+    # BUG-049 & BUG-059: Pull on Sorted_Map, nested Counted_Hash_Map, and backslash-escaped pattern
+    assert Xitdb.pull!(db["sm"], "{field, nested{x}}") == %{
+             "field" => "ok",
+             "nested" => %{"x" => 7}
+           }
+
+    assert Xitdb.pull!(db, ~s({a\\,b, a\\"b, c})) == %{
+             "a\\,b" => "comma",
+             "a\\\"b" => "qval",
+             "c" => "plain"
+           }
+
+    # BUG-037: Datalog sum float followed by negative i64 preserves f64
+    res_sum = Xitdb.query!(db, "find sum(?n) where vals[[?i]].n = ?n")
+    assert [[sum_val]] = res_sum.rows
+    assert_in_delta sum_val, -0.5, 1.0e-9
+
+    # BUG-060: Whitespace after @moment before sigil-prefixed path
+    res_at = Xitdb.query!(db, "find ?name where @0 .users[?u].name = ?name")
+    assert res_at.rows == [["Ada"]]
+
+    # BUG-051: BM25 skips "__tx" metadata entry in terms Sorted_Map
+    assert {:ok, [{"1", _score}]} =
+             NIF.nif_bm25_search(db.db_ref, -1, 0, "items", ["hello"], 5, %{min_prefix_length: 2})
+
+    assert {:ok, []} =
+             NIF.nif_bm25_search(db.db_ref, -1, 0, "items", ["__tx"], 5, %{min_prefix_length: 2})
+
+    # BUG-056: Selector.parse_selector_steps raises ArgumentError on unclosed brackets/quotes
+    for bad <- [".[\"unclosed", "[0", "[[0]x]", ".'abc\\", "[abc]"] do
+      assert_raise ArgumentError, fn ->
+        Selector.parse_selector_steps(bad)
+      end
+    end
+
+    # BUG-057: TxCompiler rejects nil and booleans in raw MapSet / Collection set
+    assert_raise ArgumentError, fn ->
+      Xitdb.TxCompiler.compile_node(["s"], MapSet.new([nil]), true)
+    end
+
+    assert_raise ArgumentError, fn ->
+      Xitdb.TxCompiler.compile_node(["s"], Xitdb.counted_set([true]), true)
+    end
+
+    :ok = Xitdb.close(db)
+  end
 end

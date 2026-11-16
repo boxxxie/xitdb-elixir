@@ -329,7 +329,12 @@ defmodule Xitdb.DSL.TxRuntime do
   end
 
   defp effective_base_steps(chronological, target_steps) do
-    Enum.reduce(chronological, target_steps, fn
+    initial_base =
+      Enum.take_while(target_steps, fn {kind, _} ->
+        kind not in [:array_list, :linked_array_list]
+      end)
+
+    Enum.reduce(chronological, initial_base, fn
       {:append, steps, _}, cur ->
         if prefix_steps?(steps, cur), do: steps, else: cur
 
@@ -341,7 +346,7 @@ defmodule Xitdb.DSL.TxRuntime do
 
       {:rm, steps}, cur ->
         case List.last(steps) do
-          {:linked_array_list, _} ->
+          {kind, _} when kind in [:array_list, :linked_array_list] ->
             parent = Enum.drop(steps, -1)
             if prefix_steps?(parent, cur), do: parent, else: cur
 
@@ -584,7 +589,8 @@ defmodule Xitdb.DSL.TxRuntime do
     Map.delete(map, key)
   end
 
-  defp rm_at_steps(list, [{:linked_array_list, idx}]) when is_list(list) do
+  defp rm_at_steps(list, [{kind, idx}])
+       when kind in [:array_list, :linked_array_list] and is_list(list) do
     List.delete_at(list, idx)
   end
 
@@ -593,12 +599,14 @@ defmodule Xitdb.DSL.TxRuntime do
     MapSet.delete(set, member)
   end
 
-  defp rm_at_steps(current, [step | rest]) do
+  defp rm_at_steps(current, [step | rest]) when rest != [] do
     case get_at_steps(current, [step]) do
       nil -> current
       child -> put_at_steps(current, [step], rm_at_steps(child, rest))
     end
   end
+
+  defp rm_at_steps(current, _steps), do: current
 
   defp format_steps_selector([]), do: ""
 
