@@ -72,6 +72,12 @@ defmodule Xitdb.Selector do
   def format_step(:sorted_map, key), do: "$" <> format_key(key)
   def format_step(:array_list, idx) when is_integer(idx), do: "[#{idx}]"
   def format_step(:linked_array_list, idx) when is_integer(idx), do: "[[#{idx}]]"
+
+  def format_step(kind, invalid) when kind in [:array_list, :linked_array_list] do
+    raise ArgumentError,
+          "Invalid #{kind} index #{inspect(invalid)}: expected integer index"
+  end
+
   def format_step(:hash_set, member), do: "%" <> format_key(member)
   def format_step(:counted_hash_set, member), do: "#%" <> format_key(member)
   def format_step(:sorted_set, member), do: "^" <> format_key(member)
@@ -86,11 +92,16 @@ defmodule Xitdb.Selector do
   def format_typed_step(kind, val) when kind in [:sorted, :sorted_map],
     do: format_step(:sorted_map, val)
 
-  def format_typed_step(kind, val) when kind in [:array, :array_list],
+  def format_typed_step(kind, val) when kind in [:array, :array_list] and is_integer(val),
     do: format_step(:array_list, val)
 
-  def format_typed_step(kind, val) when kind in [:linked, :linked_list, :linked_array_list],
-    do: format_step(:linked_array_list, val)
+  def format_typed_step(kind, [idx])
+      when kind in [:linked, :linked_list, :linked_array_list] and is_integer(idx),
+      do: format_step(:linked_array_list, idx)
+
+  def format_typed_step(kind, val)
+      when kind in [:linked, :linked_list, :linked_array_list] and is_integer(val),
+      do: format_step(:linked_array_list, val)
 
   def format_typed_step(kind, val) when kind in [:set, :hash_set, :set_member],
     do: format_step(:hash_set, val)
@@ -103,6 +114,11 @@ defmodule Xitdb.Selector do
     do: format_step(:sorted_set, val)
 
   def format_typed_step(:at_moment, idx) when is_integer(idx), do: "@#{idx}"
+
+  def format_typed_step(kind, val) do
+    raise ArgumentError,
+          "Invalid typed path step {#{inspect(kind)}, #{inspect(val)}}"
+  end
 
   @spec format_bracket_step(term()) :: String.t()
   def format_bracket_step(idx) when is_integer(idx), do: format_step(:array_list, idx)
@@ -296,14 +312,27 @@ defmodule Xitdb.Selector do
   end
 
   defp parse_key_token(<<?[, ?', rest::binary>>) do
-    {unescaped, <<?], tail::binary>>} = parse_single_quoted_string(rest, [])
-    {unescaped, tail}
+    case parse_single_quoted_string(rest, []) do
+      {unescaped, <<?], tail::binary>>} ->
+        {unescaped, tail}
+
+      _ ->
+        raise ArgumentError, "Invalid selector syntax: unclosed bracketed single-quoted key"
+    end
   end
 
   defp parse_key_token(<<?[, ?", rest::binary>>) do
-    {unescaped, <<?], tail::binary>>} = parse_quoted_string(rest, [])
-    {unescaped, tail}
+    case parse_quoted_string(rest, []) do
+      {unescaped, <<?], tail::binary>>} ->
+        {unescaped, tail}
+
+      _ ->
+        raise ArgumentError, "Invalid selector syntax: unclosed bracketed quoted key"
+    end
   end
+
+  defp parse_key_token(<<?', rest::binary>>), do: parse_single_quoted_string(rest, [])
+  defp parse_key_token(<<?", rest::binary>>), do: parse_quoted_string(rest, [])
 
   defp parse_key_token(bin), do: take_until_sigil(bin)
 

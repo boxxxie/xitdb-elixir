@@ -600,6 +600,7 @@ defmodule Xitdb do
   Resolves a canonical root-anchored `xitdb` selector string (`~x|.users["101"].todos[1]|`)
   against `db` or a committed root snapshot `%Xitdb.Cursor{}` (from `Xitdb.db/1` or `Xitdb.as_of/2`).
   """
+  @compile {:inline, select: 2, select!: 2, do_select: 3, do_select!: 3}
   @spec select(t() | Cursor.t(), String.t() | [term()]) :: {:ok, term()} | {:error, Error.t()}
   def select(%__MODULE__{db_ref: db_ref}, selector)
       when is_binary(selector) or is_list(selector) do
@@ -622,8 +623,14 @@ defmodule Xitdb do
 
   defp do_select(db_ref, moment, selector) do
     case NIF.nif_select(db_ref, moment, selector) do
-      {:ok, raw} -> {:ok, wrap_selected(db_ref, raw, moment, selector)}
-      {:error, reason} -> {:error, %Error{reason: reason, details: %{selector: selector}}}
+      {:ok, raw} when is_binary(raw) or is_number(raw) or is_boolean(raw) or is_nil(raw) ->
+        {:ok, raw}
+
+      {:ok, raw} ->
+        {:ok, wrap_selected(db_ref, raw, moment, selector)}
+
+      {:error, reason} ->
+        {:error, %Error{reason: reason, details: %{selector: selector}}}
     end
   end
 
@@ -678,7 +685,35 @@ defmodule Xitdb do
 
   @doc "Same as `select/2`, but raises `Xitdb.Error` on failure."
   @spec select!(t() | Cursor.t(), String.t() | [term()]) :: term()
-  def select!(target, selector), do: target |> select(selector) |> Error.unwrap!()
+  def select!(%__MODULE__{db_ref: db_ref}, selector)
+      when is_binary(selector) or is_list(selector) do
+    do_select!(db_ref, -1, selector)
+  end
+
+  def select!(%Cursor{root: true, tx_mode: false, db_ref: db_ref, moment: moment}, selector)
+      when is_binary(selector) or is_list(selector) do
+    do_select!(db_ref, moment, selector)
+  end
+
+  def select!(%Cursor{tag: tag, tx_mode: tx_mode}, selector)
+      when is_binary(selector) or is_list(selector) do
+    raise Error,
+      reason: :non_root_cursor,
+      details: %{tag: tag, tx_mode: tx_mode, selector: selector}
+  end
+
+  defp do_select!(db_ref, moment, selector) do
+    case NIF.nif_select(db_ref, moment, selector) do
+      {:ok, raw} when is_binary(raw) or is_number(raw) or is_boolean(raw) or is_nil(raw) ->
+        raw
+
+      {:ok, raw} ->
+        wrap_selected(db_ref, raw, moment, selector)
+
+      {:error, reason} ->
+        raise Error, reason: reason, details: %{selector: selector}
+    end
+  end
 
   @doc """
   Executes a Datomic-style Pull projection against a `%Xitdb.Cursor{}` or `%Xitdb{}` handle.

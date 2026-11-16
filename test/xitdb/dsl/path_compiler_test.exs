@@ -184,4 +184,188 @@ defmodule Xitdb.DSL.PathCompilerTest do
       Xitdb.close(db)
     end
   end
+
+  test "select/2 and select!/2 support nif_unpack_step_list fast paths and fallbacks" do
+    db = Xitdb.open!(backend: :memory)
+
+    try do
+      deep_tree = Enum.reduce(20..1//-1, "leaf20", fn i, acc -> %{"k#{i}" => acc} end)
+
+      db =
+        Xitdb.transact!(db, %{
+          "users" => %{"alice" => %{"name" => "Alice v1"}},
+          "arr" => [10, %{"label" => "second"}, 30],
+          "counted" => Xitdb.counted_map(%{"dept" => Xitdb.sorted_map(%{"101" => "staff"})}),
+          "linked" => Xitdb.linked_list(["head", "tail"]),
+          "hset" => Xitdb.hash_set(["ok"]),
+          "cset" => Xitdb.counted_set(["cok"]),
+          "sset" => Xitdb.sorted_set(["sok"]),
+          "deep" => deep_tree
+        })
+
+      db = Xitdb.transact!(db, %{"users" => %{"alice" => %{"name" => "Alice v2"}}})
+
+      # Plain binaries, negative & positive integers, >16 step depth, tagged steps, and at_moment
+      assert Xitdb.select!(db, ["users", "alice", "name"]) == "Alice v2"
+      assert Xitdb.select(db, ["arr", 0]) == {:ok, 10}
+      assert Xitdb.select!(db, ["arr", 1, "label"]) == "second"
+      assert Xitdb.select!(db, ["arr", -1]) == 30
+
+      assert Xitdb.select!(db, ["deep" | Enum.map(1..20, &"k#{&1}")]) == "leaf20"
+
+      assert Xitdb.select!(db, [{:map, "counted"}, {:counted_map, "dept"}, {:sorted_map, "101"}]) ==
+               "staff"
+
+      assert Xitdb.select!(db, [{:map, "linked"}, {:linked_list, 1}]) == "tail"
+      assert Xitdb.select!(db, ["linked", [1]]) == "tail"
+      assert Xitdb.select!(db, [{:map, "hset"}, {:set_member, "ok"}]) == "ok"
+      assert Xitdb.select!(db, [{:map, "cset"}, {:counted_set_member, "cok"}]) == "cok"
+      assert Xitdb.select!(db, [{:map, "sset"}, {:sorted_set_member, "sok"}]) == "sok"
+
+      assert Xitdb.select!(db, [{:at_moment, 0}, "users", "alice", "name"]) == "Alice v1"
+      assert is_map(Xitdb.select!(db, [{:at_moment, 0}, "deep" | Enum.map(1..15, &"k#{&1}")]))
+      assert is_map(Xitdb.select!(db, ["deep" | Enum.map(1..16, &"k#{&1}")]))
+      assert Xitdb.select!(db, [{:at_moment, 0}, "deep" | Enum.map(1..20, &"k#{&1}")]) == "leaf20"
+      assert Xitdb.select!(db, [:users, :alice, :name]) == "Alice v2"
+      assert is_map(Xitdb.select!(db, [{:at_moment, 0}]))
+
+      # Missing map key resolves to nil; invalid moment or invalid steps raise/return errors
+      assert Xitdb.select(db, ["users", "nobody"]) == {:ok, nil}
+      assert Xitdb.select!(db, ["users", "nobody"]) == nil
+      assert {:error, %Xitdb.Error{}} = Xitdb.select(db, [{:at_moment, 999}, "users"])
+
+      assert {:error, %Xitdb.Error{reason: :invalid_selector}} =
+               Xitdb.select(db, [{:at_moment, "0"}, "users"])
+
+      assert {:error, %Xitdb.Error{reason: :invalid_selector}} =
+               Xitdb.select(db, [{:at_moment, :zero}, "users"])
+
+      assert {:error, %Xitdb.Error{reason: :invalid_selector}} =
+               Xitdb.select(db, ["linked", []])
+
+      assert {:error, %Xitdb.Error{reason: :invalid_selector}} =
+               Xitdb.select(db, ["linked", [1, 2]])
+
+      assert {:error, %Xitdb.Error{reason: :invalid_selector}} =
+               Xitdb.select(db, ["users", 1.5])
+
+      assert {:error, %Xitdb.Error{reason: :invalid_selector}} =
+               Xitdb.select(db, ["users", %{}])
+
+      assert {:error, %Xitdb.Error{reason: :invalid_selector}} =
+               Xitdb.select(db, ["users", {:a, :b, :c}])
+
+      assert_raise Xitdb.Error, fn ->
+        Xitdb.select!(db, [{:at_moment, 999}, "users"])
+      end
+
+      assert_raise Xitdb.Error, fn ->
+        Xitdb.select!(db, [{:bogus, "x"}])
+      end
+
+      assert {:error, %Xitdb.Error{reason: :invalid_selector}} =
+               Xitdb.select(db, [{:bogus, "x"}])
+
+      assert {:error, %Xitdb.Error{reason: :invalid_selector}} =
+               Xitdb.select(db, ["users" | :improper])
+
+      assert {:error, %Xitdb.Error{reason: :invalid_selector}} =
+               Xitdb.transact_ops(db, [{:put, [{:at_moment, 0}, "users", "x"], 1}])
+    after
+      Xitdb.close(db)
+    end
+  end
+
+  test "path_steps/1 compiles cleanly without warnings when dynamic arguments have narrowed types" do
+    assert guarded_dynamic_steps("departments", "alice", 0) == [
+             "users",
+             "departments",
+             {:counted_hash_map, "alice"},
+             "todos",
+             0
+           ]
+  end
+
+  defp guarded_dynamic_steps(dept, id, idx)
+       when is_binary(dept) and is_binary(id) and is_integer(idx) do
+    path_steps(users.counted(dept)[id].todos[idx])
+  end
+
+  test "Slice 03 regressions: select! moment/root, adaptive history_of/select, strict sigils, and parser guards" do
+    db =
+      Xitdb.open!(backend: :memory)
+      |> Xitdb.transact!(%{"users" => %{"alice" => %{"n" => 1}}}, doc: "scalar-root-m0")
+      |> Xitdb.transact!(
+        %{
+          "susers" => Xitdb.sorted_map(%{"alice" => Xitdb.linked_list(["zero", "one"])}),
+          "counted" => Xitdb.counted_map(%{"alice" => %{"a.b" => "dotted"}})
+        },
+        doc: "m1"
+      )
+
+    on_exit(fn -> Xitdb.close(db) end)
+
+    # BUG-03-01: select! preserves @moment and root: true
+    r0 = Xitdb.select!(db, "@0")
+    assert r0.root == true
+    assert r0.moment == 0
+
+    c0 = Xitdb.select!(db, "@0.users")
+    assert c0.moment == 0
+    assert c0.root == false
+
+    # BUG-03-02: path_steps/1 works against Sorted_Map + Linked_Array_List in select! and history_of
+    assert "one" = Xitdb.select!(db, path_steps(susers.alice[1]))
+    assert {:ok, hist} = Xitdb.history_of(db, path_steps(susers.alice[1]))
+    assert Enum.map(hist, & &1.value) == ["one"]
+
+    # BUG-03-03: explicit sigils (# / [[i]]) stay strict against Hash_Map / Array_List
+    assert {:ok, nil} = Xitdb.select(db, "@0#users")
+
+    # BUG-03-04: history_of preserves doc/instant when path hits Unexpected_Tag at a later moment
+    db_scalar_m1 =
+      Xitdb.open!(backend: :memory)
+      |> Xitdb.transact!(%{"users" => %{"alice" => 2}}, doc: "m0-doc", instant: 111)
+      |> Xitdb.transact!(%{"users" => "not-a-map"}, doc: "m1-doc", instant: 222)
+
+    on_exit(fn -> Xitdb.close(db_scalar_m1) end)
+    assert {:ok, [h0, h1]} = Xitdb.history_of(db_scalar_m1, ".users.alice")
+    assert h0.value == 2
+    assert h0.doc == "m0-doc"
+    assert h0.instant == 111
+    assert h1.value == nil
+    assert h1.doc == "m1-doc"
+    assert h1.instant == 222
+
+    # BUG-03-05 & BUG-03-06: Selector & NIF parser preserve #users["a.b"] / .counted#alice["a.b"] and reject @ in history_of
+    assert Xitdb.Selector.parse_selector_steps(~S|#alice["a.b"]|) == [
+             {:counted_hash_map, "alice"},
+             {:hash_map, "a.b"}
+           ]
+
+    assert Xitdb.Selector.parse_selector_steps(~S|.users#alice["a.b"]|) == [
+             {:hash_map, "users"},
+             {:counted_hash_map, "alice"},
+             {:hash_map, "a.b"}
+           ]
+
+    assert {:ok, nil} = Xitdb.select(db, ~S|#counted["a.b"]|)
+    assert {:ok, "dotted"} = Xitdb.select(db, ~S|.counted#alice["a.b"]|)
+
+    assert {:error, %Xitdb.Error{reason: :invalid_selector}} = Xitdb.history_of(db, ".users.@0")
+    assert {:error, %Xitdb.Error{reason: :invalid_selector}} = Xitdb.select(db, ".users.@0")
+
+    # BUG-03-07: invalid typed steps raise ArgumentError instead of FunctionClauseError/MatchError
+    assert_raise ArgumentError, fn ->
+      Xitdb.Selector.format_typed_step(:array, "not_int")
+    end
+
+    assert_raise ArgumentError, fn ->
+      Xitdb.Selector.format_typed_step(:bogus, "x")
+    end
+
+    assert_raise ArgumentError, fn ->
+      Code.eval_quoted(quote(do: path(array("not_int"))), [], env: __ENV__)
+    end
+  end
 end
