@@ -237,7 +237,11 @@ def pool_records($recs):
 
 def commit_matches($rec_commit; $target):
   ($rec_commit // "unknown") as $c |
-  ($c == $target) or ($target != "" and ($c | startswith($target)));
+  if ($target | endswith("-dirty")) then
+    $c == $target
+  else
+    (($c | endswith("-dirty")) | not) and (($c == $target) or ($target != "" and ($c | startswith($target))))
+  end;
 
 def latest_snapshot_for_lang($all; $lang):
   ($all | map(select(.lang == $lang))) as $lang_recs |
@@ -283,7 +287,9 @@ def latest_snapshot_for_lang($all; $lang):
   end;
 
 def distinct_commits($all; $lang):
-  ($all | map(select(.lang == $lang and (.commit // "unknown") != "unknown" and (.commit // "") != ""))) as $recs |
+  ($all | map(select(.lang == $lang and (.commit // "unknown") != "unknown" and (.commit // "") != ""))) as $all_recs |
+  ($all_recs | map(select((.commit // "") | endswith("-dirty") | not))) as $clean_recs |
+  (if ($clean_recs | length) > 0 then $clean_recs else $all_recs end) as $recs |
   ($recs | reduce .[] as $r ({order: [], counts: {}};
     ($r.commit // "unknown") as $c |
     (if (.counts[$c] // null) == null then
@@ -295,13 +301,11 @@ def distinct_commits($all; $lang):
   (if ($counts | length) == 0 then 0 else ([$counts[].n] | max) end) as $max_n |
   (($max_n * 0.8) | floor) as $min_cov |
   ([$counts[] | select(.n >= $min_cov) | .c]) as $covered |
-  (if ($covered | length) > 0 then $covered else $by_c.order end) as $commits |
-  ($commits | map(select(endswith("-dirty") | not))) as $clean |
-  if ($clean | length) > 0 then $clean else $commits end;
+  if ($covered | length) > 0 then $covered else $by_c.order end;
 
 def pool_commit_snapshot($all; $lang; $sha):
   ($all
-   | map(select(.lang == $lang and commit_matches(.commit; $sha)))
+   | map(select(.lang == $lang and (.commit // "unknown") == $sha))
    | group_by(.name)
    | map(pool_records(.) | .commit = $sha)
    | sort_by(.rank));

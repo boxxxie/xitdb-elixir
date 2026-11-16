@@ -14,17 +14,19 @@ import "core:time"
 import "core:unicode/utf8"
 import xitdb "xitdb:."
 
-foreign import libc "system:c"
+when ODIN_OS != .Windows {
+	foreign import libc "system:c"
 
-@(default_calling_convention = "c")
-foreign libc {
-	popen :: proc(command: cstring, mode: cstring) -> rawptr ---
-	pclose :: proc(stream: rawptr) -> c.int ---
-	fgets :: proc(str: [^]u8, n: c.int, stream: rawptr) -> [^]u8 ---
+	@(default_calling_convention = "c")
+	foreign libc {
+		popen :: proc(command: cstring, mode: cstring) -> rawptr ---
+		pclose :: proc(stream: rawptr) -> c.int ---
+		fgets :: proc(str: [^]u8, n: c.int, stream: rawptr) -> [^]u8 ---
+	}
 }
 
 MAX_RUNS        :: 64
-MAX_TOTAL_RANKS :: 32
+MAX_TOTAL_RANKS :: 64
 
 Bench_Record :: struct {
 	rank:       int,
@@ -48,28 +50,30 @@ g_name_filter:    string = ""
 g_records:        [dynamic]Bench_Record
 
 g_selective_run:  bool = false
-g_existing_lines: [MAX_TOTAL_RANKS]string
+g_existing_lines: [MAX_TOTAL_RANKS][dynamic]string
 g_updated_lines:  [MAX_TOTAL_RANKS]string
 g_bench_sink:     u64 = 0
 
 resolve_git_commit :: proc(allocator := context.allocator) -> string {
+	defer free_all(context.temp_allocator)
+	scratch := context.temp_allocator
 	git_dir := ".git"
 	common_dir := ".git"
 
-	if dot_git_bytes, dg_err := os.read_entire_file(".git", allocator); dg_err == nil {
+	if dot_git_bytes, dg_err := os.read_entire_file(".git", scratch); dg_err == nil {
 		dg_str := strings.trim_space(string(dot_git_bytes))
 		if strings.has_prefix(dg_str, "gitdir:") {
 			gd := strings.trim_space(dg_str[len("gitdir:"):])
 			git_dir = gd
 			common_dir = gd
-			cm_path := fmt.aprintf("%s/commondir", git_dir, allocator = allocator)
-			if cm_bytes, cm_err := os.read_entire_file(cm_path, allocator); cm_err == nil {
+			cm_path := fmt.tprintf("%s/commondir", git_dir)
+			if cm_bytes, cm_err := os.read_entire_file(cm_path, scratch); cm_err == nil {
 				cm_rel := strings.trim_space(string(cm_bytes))
 				if len(cm_rel) > 0 {
 					if strings.has_prefix(cm_rel, "/") {
 						common_dir = cm_rel
 					} else {
-						common_dir = fmt.aprintf("%s/%s", git_dir, cm_rel, allocator = allocator)
+						common_dir = fmt.tprintf("%s/%s", git_dir, cm_rel)
 					}
 				}
 			}
@@ -77,24 +81,24 @@ resolve_git_commit :: proc(allocator := context.allocator) -> string {
 	}
 
 	sha_short := ""
-	head_path := fmt.aprintf("%s/HEAD", git_dir, allocator = allocator)
-	if head_bytes, err := os.read_entire_file(head_path, allocator); err == nil {
+	head_path := fmt.tprintf("%s/HEAD", git_dir)
+	if head_bytes, err := os.read_entire_file(head_path, scratch); err == nil {
 		head_str := strings.trim_space(string(head_bytes))
 		if strings.has_prefix(head_str, "ref: ") {
 			ref_rel := strings.trim_space(head_str[5:])
 			for base in ([2]string{git_dir, common_dir}) {
-				ref_path := fmt.aprintf("%s/%s", base, ref_rel, allocator = allocator)
-				if ref_bytes, r_err := os.read_entire_file(ref_path, allocator); r_err == nil {
+				ref_path := fmt.tprintf("%s/%s", base, ref_rel)
+				if ref_bytes, r_err := os.read_entire_file(ref_path, scratch); r_err == nil {
 					sha := strings.trim_space(string(ref_bytes))
 					sha_short = sha[:min(len(sha), 12)]
 					break
 				}
 			}
 			if sha_short == "" {
-				packed_path := fmt.aprintf("%s/packed-refs", common_dir, allocator = allocator)
-				if packed_bytes, p_err := os.read_entire_file(packed_path, allocator); p_err == nil {
-					lines := strings.split_lines(string(packed_bytes), allocator)
-					suffix := fmt.aprintf(" %s", ref_rel, allocator = allocator)
+				packed_path := fmt.tprintf("%s/packed-refs", common_dir)
+				if packed_bytes, p_err := os.read_entire_file(packed_path, scratch); p_err == nil {
+					lines := strings.split_lines(string(packed_bytes), scratch)
+					suffix := fmt.tprintf(" %s", ref_rel)
 					for line in lines {
 						trimmed := strings.trim_space(line)
 						if len(trimmed) == 0 || strings.has_prefix(trimmed, "#") || strings.has_prefix(trimmed, "^") {
@@ -116,19 +120,21 @@ resolve_git_commit :: proc(allocator := context.allocator) -> string {
 		return "unknown"
 	}
 
-	fp := popen(
-		"git status --porcelain --untracked-files=no -- lib native benchmarks/bench_elixir.exs benchmarks/bench_client.odin 2>/dev/null",
-		"r",
-	)
-	if fp != nil {
-		buf: [128]u8 = ---
-		is_dirty := fgets(raw_data(buf[:]), c.int(len(buf)), fp) != nil
-		pclose(fp)
-		if is_dirty {
-			return fmt.aprintf("%s-dirty", sha_short, allocator = allocator)
+	when ODIN_OS != .Windows {
+		fp := popen(
+			"git status --porcelain --untracked-files=no -- lib native benchmarks/bench_elixir.exs benchmarks/bench_client.odin 2>/dev/null",
+			"r",
+		)
+		if fp != nil {
+			buf: [128]u8 = ---
+			is_dirty := fgets(raw_data(buf[:]), c.int(len(buf)), fp) != nil
+			pclose(fp)
+			if is_dirty {
+				return fmt.aprintf("%s-dirty", sha_short, allocator = allocator)
+			}
 		}
 	}
-	return sha_short
+	return strings.clone(sha_short, allocator)
 }
 
 parse_cli_args :: proc() {
@@ -289,7 +295,7 @@ load_existing_jsonl_ranks :: proc(path: string) {
 		comma := strings.index_byte(rest, ',')
 		if comma <= 0 do continue
 		if r, ok := strconv.parse_int(rest[:comma]); ok && r >= 1 && r < MAX_TOTAL_RANKS {
-			g_existing_lines[r] = fmt.aprintf("%s\n", line)
+			append(&g_existing_lines[r], fmt.aprintf("%s\n", line))
 		}
 	}
 }
@@ -402,8 +408,10 @@ emit_jsonl :: proc() {
 		for r in 1 ..< MAX_TOTAL_RANKS {
 			if len(g_updated_lines[r]) > 0 {
 				strings.write_string(&merged_sb, g_updated_lines[r])
-			} else if len(g_existing_lines[r]) > 0 {
-				strings.write_string(&merged_sb, g_existing_lines[r])
+			} else {
+				for existing_ln in g_existing_lines[r] {
+					strings.write_string(&merged_sb, existing_ln)
+				}
 			}
 		}
 		merged_payload := strings.to_string(merged_sb)
@@ -827,7 +835,6 @@ main :: proc() {
 	// Shared fixture DB for read/query benchmarks (N=500)
 	core: xitdb.Core
 	db: xitdb.Database
-	m0_cur: xitdb.Read_Cursor
 	m0_map: xitdb.Read_Hash_Map
 	users_map: xitdb.Read_Hash_Map
 	sorted_map: xitdb.Read_Sorted_Map
@@ -846,7 +853,7 @@ main :: proc() {
 		rc := xitdb.database_root_cursor(&db).read_cursor
 		hist, _ := xitdb.read_array_list_init(rc)
 		m0_cur_maybe, _ := xitdb.array_list_get_cursor(hist, 0)
-		m0_cur = m0_cur_maybe.?
+		m0_cur := m0_cur_maybe.?
 		m0_map, _ = xitdb.read_hash_map_init(m0_cur)
 
 		users_cur_maybe, _ := xitdb.hash_map_get_cursor(m0_map, "users")
@@ -1381,6 +1388,7 @@ main :: proc() {
 	if r25 {
 		sb_seek: [128]u8 = ---
 		val_buf: [128]u8 = ---
+		acc: u64 = 0
 		for r in 0 ..< (g_warmup + g_runs) {
 			t0 := time.now()
 			for _ in 0 ..< 100 {
@@ -1402,12 +1410,24 @@ main :: proc() {
 					if !strings.has_prefix(ks, "u4") {
 						break
 					}
+					acc += u64(len(ks))
+					if len(ks) > 0 {
+						acc += u64(ks[0])
+					}
 					if cnt == 16 {
-						_ = ks
 						break
 					}
-					if _, v_err := xitdb.cursor_read_bytes_buf(val_cur, val_buf[:]); v_err != nil {
-						_, _ = xitdb.cursor_read_string(val_cur, 0, context.temp_allocator)
+					if vbo, v_err := xitdb.cursor_read_bytes_buf(val_cur, val_buf[:]); v_err == nil {
+						acc += u64(len(vbo.value))
+						if len(vbo.value) > 0 {
+							acc += u64(vbo.value[0])
+						}
+					} else {
+						vs, _ := xitdb.cursor_read_string(val_cur, 0, context.temp_allocator)
+						acc += u64(len(vs))
+						if len(vs) > 0 {
+							acc += u64(vs[0])
+						}
 					}
 					cnt += 1
 				}
@@ -1417,6 +1437,7 @@ main :: proc() {
 			}
 			free_all(context.temp_allocator)
 		}
+		intrinsics.volatile_store(&g_bench_sink, g_bench_sink + acc)
 		record_samples(25, "Search: Sorted_Map B+Tree prefix seek (limit=16)", 100, samples)
 	}
 
@@ -1532,6 +1553,7 @@ main :: proc() {
 
 	// #28: DSL: Pre-tokenized path_steps select(path_steps(users[id].name))
 	if r28 {
+		acc: u64 = 0
 		for r in 0 ..< (g_warmup + g_runs) {
 			t0 := time.now()
 			for i in 0 ..< 500 {
@@ -1545,13 +1567,18 @@ main :: proc() {
 				hist_cur, _ := xitdb.read_array_list_init(rc)
 				mc_maybe, _ := xitdb.array_list_get_cursor(hist_cur, -1)
 				c_maybe, _ := xitdb.read_steps_cursor(mc_maybe.?, steps[:])
-				_, _ = xitdb.cursor_read_string(c_maybe.?, 0, context.temp_allocator)
+				s, _ := xitdb.cursor_read_string(c_maybe.?, 0, context.temp_allocator)
+				acc += u64(len(s))
+				if len(s) > 0 {
+					acc += u64(s[0])
+				}
 			}
 			if r >= g_warmup {
 				samples[r - g_warmup] = f64(time.duration_nanoseconds(time.since(t0))) / 500.0
 			}
 			free_all(context.temp_allocator)
 		}
+		intrinsics.volatile_store(&g_bench_sink, g_bench_sink + acc)
 		record_samples(28, "DSL: Pre-tokenized path_steps select(path_steps(users[id].name))", 500, samples)
 	}
 
