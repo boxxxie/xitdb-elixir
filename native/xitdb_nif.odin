@@ -1062,14 +1062,14 @@ odin_nif_slot_get_key :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF
 		return make_err(env, "badarg")
 	}
 
-	slot, _, is_empty, r_err, err_reason := resolve_slot_arg(handle, tag_int, val_int)
+	slot, is_root, is_empty, r_err, err_reason := resolve_slot_arg(handle, tag_int, val_int)
 	if r_err != nil {
 		return make_xitdb_err(env, r_err)
 	}
 	if err_reason != "" {
 		return make_err(env, err_reason)
 	}
-	if is_empty {
+	if is_empty || (is_root && key_str == "__tx") {
 		return ATOM_ERROR
 	}
 
@@ -1326,56 +1326,62 @@ odin_nif_slot_contains :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NI
 		db       = &handle.db,
 	}
 
+	found := false
+	err: xitdb.Error = nil
+	slot_maybe: Maybe(xitdb.Slot) = nil
+
 	#partial switch slot.tag {
-	case .Hash_Set, .Counted_Hash_Set:
-		hs := xitdb.Read_Hash_Set{cursor = cur}
-		slot_maybe, err := xitdb.hash_set_get_slot(hs, key_str)
-		if err == .Key_Not_Found {
-			return make_ok(env, ATOM_FALSE)
+	case .Hash_Set:
+		hs: xitdb.Read_Hash_Set
+		hs, err = xitdb.read_hash_set_init(cur)
+		if err == nil {
+			slot_maybe, err = xitdb.hash_set_get_slot(hs, key_str)
 		}
-		if err != nil {
-			return make_xitdb_err(env, err)
+	case .Counted_Hash_Set:
+		chs: xitdb.Read_Counted_Hash_Set
+		chs, err = xitdb.read_counted_hash_set_init(cur)
+		if err == nil {
+			slot_maybe, err = xitdb.hash_set_get_slot(chs.read_hash_set, key_str)
 		}
-		_, found := slot_maybe.?
-		return make_ok(env, ATOM_TRUE if found else ATOM_FALSE)
-
 	case .Sorted_Set:
-		ss := xitdb.Read_Sorted_Set{cursor = cur}
-		found, err := xitdb.sorted_set_contains(ss, key_str)
-		if err == .Key_Not_Found {
-			return make_ok(env, ATOM_FALSE)
+		ss: xitdb.Read_Sorted_Set
+		ss, err = xitdb.read_sorted_set_init(cur)
+		if err == nil {
+			found, err = xitdb.sorted_set_contains(ss, key_str)
 		}
-		if err != nil {
-			return make_xitdb_err(env, err)
+	case .Hash_Map:
+		hm: xitdb.Read_Hash_Map
+		hm, err = xitdb.read_hash_map_init(cur)
+		if err == nil {
+			slot_maybe, err = xitdb.hash_map_get_slot(hm, key_str)
 		}
-		return make_ok(env, ATOM_TRUE if found else ATOM_FALSE)
-
-	case .Hash_Map, .Counted_Hash_Map:
-		hm := xitdb.Read_Hash_Map{cursor = cur}
-		slot_maybe, err := xitdb.hash_map_get_slot(hm, key_str)
-		if err == .Key_Not_Found {
-			return make_ok(env, ATOM_FALSE)
+	case .Counted_Hash_Map:
+		chm: xitdb.Read_Counted_Hash_Map
+		chm, err = xitdb.read_counted_hash_map_init(cur)
+		if err == nil {
+			slot_maybe, err = xitdb.hash_map_get_slot(chm.read_hash_map, key_str)
 		}
-		if err != nil {
-			return make_xitdb_err(env, err)
-		}
-		s, found := slot_maybe.?
-		return make_ok(env, ATOM_TRUE if (found && (s.tag != .None || s.full)) else ATOM_FALSE)
-
 	case .Sorted_Map:
-		sm := xitdb.Read_Sorted_Map{cursor = cur}
-		slot_maybe, err := xitdb.sorted_map_get_slot(sm, key_str)
-		if err == .Key_Not_Found {
-			return make_ok(env, ATOM_FALSE)
+		sm: xitdb.Read_Sorted_Map
+		sm, err = xitdb.read_sorted_map_init(cur)
+		if err == nil {
+			slot_maybe, err = xitdb.sorted_map_get_slot(sm, key_str)
 		}
-		if err != nil {
-			return make_xitdb_err(env, err)
-		}
-		s, found := slot_maybe.?
-		return make_ok(env, ATOM_TRUE if (found && (s.tag != .None || s.full)) else ATOM_FALSE)
+	case:
+		return make_err(env, "unsupported")
 	}
 
-	return make_err(env, "unsupported")
+	if err == .Key_Not_Found {
+		return make_ok(env, ATOM_FALSE)
+	}
+	if err != nil {
+		return make_xitdb_err(env, err)
+	}
+	if slot.tag == .Sorted_Set {
+		return make_ok(env, ATOM_TRUE if found else ATOM_FALSE)
+	}
+	s, has_slot := slot_maybe.?
+	return make_ok(env, ATOM_TRUE if (has_slot && (s.tag != .None || s.full)) else ATOM_FALSE)
 }
 
 sorted_map_tx_rank :: proc(cur: xitdb.Read_Cursor) -> (has_tx: bool, rank: i64, err: xitdb.Error) {
@@ -3018,7 +3024,7 @@ rm_if_exists_callback :: proc(moment_cur: ^xitdb.Write_Cursor, user_data: rawptr
 				xitdb.hm(rule.field_key),
 			}
 			old_maybe, _, old_err := read_steps_cursor_adaptive(moment_hm.read_hash_map.cursor, lookup[:])
-			if old_err != nil && old_err != .Unexpected_Tag {
+			if old_err != nil && old_err != .Unexpected_Tag && old_err != .Key_Not_Found {
 				return old_err
 			}
 			if old_cur, has_old := old_maybe.?; has_old {
@@ -3210,7 +3216,35 @@ read_cur_string_if_bytes :: proc(cur: xitdb.Read_Cursor) -> (s: string, ok: bool
 	return "", false, nil
 }
 
+has_index_rule_for_source :: proc(ms: ^Merge_State, src_key: string) -> bool {
+	if !ms.has_indexes {
+		return false
+	}
+	for rule in ms.tx.index_rules {
+		if rule.source_map_key == src_key {
+			return true
+		}
+	}
+	return false
+}
+
+has_index_rule_for_field :: proc(ms: ^Merge_State, src_key: string, field_key: string) -> bool {
+	if !ms.has_indexes {
+		return false
+	}
+	for rule in ms.tx.index_rules {
+		if rule.source_map_key == src_key && rule.field_key == field_key {
+			return true
+		}
+	}
+	return false
+}
+
 queue_record_removal_indexes :: proc(ms: ^Merge_State, src_key: string, rec_cur: xitdb.Read_Cursor) -> xitdb.Error {
+	sp := xitdb.cursor_resolved(rec_cur) or_return
+	if sp.slot.tag != .Hash_Map && sp.slot.tag != .Counted_Hash_Map && sp.slot.tag != .Sorted_Map {
+		return nil
+	}
 	for rule in ms.tx.index_rules {
 		if rule.source_map_key != src_key {
 			continue
@@ -3234,6 +3268,46 @@ queue_record_removal_indexes :: proc(ms: ^Merge_State, src_key: string, rec_cur:
 				})
 			}
 		}
+	}
+	return nil
+}
+
+evict_source_map_indexes :: proc(ms: ^Merge_State, src_key: string, src_cur: xitdb.Read_Cursor) -> xitdb.Error {
+	if !has_index_rule_for_source(ms, src_key) {
+		return nil
+	}
+	sp := xitdb.cursor_resolved(src_cur) or_return
+	if sp.slot.value == 0 || (sp.slot.tag != .Hash_Map && sp.slot.tag != .Counted_Hash_Map && sp.slot.tag != .Sorted_Map) {
+		return nil
+	}
+	it := xitdb.cursor_iterator(src_cur) or_return
+	for {
+		next_maybe := xitdb.cursor_iterator_next(&it) or_return
+		elem_cur, has_next := next_maybe.?
+		if !has_next {
+			break
+		}
+		_, val_cur := xitdb.cursor_read_kv_pair_slots(elem_cur) or_return
+		queue_record_removal_indexes(ms, src_key, val_cur) or_return
+	}
+	return nil
+}
+
+maybe_evict_before_cursor_reset :: proc(
+	ms: ^Merge_State,
+	cur: xitdb.Read_Cursor,
+	reset: bool,
+	depth: int,
+	src_key: string,
+) -> xitdb.Error {
+	if !ms.has_indexes || reset {
+		return nil
+	}
+	if depth == 1 {
+		return evict_source_map_indexes(ms, src_key, cur)
+	}
+	if depth == 2 && has_index_rule_for_source(ms, src_key) {
+		return queue_record_removal_indexes(ms, src_key, cur)
 	}
 	return nil
 }
@@ -3284,13 +3358,19 @@ flush_pending_indexes :: proc(ms: ^Merge_State, moment_hm: ^xitdb.Write_Hash_Map
 		return nil
 	}
 	xitdb.cursor_reload_slot(&moment_hm.write_cursor) or_return
+	// Pass 1: remove all old keys before inserting new keys so swaps/reuse never clobber updates.
 	for pop in ms.pending_idx {
-		idx_cur := xitdb.hash_map_put_cursor(moment_hm, pop.index_map_key) or_return
-		idx_sm := xitdb.write_sorted_map_init(idx_cur) or_return
 		if pop.has_old {
+			idx_cur := xitdb.hash_map_put_cursor(moment_hm, pop.index_map_key) or_return
+			idx_sm := xitdb.write_sorted_map_init(idx_cur) or_return
 			_, _ = xitdb.sorted_map_remove(&idx_sm, pop.old_key)
 		}
+	}
+	// Pass 2: insert all new index entries.
+	for pop in ms.pending_idx {
 		if pop.has_new {
+			idx_cur := xitdb.hash_map_put_cursor(moment_hm, pop.index_map_key) or_return
+			idx_sm := xitdb.write_sorted_map_init(idx_cur) or_return
 			xitdb.sorted_map_put(&idx_sm, pop.new_key, pop.record_id) or_return
 		}
 	}
@@ -3349,7 +3429,7 @@ merge_kv_entry_hm :: proc(
 		if reset {
 			return nil
 		}
-		if ms.has_indexes && (depth == 1 || depth == 2) {
+		if ms.has_indexes && ((depth == 0 && has_index_rule_for_source(ms, k_str)) || ((depth == 1 || depth == 2) && has_index_rule_for_source(ms, src_key))) {
 			xitdb.cursor_reload_slot(&hm.write_cursor) or_return
 			rhm := xitdb.Read_Hash_Map{cursor = hm.write_cursor.read_cursor}
 			c_maybe, r_err := xitdb.hash_map_get_cursor(rhm, k_str)
@@ -3357,7 +3437,9 @@ merge_kv_entry_hm :: proc(
 				return r_err
 			}
 			if found_cur, found := c_maybe.?; found {
-				if depth == 1 {
+				if depth == 0 {
+					evict_source_map_indexes(ms, k_str, found_cur) or_return
+				} else if depth == 1 {
 					queue_record_removal_indexes(ms, src_key, found_cur) or_return
 				} else {
 					queue_field_index_change(ms, src_key, rec_key, k_str, found_cur, "", false) or_return
@@ -3369,15 +3451,28 @@ merge_kv_entry_hm :: proc(
 	}
 
 	if wdata, is_scalar := decode_writeable_value(ms.env, val_term); is_scalar {
-		if ms.has_indexes && depth == 2 {
-			has_matching_rule := false
-			for rule in ms.tx.index_rules {
-				if rule.source_map_key == src_key && rule.field_key == k_str {
-					has_matching_rule = true
-					break
+		if ms.has_indexes {
+			if !reset && depth == 0 && has_index_rule_for_source(ms, k_str) {
+				xitdb.cursor_reload_slot(&hm.write_cursor) or_return
+				rhm := xitdb.Read_Hash_Map{cursor = hm.write_cursor.read_cursor}
+				c_maybe, r_err := xitdb.hash_map_get_cursor(rhm, k_str)
+				if r_err != nil && r_err != .Key_Not_Found {
+					return r_err
 				}
-			}
-			if has_matching_rule {
+				if found_cur, found := c_maybe.?; found {
+					evict_source_map_indexes(ms, k_str, found_cur) or_return
+				}
+			} else if !reset && depth == 1 && has_index_rule_for_source(ms, src_key) {
+				xitdb.cursor_reload_slot(&hm.write_cursor) or_return
+				rhm := xitdb.Read_Hash_Map{cursor = hm.write_cursor.read_cursor}
+				c_maybe, r_err := xitdb.hash_map_get_cursor(rhm, k_str)
+				if r_err != nil && r_err != .Key_Not_Found {
+					return r_err
+				}
+				if found_cur, found := c_maybe.?; found {
+					queue_record_removal_indexes(ms, src_key, found_cur) or_return
+				}
+			} else if depth == 2 && has_index_rule_for_field(ms, src_key, k_str) {
 				old_maybe: Maybe(xitdb.Read_Cursor) = nil
 				if !reset {
 					xitdb.cursor_reload_slot(&hm.write_cursor) or_return
@@ -3405,21 +3500,15 @@ merge_kv_entry_hm :: proc(
 		}
 	}
 
-	if ms.has_indexes && depth == 2 && !reset {
-		has_matching_rule := false
-		for rule in ms.tx.index_rules {
-			if rule.source_map_key == src_key && rule.field_key == k_str {
-				has_matching_rule = true
-				break
-			}
+	if !reset && depth == 2 && has_index_rule_for_field(ms, src_key, k_str) {
+		xitdb.cursor_reload_slot(&hm.write_cursor) or_return
+		rhm := xitdb.Read_Hash_Map{cursor = hm.write_cursor.read_cursor}
+		cm, r_err := xitdb.hash_map_get_cursor(rhm, k_str)
+		if r_err != nil && r_err != .Key_Not_Found {
+			return r_err
 		}
-		if has_matching_rule {
-			xitdb.cursor_reload_slot(&hm.write_cursor) or_return
-			rhm := xitdb.Read_Hash_Map{cursor = hm.write_cursor.read_cursor}
-			cm, r_err := xitdb.hash_map_get_cursor(rhm, k_str)
-			if r_err == nil {
-				queue_field_index_change(ms, src_key, rec_key, k_str, cm, "", false) or_return
-			}
+		if r_err == nil {
+			queue_field_index_change(ms, src_key, rec_key, k_str, cm, "", false) or_return
 		}
 	}
 
@@ -3448,7 +3537,7 @@ merge_kv_entry_sm :: proc(
 		if reset {
 			return nil
 		}
-		if ms.has_indexes && (depth == 1 || depth == 2) {
+		if ms.has_indexes && ((depth == 0 && has_index_rule_for_source(ms, k_str)) || ((depth == 1 || depth == 2) && has_index_rule_for_source(ms, src_key))) {
 			xitdb.cursor_reload_slot(&sm.write_cursor) or_return
 			rsm := xitdb.Read_Sorted_Map{cursor = sm.write_cursor.read_cursor}
 			c_maybe, r_err := xitdb.sorted_map_get_cursor(rsm, k_str)
@@ -3456,7 +3545,9 @@ merge_kv_entry_sm :: proc(
 				return r_err
 			}
 			if found_cur, found := c_maybe.?; found {
-				if depth == 1 {
+				if depth == 0 {
+					evict_source_map_indexes(ms, k_str, found_cur) or_return
+				} else if depth == 1 {
 					queue_record_removal_indexes(ms, src_key, found_cur) or_return
 				} else {
 					queue_field_index_change(ms, src_key, rec_key, k_str, found_cur, "", false) or_return
@@ -3468,15 +3559,28 @@ merge_kv_entry_sm :: proc(
 	}
 
 	if wdata, is_scalar := decode_writeable_value(ms.env, val_term); is_scalar {
-		if ms.has_indexes && depth == 2 {
-			has_matching_rule := false
-			for rule in ms.tx.index_rules {
-				if rule.source_map_key == src_key && rule.field_key == k_str {
-					has_matching_rule = true
-					break
+		if ms.has_indexes {
+			if !reset && depth == 0 && has_index_rule_for_source(ms, k_str) {
+				xitdb.cursor_reload_slot(&sm.write_cursor) or_return
+				rsm := xitdb.Read_Sorted_Map{cursor = sm.write_cursor.read_cursor}
+				c_maybe, r_err := xitdb.sorted_map_get_cursor(rsm, k_str)
+				if r_err != nil && r_err != .Key_Not_Found {
+					return r_err
 				}
-			}
-			if has_matching_rule {
+				if found_cur, found := c_maybe.?; found {
+					evict_source_map_indexes(ms, k_str, found_cur) or_return
+				}
+			} else if !reset && depth == 1 && has_index_rule_for_source(ms, src_key) {
+				xitdb.cursor_reload_slot(&sm.write_cursor) or_return
+				rsm := xitdb.Read_Sorted_Map{cursor = sm.write_cursor.read_cursor}
+				c_maybe, r_err := xitdb.sorted_map_get_cursor(rsm, k_str)
+				if r_err != nil && r_err != .Key_Not_Found {
+					return r_err
+				}
+				if found_cur, found := c_maybe.?; found {
+					queue_record_removal_indexes(ms, src_key, found_cur) or_return
+				}
+			} else if depth == 2 && has_index_rule_for_field(ms, src_key, k_str) {
 				old_maybe: Maybe(xitdb.Read_Cursor) = nil
 				if !reset {
 					xitdb.cursor_reload_slot(&sm.write_cursor) or_return
@@ -3504,21 +3608,15 @@ merge_kv_entry_sm :: proc(
 		}
 	}
 
-	if ms.has_indexes && depth == 2 && !reset {
-		has_matching_rule := false
-		for rule in ms.tx.index_rules {
-			if rule.source_map_key == src_key && rule.field_key == k_str {
-				has_matching_rule = true
-				break
-			}
+	if !reset && depth == 2 && has_index_rule_for_field(ms, src_key, k_str) {
+		xitdb.cursor_reload_slot(&sm.write_cursor) or_return
+		rsm := xitdb.Read_Sorted_Map{cursor = sm.write_cursor.read_cursor}
+		cm, r_err := xitdb.sorted_map_get_cursor(rsm, k_str)
+		if r_err != nil && r_err != .Key_Not_Found {
+			return r_err
 		}
-		if has_matching_rule {
-			xitdb.cursor_reload_slot(&sm.write_cursor) or_return
-			rsm := xitdb.Read_Sorted_Map{cursor = sm.write_cursor.read_cursor}
-			cm, r_err := xitdb.sorted_map_get_cursor(rsm, k_str)
-			if r_err == nil {
-				queue_field_index_change(ms, src_key, rec_key, k_str, cm, "", false) or_return
-			}
+		if r_err == nil {
+			queue_field_index_change(ms, src_key, rec_key, k_str, cm, "", false) or_return
 		}
 	}
 
@@ -3649,6 +3747,7 @@ merge_list_into_cursor :: proc(
 	cur: ^xitdb.Write_Cursor,
 	kind_str: string,
 	list_term: ERL_NIF_TERM,
+	reset: bool,
 	depth: int,
 	src_key: string,
 	rec_key: string,
@@ -3659,6 +3758,7 @@ merge_list_into_cursor :: proc(
 	if nif_is_list(ms.env, list_term) == 0 {
 		return fail_validation(ms.validation_err, "invalid_put_op")
 	}
+	maybe_evict_before_cursor_reset(ms, cur.read_cursor, reset, depth, src_key) or_return
 	xitdb.cursor_write(cur, xitdb.Slot{}) or_return
 	if kind_str == "linked_array_list" {
 		ll := xitdb.write_linked_array_list_init(cur^) or_return
@@ -3714,11 +3814,12 @@ merge_node_into_cursor :: proc(
 		if !is_structured_write_candidate(ms.env, term) {
 			return fail_validation(ms.validation_err, "invalid_put_op")
 		}
+		maybe_evict_before_cursor_reset(ms, cur.read_cursor, reset, depth, src_key) or_return
 		xitdb.cursor_write(cur, xitdb.Slot{}) or_return
 		return write_term_to_cursor(ms.env, cur, term, ms.validation_err, "invalid_put_op", depth)
 	}
 	if nif_is_list(ms.env, term) != 0 {
-		return merge_list_into_cursor(ms, cur, "array_list", term, depth, src_key, rec_key)
+		return merge_list_into_cursor(ms, cur, "array_list", term, reset, depth, src_key, rec_key)
 	}
 	if nif_is_map(ms.env, term) != 0 {
 		struct_term: ERL_NIF_TERM
@@ -3737,11 +3838,12 @@ merge_node_into_cursor :: proc(
 				case "hash_map", "counted_hash_map", "sorted_map":
 					return merge_kv_collection_into_cursor(ms, cur, kind_str, data_term, reset, depth, src_key, rec_key)
 				case "array_list", "linked_array_list":
-					return merge_list_into_cursor(ms, cur, kind_str, data_term, depth, src_key, rec_key)
+					return merge_list_into_cursor(ms, cur, kind_str, data_term, reset, depth, src_key, rec_key)
 				case "hash_set", "counted_hash_set", "sorted_set":
 					if !is_valid_set_container(ms.env, data_term) {
 						return fail_validation(ms.validation_err, "invalid_put_op")
 					}
+					maybe_evict_before_cursor_reset(ms, cur.read_cursor, reset, depth, src_key) or_return
 					xitdb.cursor_write(cur, xitdb.Slot{}) or_return
 					return write_collection_term_to_cursor(ms.env, cur, kind_str, data_term, ms.validation_err, "invalid_put_op", depth)
 				}
@@ -3751,6 +3853,7 @@ merge_node_into_cursor :: proc(
 				if !is_valid_set_container(ms.env, term) {
 					return fail_validation(ms.validation_err, "invalid_put_op")
 				}
+				maybe_evict_before_cursor_reset(ms, cur.read_cursor, reset, depth, src_key) or_return
 				xitdb.cursor_write(cur, xitdb.Slot{}) or_return
 				return write_collection_term_to_cursor(ms.env, cur, "counted_hash_set", term, ms.validation_err, "invalid_put_op", depth)
 			}
@@ -3763,6 +3866,7 @@ merge_node_into_cursor :: proc(
 		}
 		eff_reset := reset || map_sz == 0
 		if eff_reset {
+			maybe_evict_before_cursor_reset(ms, cur.read_cursor, reset, depth, src_key) or_return
 			xitdb.cursor_write(cur, xitdb.Slot{}) or_return
 		}
 		if !eff_reset && ms.adapt_containers {
@@ -4136,16 +4240,9 @@ record_merge_map_pending_tags :: proc(
 		}
 
 		if is_plain_nonempty_map {
-			if existing_pt, has_pt := pending_tags[p_key]; has_pt && existing_pt != .None {
-				// Preserve existing pending container tag (e.g. from prior put/init_col)
-			} else if !base_empty {
-				if cur_maybe, _, c_err := read_steps_cursor_adaptive(base_cur, prefix_steps[:]); c_err == nil {
-					if c, found := cur_maybe.?; found {
-						if sp, sp_err := xitdb.cursor_resolved(c); sp_err == nil && is_container_tag(sp.slot.tag) {
-							pending_tags[p_key] = sp.slot.tag
-						}
-					}
-				}
+			live_tag, exists := resolve_live_tag(base_cur, base_empty, prefix_steps[:], pending_tags^, fork_aliases^)
+			if !exists || !is_container_tag(live_tag) {
+				pending_tags[p_key] = .Hash_Map
 			}
 			record_merge_map_pending_tags(env, base_cur, base_empty, val, prefix_steps, pending_tags, fork_aliases, depth + 1)
 		} else {
@@ -4173,20 +4270,32 @@ adapt_steps_for_base_moment :: proc(
 	for i := 0; i < len(steps); i += 1 {
 		prefix_key := pending_path_key(steps[:i])
 		cur_tag: xitdb.Tag = .None
-		if pt, has_pt := pending_tags[prefix_key]; has_pt {
-			cur_tag = pt
-			base_valid = false
-		} else {
-			if !base_valid && i > 0 {
-				if alias_steps, has_alias := fork_aliases[prefix_key]; has_alias && len(alias_steps) > 0 {
+		has_alias := false
+		if i > 0 {
+			if alias_steps, ok_alias := fork_aliases[prefix_key]; ok_alias && len(alias_steps) > 0 {
+				has_alias = true
+				if !base_empty {
 					if alias_maybe, _, a_err := read_steps_cursor_adaptive(base_cur, alias_steps); a_err == nil {
 						if alias_cur, found := alias_maybe.?; found {
 							cur = alias_cur
 							base_valid = true
+						} else {
+							base_valid = false
 						}
+					} else {
+						base_valid = false
 					}
+				} else {
+					base_valid = false
 				}
 			}
+		}
+		if pt, has_pt := pending_tags[prefix_key]; has_pt {
+			cur_tag = pt
+			if pt == .None || !has_alias {
+				base_valid = false
+			}
+		} else {
 			if base_valid {
 				sp, sp_err := xitdb.cursor_resolved(cur)
 				if sp_err != nil || sp.slot.tag == .None {
@@ -4266,27 +4375,128 @@ resolve_live_tag :: proc(
 	base_empty: bool,
 	steps: []xitdb.Path_Step,
 	pending_tags: map[string]xitdb.Tag,
+	fork_aliases: map[string][]xitdb.Path_Step,
 ) -> (tag: xitdb.Tag, exists: bool) {
-	k := pending_path_key(steps)
-	if pt, has_pt := pending_tags[k]; has_pt {
-		return pt, pt != .None
-	}
-	if base_empty {
+	if len(steps) == 0 {
 		return .None, false
 	}
-	cur_maybe, _, err := read_steps_cursor_adaptive(base_cur, steps)
-	if err != nil {
-		return .None, false
+	cur := base_cur
+	base_valid := !base_empty
+	for i := 0; i <= len(steps); i += 1 {
+		prefix_key := pending_path_key(steps[:i])
+		has_alias := false
+		if i > 0 {
+			if alias_steps, ok_alias := fork_aliases[prefix_key]; ok_alias && len(alias_steps) > 0 {
+				has_alias = true
+				if !base_empty {
+					if alias_maybe, _, a_err := read_steps_cursor_adaptive(base_cur, alias_steps); a_err == nil {
+						if alias_cur, found := alias_maybe.?; found {
+							cur = alias_cur
+							base_valid = true
+						} else {
+							base_valid = false
+						}
+					} else {
+						base_valid = false
+					}
+				} else {
+					base_valid = false
+				}
+			}
+		}
+		if pt, has_pt := pending_tags[prefix_key]; has_pt {
+			if pt == .None {
+				return .None, false
+			}
+			if i == len(steps) {
+				return pt, true
+			}
+			if !has_alias {
+				base_valid = false
+			}
+		} else if i == len(steps) {
+			if !base_valid {
+				return .None, false
+			}
+			sp, sp_err := xitdb.cursor_resolved(cur)
+			if sp_err != nil || sp.slot.tag == .None {
+				return .None, false
+			}
+			return sp.slot.tag, true
+		}
+		if i < len(steps) && base_valid {
+			next_maybe, _, err := read_steps_cursor_adaptive(cur, steps[i:i + 1])
+			if err != nil {
+				base_valid = false
+			} else if next_cur, found := next_maybe.?; found {
+				cur = next_cur
+			} else {
+				base_valid = false
+			}
+		}
 	}
-	cur, found := cur_maybe.?
-	if !found {
-		return .None, false
+	return .None, false
+}
+
+ensure_ancestor_pending_tags :: proc(steps: []xitdb.Path_Step, pending_tags: ^map[string]xitdb.Tag) {
+	for i := 1; i < len(steps); i += 1 {
+		anc_key := pending_path_key(steps[:i])
+		if pt, has_pt := pending_tags[anc_key]; has_pt && pt == .None {
+			#partial switch steps[i].kind {
+			case .Array_List_Idx:
+				pending_tags[anc_key] = .Array_List
+			case .Linked_List_Idx:
+				pending_tags[anc_key] = .Linked_Array_List
+			case .Counted_Hash_Map_Key:
+				pending_tags[anc_key] = .Counted_Hash_Map
+			case .Sorted_Map_Key:
+				pending_tags[anc_key] = .Sorted_Map
+			case .Hash_Set_Member:
+				pending_tags[anc_key] = .Hash_Set
+			case .Counted_Set_Member:
+				pending_tags[anc_key] = .Counted_Hash_Set
+			case .Sorted_Set_Member:
+				pending_tags[anc_key] = .Sorted_Set
+			case:
+				pending_tags[anc_key] = .Hash_Map
+			}
+		}
 	}
-	sp, sp_err := xitdb.cursor_resolved(cur)
-	if sp_err != nil || sp.slot.tag == .None {
-		return .None, false
+}
+
+resolve_fork_base_origin :: proc(
+	base_cur: xitdb.Read_Cursor,
+	base_empty: bool,
+	steps: []xitdb.Path_Step,
+	pending_tags: map[string]xitdb.Tag,
+	fork_aliases: map[string][]xitdb.Path_Step,
+	allocator: runtime.Allocator,
+) -> (origin: []xitdb.Path_Step, ok: bool) {
+	if base_empty || len(steps) == 0 {
+		return nil, false
 	}
-	return sp.slot.tag, true
+	candidate: []xitdb.Path_Step = steps
+	for i := len(steps); i >= 1; i -= 1 {
+		prefix_key := pending_path_key(steps[:i])
+		if alias_steps, has_alias := fork_aliases[prefix_key]; has_alias && len(alias_steps) > 0 {
+			combined := make([]xitdb.Path_Step, len(alias_steps) + (len(steps) - i), allocator)
+			copy(combined[:len(alias_steps)], alias_steps)
+			copy(combined[len(alias_steps):], steps[i:])
+			candidate = combined
+			break
+		}
+		if _, has_pt := pending_tags[prefix_key]; has_pt {
+			return nil, false
+		}
+	}
+	if cur_maybe, _, err := read_steps_cursor_adaptive(base_cur, candidate); err == nil {
+		if c, found := cur_maybe.?; found {
+			if sp, sp_err := xitdb.cursor_resolved(c); sp_err == nil && sp.slot.tag != .None {
+				return candidate, true
+			}
+		}
+	}
+	return nil, false
 }
 
 adapt_tx_ops_for_base_moment :: proc(handle: ^Db_Handle, tx: ^xitdb.Tx) -> bool {
@@ -4312,6 +4522,7 @@ adapt_tx_ops_for_base_moment :: proc(handle: ^Db_Handle, tx: ^xitdb.Tx) -> bool 
 			k := pending_path_key(op.steps)
 			purge_pending_prefix(&pending_tags, k)
 			purge_fork_aliases_prefix(&fork_aliases, k)
+			ensure_ancestor_pending_tags(op.steps, &pending_tags)
 		case .Remove:
 			if len(op.steps) >= 1 && adapt_steps_for_base_moment(base_cur, base_empty, op.steps, pending_tags, fork_aliases) {
 				adapted = true
@@ -4323,6 +4534,13 @@ adapt_tx_ops_for_base_moment :: proc(handle: ^Db_Handle, tx: ^xitdb.Tx) -> bool 
 			if len(op.steps) >= 1 && adapt_steps_for_base_moment(base_cur, base_empty, op.steps, pending_tags, fork_aliases) {
 				adapted = true
 			}
+			if op.kind == .Append || op.kind == .Insert {
+				ensure_ancestor_pending_tags(op.steps, &pending_tags)
+				k := pending_path_key(op.steps)
+				if pt, has_pt := pending_tags[k]; has_pt && pt == .None {
+					pending_tags[k] = .Linked_Array_List if op.kind == .Insert else .Array_List
+				}
+			}
 		case .Fork:
 			if len(op.from_steps) >= 1 && adapt_steps_for_base_moment(base_cur, base_empty, op.from_steps, pending_tags, fork_aliases) {
 				adapted = true
@@ -4331,31 +4549,46 @@ adapt_tx_ops_for_base_moment :: proc(handle: ^Db_Handle, tx: ^xitdb.Tx) -> bool 
 				adapted = true
 			}
 			dst_key := pending_path_key(op.steps)
-			purge_pending_prefix(&pending_tags, dst_key)
-			purge_fork_aliases_prefix(&fork_aliases, dst_key)
 			src_key := pending_path_key(op.from_steps)
-			copied_any := false
-			// Snapshot matching pending_tags before inserting new entries
+			src_tag, has_src := resolve_live_tag(base_cur, base_empty, op.from_steps, pending_tags, fork_aliases)
+			base_origin, has_base_origin := resolve_fork_base_origin(base_cur, base_empty, op.from_steps, pending_tags, fork_aliases, context.temp_allocator)
+			// Snapshot matching pending_tags and fork_aliases before purging dst_key.
 			Pending_Copy :: struct {
 				key: string,
 				tag: xitdb.Tag,
 			}
+			Alias_Copy :: struct {
+				key:   string,
+				steps: []xitdb.Path_Step,
+			}
 			copies := make([dynamic]Pending_Copy, 0, 8, context.temp_allocator)
 			for pk, ptag in pending_tags {
-				if pending_has_prefix(pk, src_key) && ptag != .None {
+				if pk != src_key && pending_has_prefix(pk, src_key) {
 					suffix := pk[len(src_key):]
 					append(&copies, Pending_Copy{key = fmt.tprintf("%s%s", dst_key, suffix), tag = ptag})
-					copied_any = true
 				}
 			}
+			alias_copies := make([dynamic]Alias_Copy, 0, 4, context.temp_allocator)
+			for ak, asteps in fork_aliases {
+				if ak != src_key && len(asteps) > 0 && pending_has_prefix(ak, src_key) {
+					suffix := ak[len(src_key):]
+					append(&alias_copies, Alias_Copy{key = fmt.tprintf("%s%s", dst_key, suffix), steps = asteps})
+				}
+			}
+			purge_pending_prefix(&pending_tags, dst_key)
+			purge_fork_aliases_prefix(&fork_aliases, dst_key)
+			ensure_ancestor_pending_tags(op.steps, &pending_tags)
 			for cp in copies {
 				pending_tags[cp.key] = cp.tag
 			}
-			if !copied_any && !base_empty {
-				if src_tag, has_src := resolve_live_tag(base_cur, base_empty, op.from_steps, pending_tags); has_src {
-					pending_tags[dst_key] = src_tag
-				}
-				fork_aliases[dst_key] = op.from_steps
+			for ac in alias_copies {
+				fork_aliases[ac.key] = ac.steps
+			}
+			if has_src {
+				pending_tags[dst_key] = src_tag
+			}
+			if has_base_origin {
+				fork_aliases[dst_key] = base_origin
 			}
 		case .Savepoint:
 			// no steps
@@ -4369,7 +4602,14 @@ adapt_tx_ops_for_base_moment :: proc(handle: ^Db_Handle, tx: ^xitdb.Tx) -> bool 
 					k := pending_path_key(sc.steps)
 					purge_pending_prefix(&pending_tags, k)
 					purge_fork_aliases_prefix(&fork_aliases, k)
+					ensure_ancestor_pending_tags(sc.steps, &pending_tags)
 					record_term_pending_tags(sc.env, k, sc.term, &pending_tags)
+				} else if sc.kind == .Append || sc.kind == .Insert {
+					ensure_ancestor_pending_tags(sc.steps, &pending_tags)
+					k := pending_path_key(sc.steps)
+					if pt, has_pt := pending_tags[k]; has_pt && pt == .None {
+						pending_tags[k] = .Linked_Array_List if sc.kind == .Insert else .Array_List
+					}
 				}
 			} else if op.callback == rm_if_exists_callback && op.user_data != nil {
 				rc := (^Rm_If_Exists_Ctx)(op.user_data)
@@ -4394,8 +4634,10 @@ adapt_tx_ops_for_base_moment :: proc(handle: ^Db_Handle, tx: ^xitdb.Tx) -> bool 
 					if ic.reset {
 						purge_pending_prefix(&pending_tags, k)
 						purge_fork_aliases_prefix(&fork_aliases, k)
+						ensure_ancestor_pending_tags(ic.steps, &pending_tags)
 						pending_tags[k] = new_tag
-					} else if _, exists := resolve_live_tag(base_cur, base_empty, ic.steps, pending_tags); !exists {
+					} else if _, exists := resolve_live_tag(base_cur, base_empty, ic.steps, pending_tags, fork_aliases); !exists {
+						ensure_ancestor_pending_tags(ic.steps, &pending_tags)
 						pending_tags[k] = new_tag
 					}
 				}
@@ -5123,6 +5365,10 @@ split_top_level_pull_specs :: proc(inner: string, allocator: runtime.Allocator) 
 			i += 1
 			continue
 		}
+		if ch == '\\' && i + 1 < len(inner) {
+			i += 2
+			continue
+		}
 		if ch == '"' || ch == '\'' {
 			in_quote = ch
 		} else if ch == '{' {
@@ -5172,6 +5418,10 @@ find_top_level_pull_brace :: proc(s: string) -> int {
 			i += 1
 			continue
 		}
+		if ch == '\\' && i + 1 < len(s) {
+			i += 2
+			continue
+		}
 		if ch == '"' || ch == '\'' {
 			in_quote = ch
 		} else if ch == '[' {
@@ -5203,6 +5453,10 @@ find_last_unquoted_lbracket :: proc(s: string) -> int {
 				in_quote = 0
 			}
 			i += 1
+			continue
+		}
+		if ch == '\\' && i + 1 < len(s) {
+			i += 2
 			continue
 		}
 		if ch == '"' || ch == '\'' {
@@ -5524,6 +5778,9 @@ nif_pull_cursor :: proc(
 					continue
 				}
 				target_maybe, r_err := xitdb.read_steps_cursor(cur, steps)
+				if r_err == .Unexpected_Tag {
+					target_maybe, _, r_err = read_steps_cursor_adaptive(cur, steps)
+				}
 				if r_err != nil {
 					if r_err == .Unexpected_Tag {
 						continue
@@ -6121,8 +6378,45 @@ nif_dl_split_comma_args :: proc(s: string, allocator: runtime.Allocator) -> []st
 	return args[:]
 }
 
+is_standalone_moment_prefix :: proc(raw: string) -> bool {
+	s := strings.trim_space(raw)
+	if len(s) > 4 && s[:3] == "not" && nif_dl_is_ws(s[3]) {
+		s = strings.trim_space(s[4:])
+	}
+	if len(s) < 2 || s[0] != '@' {
+		return false
+	}
+	rest := s[1:]
+	if rest[0] == '?' {
+		if len(rest) < 2 {
+			return false
+		}
+		for i := 1; i < len(rest); i += 1 {
+			ch := rest[i]
+			if ch == '.' || ch == '[' || ch == ']' || ch == '#' || ch == '$' || ch == '%' ||
+			   ch == '^' || ch == '=' || ch == '<' || ch == '>' || ch == '!' || nif_dl_is_ws(ch) {
+				return false
+			}
+		}
+		return true
+	}
+	start := 0
+	if rest[0] == '-' {
+		start = 1
+	}
+	if start >= len(rest) {
+		return false
+	}
+	for i := start; i < len(rest); i += 1 {
+		if rest[i] < '0' || rest[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 nif_dl_looks_like_complete_clause :: proc(s: string) -> bool {
-	if len(s) == 0 || s == "not" {
+	if len(s) == 0 || s == "not" || is_standalone_moment_prefix(s) {
 		return false
 	}
 	if strings.has_suffix(s, "=") || strings.has_suffix(s, "<") || strings.has_suffix(s, ">") || strings.has_suffix(s, "!") {
@@ -6870,7 +7164,38 @@ nif_dl_pull_val_as_i64 :: proc(v: xitdb.Pull_Value) -> (i64, bool) {
 	case i64:
 		return val, true
 	case u64:
-		return i64(val), true
+		if val <= u64(max(i64)) {
+			return i64(val), true
+		}
+		return 0, false
+	}
+	return 0, false
+}
+
+nif_dl_compare_ints :: proc(a, b: xitdb.Pull_Value) -> (cmp: int, ok: bool) {
+	#partial switch va in a {
+	case i64:
+		#partial switch vb in b {
+		case i64:
+			return (-1 if va < vb else (1 if va > vb else 0)), true
+		case u64:
+			if va < 0 {
+				return -1, true
+			}
+			ua := u64(va)
+			return (-1 if ua < vb else (1 if ua > vb else 0)), true
+		}
+	case u64:
+		#partial switch vb in b {
+		case u64:
+			return (-1 if va < vb else (1 if va > vb else 0)), true
+		case i64:
+			if vb < 0 {
+				return 1, true
+			}
+			ub := u64(vb)
+			return (-1 if va < ub else (1 if va > ub else 0)), true
+		}
 	}
 	return 0, false
 }
@@ -6882,10 +7207,8 @@ nif_dl_value_equals :: proc(a, b: xitdb.Pull_Value) -> bool {
 	if a == nil || b == nil {
 		return false
 	}
-	if ai, ok1 := nif_dl_pull_val_as_i64(a); ok1 {
-		if bi, ok2 := nif_dl_pull_val_as_i64(b); ok2 {
-			return ai == bi
-		}
+	if cmp, ok := nif_dl_compare_ints(a, b); ok {
+		return cmp == 0
 	}
 	#partial switch va in a {
 	case string:
@@ -6905,16 +7228,8 @@ nif_dl_value_equals :: proc(a, b: xitdb.Pull_Value) -> bool {
 }
 
 nif_dl_compare_values :: proc(a, b: xitdb.Pull_Value) -> (cmp: int, ok: bool) {
-	if ai, ok1 := nif_dl_pull_val_as_i64(a); ok1 {
-		if bi, ok2 := nif_dl_pull_val_as_i64(b); ok2 {
-			if ai < bi {
-				return -1, true
-			}
-			if ai > bi {
-				return 1, true
-			}
-			return 0, true
-		}
+	if int_cmp, int_ok := nif_dl_compare_ints(a, b); int_ok {
+		return int_cmp, true
 	}
 	#partial switch va in a {
 	case string:
@@ -7415,14 +7730,14 @@ nif_dl_eval_pattern_steps :: proc(
 		}
 	}
 
-	if check_only {
+	if clause_idx < 0 {
 		if bound_rhs >= 0 {
 			env.bound[bound_rhs] = false
 			env.vals[bound_rhs] = nil
 		}
 		return true, nil
 	}
-	res, rerr := nif_dl_eval_clauses(db, q, clause_idx + 1, default_moment, env, out_rows, out_envs, false, allocator)
+	res, rerr := nif_dl_eval_clauses(db, q, clause_idx + 1, default_moment, env, out_rows, out_envs, check_only, allocator)
 	if bound_rhs >= 0 {
 		env.bound[bound_rhs] = false
 		env.vals[bound_rhs] = nil
@@ -7635,7 +7950,9 @@ nif_dl_compute_aggregations :: proc(q: ^NIF_Datalog_Query, envs: []NIF_Datalog_E
 				case u64:
 					b.sum_u64[col_i] += v
 				case i64:
-					b.sum_kind[col_i] = 1
+					if b.sum_kind[col_i] < 1 {
+						b.sum_kind[col_i] = 1
+					}
 					b.sum_i64[col_i] += v
 				case f64:
 					b.sum_kind[col_i] = 2
@@ -7948,6 +8265,9 @@ read_cursor_nonneg_int :: proc(cur: xitdb.Read_Cursor) -> (val: i64, ok: bool, e
 	#partial switch slot_ptr.slot.tag {
 	case .Uint:
 		u := xitdb.cursor_read_uint(cur) or_return
+		if u > u64(max(i64)) {
+			return max(i64), true, nil
+		}
 		return i64(u), true, nil
 	case .Int:
 		i := xitdb.cursor_read_int(cur) or_return
@@ -8721,13 +9041,16 @@ odin_nif_bm25_search :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_
 				if !strings.has_prefix(matched_term, q_tok) {
 					break
 				}
+				if matched_term == "__tx" {
+					continue
+				}
 				mult := opts.exact_boost if matched_term == q_tok else opts.prefix_weight
 				if cp_err := collect_postings_into_map(val_cur, mult, &merged, arena_alloc); cp_err != nil {
 					return make_xitdb_err(env, cp_err)
 				}
 				scanned += 1
 			}
-		} else {
+		} else if q_tok != "__tx" {
 			p_maybe, p_err := xitdb.sorted_map_get_cursor(terms_sm, q_tok)
 			if p_err != nil {
 				return make_xitdb_err(env, p_err)
