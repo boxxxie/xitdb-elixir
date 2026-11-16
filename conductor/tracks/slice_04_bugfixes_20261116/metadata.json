@@ -1,0 +1,8 @@
+{
+  "track_id": "slice_04_bugfixes_20261116",
+  "type": "bugfix",
+  "status": "completed",
+  "created_at": "2026-11-16T04:20:00Z",
+  "updated_at": "2026-11-16T05:45:00Z",
+  "description": "Slice 04 Bugfixes: Single-Pass Tx Writers & Atomic Rollback (BUG-04-01..BUG-04-04)"
+}
