@@ -2222,7 +2222,7 @@ defmodule Xitdb.Cursor do
             full_int = if full, do: 1, else: 0
 
             case NIF.nif_slot_materialize(db_ref, tag_id, val, full_int) do
-              {:ok, raw} -> unwrap_nif_value(db_ref, raw, cursor.moment, [])
+              {:ok, raw} -> raw
               {:error, reason} -> raise Xitdb.Error, reason: reason
             end
           end
