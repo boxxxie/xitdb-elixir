@@ -83,7 +83,7 @@ severities:
 ### `BUG-06-05`: Six benchmark slice files omit primary Elixir `!`/`?` functions and `lib/xitdb/nif.ex`
 - **Severity:** `medium` | **Confidence:** `high` | **Category:** `docs-baseline` | **Scope:** `this-slice`
 - **Introduced In:** `f768876` / `da1b118`
-- **Files:** `benchmarks/slices/02_access_single_call_selector_select_users_id_name.md`, `benchmarks/slices/07_enum_o_1_enum_member_2_on_counted_hash_set_n_500.md`, `benchmarks/slices/21_query_datomic_pull_projection_4_attrs_nested_slice.md`, `benchmarks/slices/24_storage_buffered_file_transact_sync_50_commits.md`, `benchmarks/slices/26_search_bm25_corpus_search_n_200_2_term_prefix_limit_10.md`, `benchmarks/slices/28_access_pre_tokenized_path_steps_select_path_steps_users_id_name.md`, `benchmarks/compare_1v1.py:1025-1035`
+- **Files:** `benchmarks/slices/02_access_single_call_selector_select_users_id_name.md`, `benchmarks/slices/07_enum_o_1_enum_member_2_on_counted_hash_set_n_500.md`, `benchmarks/slices/21_query_datomic_pull_projection_4_attrs_nested_slice.md`, `benchmarks/slices/24_storage_buffered_file_transact_sync_50_commits.md`, `benchmarks/slices/26_search_bm25_corpus_search_n_200_2_term_prefix_limit_10.md`, `benchmarks/slices/28_dsl_pre_tokenized_path_steps_select_path_steps_users_id_name.md`, `benchmarks/compare_1v1.py:1025-1035`
 - **Symbols:** `parse_elixir_lib_functions`, `extract_enclosing_procs`
 - **Verify With:** `./benchmarks/compare_1v1.py --from-jsonl --generate-slices`
 
