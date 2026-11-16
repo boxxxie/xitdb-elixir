@@ -8,7 +8,7 @@ All notable changes to this project will be documented in this file.
 - **NIF & Cursor Performance (`native/xitdb_nif.odin`, `Xitdb`, `Xitdb.Cursor`):**
   - Built `MapSet` terms directly inside `native/xitdb_nif.odin` on materialization and skipped the redundant Elixir unwrap pass.
   - Deferred disk cursor resolution (`ov_key` via `NIF.nif_select/3`) in `Xitdb.Cursor.stage_list_edit/3` until materializing a list with staged descendants or fork aliases, avoiding an extra NIF call on standard `insert_at/4` and `delete_at/3` mutations.
-- **Underlying `odin-xitdb` `2.0.1`:** Updated `native/xitdb-odin` to `2.0.1` (`c444fc9`), resolving variable shadowing warnings under `odin check -vet` across `cursor.odin`, `lua.odin`, and `types.odin`.
+- **Underlying `odin-xitdb` `2.0.1`:** Updated `native/xitdb-odin` to `2.0.1` (`e4176e5`), resolving variable shadowing warnings under `odin check -vet` across `cursor.odin`, `lua.odin`, and `types.odin`.
 
 ### Fixed
 - **NIF Index Merges, Base-Moment Forks, Pull & Datalog (`native/xitdb_nif.odin`):**
