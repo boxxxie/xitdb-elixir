@@ -879,13 +879,14 @@ odin_nif_moment_slot :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_
 	context = runtime.default_context()
 	defer free_all(context.temp_allocator)
 
-	if argc != 2 {
+	if argc != 2 && argc != 3 {
 		return make_err(env, "badarg")
 	}
 	moment_idx: i64 = -1
 	if nif_get_int64(env, argv[1], &moment_idx) == 0 {
 		return make_err(env, "badarg")
 	}
+	with_index := argc == 3
 
 	handle, ok := acquire_rlock(env, argv[0])
 	if !ok {
@@ -900,20 +901,44 @@ odin_nif_moment_slot :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_
 	if err_reason != "" {
 		return make_err(env, err_reason)
 	}
+	resolved_idx: i64 = -1
+	if with_index && !is_empty {
+		if moment_idx >= 0 {
+			resolved_idx = moment_idx
+		} else {
+			rc := xitdb.database_root_cursor(&handle.db).read_cursor
+			hist, h_err := xitdb.read_array_list_init(rc)
+			if h_err != nil {
+				return make_xitdb_err(env, h_err)
+			}
+			cnt, c_err := xitdb.array_list_count(hist)
+			if c_err != nil {
+				return make_xitdb_err(env, c_err)
+			}
+			resolved_idx = cnt + moment_idx
+		}
+	}
 	if is_empty {
-		return make_ok(env, nif_make_tuple5(
+		empty_term := nif_make_tuple5(
 			env,
 			ATOM_CURSOR,
 			TAG_ATOMS[u8(xitdb.Tag.Hash_Map)],
 			nif_make_int64(env, i64(u8(xitdb.Tag.Hash_Map))),
 			nif_make_int64(env, 0),
 			nif_make_int64(env, 0),
-		))
+		)
+		if with_index {
+			return nif_make_tuple3(env, ATOM_OK, empty_term, nif_make_int64(env, -1))
+		}
+		return make_ok(env, empty_term)
 	}
 
 	term, t_err := slot_to_term(env, &handle.db, slot)
 	if t_err != nil {
 		return make_xitdb_err(env, t_err)
+	}
+	if with_index {
+		return nif_make_tuple3(env, ATOM_OK, term, nif_make_int64(env, resolved_idx))
 	}
 	return make_ok(env, term)
 }
@@ -1113,7 +1138,7 @@ odin_nif_slot_count :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_T
 	}
 	defer nif_rwlock_runlock(handle.rwlock)
 
-	slot, _, is_empty, r_err, err_reason := resolve_slot_arg(handle, tag_int, val_int)
+	slot, is_root, is_empty, r_err, err_reason := resolve_slot_arg(handle, tag_int, val_int)
 	if r_err != nil {
 		return make_xitdb_err(env, r_err)
 	}
@@ -1133,6 +1158,33 @@ odin_nif_slot_count :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_T
 		cnt, err := xitdb.cursor_count(cur)
 		if err != nil {
 			return make_xitdb_err(env, err)
+		}
+		if is_root && cnt > 0 {
+			if slot.tag == .Counted_Hash_Map {
+				if cm, cm_err := xitdb.read_counted_hash_map_init(cur); cm_err == nil {
+					if tx_s, tx_err := xitdb.hash_map_get_slot(cm.read_hash_map, "__tx"); tx_err == nil {
+						if s, found := tx_s.?; found && (s.tag != .None || s.full) {
+							cnt -= 1
+						}
+					} else if tx_err != .Key_Not_Found {
+						return make_xitdb_err(env, tx_err)
+					}
+				} else {
+					return make_xitdb_err(env, cm_err)
+				}
+			} else if slot.tag == .Sorted_Map {
+				if sm, sm_err := xitdb.read_sorted_map_init(cur); sm_err == nil {
+					if tx_s, tx_err := xitdb.sorted_map_get_slot(sm, "__tx"); tx_err == nil {
+						if s, found := tx_s.?; found && (s.tag != .None || s.full) {
+							cnt -= 1
+						}
+					} else if tx_err != .Key_Not_Found {
+						return make_xitdb_err(env, tx_err)
+					}
+				} else {
+					return make_xitdb_err(env, sm_err)
+				}
+			}
 		}
 		return make_ok(env, nif_make_int64(env, cnt))
 	}
@@ -1235,6 +1287,22 @@ odin_nif_slot_contains :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NI
 	return make_err(env, "unsupported")
 }
 
+sorted_map_tx_rank :: proc(cur: xitdb.Read_Cursor) -> (has_tx: bool, rank: i64, err: xitdb.Error) {
+	tx_key := "__tx"
+	tx_it := xitdb.cursor_iterator_sorted_from_key(cur, transmute([]u8)tx_key) or_return
+	tx_rank := tx_it.index
+	next_maybe := xitdb.cursor_iterator_next(&tx_it) or_return
+	if elem_cur, ok := next_maybe.?; ok {
+		key_cur, _ := xitdb.cursor_read_kv_pair_slots(elem_cur) or_return
+		sb_buf: [16]u8 = ---
+		k_str := read_key_cursor_string(key_cur, sb_buf[:]) or_return
+		if k_str == tx_key {
+			return true, tx_rank, nil
+		}
+	}
+	return false, 0, nil
+}
+
 @(export)
 odin_nif_slot_slice :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {
 	context = runtime.default_context()
@@ -1263,7 +1331,7 @@ odin_nif_slot_slice :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_T
 	}
 	defer nif_rwlock_runlock(handle.rwlock)
 
-	slot, _, is_empty, r_err, err_reason := resolve_slot_arg(handle, tag_int, val_int)
+	slot, is_root, is_empty, r_err, err_reason := resolve_slot_arg(handle, tag_int, val_int)
 	if r_err != nil {
 		return make_xitdb_err(env, r_err)
 	}
@@ -1293,7 +1361,17 @@ odin_nif_slot_slice :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_T
 	case .Linked_Array_List:
 		it, err = xitdb.cursor_iterator_linked_array_list_from_index(cur, start_idx)
 	case .Sorted_Map, .Sorted_Set:
-		it, err = xitdb.cursor_iterator_sorted_from_index(cur, start_idx)
+		seek_idx := start_idx
+		if is_root && slot.tag == .Sorted_Map {
+			has_tx, tx_rank, tx_err := sorted_map_tx_rank(cur)
+			if tx_err != nil {
+				return make_xitdb_err(env, tx_err)
+			}
+			if has_tx && start_idx >= tx_rank {
+				seek_idx = start_idx + 1
+			}
+		}
+		it, err = xitdb.cursor_iterator_sorted_from_index(cur, seek_idx)
 	case:
 		return make_err(env, "unsupported")
 	}
@@ -1306,8 +1384,9 @@ odin_nif_slot_slice :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_T
 	item_len := 0
 	item_dyn: [dynamic]ERL_NIF_TERM
 	using_dyn := false
-	sb_buf: [8]u8 = ---
-	for i: i64 = 0; i < length; i += 1 {
+	sb_buf: [128]u8 = ---
+	emitted: i64 = 0
+	for emitted < length {
 		next_maybe, n_err := xitdb.cursor_iterator_next(&it)
 		if n_err != nil {
 			return make_xitdb_err(env, n_err)
@@ -1327,6 +1406,7 @@ odin_nif_slot_slice :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_T
 				return make_xitdb_err(env, t_err)
 			}
 			push_nif_term(item_buf[:], &item_len, &item_dyn, &using_dyn, t, context.temp_allocator)
+			emitted += 1
 		case .Sorted_Set:
 			key_cur, _, kv_err := xitdb.cursor_read_kv_pair_slots(elem_cur)
 			if kv_err != nil {
@@ -1337,6 +1417,7 @@ odin_nif_slot_slice :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_T
 				return make_xitdb_err(env, t_err)
 			}
 			push_nif_term(item_buf[:], &item_len, &item_dyn, &using_dyn, t, context.temp_allocator)
+			emitted += 1
 		case .Sorted_Map:
 			key_cur, val_cur, kv_err := xitdb.cursor_read_kv_pair_slots(elem_cur)
 			if kv_err != nil {
@@ -1346,11 +1427,15 @@ odin_nif_slot_slice :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_T
 			if k_err != nil {
 				return make_xitdb_err(env, k_err)
 			}
+			if is_root && k_str == "__tx" {
+				continue
+			}
 			vt, vt_err := slot_to_term(env, &handle.db, val_cur.slot_ptr.slot)
 			if vt_err != nil {
 				return make_xitdb_err(env, vt_err)
 			}
 			push_nif_term(item_buf[:], &item_len, &item_dyn, &using_dyn, nif_make_tuple2(env, make_binary(env, k_str), vt), context.temp_allocator)
+			emitted += 1
 		}
 	}
 
@@ -1413,7 +1498,17 @@ odin_nif_slot_entries :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF
 		it, err = xitdb.cursor_iterator_linked_array_list_from_index(cur, offset)
 		direct_seek = true
 	case .Sorted_Map, .Sorted_Set:
-		it, err = xitdb.cursor_iterator_sorted_from_index(cur, offset)
+		seek_offset := offset
+		if is_root && slot.tag == .Sorted_Map && offset > 0 {
+			has_tx, tx_rank, tx_err := sorted_map_tx_rank(cur)
+			if tx_err != nil {
+				return make_xitdb_err(env, tx_err)
+			}
+			if has_tx && offset >= tx_rank {
+				seek_offset = offset + 1
+			}
+		}
+		it, err = xitdb.cursor_iterator_sorted_from_index(cur, seek_offset)
 		direct_seek = true
 	case:
 		it, err = xitdb.cursor_iterator(cur)
@@ -2874,7 +2969,10 @@ rm_if_exists_callback :: proc(moment_cur: ^xitdb.Write_Cursor, user_data: rawptr
 				xitdb.hm(rc.steps[1].key),
 				xitdb.hm(rule.field_key),
 			}
-			old_maybe := xitdb.read_steps_cursor(moment_hm.read_hash_map.cursor, lookup[:]) or_return
+			old_maybe, _, old_err := read_steps_cursor_adaptive(moment_hm.read_hash_map.cursor, lookup[:])
+			if old_err != nil && old_err != .Unexpected_Tag {
+				return old_err
+			}
 			if old_cur, has_old := old_maybe.?; has_old {
 				old_slot := xitdb.cursor_slot(old_cur) or_return
 				if old_slot.tag == .Short_Bytes || old_slot.tag == .Bytes {
@@ -3178,16 +3276,18 @@ Pending_Index_Op :: struct {
 }
 
 Merge_State :: struct {
-	env:         ErlNifEnv,
-	tx:          ^xitdb.Tx,
-	has_indexes: bool,
-	pending_idx: [dynamic]Pending_Index_Op,
+	env:              ErlNifEnv,
+	tx:               ^xitdb.Tx,
+	has_indexes:      bool,
+	adapt_containers: bool,
+	pending_idx:      [dynamic]Pending_Index_Op,
 }
 
 Merge_Map_Ctx :: struct {
-	env:      ErlNifEnv,
-	map_term: ERL_NIF_TERM,
-	tx:       ^xitdb.Tx,
+	env:              ErlNifEnv,
+	map_term:         ERL_NIF_TERM,
+	tx:               ^xitdb.Tx,
+	adapt_containers: bool,
 }
 
 read_cur_string_if_bytes :: proc(cur: xitdb.Read_Cursor) -> (s: string, ok: bool, err: xitdb.Error) {
@@ -3205,7 +3305,7 @@ queue_record_removal_indexes :: proc(ms: ^Merge_State, src_key: string, rec_cur:
 			continue
 		}
 		f_steps := [1]xitdb.Path_Step{xitdb.hm(rule.field_key)}
-		old_maybe, f_err := xitdb.read_steps_cursor(rec_cur, f_steps[:])
+		old_maybe, _, f_err := read_steps_cursor_adaptive(rec_cur, f_steps[:])
 		if f_err != nil {
 			if f_err == .Key_Not_Found || f_err == .Unexpected_Tag {
 				continue
@@ -3487,6 +3587,24 @@ merge_kv_entry_sm :: proc(
 		}
 	}
 
+	if ms.has_indexes && depth == 2 && !reset {
+		has_matching_rule := false
+		for rule in ms.tx.index_rules {
+			if rule.source_map_key == src_key && rule.field_key == k_str {
+				has_matching_rule = true
+				break
+			}
+		}
+		if has_matching_rule {
+			xitdb.cursor_reload_slot(&sm.write_cursor) or_return
+			rsm := xitdb.Read_Sorted_Map{cursor = sm.write_cursor.read_cursor}
+			cm, r_err := xitdb.sorted_map_get_cursor(rsm, k_str)
+			if r_err == nil {
+				queue_field_index_change(ms, src_key, rec_key, k_str, cm, "", false) or_return
+			}
+		}
+	}
+
 	child_cur := xitdb.sorted_map_put_cursor(sm, k_str) or_return
 	next_src := k_str if depth == 0 else src_key
 	next_rec := k_str if depth == 1 else rec_key
@@ -3509,6 +3627,26 @@ merge_map_entries_hm :: proc(
 	}
 	for i in 0 ..< len(keys) {
 		merge_kv_entry_hm(ms, hm, keys[i], vals[i], reset, depth, src_key, rec_key) or_return
+	}
+	return nil
+}
+
+merge_map_entries_sm :: proc(
+	ms: ^Merge_State,
+	sm: ^xitdb.Write_Sorted_Map,
+	map_term: ERL_NIF_TERM,
+	reset: bool,
+	depth: int,
+	src_key: string,
+	rec_key: string,
+) -> xitdb.Error {
+	sb: KV_Stack_Buf = ---
+	keys, vals, ok := extract_map_kvs(ms.env, map_term, &sb)
+	if !ok {
+		return .Unexpected_Tag
+	}
+	for i in 0 ..< len(keys) {
+		merge_kv_entry_sm(ms, sm, keys[i], vals[i], reset, depth, src_key, rec_key) or_return
 	}
 	return nil
 }
@@ -3560,15 +3698,7 @@ merge_kv_collection_into_cursor :: proc(
 	case "sorted_map":
 		sm := xitdb.write_sorted_map_init(cur^) or_return
 		if is_map_data {
-			sb: KV_Stack_Buf = ---
-			keys, vals, ok := extract_map_kvs(ms.env, data_term, &sb)
-			if !ok {
-				return .Unexpected_Tag
-			}
-			for i in 0 ..< len(keys) {
-				merge_kv_entry_sm(ms, &sm, keys[i], vals[i], reset, depth, src_key, rec_key) or_return
-			}
-			return nil
+			return merge_map_entries_sm(ms, &sm, data_term, reset, depth, src_key, rec_key)
 		}
 		head: ERL_NIF_TERM
 		tail := data_term
@@ -3703,6 +3833,17 @@ merge_node_into_cursor :: proc(
 		if eff_reset {
 			xitdb.cursor_write(cur, xitdb.Slot{}) or_return
 		}
+		if !eff_reset && ms.adapt_containers {
+			sp := xitdb.cursor_resolved(cur.read_cursor) or_return
+			#partial switch sp.slot.tag {
+			case .Counted_Hash_Map:
+				chm := xitdb.write_counted_hash_map_init(cur^) or_return
+				return merge_map_entries_hm(ms, &chm.write_hash_map, term, eff_reset, depth, src_key, rec_key)
+			case .Sorted_Map:
+				sm := xitdb.write_sorted_map_init(cur^) or_return
+				return merge_map_entries_sm(ms, &sm, term, eff_reset, depth, src_key, rec_key)
+			}
+		}
 		hm := xitdb.write_hash_map_init(cur^) or_return
 		if sz == 0 {
 			return nil
@@ -3723,9 +3864,10 @@ merge_map_callback :: proc(moment_cur: ^xitdb.Write_Cursor, user_data: rawptr) -
 		return nil
 	}
 	ms := Merge_State{
-		env         = mc.env,
-		tx          = mc.tx,
-		has_indexes = mc.tx != nil && len(mc.tx.index_rules) > 0,
+		env              = mc.env,
+		tx               = mc.tx,
+		has_indexes      = mc.tx != nil && len(mc.tx.index_rules) > 0,
+		adapt_containers = mc.adapt_containers,
 	}
 	if ms.has_indexes {
 		ms.pending_idx = make([dynamic]Pending_Index_Op, 0, 8, context.temp_allocator)
@@ -3736,6 +3878,636 @@ merge_map_callback :: proc(moment_cur: ^xitdb.Write_Cursor, user_data: rawptr) -
 		if ms.has_indexes && len(ms.pending_idx) > 0 {
 			flush_pending_indexes(&ms, &moment_hm) or_return
 		}
+	}
+	return nil
+}
+
+read_steps_cursor_adaptive :: proc(root: xitdb.Read_Cursor, steps: []xitdb.Path_Step) -> (res: Maybe(xitdb.Read_Cursor), hit_scalar: bool, err: xitdb.Error) {
+	cur := root
+	for i := 0; i < len(steps); i += 1 {
+		step := steps[i]
+		sp := xitdb.cursor_resolved(cur) or_return
+		if sp.slot.tag == .None {
+			return nil, false, nil
+		}
+		if !is_container_tag(sp.slot.tag) {
+			return nil, true, .Unexpected_Tag
+		}
+		next_maybe: Maybe(xitdb.Read_Cursor)
+		if step.kind == .Hash_Map_Key {
+			#partial switch sp.slot.tag {
+			case .Hash_Map:
+				hm := xitdb.read_hash_map_init(cur) or_return
+				next_maybe = xitdb.hash_map_get_cursor(hm, step.key) or_return
+			case .Counted_Hash_Map:
+				chm := xitdb.read_counted_hash_map_init(cur) or_return
+				next_maybe = xitdb.hash_map_get_cursor(chm.read_hash_map, step.key) or_return
+			case .Sorted_Map:
+				sm := xitdb.read_sorted_map_init(cur) or_return
+				next_maybe = xitdb.sorted_map_get_cursor(sm, step.key) or_return
+			case .Hash_Set:
+				hs := xitdb.read_hash_set_init(cur) or_return
+				next_maybe = xitdb.hash_set_get_cursor(hs, step.key) or_return
+			case .Counted_Hash_Set:
+				cs := xitdb.read_counted_hash_set_init(cur) or_return
+				next_maybe = xitdb.hash_set_get_cursor(cs.read_hash_set, step.key) or_return
+			case .Sorted_Set:
+				ss := xitdb.read_sorted_set_init(cur) or_return
+				next_maybe = xitdb.cursor_read_path(
+					ss.cursor,
+					[]xitdb.Path_Part{xitdb.Sorted_Map_Get{target = xitdb.Sorted_Map_Get_Key{key = transmute([]u8)step.key}}},
+				) or_return
+			case:
+				return nil, false, .Unexpected_Tag
+			}
+		} else if step.kind == .Array_List_Idx {
+			#partial switch sp.slot.tag {
+			case .Array_List:
+				al := xitdb.read_array_list_init(cur) or_return
+				next_maybe = xitdb.array_list_get_cursor(al, step.index) or_return
+			case .Linked_Array_List:
+				ll := xitdb.read_linked_array_list_init(cur) or_return
+				next_maybe = xitdb.linked_array_list_get_cursor(ll, step.index) or_return
+			case:
+				return nil, false, .Unexpected_Tag
+			}
+		} else {
+			next_maybe = xitdb.read_steps_cursor(cur, steps[i:i + 1]) or_return
+		}
+		next_cur, found := next_maybe.?
+		if !found {
+			return nil, false, nil
+		}
+		cur = next_cur
+	}
+	return cur, false, nil
+}
+
+pending_path_key :: proc(steps: []xitdb.Path_Step) -> string {
+	if len(steps) == 0 {
+		return ""
+	}
+	sb := strings.builder_make(context.temp_allocator)
+	for s in steps {
+		switch s.kind {
+		case .Hash_Map_Key, .Counted_Hash_Map_Key, .Sorted_Map_Key:
+			fmt.sbprintf(&sb, ".%d:%s", len(s.key), s.key)
+		case .Array_List_Idx, .Linked_List_Idx:
+			fmt.sbprintf(&sb, "[%d]", s.index)
+		case .Hash_Set_Member, .Counted_Set_Member, .Sorted_Set_Member:
+			fmt.sbprintf(&sb, "%%%d:%s", len(s.key), s.key)
+		}
+	}
+	return strings.to_string(sb)
+}
+
+pending_has_prefix :: proc(k: string, prefix: string) -> bool {
+	if len(prefix) == 0 {
+		return true
+	}
+	if k == prefix {
+		return true
+	}
+	if len(k) > len(prefix) && strings.has_prefix(k, prefix) {
+		ch := k[len(prefix)]
+		return ch == '.' || ch == '[' || ch == '%'
+	}
+	return false
+}
+
+tag_from_col_kind :: proc(kind_str: string) -> (tag: xitdb.Tag, ok: bool) {
+	switch kind_str {
+	case "hash_map":
+		return .Hash_Map, true
+	case "counted_hash_map":
+		return .Counted_Hash_Map, true
+	case "sorted_map":
+		return .Sorted_Map, true
+	case "array_list":
+		return .Array_List, true
+	case "linked_array_list":
+		return .Linked_Array_List, true
+	case "hash_set":
+		return .Hash_Set, true
+	case "counted_hash_set":
+		return .Counted_Hash_Set, true
+	case "sorted_set":
+		return .Sorted_Set, true
+	}
+	return .None, false
+}
+
+purge_pending_prefix :: proc(pending_tags: ^map[string]xitdb.Tag, prefix: string) {
+	if len(prefix) == 0 {
+		clear(pending_tags)
+		return
+	}
+	for k in pending_tags {
+		if pending_has_prefix(k, prefix) {
+			pending_tags[k] = .None
+		}
+	}
+	pending_tags[prefix] = .None
+}
+
+purge_fork_aliases_prefix :: proc(fork_aliases: ^map[string][]xitdb.Path_Step, prefix: string) {
+	if len(prefix) == 0 {
+		clear(fork_aliases)
+		return
+	}
+	for k in fork_aliases {
+		if pending_has_prefix(k, prefix) {
+			fork_aliases[k] = nil
+		}
+	}
+}
+
+record_term_pending_tags :: proc(
+	env: ErlNifEnv,
+	prefix: string,
+	term: ERL_NIF_TERM,
+	pending_tags: ^map[string]xitdb.Tag,
+	depth: int = 0,
+) {
+	if depth > 64 {
+		return
+	}
+	arity: c.int = 0
+	elems: [^]ERL_NIF_TERM = nil
+	if nif_get_tuple(env, term, &arity, &elems) != 0 {
+		if arity == 2 && elems[0] == ATOM_XITDB_SET {
+			pending_tags[prefix] = .Hash_Set
+			return
+		}
+		if arity == 3 && elems[0] == ATOM_XITDB_COL {
+			atom_buf: [64]u8 = ---
+			kind_str, ok_k := get_atom_string(env, elems[1], atom_buf[:])
+			if !ok_k {
+				kind_str, ok_k = get_string_from_binary(env, elems[1])
+			}
+			if ok_k {
+				if tag, ok_t := tag_from_col_kind(kind_str); ok_t {
+					pending_tags[prefix] = tag
+					record_nested_collection_tags(env, prefix, tag, elems[2], pending_tags, depth + 1)
+				}
+			}
+			return
+		}
+		return
+	}
+	if nif_is_list(env, term) != 0 {
+		pending_tags[prefix] = .Array_List
+		list := term
+		head, tail: ERL_NIF_TERM
+		idx: i64 = 0
+		for nif_get_list_cell(env, list, &head, &tail) != 0 {
+			child_key := fmt.tprintf("%s[%d]", prefix, idx)
+			record_term_pending_tags(env, child_key, head, pending_tags, depth + 1)
+			idx += 1
+			list = tail
+		}
+		return
+	}
+	if nif_is_map(env, term) != 0 {
+		st: ERL_NIF_TERM = 0
+		if nif_get_map_value(env, term, ATOM_STRUCT, &st) != 0 {
+			if st == ATOM_XITDB_COLLECTION_MOD {
+				kind_term, data_term: ERL_NIF_TERM
+				if nif_get_map_value(env, term, ATOM_KIND, &kind_term) != 0 &&
+				   nif_get_map_value(env, term, ATOM_DATA, &data_term) != 0 {
+					if kind_str, ok_k := term_to_kind_string(env, kind_term); ok_k {
+						if tag, ok_t := tag_from_col_kind(kind_str); ok_t {
+							pending_tags[prefix] = tag
+							record_nested_collection_tags(env, prefix, tag, data_term, pending_tags, depth + 1)
+						}
+					}
+				}
+			} else if st == ATOM_MAPSET_MOD {
+				pending_tags[prefix] = .Counted_Hash_Set
+			}
+			return
+		}
+		if len(prefix) > 0 {
+			pending_tags[prefix] = .Hash_Map
+		}
+		sb: KV_Stack_Buf = ---
+		keys, vals, ok := extract_map_kvs(env, term, &sb)
+		if ok {
+			for i in 0 ..< len(keys) {
+				if k_str, ok_k := term_to_key_string(env, keys[i]); ok_k {
+					child_key := fmt.tprintf("%s.%d:%s", prefix, len(k_str), k_str)
+					record_term_pending_tags(env, child_key, vals[i], pending_tags, depth + 1)
+				}
+			}
+		}
+	}
+}
+
+record_nested_collection_tags :: proc(
+	env: ErlNifEnv,
+	prefix: string,
+	tag: xitdb.Tag,
+	data_term: ERL_NIF_TERM,
+	pending_tags: ^map[string]xitdb.Tag,
+	depth: int,
+) {
+	if depth > 64 {
+		return
+	}
+	#partial switch tag {
+	case .Hash_Map, .Counted_Hash_Map, .Sorted_Map:
+		if nif_is_map(env, data_term) != 0 {
+			sb: KV_Stack_Buf = ---
+			keys, vals, ok := extract_map_kvs(env, data_term, &sb)
+			if ok {
+				for i in 0 ..< len(keys) {
+					if k_str, ok_k := term_to_key_string(env, keys[i]); ok_k {
+						child_key := fmt.tprintf("%s.%d:%s", prefix, len(k_str), k_str)
+						record_term_pending_tags(env, child_key, vals[i], pending_tags, depth + 1)
+					}
+				}
+			}
+		} else if nif_is_list(env, data_term) != 0 {
+			list := data_term
+			head, tail: ERL_NIF_TERM
+			for nif_get_list_cell(env, list, &head, &tail) != 0 {
+				arity: c.int = 0
+				elems: [^]ERL_NIF_TERM = nil
+				if nif_get_tuple(env, head, &arity, &elems) != 0 && arity == 2 {
+					if k_str, ok_k := term_to_key_string(env, elems[0]); ok_k {
+						child_key := fmt.tprintf("%s.%d:%s", prefix, len(k_str), k_str)
+						record_term_pending_tags(env, child_key, elems[1], pending_tags, depth + 1)
+					}
+				}
+				list = tail
+			}
+		}
+	case .Array_List, .Linked_Array_List:
+		if nif_is_list(env, data_term) != 0 {
+			list := data_term
+			head, tail: ERL_NIF_TERM
+			idx: i64 = 0
+			for nif_get_list_cell(env, list, &head, &tail) != 0 {
+				child_key := fmt.tprintf("%s[%d]", prefix, idx)
+				record_term_pending_tags(env, child_key, head, pending_tags, depth + 1)
+				idx += 1
+				list = tail
+			}
+		}
+	}
+}
+
+record_merge_map_pending_tags :: proc(
+	env: ErlNifEnv,
+	base_cur: xitdb.Read_Cursor,
+	base_empty: bool,
+	map_term: ERL_NIF_TERM,
+	prefix_steps: ^[dynamic]xitdb.Path_Step,
+	pending_tags: ^map[string]xitdb.Tag,
+	fork_aliases: ^map[string][]xitdb.Path_Step,
+	depth: int = 0,
+) {
+	if depth > 64 {
+		return
+	}
+	sb: KV_Stack_Buf = ---
+	keys, vals, ok := extract_map_kvs(env, map_term, &sb)
+	if !ok {
+		return
+	}
+	for i in 0 ..< len(keys) {
+		k_str, ok_k := term_to_key_string(env, keys[i])
+		if !ok_k {
+			continue
+		}
+		append(prefix_steps, xitdb.hm(k_str))
+		val := vals[i]
+		p_key := pending_path_key(prefix_steps[:])
+
+		is_plain_nonempty_map := false
+		if nif_is_map(env, val) != 0 {
+			struct_term: ERL_NIF_TERM
+			if nif_get_map_value(env, val, ATOM_STRUCT, &struct_term) == 0 {
+				sz: c.size_t = 0
+				if nif_get_map_size(env, val, &sz) != 0 && sz > 0 {
+					is_plain_nonempty_map = true
+				}
+			}
+		}
+
+		if is_plain_nonempty_map {
+			if existing_pt, has_pt := pending_tags[p_key]; has_pt && existing_pt != .None {
+				// Preserve existing pending container tag (e.g. from prior put/init_col)
+			} else if !base_empty {
+				if cur_maybe, _, c_err := read_steps_cursor_adaptive(base_cur, prefix_steps[:]); c_err == nil {
+					if c, found := cur_maybe.?; found {
+						if sp, sp_err := xitdb.cursor_resolved(c); sp_err == nil && is_container_tag(sp.slot.tag) {
+							pending_tags[p_key] = sp.slot.tag
+						}
+					}
+				}
+			}
+			record_merge_map_pending_tags(env, base_cur, base_empty, val, prefix_steps, pending_tags, fork_aliases, depth + 1)
+		} else {
+			purge_pending_prefix(pending_tags, p_key)
+			purge_fork_aliases_prefix(fork_aliases, p_key)
+			record_term_pending_tags(env, p_key, val, pending_tags, depth + 1)
+		}
+		pop(prefix_steps)
+	}
+}
+
+adapt_steps_for_base_moment :: proc(
+	base_cur: xitdb.Read_Cursor,
+	base_empty: bool,
+	steps: []xitdb.Path_Step,
+	pending_tags: map[string]xitdb.Tag,
+	fork_aliases: map[string][]xitdb.Path_Step,
+) -> bool {
+	if len(steps) == 0 {
+		return false
+	}
+	adapted := false
+	cur := base_cur
+	base_valid := !base_empty
+	for i := 0; i < len(steps); i += 1 {
+		prefix_key := pending_path_key(steps[:i])
+		cur_tag: xitdb.Tag = .None
+		if pt, has_pt := pending_tags[prefix_key]; has_pt {
+			cur_tag = pt
+			base_valid = false
+		} else {
+			if !base_valid && i > 0 {
+				if alias_steps, has_alias := fork_aliases[prefix_key]; has_alias && len(alias_steps) > 0 {
+					if alias_maybe, _, a_err := read_steps_cursor_adaptive(base_cur, alias_steps); a_err == nil {
+						if alias_cur, found := alias_maybe.?; found {
+							cur = alias_cur
+							base_valid = true
+						}
+					}
+				}
+			}
+			if base_valid {
+				sp, sp_err := xitdb.cursor_resolved(cur)
+				if sp_err != nil || sp.slot.tag == .None {
+					base_valid = false
+				} else {
+					cur_tag = sp.slot.tag
+				}
+			} else if i == 0 {
+				// Moment 0 root is created as a Hash_Map by tx_commit
+				cur_tag = .Hash_Map
+			}
+		}
+		if cur_tag == .None {
+			return adapted
+		}
+		if steps[i].kind == .Hash_Map_Key {
+			#partial switch cur_tag {
+			case .Counted_Hash_Map:
+				steps[i].kind = .Counted_Hash_Map_Key
+				adapted = true
+			case .Sorted_Map:
+				steps[i].kind = .Sorted_Map_Key
+				adapted = true
+			case .Hash_Set:
+				if i + 1 == len(steps) {
+					steps[i].kind = .Hash_Set_Member
+					adapted = true
+				} else {
+					return adapted
+				}
+			case .Counted_Hash_Set:
+				if i + 1 == len(steps) {
+					steps[i].kind = .Counted_Set_Member
+					adapted = true
+				} else {
+					return adapted
+				}
+			case .Sorted_Set:
+				if i + 1 == len(steps) {
+					steps[i].kind = .Sorted_Set_Member
+					adapted = true
+				} else {
+					return adapted
+				}
+			case .Hash_Map:
+				// already .Hash_Map_Key
+			case:
+				return adapted
+			}
+		} else if steps[i].kind == .Array_List_Idx {
+			if cur_tag == .Linked_Array_List {
+				steps[i].kind = .Linked_List_Idx
+				adapted = true
+			} else if cur_tag != .Array_List {
+				return adapted
+			}
+		}
+		if i + 1 >= len(steps) {
+			return adapted
+		}
+		if base_valid {
+			next_maybe, _, err := read_steps_cursor_adaptive(cur, steps[i:i + 1])
+			if err != nil {
+				base_valid = false
+			} else if next_cur, found := next_maybe.?; found {
+				cur = next_cur
+			} else {
+				base_valid = false
+			}
+		}
+	}
+	return adapted
+}
+
+resolve_live_tag :: proc(
+	base_cur: xitdb.Read_Cursor,
+	base_empty: bool,
+	steps: []xitdb.Path_Step,
+	pending_tags: map[string]xitdb.Tag,
+) -> (tag: xitdb.Tag, exists: bool) {
+	k := pending_path_key(steps)
+	if pt, has_pt := pending_tags[k]; has_pt {
+		return pt, pt != .None
+	}
+	if base_empty {
+		return .None, false
+	}
+	cur_maybe, _, err := read_steps_cursor_adaptive(base_cur, steps)
+	if err != nil {
+		return .None, false
+	}
+	cur, found := cur_maybe.?
+	if !found {
+		return .None, false
+	}
+	sp, sp_err := xitdb.cursor_resolved(cur)
+	if sp_err != nil || sp.slot.tag == .None {
+		return .None, false
+	}
+	return sp.slot.tag, true
+}
+
+adapt_tx_ops_for_base_moment :: proc(handle: ^Db_Handle, tx: ^xitdb.Tx) -> bool {
+	base_moment_idx := tx.base_moment.? or_else -1
+	base_slot, _, base_empty, base_err, _ := resolve_slot_arg(handle, -1, base_moment_idx)
+	if base_err != nil {
+		return false
+	}
+	base_cur := xitdb.Read_Cursor{
+		slot_ptr = xitdb.Slot_Pointer{position = nil, slot = xitdb.Slot{} if base_empty else base_slot},
+		db       = &handle.db,
+	}
+
+	pending_tags := make(map[string]xitdb.Tag, 16, context.temp_allocator)
+	fork_aliases := make(map[string][]xitdb.Path_Step, 4, context.temp_allocator)
+	adapted := false
+	for &op in tx.ops {
+		switch op.kind {
+		case .Put:
+			if len(op.steps) >= 1 && adapt_steps_for_base_moment(base_cur, base_empty, op.steps, pending_tags, fork_aliases) {
+				adapted = true
+			}
+			k := pending_path_key(op.steps)
+			purge_pending_prefix(&pending_tags, k)
+			purge_fork_aliases_prefix(&fork_aliases, k)
+		case .Remove:
+			if len(op.steps) >= 1 && adapt_steps_for_base_moment(base_cur, base_empty, op.steps, pending_tags, fork_aliases) {
+				adapted = true
+			}
+			k := pending_path_key(op.steps)
+			purge_pending_prefix(&pending_tags, k)
+			purge_fork_aliases_prefix(&fork_aliases, k)
+		case .Append, .Insert, .Slice:
+			if len(op.steps) >= 1 && adapt_steps_for_base_moment(base_cur, base_empty, op.steps, pending_tags, fork_aliases) {
+				adapted = true
+			}
+		case .Fork:
+			if len(op.from_steps) >= 1 && adapt_steps_for_base_moment(base_cur, base_empty, op.from_steps, pending_tags, fork_aliases) {
+				adapted = true
+			}
+			if len(op.steps) >= 1 && adapt_steps_for_base_moment(base_cur, base_empty, op.steps, pending_tags, fork_aliases) {
+				adapted = true
+			}
+			dst_key := pending_path_key(op.steps)
+			purge_pending_prefix(&pending_tags, dst_key)
+			purge_fork_aliases_prefix(&fork_aliases, dst_key)
+			src_key := pending_path_key(op.from_steps)
+			copied_any := false
+			// Snapshot matching pending_tags before inserting new entries
+			Pending_Copy :: struct {
+				key: string,
+				tag: xitdb.Tag,
+			}
+			copies := make([dynamic]Pending_Copy, 0, 8, context.temp_allocator)
+			for pk, ptag in pending_tags {
+				if pending_has_prefix(pk, src_key) && ptag != .None {
+					suffix := pk[len(src_key):]
+					append(&copies, Pending_Copy{key = fmt.tprintf("%s%s", dst_key, suffix), tag = ptag})
+					copied_any = true
+				}
+			}
+			for cp in copies {
+				pending_tags[cp.key] = cp.tag
+			}
+			if !copied_any && !base_empty {
+				if src_tag, has_src := resolve_live_tag(base_cur, base_empty, op.from_steps, pending_tags); has_src {
+					pending_tags[dst_key] = src_tag
+				}
+				fork_aliases[dst_key] = op.from_steps
+			}
+		case .Savepoint:
+			// no steps
+		case .Callback:
+			if op.callback == structured_op_callback && op.user_data != nil {
+				sc := (^Structured_Op_Ctx)(op.user_data)
+				if len(sc.steps) >= 1 && adapt_steps_for_base_moment(base_cur, base_empty, sc.steps, pending_tags, fork_aliases) {
+					adapted = true
+				}
+				if sc.kind == .Put {
+					k := pending_path_key(sc.steps)
+					purge_pending_prefix(&pending_tags, k)
+					purge_fork_aliases_prefix(&fork_aliases, k)
+					record_term_pending_tags(sc.env, k, sc.term, &pending_tags)
+				}
+			} else if op.callback == rm_if_exists_callback && op.user_data != nil {
+				rc := (^Rm_If_Exists_Ctx)(op.user_data)
+				if len(rc.steps) >= 1 && adapt_steps_for_base_moment(base_cur, base_empty, rc.steps, pending_tags, fork_aliases) {
+					adapted = true
+				}
+				k := pending_path_key(rc.steps)
+				purge_pending_prefix(&pending_tags, k)
+				purge_fork_aliases_prefix(&fork_aliases, k)
+			} else if op.callback == slice_op_callback && op.user_data != nil {
+				sc := (^Slice_Op_Ctx)(op.user_data)
+				if len(sc.steps) >= 1 && adapt_steps_for_base_moment(base_cur, base_empty, sc.steps, pending_tags, fork_aliases) {
+					adapted = true
+				}
+			} else if op.callback == init_col_callback && op.user_data != nil {
+				ic := (^Init_Col_Ctx)(op.user_data)
+				if len(ic.steps) >= 1 && adapt_steps_for_base_moment(base_cur, base_empty, ic.steps, pending_tags, fork_aliases) {
+					adapted = true
+				}
+				if new_tag, ok_t := tag_from_col_kind(ic.kind); ok_t {
+					k := pending_path_key(ic.steps)
+					if ic.reset {
+						purge_pending_prefix(&pending_tags, k)
+						purge_fork_aliases_prefix(&fork_aliases, k)
+						pending_tags[k] = new_tag
+					} else if _, exists := resolve_live_tag(base_cur, base_empty, ic.steps, pending_tags); !exists {
+						pending_tags[k] = new_tag
+					}
+				}
+			} else if op.callback == merge_map_callback && op.user_data != nil {
+				mc := (^Merge_Map_Ctx)(op.user_data)
+				if !mc.adapt_containers {
+					mc.adapt_containers = true
+					adapted = true
+				}
+				prefix_steps := make([dynamic]xitdb.Path_Step, 0, 4, context.temp_allocator)
+				record_merge_map_pending_tags(mc.env, base_cur, base_empty, mc.map_term, &prefix_steps, &pending_tags, &fork_aliases)
+			}
+		}
+	}
+	return adapted
+}
+
+rollback_failed_tx :: proc(
+	db: ^xitdb.Database,
+	pre_header: xitdb.Root_Header,
+	pre_hdr_err: xitdb.Error,
+	pre_len: i64,
+	pre_len_err: xitdb.Error,
+	pre_rh_bytes: [xitdb.ROOT_HEADER_LENGTH]u8,
+	pre_rh_err: xitdb.Error,
+) -> xitdb.Error {
+	has_target_len := pre_hdr_err == nil || pre_len_err == nil
+	target_len := pre_header.file_size if pre_hdr_err == nil else pre_len
+	len_changed := false
+	if has_target_len {
+		cur_len, cur_len_err := xitdb.core_length(db.core)
+		if cur_len_err != nil || cur_len != target_len {
+			len_changed = true
+			xitdb.core_set_length(db.core, target_len) or_return
+			after_len := xitdb.core_length(db.core) or_return
+			if after_len != target_len {
+				return .Truncated_Database
+			}
+		}
+	}
+
+	cur_rh_bytes: [xitdb.ROOT_HEADER_LENGTH]u8 = ---
+	cur_rh_err := xitdb.core_read_exact_at(db.core, xitdb.ROOT_HEADER_START, cur_rh_bytes[:])
+	hdr_changed := pre_rh_err == nil && (cur_rh_err != nil || cur_rh_bytes != pre_rh_bytes)
+	if hdr_changed {
+		rh_bytes := xitdb.root_header_to_bytes(pre_header) if pre_hdr_err == nil else pre_rh_bytes
+		xitdb.core_seek_to(db.core, xitdb.ROOT_HEADER_START) or_return
+		xitdb.core_write_all(db.core, rh_bytes[:]) or_return
+		xitdb.core_flush(db.core) or_return
+		xitdb.core_sync(db.core) or_return
+	} else if len_changed {
+		xitdb.core_flush(db.core) or_return
 	}
 	return nil
 }
@@ -4032,7 +4804,26 @@ odin_nif_transact :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TER
 		}
 	}
 
-	rep, c_err := xitdb.tx_commit(&tx)
+	pre_header, pre_hdr_err := xitdb.database_read_root_header(&handle.db)
+	pre_len, pre_len_err := xitdb.core_length(handle.db.core)
+	pre_rh_bytes: [xitdb.ROOT_HEADER_LENGTH]u8 = ---
+	pre_rh_err := xitdb.core_read_exact_at(handle.db.core, xitdb.ROOT_HEADER_START, pre_rh_bytes[:])
+
+	rep: xitdb.Tx_Report
+	c_err: xitdb.Error
+	for attempt := 0; attempt < 2; attempt += 1 {
+		rep, c_err = xitdb.tx_commit(&tx)
+		if c_err == nil {
+			break
+		}
+		if rb_err := rollback_failed_tx(&handle.db, pre_header, pre_hdr_err, pre_len, pre_len_err, pre_rh_bytes, pre_rh_err); rb_err != nil {
+			return make_xitdb_err(env, rb_err)
+		}
+		if attempt == 0 && c_err == .Unexpected_Tag && adapt_tx_ops_for_base_moment(handle, &tx) {
+			continue
+		}
+		break
+	}
 	if c_err != nil {
 		return make_xitdb_err(env, c_err)
 	}
@@ -4100,12 +4891,18 @@ odin_nif_select :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM)
 	}
 	cur := m_cur
 	if len(parsed.steps) > 0 {
+		hit_scalar := false
 		cur_maybe, err := xitdb.read_steps_cursor(m_cur, parsed.steps)
 		if err != nil {
 			if err == .Unexpected_Tag {
-				return make_ok(env, ATOM_NIL)
+				cur_maybe, hit_scalar, err = read_steps_cursor_adaptive(m_cur, parsed.steps)
 			}
-			return make_xitdb_err(env, err)
+			if err != nil {
+				if err == .Unexpected_Tag && !hit_scalar {
+					return make_ok(env, ATOM_NIL)
+				}
+				return make_xitdb_err(env, err)
+			}
 		}
 		found_cur, found := cur_maybe.?
 		if !found {

@@ -1,4 +1,5 @@
 Application.put_env(:ash, :default_string_length_count, :codepoints)
+Xitdb.Cursor.register_beam_tracer()
 ExUnit.start()
 
 if Code.ensure_loaded?(Ash.DataLayer) do
