@@ -103,3 +103,8 @@ All completed tracks from **Waves 0–5** (Tracks 1–17, including split tracks
 
 - [x] **Track: Slice 07 Bugfixes: Conductor Track Schema & Spec Alignment (BUG-07-01..BUG-07-08)**
 *Link: [./tracks/slice_07_bugfixes_20261116/](./tracks/slice_07_bugfixes_20261116/)*
+
+---
+
+- [ ] **Track: Upgrade Elixir to 1.20.5 and Erlang/OTP to 29.1.2**
+*Link: [./tracks/elixir_1_20_upgrade_20261118/](./tracks/elixir_1_20_upgrade_20261118/)*
