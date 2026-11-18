@@ -108,3 +108,8 @@ All completed tracks from **Waves 0–5** (Tracks 1–17, including split tracks
 
 - [ ] **Track: Upgrade Elixir to 1.20.5 and Erlang/OTP to 29.1.2**
 *Link: [./tracks/elixir_1_20_upgrade_20261118/](./tracks/elixir_1_20_upgrade_20261118/)*
+
+---
+
+- [ ] **Track: Integrate ExFuzz Coverage-Guided Fuzz Testing for Parsers, Codecs, Search, NIF Boundaries & Stateful Cursor/Tx**
+*Link: [./tracks/ex_fuzz_coverage_fuzzing_20261118/](./tracks/ex_fuzz_coverage_fuzzing_20261118/)*

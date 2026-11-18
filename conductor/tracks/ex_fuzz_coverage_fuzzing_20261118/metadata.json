@@ -1,0 +1,8 @@
+{
+  "track_id": "ex_fuzz_coverage_fuzzing_20261118",
+  "type": "chore",
+  "status": "new",
+  "created_at": "2026-11-18T13:02:00+08:00",
+  "updated_at": "2026-11-18T13:02:00+08:00",
+  "description": "Integrate ExFuzz coverage-guided fuzz testing for parsers, codecs, search, NIF boundaries, and stateful Cursor/Tx machines"
+}
