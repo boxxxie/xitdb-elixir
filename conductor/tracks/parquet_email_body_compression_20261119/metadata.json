@@ -1,0 +1,8 @@
+{
+  "track_id": "parquet_email_body_compression_20261119",
+  "type": "feature",
+  "status": "new",
+  "created_at": "2026-11-19T08:30:00Z",
+  "updated_at": "2026-11-19T08:30:00Z",
+  "description": "Parquet-style columnar row-group, dictionary, and transparent blob compression in xitdb for large repetitive payloads (e.g. 543k+ email bodies)"
+}

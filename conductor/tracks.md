@@ -113,3 +113,8 @@ All completed tracks from **Waves 0–5** (Tracks 1–17, including split tracks
 
 - [ ] **Track: Integrate ExFuzz Coverage-Guided Fuzz Testing for Parsers, Codecs, Search, NIF Boundaries & Stateful Cursor/Tx**
 *Link: [./tracks/ex_fuzz_coverage_fuzzing_20261118/](./tracks/ex_fuzz_coverage_fuzzing_20261118/)*
+
+---
+
+- [ ] **Track: Parquet-Style Columnar & Transparent Blob Compression for Large Repetitive Payloads (Email Bodies)**
+*Link: [./tracks/parquet_email_body_compression_20261119/](./tracks/parquet_email_body_compression_20261119/)*
