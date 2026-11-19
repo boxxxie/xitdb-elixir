@@ -648,6 +648,7 @@ defmodule Xitdb do
 
   def materialize(%Cursor{} = cursor, opts) when is_list(opts) do
     raw_tagged? = Keyword.get(opts, :raw_tagged, false)
+    max_bytes = fetch_max_decompressed_bytes!(opts)
 
     base =
       cond do
@@ -655,13 +656,27 @@ defmodule Xitdb do
           nil
 
         cursor.root and cursor.tag_id != -1 and cursor.value == 0 ->
-          case NIF.nif_slot_materialize(cursor.db_ref, cursor.tag_id, 0, 0, raw_tagged?) do
+          case NIF.nif_slot_materialize(
+                 cursor.db_ref,
+                 cursor.tag_id,
+                 0,
+                 0,
+                 raw_tagged?,
+                 max_bytes
+               ) do
             {:ok, raw} -> raw
             {:error, reason} -> raise Error, reason: reason
           end
 
         cursor.root ->
-          case NIF.nif_slot_materialize(cursor.db_ref, -1, cursor.moment, 0, raw_tagged?) do
+          case NIF.nif_slot_materialize(
+                 cursor.db_ref,
+                 -1,
+                 cursor.moment,
+                 0,
+                 raw_tagged?,
+                 max_bytes
+               ) do
             {:ok, raw} -> raw
             {:error, reason} -> raise Error, reason: reason
           end
@@ -675,7 +690,7 @@ defmodule Xitdb do
 
           full_int = if full, do: 1, else: 0
 
-          case NIF.nif_slot_materialize(db_ref, tag_id, val, full_int, raw_tagged?) do
+          case NIF.nif_slot_materialize(db_ref, tag_id, val, full_int, raw_tagged?, max_bytes) do
             {:ok, raw} -> raw
             {:error, reason} -> raise Error, reason: reason
           end
@@ -736,34 +751,36 @@ defmodule Xitdb do
   defp do_select(db_ref, moment, selector, opts) do
     raw_tagged? = Keyword.get(opts, :raw_tagged, false)
 
-    case NIF.nif_select(db_ref, moment, selector, raw_tagged?) do
-      {:ok, raw} when is_binary(raw) or is_number(raw) or is_boolean(raw) or is_nil(raw) ->
-        {:ok, raw}
+    with {:ok, max_bytes} <- fetch_max_decompressed_bytes(opts) do
+      case NIF.nif_select(db_ref, moment, selector, raw_tagged?, max_bytes) do
+        {:ok, raw} when is_binary(raw) or is_number(raw) or is_boolean(raw) or is_nil(raw) ->
+          {:ok, raw}
 
-      {:ok, raw} ->
-        if raw_tagged? do
-          case raw do
-            {:tagged, _, _} -> {:ok, raw}
-            _ -> {:ok, wrap_selected(db_ref, raw, moment, selector)}
+        {:ok, raw} ->
+          if raw_tagged? do
+            case raw do
+              {:tagged, _, _} -> {:ok, raw}
+              _ -> {:ok, wrap_selected(db_ref, raw, moment, selector)}
+            end
+          else
+            eff_moment = effective_moment(moment, selector)
+
+            case raw do
+              {:tagged, tag, payload} when is_binary(payload) ->
+                if Compression.compression_tag?(tag) do
+                  Compression.resolve_tagged(tag, payload, db_ref, eff_moment, opts)
+                else
+                  {:ok, raw}
+                end
+
+              _ ->
+                {:ok, wrap_selected(db_ref, raw, moment, selector)}
+            end
           end
-        else
-          eff_moment = effective_moment(moment, selector)
 
-          case raw do
-            {:tagged, tag, payload} when is_binary(payload) ->
-              if Compression.compression_tag?(tag) do
-                Compression.resolve_tagged(tag, payload, db_ref, eff_moment, opts)
-              else
-                {:ok, raw}
-              end
-
-            _ ->
-              {:ok, wrap_selected(db_ref, raw, moment, selector)}
-          end
-        end
-
-      {:error, reason} ->
-        {:error, %Error{reason: reason, details: %{selector: selector}}}
+        {:error, reason} ->
+          {:error, %Error{reason: reason, details: %{selector: selector}}}
+      end
     end
   end
 
@@ -881,25 +898,8 @@ defmodule Xitdb do
   def pull(%Cursor{} = cursor, pattern, opts) when is_binary(pattern) and is_list(opts) do
     raw_tagged? = Keyword.get(opts, :raw_tagged, false)
 
-    raw_result =
-      if :binary.match(pattern, "*") == :nomatch do
-        do_nif_pull(cursor, pattern, raw_tagged?)
-      else
-        case Pull.split_wildcard_plan(pattern) do
-          {:single, single_pat} ->
-            do_nif_pull(cursor, single_pat, raw_tagged?)
-
-          {:merge_top, wild_pat, spec_pat} ->
-            pinned = pin_root_cursor_if_needed(cursor)
-
-            with {:ok, wild_res} <- do_nif_pull(pinned, wild_pat, raw_tagged?),
-                 {:ok, spec_res} <- pull(pinned, spec_pat, Keyword.put(opts, :raw_tagged, true)) do
-              {:ok, Pull.merge_wildcard_results(wild_res, spec_res)}
-            end
-        end
-      end
-
-    with {:ok, res} <- raw_result do
+    with {:ok, max_bytes} <- fetch_max_decompressed_bytes(opts),
+         {:ok, res} <- do_pull_pattern(cursor, pattern, raw_tagged?, max_bytes, opts) do
       if raw_tagged? do
         {:ok, res}
       else
@@ -911,6 +911,25 @@ defmodule Xitdb do
   def pull(%Cursor{} = cursor, pattern, opts) when is_list(pattern) and is_list(opts) do
     with {:ok, compiled} <- Pull.compile(pattern) do
       pull(cursor, compiled, opts)
+    end
+  end
+
+  defp do_pull_pattern(cursor, pattern, raw_tagged?, max_bytes, opts) do
+    if :binary.match(pattern, "*") == :nomatch do
+      do_nif_pull(cursor, pattern, raw_tagged?, max_bytes)
+    else
+      case Pull.split_wildcard_plan(pattern) do
+        {:single, single_pat} ->
+          do_nif_pull(cursor, single_pat, raw_tagged?, max_bytes)
+
+        {:merge_top, wild_pat, spec_pat} ->
+          pinned = pin_root_cursor_if_needed(cursor)
+
+          with {:ok, wild_res} <- do_nif_pull(pinned, wild_pat, raw_tagged?, max_bytes),
+               {:ok, spec_res} <- pull(pinned, spec_pat, Keyword.put(opts, :raw_tagged, true)) do
+            {:ok, Pull.merge_wildcard_results(wild_res, spec_res)}
+          end
+      end
     end
   end
 
@@ -937,16 +956,23 @@ defmodule Xitdb do
            moment: moment
          },
          pattern,
-         raw_tagged?
+         raw_tagged?,
+         max_bytes
        )
        when tag != :none do
     {nid, nval} = if tag_id != -1 and val == 0, do: {tag_id, 0}, else: {-1, moment}
-    db_ref |> NIF.nif_pull(nid, nval, pattern, raw_tagged?) |> Error.wrap(%{pattern: pattern})
+
+    db_ref
+    |> NIF.nif_pull(nid, nval, pattern, raw_tagged?, max_bytes)
+    |> Error.wrap(%{pattern: pattern})
   end
 
-  defp do_nif_pull(%Cursor{} = cursor, pattern, raw_tagged?) do
+  defp do_nif_pull(%Cursor{} = cursor, pattern, raw_tagged?, max_bytes) do
     %Cursor{db_ref: db_ref, tag_id: tag_id, value: val} = Cursor.ensure_resolved(cursor)
-    db_ref |> NIF.nif_pull(tag_id, val, pattern, raw_tagged?) |> Error.wrap(%{pattern: pattern})
+
+    db_ref
+    |> NIF.nif_pull(tag_id, val, pattern, raw_tagged?, max_bytes)
+    |> Error.wrap(%{pattern: pattern})
   end
 
   @doc "Same as `pull/3`, but raises `Xitdb.Error` on failure."
@@ -959,6 +985,7 @@ defmodule Xitdb do
 
   ## Options
   - `:raw_tagged` (`boolean()`) — keep raw compression tags `{:tagged, tag, payload}` without decoding (default `false`).
+  - `:max_decompressed_bytes` (`pos_integer()`) — maximum allowed decoded payload size in bytes.
   - `:include_internal` (`boolean()`) — include `.__blobs`, `.__dicts`, and `.__col_pages` bookkeeping paths (default `false`).
   """
   @spec diff_moments(t(), integer(), integer(), keyword()) :: {:ok, [map()]} | {:error, Error.t()}
@@ -967,8 +994,11 @@ defmodule Xitdb do
     raw_tagged? = Keyword.get(opts, :raw_tagged, false)
     include_internal? = Keyword.get(opts, :include_internal, false)
 
-    with {:ok, raw_diffs} <-
-           db_ref |> NIF.nif_diff_moments(moment_a, moment_b, raw_tagged?) |> Error.wrap() do
+    with {:ok, max_bytes} <- fetch_max_decompressed_bytes(opts),
+         {:ok, raw_diffs} <-
+           db_ref
+           |> NIF.nif_diff_moments(moment_a, moment_b, raw_tagged?, max_bytes)
+           |> Error.wrap() do
       filtered =
         if include_internal? do
           raw_diffs
@@ -986,14 +1016,23 @@ defmodule Xitdb do
 
   @doc """
   Returns the historical lineage of `selector` across all moments where its `Slot` changed.
+
+  ## Options
+  - `:raw_tagged` (`boolean()`) — keep raw compression tags `{:tagged, tag, payload}` without decoding (default `false`).
+  - `:max_decompressed_bytes` (`pos_integer()`) — maximum allowed decoded payload size in bytes.
   """
   @spec history_of(t(), String.t() | [term()], keyword()) ::
           {:ok, [map()]} | {:error, Error.t()}
   def history_of(%__MODULE__{db_ref: db_ref}, selector, opts \\ [])
       when (is_binary(selector) or is_list(selector)) and is_list(opts) do
-    with {:ok, entries} <-
-           db_ref |> NIF.nif_history_of(selector) |> Error.wrap(%{selector: selector}) do
-      if Keyword.get(opts, :raw_tagged, false) do
+    raw_tagged? = Keyword.get(opts, :raw_tagged, false)
+
+    with {:ok, max_bytes} <- fetch_max_decompressed_bytes(opts),
+         {:ok, entries} <-
+           db_ref
+           |> NIF.nif_history_of(selector, raw_tagged?, max_bytes)
+           |> Error.wrap(%{selector: selector}) do
+      if raw_tagged? do
         {:ok, entries}
       else
         resolve_history_entries(entries, db_ref, opts)
@@ -1266,5 +1305,22 @@ defmodule Xitdb do
      Error.wrap(:invalid_options, %{
        message: "expected keyword list of options, got: #{inspect(other)}"
      })}
+  end
+
+  defp fetch_max_decompressed_bytes(opts) do
+    case Keyword.fetch(opts, :max_decompressed_bytes) do
+      :error ->
+        {:ok, Compression.default_max_decompressed_bytes()}
+
+      {:ok, max_bytes} when is_integer(max_bytes) and max_bytes > 0 ->
+        {:ok, max_bytes}
+
+      {:ok, invalid} ->
+        {:error, %Error{reason: :invalid_options, details: %{max_decompressed_bytes: invalid}}}
+    end
+  end
+
+  defp fetch_max_decompressed_bytes!(opts) do
+    opts |> fetch_max_decompressed_bytes() |> Error.unwrap!()
   end
 end

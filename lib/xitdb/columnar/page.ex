@@ -124,7 +124,7 @@ defmodule Xitdb.Columnar.Page do
       <<dict_name_bin::binary-size(^dict_name_len), block_payload::binary>> = rest
       encoding = encoding_from_byte(enc_byte)
       codec = codec_from_byte(codec_byte)
-      dict_name = if dict_name_len > 0, do: dict_name_bin, else: nil
+      dict_name = if dict_name_len > 0, do: :binary.copy(dict_name_bin), else: nil
 
       with {:ok, raw_body} <-
              decompress_page_payload(
@@ -192,24 +192,28 @@ defmodule Xitdb.Columnar.Page do
 
   defp do_encode_page(values, row_count, opts) do
     dict_name_opt = opts[:dictionary]
-    dict_bytes = opts[:dictionary_bytes]
-    has_dict? = not is_nil(dict_name_opt) and is_binary(dict_bytes) and byte_size(dict_bytes) > 0
+    dict_name_str = if is_nil(dict_name_opt), do: nil, else: to_string(dict_name_opt)
 
-    req_encoding = Keyword.get(opts, :encoding, :auto)
-    encoding = choose_encoding(req_encoding, values, has_dict?)
-    codec = normalize_page_codec(Keyword.get(opts, :codec, Compression.default_codec()))
-    level = Keyword.get(opts, :level)
-
-    dict_name_bin =
-      if encoding == :dict_block and has_dict? do
-        to_string(dict_name_opt)
-      else
-        ""
-      end
-
-    if byte_size(dict_name_bin) > 255 do
-      {:error, %Error{reason: :invalid_column_page, details: %{dictionary: dict_name_bin}}}
+    if not is_nil(dict_name_str) and byte_size(dict_name_str) not in 1..255 do
+      {:error, %Error{reason: :invalid_column_page, details: %{dictionary: dict_name_str}}}
     else
+      dict_bytes = opts[:dictionary_bytes]
+
+      has_dict? =
+        not is_nil(dict_name_str) and is_binary(dict_bytes) and byte_size(dict_bytes) > 0
+
+      req_encoding = Keyword.get(opts, :encoding, :auto)
+      encoding = choose_encoding(req_encoding, values, has_dict?)
+      codec = normalize_page_codec(Keyword.get(opts, :codec, Compression.default_codec()))
+      level = Keyword.get(opts, :level)
+
+      dict_name_bin =
+        if encoding == :dict_block and has_dict? do
+          dict_name_str
+        else
+          ""
+        end
+
       presence = build_presence_mask(values, row_count)
       raw_body = encode_body(encoding, values, presence)
       raw_block_len = byte_size(raw_body)
@@ -440,7 +444,8 @@ defmodule Xitdb.Columnar.Page do
     if byte_size(raw_body) < mask_bytes do
       {:error, %Error{reason: :corrupt_column_page}}
     else
-      <<presence::binary-size(^mask_bytes), body_rest::binary>> = raw_body
+      <<presence_slice::binary-size(^mask_bytes), body_rest::binary>> = raw_body
+      presence = :binary.copy(presence_slice)
       present_flags = unpack_presence_flags(presence, row_count)
       non_nil_count = Enum.count(present_flags, & &1)
 
@@ -491,7 +496,7 @@ defmodule Xitdb.Columnar.Page do
          dict_name: dict_name,
          presence: presence,
          offsets: offsets,
-         data: data_bin
+         data: :binary.copy(data_bin)
        }}
     else
       _ -> {:error, %Error{reason: :corrupt_column_page}}
@@ -565,7 +570,7 @@ defmodule Xitdb.Columnar.Page do
   defp decode_symbols(bin, remaining, acc) do
     with {:ok, slen, rest} when byte_size(rest) >= slen <- decode_varint(bin) do
       <<s::binary-size(^slen), tail::binary>> = rest
-      decode_symbols(tail, remaining - 1, [s | acc])
+      decode_symbols(tail, remaining - 1, [:binary.copy(s) | acc])
     else
       _ -> :error
     end

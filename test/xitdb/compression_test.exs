@@ -816,5 +816,148 @@ defmodule Xitdb.CompressionTest do
       assert db["staged"]["doc"] == staged_bin <> " [UPDATED]"
       Xitdb.close(db)
     end
+
+    test "prepare_list/6 rewrites {:compressed, bin} 2-tuples in lists, array_list, linked_list, and sorted_map while keeping MapSet keys uncompressed" do
+      long_a = String.duplicate("List compressed 2-tuple alpha. ", 16)
+      long_b = String.duplicate("Array list compressed 2-tuple beta. ", 16)
+      long_c = String.duplicate("Linked list compressed 2-tuple gamma. ", 16)
+      long_d = String.duplicate("Sorted map compressed 2-tuple delta. ", 16)
+      long_e = String.duplicate("Auto list compressed binary epsilon. ", 16)
+
+      db = Xitdb.open!(backend: :memory)
+
+      db =
+        Xitdb.transact!(db, %{
+          "plain" => [{:compressed, long_a}],
+          "arr" => Xitdb.array_list([{:compressed, long_b}]),
+          "lnk" => Xitdb.linked_list([{:compressed, long_c}]),
+          "smap" => Xitdb.sorted_map([{"k1", {:compressed, long_d}}])
+        })
+
+      assert Enum.to_list(db["plain"]) == [long_a]
+      assert {:tagged, _, _} = Xitdb.select!(db, ".plain[0]", raw_tagged: true)
+
+      assert Enum.to_list(db["arr"]) == [long_b]
+      assert {:tagged, _, _} = Xitdb.select!(db, ".arr[0]", raw_tagged: true)
+
+      assert Enum.to_list(db["lnk"]) == [long_c]
+      assert {:tagged, _, _} = Xitdb.select!(db, ".lnk[0]", raw_tagged: true)
+
+      assert db["smap"]["k1"] == long_d
+      assert {:tagged, _, _} = Xitdb.select!(db, ".smap.k1", raw_tagged: true)
+
+      db =
+        Xitdb.transact!(
+          db,
+          %{
+            "auto_list" => [{:compressed, long_e}],
+            "raw_set" => MapSet.new([long_e])
+          },
+          compress: [codec: :zstd, min_bytes: 32, min_savings: 8]
+        )
+
+      assert Enum.to_list(db["auto_list"]) == [long_e]
+      assert {:tagged, "zs", _} = Xitdb.select!(db, ".auto_list[0]", raw_tagged: true)
+      assert Enum.member?(db["raw_set"], long_e)
+
+      Xitdb.close(db)
+    end
+
+    test "max_decompressed_bytes and history_of raw_tagged are enforced uniformly for cz and zs across read entrypoints" do
+      payload_cz = String.duplicate("Zlib bounded read payload. ", 20)
+      payload_zs = String.duplicate("Zstd bounded read payload. ", 20)
+      payload_cz_v2 = String.duplicate("Zlib bounded v2 payload. ", 20)
+      payload_zs_v2 = String.duplicate("Zstd bounded v2 payload. ", 20)
+
+      db = Xitdb.open!(backend: :memory)
+
+      db =
+        Xitdb.transact!(db, %{
+          "rec" => %{
+            "tag" => "ok",
+            "cz" => {:compressed, payload_cz, codec: :zlib},
+            "zs" => {:compressed, payload_zs, codec: :zstd}
+          },
+          "rec_cz" => %{"v" => {:compressed, payload_cz, codec: :zlib}},
+          "rec_zs" => %{"v" => {:compressed, payload_zs, codec: :zstd}}
+        })
+
+      db =
+        Xitdb.transact!(db, %{
+          "rec" => %{
+            "tag" => "v2",
+            "cz" => {:compressed, payload_cz_v2, codec: :zlib},
+            "zs" => {:compressed, payload_zs_v2, codec: :zstd}
+          },
+          "rec_cz" => %{"v" => {:compressed, payload_cz_v2, codec: :zlib}},
+          "rec_zs" => %{"v" => {:compressed, payload_zs_v2, codec: :zstd}}
+        })
+
+      # select/3
+      assert {:error, %Error{reason: :decompressed_size_exceeded}} =
+               Xitdb.select(db, ".rec.cz", max_decompressed_bytes: 16)
+
+      assert {:error, %Error{reason: :decompressed_size_exceeded}} =
+               Xitdb.select(db, ".rec.zs", max_decompressed_bytes: 16)
+
+      # pull/3 (explicit and wildcard merge)
+      assert {:error, %Error{reason: :decompressed_size_exceeded}} =
+               Xitdb.pull(db, "{rec{cz}}", max_decompressed_bytes: 16)
+
+      assert {:error, %Error{reason: :decompressed_size_exceeded}} =
+               Xitdb.pull(db, "{rec{zs}}", max_decompressed_bytes: 16)
+
+      assert {:error, %Error{reason: :decompressed_size_exceeded}} =
+               Xitdb.pull(db["rec"], "{*, tag}", max_decompressed_bytes: 16)
+
+      # materialize/2
+      assert_raise Error, ~r/decompressed_size_exceeded/, fn ->
+        Xitdb.materialize(db["rec_cz"], max_decompressed_bytes: 16)
+      end
+
+      assert_raise Error, ~r/decompressed_size_exceeded/, fn ->
+        Xitdb.materialize(db["rec_zs"], max_decompressed_bytes: 16)
+      end
+
+      # diff_moments/4
+      assert {:error, %Error{reason: :decompressed_size_exceeded}} =
+               Xitdb.diff_moments(db, 0, 1, max_decompressed_bytes: 16)
+
+      # history_of/3 max_decompressed_bytes & raw_tagged: true
+      assert {:error, %Error{reason: :decompressed_size_exceeded}} =
+               Xitdb.history_of(db, ".rec.cz", max_decompressed_bytes: 16)
+
+      assert {:error, %Error{reason: :decompressed_size_exceeded}} =
+               Xitdb.history_of(db, ".rec.zs", max_decompressed_bytes: 16)
+
+      assert {:ok, [%{value: {:tagged, "cz", _}}, %{value: {:tagged, "cz", _}}]} =
+               Xitdb.history_of(db, ".rec.cz", raw_tagged: true)
+
+      assert {:ok, [%{value: {:tagged, "zs", _}}, %{value: {:tagged, "zs", _}}]} =
+               Xitdb.history_of(db, ".rec.zs", raw_tagged: true)
+
+      Xitdb.close(db)
+    end
+
+    test "supervised :xitdb_dict_cache survives short-lived task exit" do
+      samples = for i <- 1..20, do: @html_header <> "Task body #{i}" <> @html_footer
+      dict_bytes = Dictionary.train_dictionary(samples, target_size: 4_096)
+
+      tagged =
+        Task.async(fn ->
+          Compression.compress(hd(samples),
+            codec: :zstd,
+            dictionary: :task_dict,
+            dictionary_bytes: dict_bytes
+          )
+        end)
+        |> Task.await()
+
+      assert {:tagged, "zd", _} = tagged
+      assert :ets.whereis(:xitdb_dict_cache) != :undefined
+
+      assert {:ok, hd(samples)} ==
+               Compression.decompress(tagged, dictionary_bytes: dict_bytes)
+    end
   end
 end

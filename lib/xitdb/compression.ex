@@ -19,7 +19,7 @@ defmodule Xitdb.Compression do
 
   import Bitwise
 
-  alias Xitdb.{Error, NIF, Selector}
+  alias Xitdb.{CacheOwner, Error, NIF, Selector}
 
   @default_min_bytes 128
   @default_min_savings 16
@@ -297,9 +297,16 @@ defmodule Xitdb.Compression do
       {:ok, bytes} when is_binary(bytes) and byte_size(bytes) > 0 ->
         {:ok, bytes}
 
-      _ ->
+      {:ok, _other} ->
         {:error,
          %Error{reason: :missing_compression_dictionary, details: %{dictionary: dict_name}}}
+
+      {:error, :unexpected_tag} ->
+        {:error,
+         %Error{reason: :missing_compression_dictionary, details: %{dictionary: dict_name}}}
+
+      {:error, reason} ->
+        {:error, %Error{reason: reason, details: %{dictionary: dict_name}}}
     end
   end
 
@@ -969,7 +976,7 @@ defmodule Xitdb.Compression do
   end
 
   defp get_or_build_zstd_dicts(dict_bytes) do
-    ensure_dict_cache_table()
+    CacheOwner.ensure_started()
     key = :crypto.hash(:sha256, dict_bytes)
 
     case :ets.lookup(@dict_cache_table, key) do
@@ -979,36 +986,8 @@ defmodule Xitdb.Compression do
       [] ->
         {:ok, cdict} = :zstd.dict(:compress, dict_bytes)
         {:ok, ddict} = :zstd.dict(:decompress, dict_bytes)
-
-        if :ets.info(@dict_cache_table, :size) >= @dict_cache_limit do
-          case :ets.first(@dict_cache_table) do
-            :"$end_of_table" -> :ok
-            evict_key -> :ets.delete(@dict_cache_table, evict_key)
-          end
-        end
-
-        :ets.insert(@dict_cache_table, {key, cdict, ddict})
+        :ok = CacheOwner.put_dict(key, cdict, ddict, @dict_cache_limit)
         {:ok, cdict, ddict}
-    end
-  end
-
-  defp ensure_dict_cache_table do
-    case :ets.whereis(@dict_cache_table) do
-      :undefined ->
-        try do
-          :ets.new(@dict_cache_table, [
-            :named_table,
-            :public,
-            :set,
-            read_concurrency: true,
-            write_concurrency: true
-          ])
-        rescue
-          ArgumentError -> :ok
-        end
-
-      _tid ->
-        :ok
     end
   end
 
@@ -1101,8 +1080,9 @@ defmodule Xitdb.Compression do
     has_compressed_directive_map?(:maps.iterator(map))
   end
 
-  defp has_compressed_directive?(%Xitdb.Collection{data: data}),
-    do: has_compressed_directive?(data)
+  defp has_compressed_directive?(%Xitdb.Collection{kind: kind, data: data})
+       when kind in [:hash_map, :counted_hash_map, :sorted_map, :array_list, :linked_array_list],
+       do: has_compressed_directive?(data)
 
   defp has_compressed_directive?({k, v}),
     do: has_compressed_directive?(k) or has_compressed_directive?(v)
@@ -1195,7 +1175,7 @@ defmodule Xitdb.Compression do
       if is_map(data) and not is_struct(data) do
         prepare_map(data, db_or_cursor, default_opts, auto?, skip_auto?, state)
       else
-        prepare_list(Enum.to_list(data), db_or_cursor, default_opts, auto?, skip_auto?, state)
+        prepare_kv_list(Enum.to_list(data), db_or_cursor, default_opts, auto?, skip_auto?, state)
       end
 
     {%Xitdb.Collection{col | data: next_data}, next_state}
@@ -1248,18 +1228,24 @@ defmodule Xitdb.Compression do
   defp prepare_list(list, db_or_cursor, default_opts, auto?, skip_auto?, state) do
     {items_rev, next_state} =
       Enum.reduce(list, {[], state}, fn item, {acc, st} ->
-        {ni, nst} =
-          case item do
-            {k, v} ->
-              child_skip? = skip_auto? or internal_root_key?(k)
-              {nv, st2} = prepare_node(v, db_or_cursor, default_opts, auto?, child_skip?, st)
-              {{k, nv}, st2}
-
-            other ->
-              prepare_node(other, db_or_cursor, default_opts, auto?, skip_auto?, st)
-          end
-
+        {ni, nst} = prepare_node(item, db_or_cursor, default_opts, auto?, skip_auto?, st)
         {[ni | acc], nst}
+      end)
+
+    {:lists.reverse(items_rev), next_state}
+  end
+
+  defp prepare_kv_list(list, db_or_cursor, default_opts, auto?, skip_auto?, state) do
+    {items_rev, next_state} =
+      Enum.reduce(list, {[], state}, fn
+        {k, v}, {acc, st} ->
+          child_skip? = skip_auto? or internal_root_key?(k)
+          {nv, nst} = prepare_node(v, db_or_cursor, default_opts, auto?, child_skip?, st)
+          {[{k, nv} | acc], nst}
+
+        other, {acc, st} ->
+          {ni, nst} = prepare_node(other, db_or_cursor, default_opts, auto?, skip_auto?, st)
+          {[ni | acc], nst}
       end)
 
     {:lists.reverse(items_rev), next_state}

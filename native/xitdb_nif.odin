@@ -387,12 +387,17 @@ decode_cz_bytes :: proc(
 	dest_len := zlib.uLongf(raw_len)
 	rc := zlib.uncompress(raw_data(out), &dest_len, raw_data(comp), zlib.uLong(len(comp)))
 	if rc != zlib.OK || u64(dest_len) != raw_len {
+		delete(out, allocator)
 		return nil, "corrupt_compressed_payload"
 	}
 	return out, ""
 }
 
-decode_cz_to_term :: proc(env: ErlNifEnv, payload: []u8) -> (term: ERL_NIF_TERM, err_atom: string) {
+decode_cz_to_term :: proc(
+	env: ErlNifEnv,
+	payload: []u8,
+	max_bytes: u64 = MAX_NIF_DECOMPRESSED_BYTES,
+) -> (term: ERL_NIF_TERM, err_atom: string) {
 	if len(payload) < 5 {
 		return ATOM_NIL, "corrupt_compressed_payload"
 	}
@@ -400,7 +405,7 @@ decode_cz_to_term :: proc(env: ErlNifEnv, payload: []u8) -> (term: ERL_NIF_TERM,
 		return ATOM_NIL, "corrupt_compressed_payload"
 	}
 	raw_len := u64(payload[1]) | (u64(payload[2]) << 8) | (u64(payload[3]) << 16) | (u64(payload[4]) << 24)
-	if raw_len > MAX_NIF_DECOMPRESSED_BYTES {
+	if raw_len > max_bytes {
 		return ATOM_NIL, "decompressed_size_exceeded"
 	}
 	comp := payload[5:]
@@ -438,12 +443,21 @@ parse_bool_arg :: #force_inline proc(term: ERL_NIF_TERM) -> (val: bool, ok: bool
 	return false, false
 }
 
+parse_max_bytes_arg :: #force_inline proc(env: ErlNifEnv, term: ERL_NIF_TERM) -> (val: u64, ok: bool) {
+	v: i64 = 0
+	if nif_get_int64(env, term, &v) == 0 || v <= 0 {
+		return 0, false
+	}
+	return u64(v), true
+}
+
 slot_to_term :: proc(
 	env: ErlNifEnv,
 	db: ^xitdb.Database,
 	slot: xitdb.Slot,
 	raw_tagged: bool = false,
 	codec_err: ^string = nil,
+	max_bytes: u64 = MAX_NIF_DECOMPRESSED_BYTES,
 ) -> (res: ERL_NIF_TERM, err: xitdb.Error) {
 	if slot.tag == .None && !slot.full {
 		return ATOM_NIL, nil
@@ -501,7 +515,7 @@ slot_to_term :: proc(
 				return ATOM_FALSE, nil
 			}
 			if !raw_tagged && len(obj.format_tag) == 2 && obj.format_tag[0] == 'c' && obj.format_tag[1] == 'z' {
-				decoded_term, cz_err := decode_cz_to_term(env, obj.value)
+				decoded_term, cz_err := decode_cz_to_term(env, obj.value, max_bytes)
 				if cz_err != "" {
 					if codec_err != nil && len(codec_err^) == 0 {
 						codec_err^ = cz_err
@@ -668,9 +682,10 @@ materialize_slot :: proc(
 	is_root: bool = false,
 	raw_tagged: bool = false,
 	codec_err: ^string = nil,
+	max_bytes: u64 = MAX_NIF_DECOMPRESSED_BYTES,
 ) -> (res: ERL_NIF_TERM, err: xitdb.Error) {
 	if !is_container_tag(slot.tag) {
-		return slot_to_term(env, db, slot, raw_tagged, codec_err)
+		return slot_to_term(env, db, slot, raw_tagged, codec_err, max_bytes)
 	}
 
 	cur := xitdb.Read_Cursor{
@@ -692,7 +707,7 @@ materialize_slot :: proc(
 				break
 			}
 			elem_slot := xitdb.cursor_slot(elem_cur) or_return
-			term := materialize_slot(env, db, elem_slot, false, raw_tagged, codec_err) or_return
+			term := materialize_slot(env, db, elem_slot, false, raw_tagged, codec_err, max_bytes) or_return
 			push_nif_term(item_buf[:], &item_len, &item_dyn, &using_dyn, term, context.temp_allocator)
 		}
 		items := item_dyn[:] if using_dyn else item_buf[:item_len]
@@ -714,7 +729,7 @@ materialize_slot :: proc(
 				break
 			}
 			key_cur, _ := xitdb.cursor_read_kv_pair_slots(elem_cur) or_return
-			term := slot_to_term(env, db, key_cur.slot_ptr.slot, raw_tagged, codec_err) or_return
+			term := slot_to_term(env, db, key_cur.slot_ptr.slot, raw_tagged, codec_err, max_bytes) or_return
 			push_nif_term(item_buf[:], &item_len, &item_dyn, &using_dyn, term, context.temp_allocator)
 		}
 		items := item_dyn[:] if using_dyn else item_buf[:item_len]
@@ -740,7 +755,7 @@ materialize_slot :: proc(
 				continue
 			}
 			k_term := make_binary(env, key_str)
-			v_term := materialize_slot(env, db, val_cur.slot_ptr.slot, false, raw_tagged, codec_err) or_return
+			v_term := materialize_slot(env, db, val_cur.slot_ptr.slot, false, raw_tagged, codec_err, max_bytes) or_return
 			push_nif_term(key_buf[:], &key_len, &key_dyn, &using_key_dyn, k_term, context.temp_allocator)
 			push_nif_term(val_buf[:], &val_len, &val_dyn, &using_val_dyn, v_term, context.temp_allocator)
 		}
@@ -752,7 +767,13 @@ materialize_slot :: proc(
 	return ATOM_NIL, nil
 }
 
-pull_value_to_term :: proc(env: ErlNifEnv, pv: xitdb.Pull_Value, raw_tagged: bool = false, codec_err: ^string = nil) -> ERL_NIF_TERM {
+pull_value_to_term :: proc(
+	env: ErlNifEnv,
+	pv: xitdb.Pull_Value,
+	raw_tagged: bool = false,
+	codec_err: ^string = nil,
+	max_bytes: u64 = MAX_NIF_DECOMPRESSED_BYTES,
+) -> ERL_NIF_TERM {
 	switch v in pv {
 	case u64:
 		return nif_make_uint64(env, v)
@@ -770,7 +791,7 @@ pull_value_to_term :: proc(env: ErlNifEnv, pv: xitdb.Pull_Value, raw_tagged: boo
 			return ATOM_FALSE
 		}
 		if !raw_tagged && len(v.format_tag) == 2 && v.format_tag[0] == 'c' && v.format_tag[1] == 'z' {
-			t, cz_err := decode_cz_to_term(env, v.value)
+			t, cz_err := decode_cz_to_term(env, v.value, max_bytes)
 			if cz_err != "" {
 				if codec_err != nil && len(codec_err^) == 0 {
 					codec_err^ = cz_err
@@ -794,7 +815,7 @@ pull_value_to_term :: proc(env: ErlNifEnv, pv: xitdb.Pull_Value, raw_tagged: boo
 		}
 		items := make([]ERL_NIF_TERM, len(v), context.temp_allocator)
 		for elem, idx in v {
-			items[idx] = pull_value_to_term(env, elem, raw_tagged, codec_err)
+			items[idx] = pull_value_to_term(env, elem, raw_tagged, codec_err, max_bytes)
 		}
 		return nif_make_list_from_array(env, raw_data(items), c.uint(len(items)))
 	case xitdb.Pull_Map:
@@ -805,7 +826,7 @@ pull_value_to_term :: proc(env: ErlNifEnv, pv: xitdb.Pull_Value, raw_tagged: boo
 		vals := make([]ERL_NIF_TERM, len(v), context.temp_allocator)
 		for entry, idx in v {
 			keys[idx] = make_binary(env, entry.key)
-			vals[idx] = pull_value_to_term(env, entry.val, raw_tagged, codec_err)
+			vals[idx] = pull_value_to_term(env, entry.val, raw_tagged, codec_err, max_bytes)
 		}
 		return make_map_safe(env, keys, vals)
 	}
@@ -1776,16 +1797,24 @@ odin_nif_slot_materialize :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL
 	context = runtime.default_context()
 	defer free_all(context.temp_allocator)
 
-	if argc != 4 && argc != 5 {
+	if argc != 4 && argc != 5 && argc != 6 {
 		return make_err(env, "badarg")
 	}
 	raw_tagged := false
-	if argc == 5 {
+	if argc >= 5 {
 		bt, ok_rt := parse_bool_arg(argv[4])
 		if !ok_rt {
 			return make_err(env, "badarg")
 		}
 		raw_tagged = bt
+	}
+	max_bytes: u64 = MAX_NIF_DECOMPRESSED_BYTES
+	if argc == 6 {
+		mb, ok_mb := parse_max_bytes_arg(env, argv[5])
+		if !ok_mb {
+			return make_err(env, "badarg")
+		}
+		max_bytes = mb
 	}
 	tag_int, val_int, full_int: i64
 	if nif_get_int64(env, argv[1], &tag_int) == 0 ||
@@ -1824,7 +1853,7 @@ odin_nif_slot_materialize :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL
 		slot.full = (full_int != 0)
 	}
 	codec_err := ""
-	term, err := materialize_slot(env, &handle.db, slot, is_root, raw_tagged, &codec_err)
+	term, err := materialize_slot(env, &handle.db, slot, is_root, raw_tagged, &codec_err, max_bytes)
 	if err != nil {
 		if len(codec_err) > 0 {
 			return make_err(env, codec_err)
@@ -5490,16 +5519,24 @@ odin_nif_select :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM)
 	context = runtime.default_context()
 	defer free_all(context.temp_allocator)
 
-	if argc != 3 && argc != 4 {
+	if argc != 3 && argc != 4 && argc != 5 {
 		return make_err(env, "badarg")
 	}
 	raw_tagged := false
-	if argc == 4 {
+	if argc >= 4 {
 		bt, ok_rt := parse_bool_arg(argv[3])
 		if !ok_rt {
 			return make_err(env, "badarg")
 		}
 		raw_tagged = bt
+	}
+	max_bytes: u64 = MAX_NIF_DECOMPRESSED_BYTES
+	if argc == 5 {
+		mb, ok_mb := parse_max_bytes_arg(env, argv[4])
+		if !ok_mb {
+			return make_err(env, "badarg")
+		}
+		max_bytes = mb
 	}
 	moment_idx: i64 = -1
 	if nif_get_int64(env, argv[1], &moment_idx) == 0 {
@@ -5570,7 +5607,7 @@ odin_nif_select :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM)
 	}
 
 	codec_err := ""
-	term, t_err := slot_to_term(env, &handle.db, cur.slot_ptr.slot, raw_tagged, &codec_err)
+	term, t_err := slot_to_term(env, &handle.db, cur.slot_ptr.slot, raw_tagged, &codec_err, max_bytes)
 	if t_err != nil {
 		if len(codec_err) > 0 {
 			return make_err(env, codec_err)
@@ -5714,10 +5751,11 @@ nif_pull_wildcard :: proc(
 	visited: ^map[i64]bool,
 	raw_tagged: bool = false,
 	codec_err: ^string = nil,
+	max_bytes: u64 = MAX_NIF_DECOMPRESSED_BYTES,
 ) -> (res: ERL_NIF_TERM, err_reason: string, err: xitdb.Error) {
 	slot := xitdb.cursor_slot(cur) or_return
 	if !is_container_tag(slot.tag) {
-		term := slot_to_term(env, db, slot, raw_tagged, codec_err) or_return
+		term := slot_to_term(env, db, slot, raw_tagged, codec_err, max_bytes) or_return
 		return term, "", nil
 	}
 	if slot.value > 0 {
@@ -5740,7 +5778,7 @@ nif_pull_wildcard :: proc(
 			if !ok {
 				break
 			}
-			v, v_reason, v_err := nif_pull_wildcard(env, db, elem_cur, false, visited, raw_tagged, codec_err)
+			v, v_reason, v_err := nif_pull_wildcard(env, db, elem_cur, false, visited, raw_tagged, codec_err, max_bytes)
 			if v_err != nil {
 				return 0, "", v_err
 			}
@@ -5764,7 +5802,7 @@ nif_pull_wildcard :: proc(
 				break
 			}
 			key_cur, _ := xitdb.cursor_read_kv_pair_slots(elem_cur) or_return
-			v := slot_to_term(env, db, key_cur.slot_ptr.slot, raw_tagged, codec_err) or_return
+			v := slot_to_term(env, db, key_cur.slot_ptr.slot, raw_tagged, codec_err, max_bytes) or_return
 			append(&items, v)
 		}
 		if len(items) == 0 {
@@ -5787,7 +5825,7 @@ nif_pull_wildcard :: proc(
 			if is_root && k_str == "__tx" {
 				continue
 			}
-			v, v_reason, v_err := nif_pull_wildcard(env, db, val_cur, false, visited, raw_tagged, codec_err)
+			v, v_reason, v_err := nif_pull_wildcard(env, db, val_cur, false, visited, raw_tagged, codec_err, max_bytes)
 			if v_err != nil {
 				return 0, "", v_err
 			}
@@ -5830,6 +5868,7 @@ nif_pull_range :: proc(
 	visited: ^map[i64]bool,
 	raw_tagged: bool = false,
 	codec_err: ^string = nil,
+	max_bytes: u64 = MAX_NIF_DECOMPRESSED_BYTES,
 ) -> (res: ERL_NIF_TERM, err_reason: string, err: xitdb.Error) {
 	if start_idx < 0 || end_idx < start_idx {
 		return 0, "", .Invalid_Range
@@ -5860,12 +5899,12 @@ nif_pull_range :: proc(
 		if wildcard_sub {
 			elem_slot := xitdb.cursor_slot(elem_cur) or_return
 			if !is_container_tag(elem_slot.tag) {
-				term := slot_to_term(env, db, elem_slot, raw_tagged, codec_err) or_return
+				term := slot_to_term(env, db, elem_slot, raw_tagged, codec_err, max_bytes) or_return
 				append(&items, term)
 				continue
 			}
 		}
-		v, v_reason, v_err := nif_pull_cursor(env, db, elem_cur, trimmed_sub, false, visited, raw_tagged, codec_err)
+		v, v_reason, v_err := nif_pull_cursor(env, db, elem_cur, trimmed_sub, false, visited, raw_tagged, codec_err, max_bytes)
 		if v_err != nil {
 			return 0, "", v_err
 		}
@@ -5889,10 +5928,11 @@ nif_pull_cursor :: proc(
 	visited: ^map[i64]bool,
 	raw_tagged: bool = false,
 	codec_err: ^string = nil,
+	max_bytes: u64 = MAX_NIF_DECOMPRESSED_BYTES,
 ) -> (res: ERL_NIF_TERM, err_reason: string, err: xitdb.Error) {
 	p := strings.trim_space(pattern)
 	if len(p) == 0 || p == "*" {
-		return nif_pull_wildcard(env, db, cur, is_root, visited, raw_tagged, codec_err)
+		return nif_pull_wildcard(env, db, cur, is_root, visited, raw_tagged, codec_err, max_bytes)
 	}
 
 	if len(p) >= 2 && p[0] == '{' && p[len(p) - 1] == '}' {
@@ -5928,7 +5968,7 @@ nif_pull_cursor :: proc(
 					if is_root && k_str == "__tx" {
 						continue
 					}
-					v, v_reason, v_err := nif_pull_wildcard(env, db, val_cur, false, visited, raw_tagged, codec_err)
+					v, v_reason, v_err := nif_pull_wildcard(env, db, val_cur, false, visited, raw_tagged, codec_err, max_bytes)
 					if v_err != nil {
 						return 0, "", v_err
 					}
@@ -6043,7 +6083,7 @@ nif_pull_cursor :: proc(
 
 			pulled: ERL_NIF_TERM
 			if has_range {
-				pr, pr_reason, pr_err := nif_pull_range(env, db, target_cur, range_start, range_end, sub_pattern, visited, raw_tagged, codec_err)
+				pr, pr_reason, pr_err := nif_pull_range(env, db, target_cur, range_start, range_end, sub_pattern, visited, raw_tagged, codec_err, max_bytes)
 				if pr_err != nil {
 					return 0, "", pr_err
 				}
@@ -6054,9 +6094,9 @@ nif_pull_cursor :: proc(
 			} else if len(sub_pattern) == 0 || sub_pattern == "*" {
 				t_slot := xitdb.cursor_slot(target_cur) or_return
 				if !is_container_tag(t_slot.tag) {
-					pulled = slot_to_term(env, db, t_slot, raw_tagged, codec_err) or_return
+					pulled = slot_to_term(env, db, t_slot, raw_tagged, codec_err, max_bytes) or_return
 				} else {
-					pc, pc_reason, pc_err := nif_pull_cursor(env, db, target_cur, sub_pattern, false, visited, raw_tagged, codec_err)
+					pc, pc_reason, pc_err := nif_pull_cursor(env, db, target_cur, sub_pattern, false, visited, raw_tagged, codec_err, max_bytes)
 					if pc_err != nil {
 						return 0, "", pc_err
 					}
@@ -6066,7 +6106,7 @@ nif_pull_cursor :: proc(
 					pulled = pc
 				}
 			} else {
-				pc, pc_reason, pc_err := nif_pull_cursor(env, db, target_cur, sub_pattern, false, visited, raw_tagged, codec_err)
+				pc, pc_reason, pc_err := nif_pull_cursor(env, db, target_cur, sub_pattern, false, visited, raw_tagged, codec_err, max_bytes)
 				if pc_err != nil {
 					return 0, "", pc_err
 				}
@@ -6090,16 +6130,24 @@ odin_nif_pull :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -
 	context = runtime.default_context()
 	defer free_all(context.temp_allocator)
 
-	if argc != 4 && argc != 5 {
+	if argc != 4 && argc != 5 && argc != 6 {
 		return make_err(env, "badarg")
 	}
 	raw_tagged := false
-	if argc == 5 {
+	if argc >= 5 {
 		bt, ok_rt := parse_bool_arg(argv[4])
 		if !ok_rt {
 			return make_err(env, "badarg")
 		}
 		raw_tagged = bt
+	}
+	max_bytes: u64 = MAX_NIF_DECOMPRESSED_BYTES
+	if argc == 6 {
+		mb, ok_mb := parse_max_bytes_arg(env, argv[5])
+		if !ok_mb {
+			return make_err(env, "badarg")
+		}
+		max_bytes = mb
 	}
 	tag_int, val_int: i64
 	if nif_get_int64(env, argv[1], &tag_int) == 0 || nif_get_int64(env, argv[2], &val_int) == 0 {
@@ -6141,7 +6189,7 @@ odin_nif_pull :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -
 	visited: map[i64]bool
 	visited.allocator = context.temp_allocator
 	codec_err := ""
-	res_term, p_reason, p_err := nif_pull_cursor(env, &handle.db, cur, pattern_str, is_root, &visited, raw_tagged, &codec_err)
+	res_term, p_reason, p_err := nif_pull_cursor(env, &handle.db, cur, pattern_str, is_root, &visited, raw_tagged, &codec_err, max_bytes)
 	if p_err != nil {
 		if len(codec_err) > 0 {
 			return make_err(env, codec_err)
@@ -6159,16 +6207,24 @@ odin_nif_diff_moments :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF
 	context = runtime.default_context()
 	defer free_all(context.temp_allocator)
 
-	if argc != 3 && argc != 4 {
+	if argc != 3 && argc != 4 && argc != 5 {
 		return make_err(env, "badarg")
 	}
 	raw_tagged := false
-	if argc == 4 {
+	if argc >= 4 {
 		bt, ok_rt := parse_bool_arg(argv[3])
 		if !ok_rt {
 			return make_err(env, "badarg")
 		}
 		raw_tagged = bt
+	}
+	max_bytes: u64 = MAX_NIF_DECOMPRESSED_BYTES
+	if argc == 5 {
+		mb, ok_mb := parse_max_bytes_arg(env, argv[4])
+		if !ok_mb {
+			return make_err(env, "badarg")
+		}
+		max_bytes = mb
 	}
 	moment_a, moment_b: i64
 	if nif_get_int64(env, argv[1], &moment_a) == 0 || nif_get_int64(env, argv[2], &moment_b) == 0 {
@@ -6213,14 +6269,14 @@ odin_nif_diff_moments :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF
 			op_atom = ATOM_PUT
 		}
 
-		old_val, o_err := materialize_slot(env, &handle.db, chg.old_slot, false, raw_tagged, &codec_err)
+		old_val, o_err := materialize_slot(env, &handle.db, chg.old_slot, false, raw_tagged, &codec_err, max_bytes)
 		if o_err != nil {
 			if len(codec_err) > 0 {
 				return make_err(env, codec_err)
 			}
 			return make_xitdb_err(env, o_err)
 		}
-		new_val, n_err := materialize_slot(env, &handle.db, chg.new_slot, false, raw_tagged, &codec_err)
+		new_val, n_err := materialize_slot(env, &handle.db, chg.new_slot, false, raw_tagged, &codec_err, max_bytes)
 		if n_err != nil {
 			if len(codec_err) > 0 {
 				return make_err(env, codec_err)
@@ -6248,8 +6304,24 @@ odin_nif_history_of :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_T
 	context = runtime.default_context()
 	defer free_all(context.temp_allocator)
 
-	if argc != 2 {
+	if argc != 2 && argc != 3 && argc != 4 {
 		return make_err(env, "badarg")
+	}
+	raw_tagged := false
+	if argc >= 3 {
+		bt, ok_rt := parse_bool_arg(argv[2])
+		if !ok_rt {
+			return make_err(env, "badarg")
+		}
+		raw_tagged = bt
+	}
+	max_bytes: u64 = MAX_NIF_DECOMPRESSED_BYTES
+	if argc == 4 {
+		mb, ok_mb := parse_max_bytes_arg(env, argv[3])
+		if !ok_mb {
+			return make_err(env, "badarg")
+		}
+		max_bytes = mb
 	}
 
 	step_buf: [16]xitdb.Path_Step = ---
@@ -6392,7 +6464,7 @@ odin_nif_history_of :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_T
 			}
 
 			codec_err := ""
-			val_term, m_err := materialize_slot(env, &handle.db, cur_slot, false, false, &codec_err)
+			val_term, m_err := materialize_slot(env, &handle.db, cur_slot, false, raw_tagged, &codec_err, max_bytes)
 			if m_err != nil {
 				if len(codec_err) > 0 {
 					return make_err(env, codec_err)
@@ -7503,7 +7575,7 @@ nif_dl_make_cache_key :: proc(
 	allocator: runtime.Allocator,
 ) -> string {
 	buf := make([]u8, 10 + len(payload), allocator)
-	u := transmute(u64)moment_idx
+	u := u64(moment_idx)
 	for i in 0 ..< 8 {
 		buf[i] = u8(u >> uint(i * 8))
 	}
@@ -8589,7 +8661,7 @@ odin_nif_query_datalog :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NI
 	for row, r_idx in final_rows {
 		cols := make([]ERL_NIF_TERM, len(row), context.temp_allocator)
 		for cell, c_idx in row {
-			cols[c_idx] = pull_value_to_term(env, cell, raw_tagged, &codec_err)
+			cols[c_idx] = pull_value_to_term(env, cell, raw_tagged, &codec_err, max_decompressed_bytes)
 			if len(codec_err) > 0 {
 				return make_err(env, codec_err)
 			}

@@ -13,7 +13,7 @@ defmodule Xitdb.Columnar do
   actually traversed or selected.
   """
 
-  alias Xitdb.{Compression, Cursor, Error, NIF}
+  alias Xitdb.{CacheOwner, Compression, Cursor, Error, NIF}
   alias Xitdb.Columnar.Page
 
   @version_pg 0x10
@@ -331,7 +331,19 @@ defmodule Xitdb.Columnar do
 
     if byte_size(field_str) in 1..65_535 do
       field_atom = if is_atom(name), do: name, else: nil
-      merged = Keyword.merge(shared_opts, Enum.into(col_opts, []))
+      col_kw = Enum.into(col_opts, [])
+
+      eff_shared =
+        if Keyword.has_key?(col_kw, :dictionary) and
+             not Keyword.has_key?(col_kw, :dictionary_bytes) and
+             normalize_dict_opt(Keyword.get(col_kw, :dictionary)) !=
+               normalize_dict_opt(Keyword.get(shared_opts, :dictionary)) do
+          Keyword.delete(shared_opts, :dictionary_bytes)
+        else
+          shared_opts
+        end
+
+      merged = Keyword.merge(eff_shared, col_kw)
       {:ok, %{field_str: field_str, field_atom: field_atom, opts: merged}}
     else
       {:error, %Error{reason: :invalid_options, details: %{column: name}}}
@@ -342,7 +354,12 @@ defmodule Xitdb.Columnar do
     {:error, %Error{reason: :invalid_options, details: %{column: other}}}
   end
 
+  defp normalize_dict_opt(nil), do: nil
+  defp normalize_dict_opt(name), do: to_string(name)
+
   defp preload_dictionaries(col_configs, db_ref, moment) do
+    eff_moment = moment || -1
+
     col_configs
     |> Enum.reduce_while({:ok, %{}}, fn %{opts: opts}, {:ok, cache} ->
       case {Keyword.get(opts, :dictionary), Keyword.get(opts, :dictionary_bytes)} do
@@ -356,6 +373,10 @@ defmodule Xitdb.Columnar do
           dict_str = to_string(dict_name)
 
           cond do
+            byte_size(dict_str) not in 1..255 ->
+              {:halt,
+               {:error, %Error{reason: :invalid_column_page, details: %{dictionary: dict_str}}}}
+
             Map.has_key?(cache, dict_str) ->
               {:cont, {:ok, cache}}
 
@@ -363,9 +384,10 @@ defmodule Xitdb.Columnar do
               {:cont, {:ok, cache}}
 
             true ->
-              case Compression.fetch_dictionary_bytes(db_ref, moment, dict_str) do
+              case Compression.fetch_dictionary_bytes(db_ref, eff_moment, dict_str) do
                 {:ok, bytes} -> {:cont, {:ok, Map.put(cache, dict_str, bytes)}}
                 {:error, %Error{reason: :missing_compression_dictionary}} -> {:cont, {:ok, cache}}
+                {:error, %Error{} = err} -> {:halt, {:error, err}}
               end
           end
       end
@@ -517,7 +539,7 @@ defmodule Xitdb.Columnar do
   # ============================================================================
 
   defp fetch_or_decode_page(col, field, page_id, db_ref, moment, opts) do
-    ensure_page_cache_table()
+    CacheOwner.ensure_started()
 
     max_bytes =
       Keyword.get(opts, :max_decompressed_bytes, Compression.default_max_decompressed_bytes())
@@ -578,47 +600,7 @@ defmodule Xitdb.Columnar do
   end
 
   defp insert_cached_page(cache_key, %Page{} = page, raw_len) do
-    ensure_page_cache_table()
-
-    if :ets.info(@page_cache_table, :size) >= @page_cache_limit do
-      case :ets.tab2list(@page_cache_table) do
-        [] ->
-          :ok
-
-        entries ->
-          {oldest_key, _page, _raw_len, _ts} =
-            Enum.min_by(entries, fn {_k, _p, _len, ts} -> ts end)
-
-          :ets.delete(@page_cache_table, oldest_key)
-      end
-    end
-
-    :ets.insert(
-      @page_cache_table,
-      {cache_key, page, raw_len, System.monotonic_time(:nanosecond)}
-    )
-
-    :ok
-  end
-
-  defp ensure_page_cache_table do
-    case :ets.whereis(@page_cache_table) do
-      :undefined ->
-        try do
-          :ets.new(@page_cache_table, [
-            :named_table,
-            :public,
-            :set,
-            read_concurrency: true,
-            write_concurrency: true
-          ])
-        rescue
-          ArgumentError -> :ok
-        end
-
-      _tid ->
-        :ok
-    end
+    CacheOwner.put_page(cache_key, page, raw_len, @page_cache_limit)
   end
 
   defp initial_stats do

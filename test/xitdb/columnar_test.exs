@@ -251,5 +251,129 @@ defmodule Xitdb.ColumnarTest do
       Xitdb.close(db1)
       Xitdb.close(db2)
     end
+
+    test "supervised :xitdb_page_cache survives creator task exit and never exceeds @page_cache_limit under concurrent misses" do
+      payload = String.duplicate("Concurrent page cache stress payload. ", 10)
+      rows = for i <- 1..160, do: {Integer.to_string(i), %{"body" => "#{payload}#{i}"}}
+
+      db =
+        Xitdb.open!(backend: :memory)
+        |> Columnar.put_rows!("items", rows,
+          columns: [:body],
+          row_group_size: 1,
+          codec: :zstd
+        )
+
+      Columnar.clear_cache(:all)
+
+      # Creator task populates cache and immediately exits; table must stay alive
+      Task.async(fn ->
+        assert db["items"]["1"]["body"] == "#{payload}1"
+      end)
+      |> Task.await()
+
+      assert :ets.whereis(:xitdb_page_cache) != :undefined
+      assert db["items"]["1"]["body"] == "#{payload}1"
+
+      # Wave of concurrent misses across 160 distinct pages must keep table size <= 128
+      1..160
+      |> Task.async_stream(
+        fn idx ->
+          assert db["items"][Integer.to_string(idx)]["body"] == "#{payload}#{idx}"
+        end,
+        max_concurrency: 16,
+        ordered: false
+      )
+      |> Stream.run()
+
+      assert :ets.info(:xitdb_page_cache, :size) <= 128
+      Xitdb.close(db)
+    end
+
+    test "Page.decode_page/2 copies subbinaries so decoded Page structs do not retain compressed or raw_body refc binaries" do
+      emails =
+        for i <- 1..16 do
+          @html_head <> @html_section <> "Subbinary copy email #{i}" <> @html_foot
+        end
+
+      dict_bytes = Dictionary.train_dictionary(emails, target_size: 4_096)
+      long_dict_name = String.duplicate("d", 70)
+
+      {:ok, dict_page_bin} =
+        Page.encode_page(emails,
+          encoding: :dict_block,
+          codec: :zstd,
+          dictionary: long_dict_name,
+          dictionary_bytes: dict_bytes
+        )
+
+      assert {:ok, dict_page} = Page.decode_page(dict_page_bin, dictionary_bytes: dict_bytes)
+      assert :binary.referenced_byte_size(dict_page.dict_name) == byte_size(dict_page.dict_name)
+      assert :binary.referenced_byte_size(dict_page.presence) == byte_size(dict_page.presence)
+      assert :binary.referenced_byte_size(dict_page.data) == byte_size(dict_page.data)
+
+      big_sym = String.duplicate("RLE_SYM_", 20)
+      rle_rows = List.duplicate(big_sym, 16)
+      {:ok, rle_page_bin} = Page.encode_page(rle_rows, encoding: :dict_rle, codec: :none)
+      assert {:ok, rle_page} = Page.decode_page(rle_page_bin)
+      sym = elem(rle_page.sym_table, 0)
+      assert :binary.referenced_byte_size(sym) == byte_size(sym)
+      assert :binary.referenced_byte_size(rle_page.presence) == byte_size(rle_page.presence)
+    end
+
+    test "per-column dictionary override drops stale shared dictionary_bytes and invalid dict names or closed db errors propagate cleanly" do
+      d1_samples = for i <- 1..10, do: "ALPHA_TEMPLATE_#{i}_" <> String.duplicate("A", 120)
+      d2_samples = for i <- 1..10, do: "BETA_TEMPLATE_#{i}_" <> String.duplicate("B", 120)
+
+      d1_bytes = Dictionary.train_dictionary(d1_samples, target_size: 2_048)
+      d2_bytes = Dictionary.train_dictionary(d2_samples, target_size: 2_048)
+
+      db = Xitdb.open!(backend: :memory)
+      {:ok, db} = Dictionary.put(db, :d1, d1_bytes)
+      {:ok, db} = Dictionary.put(db, :d2, d2_bytes)
+
+      rows =
+        for i <- 1..4 do
+          {Integer.to_string(i),
+           %{
+             "col1" => Enum.at(d1_samples, i),
+             "col2" => Enum.at(d2_samples, i)
+           }}
+        end
+
+      db =
+        Columnar.put_rows!(db, "items", rows,
+          columns: [:col1, {:col2, encoding: :dict_block, dictionary: :d2}],
+          encoding: :dict_block,
+          codec: :zstd,
+          dictionary: :d1,
+          dictionary_bytes: d1_bytes
+        )
+
+      [{_p2, p2_bin}] = Enum.to_list(db["__col_pages"]["items"]["col2"])
+
+      assert {:ok, %Page{encoding: :dict_block, dict_name: "d2"}} =
+               Page.decode_page(p2_bin, dictionary_bytes: d2_bytes)
+
+      assert db["items"]["1"]["col1"] == Enum.at(d1_samples, 1)
+      assert db["items"]["1"]["col2"] == Enum.at(d2_samples, 1)
+
+      # Empty dictionary name is rejected cleanly at encode time
+      assert {:error, %Error{reason: :invalid_column_page}} =
+               Page.encode_page(["hello", "world"],
+                 encoding: :dict_block,
+                 dictionary: "",
+                 dictionary_bytes: d1_bytes
+               )
+
+      # Non-missing dictionary fetch errors (e.g. closed handle) return {:error, %Error{}} rather than CaseClauseError
+      Xitdb.close(db)
+
+      assert {:error, %Error{reason: :closed}} =
+               Columnar.put_rows(db, "items", rows,
+                 columns: [{:col1, dictionary: :d1}],
+                 codec: :zstd
+               )
+    end
   end
 end
