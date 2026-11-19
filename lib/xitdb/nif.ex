@@ -13,6 +13,7 @@ defmodule Xitdb.NIF do
   end
 
   def nif_open(_backend, _path, _hash), do: :erlang.nif_error(:nif_not_loaded)
+  def nif_open(_backend, _path, _hash, _read_only), do: :erlang.nif_error(:nif_not_loaded)
   def nif_close(_db_ref), do: :erlang.nif_error(:nif_not_loaded)
   def nif_sync(_db_ref), do: :erlang.nif_error(:nif_not_loaded)
   def nif_info(_db_ref), do: :erlang.nif_error(:nif_not_loaded)

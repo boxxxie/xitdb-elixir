@@ -394,6 +394,7 @@ int nif_make_map_put(ErlNifEnv* env, ERL_NIF_TERM map_in, ERL_NIF_TERM key, ERL_
 
 static ErlNifFunc nif_funcs[] = {
     {"nif_open",             3, odin_nif_open,             ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"nif_open",             4, odin_nif_open,             ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"nif_close",            1, odin_nif_close,            ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"nif_sync",             1, odin_nif_sync,             ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"nif_info",             1, odin_nif_info,             0},

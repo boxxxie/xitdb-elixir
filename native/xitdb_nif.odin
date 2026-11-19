@@ -83,6 +83,7 @@ Db_Handle :: struct {
 	db:        xitdb.Database,
 	rwlock:    rawptr,
 	is_closed: bool,
+	read_only: bool,
 	backend:   u8, // 0 = memory, 1 = file, 2 = buffered_file
 }
 
@@ -755,8 +756,19 @@ odin_nif_open :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -
 	context = runtime.default_context()
 	defer free_all(context.temp_allocator)
 
-	if argc != 3 {
+	if argc != 3 && argc != 4 {
 		return make_err(env, "badarg")
+	}
+
+	read_only := false
+	if argc == 4 {
+		if argv[3] == ATOM_TRUE {
+			read_only = true
+		} else if argv[3] == ATOM_FALSE {
+			read_only = false
+		} else {
+			return make_err(env, "badarg")
+		}
 	}
 
 	atom_buf: [64]u8 = ---
@@ -784,6 +796,10 @@ odin_nif_open :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -
 	}
 	handle := (^Db_Handle)(raw_res)
 	handle^ = {}
+	handle.read_only = read_only
+
+	file_flags := os.File_Flags{.Read} if read_only else os.File_Flags{.Read, .Write, .Create}
+	fsync := !read_only
 
 	open_err: xitdb.Error = nil
 	switch backend_str {
@@ -791,10 +807,10 @@ odin_nif_open :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -
 		handle.core = xitdb.core_memory_init(context.allocator)
 		handle.backend = 0
 	case "file":
-		handle.core, open_err = xitdb.core_file_open(path_str, os.File_Flags{.Read, .Write, .Create}, true)
+		handle.core, open_err = xitdb.core_file_open(path_str, file_flags, fsync)
 		handle.backend = 1
 	case "buffered_file":
-		handle.core, open_err = xitdb.core_buffered_file_open(path_str, xitdb.DEFAULT_BUFFER_SIZE, os.File_Flags{.Read, .Write, .Create}, true, context.allocator)
+		handle.core, open_err = xitdb.core_buffered_file_open(path_str, xitdb.DEFAULT_BUFFER_SIZE, file_flags, fsync, context.allocator)
 		handle.backend = 2
 	case:
 		handle.is_closed = true
@@ -806,6 +822,39 @@ odin_nif_open :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -
 		handle.is_closed = true
 		_ = nif_make_db_resource(env, raw_res)
 		return make_xitdb_err(env, open_err)
+	}
+
+	if read_only && backend_str != "memory" {
+		len_val, len_err := xitdb.core_length(&handle.core)
+		if len_err != nil || len_val <= 0 {
+			_ = xitdb.core_destroy(&handle.core, close_file = true)
+			handle.is_closed = true
+			_ = nif_make_db_resource(env, raw_res)
+			if len_err != nil {
+				return make_xitdb_err(env, len_err)
+			}
+			return make_xitdb_err(env, xitdb.Xitdb_Error.Invalid_Database)
+		}
+
+		probe_db := xitdb.Database{core = &handle.core, hasher = hasher}
+		probe_hdr, hdr_err := xitdb.database_read_and_validate_header(&probe_db)
+		if hdr_err != nil {
+			_ = xitdb.core_destroy(&handle.core, close_file = true)
+			handle.is_closed = true
+			_ = nif_make_db_resource(env, raw_res)
+			return make_xitdb_err(env, hdr_err)
+		}
+		probe_db.header = probe_hdr
+		fsize, fs_err := xitdb.database_read_file_size(&probe_db)
+		if fs_err != nil || fsize <= 0 {
+			_ = xitdb.core_destroy(&handle.core, close_file = true)
+			handle.is_closed = true
+			_ = nif_make_db_resource(env, raw_res)
+			if fs_err != nil {
+				return make_xitdb_err(env, fs_err)
+			}
+			return make_xitdb_err(env, xitdb.Xitdb_Error.Invalid_Database)
+		}
 	}
 
 	init_err: xitdb.Error = nil
@@ -864,6 +913,10 @@ odin_nif_sync :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -
 		return make_err(env, "closed")
 	}
 	defer nif_rwlock_rwunlock(handle.rwlock)
+
+	if handle.read_only {
+		return make_err(env, "read_only")
+	}
 
 	if err := xitdb.core_sync(&handle.core); err != nil {
 		return make_xitdb_err(env, err)
@@ -5231,8 +5284,29 @@ odin_nif_transact :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TER
 	}
 	defer nif_rwlock_rwunlock(handle.rwlock)
 
+	if handle.read_only {
+		return make_err(env, "read_only")
+	}
+
 	tx := xitdb.tx_init(&handle.db, base_moment = base_moment, track_changes = false, allocator = context.temp_allocator)
 	defer xitdb.tx_destroy(&tx)
+
+	base_slot, _, base_empty, base_err, _ := resolve_slot_arg(handle, -1, base_moment)
+	if base_err == nil && !base_empty && base_slot.tag == .Hash_Map {
+		base_cur := xitdb.Read_Cursor{
+			slot_ptr = xitdb.Slot_Pointer{position = nil, slot = base_slot},
+			db       = &handle.db,
+		}
+		if base_map, bm_err := xitdb.read_hash_map_init(base_cur); bm_err == nil {
+			if tx_cur_maybe, tc_err := xitdb.hash_map_get_cursor(base_map, "__tx"); tc_err == nil {
+				if _, has_tx := tx_cur_maybe.?; has_tx {
+					clear_steps := make([]xitdb.Path_Step, 1, tx.allocator)
+					clear_steps[0] = xitdb.hm("__tx")
+					append(&tx.ops, xitdb.Tx_Op{kind = .Remove, steps = clear_steps})
+				}
+			}
+		}
+	}
 
 	if len(doc_str) > 0 {
 		xitdb.tx_doc(&tx, doc_str)

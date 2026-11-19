@@ -99,6 +99,12 @@ defmodule Xitdb do
                    type: {:in, [:sha1, :sha256]},
                    default: :sha1,
                    doc: "Cryptographic digest algorithm for HAMT keys (`:sha1` or `:sha256`)."
+                 ],
+                 read_only: [
+                   type: :boolean,
+                   default: false,
+                   doc:
+                     "Opens file-backed stores strictly read-only without creating missing files or allowing mutations."
                  ]
                )
 
@@ -121,7 +127,7 @@ defmodule Xitdb do
                        doc: "Epoch timestamp in milliseconds stored in `__tx.tx_instant`."
                      ],
                      meta: [
-                       type: {:or, [:map, :keyword_list]},
+                       type: {:or, [{:map, {:or, [:atom, :string]}, :any}, :keyword_list]},
                        doc: "Custom commit metadata stored under `__tx.<key>`."
                      ],
                      base_moment: [
@@ -158,15 +164,17 @@ defmodule Xitdb do
   @default_transact_opts NimbleOptions.validate!([], @transact_schema)
   @default_query_opts NimbleOptions.validate!([], @query_schema)
   @default_compact_opts NimbleOptions.validate!([], @compact_schema)
+  @tx_context_key :xitdb_tx_context
 
   @enforce_keys [:db_ref, :backend]
-  defstruct [:db_ref, :backend, :path, hash: :sha1]
+  defstruct [:db_ref, :backend, :path, hash: :sha1, read_only: false]
 
   @type t :: %__MODULE__{
           db_ref: reference(),
           backend: :memory | :file | :buffered_file,
           path: String.t(),
-          hash: :sha1 | :sha256
+          hash: :sha1 | :sha256,
+          read_only: boolean()
         }
 
   # ============================================================================
@@ -185,13 +193,21 @@ defmodule Xitdb do
       backend = validated[:backend]
       path = validated[:path]
       hash = validated[:hash]
+      read_only = validated[:read_only]
 
       if backend in [:file, :buffered_file] and path == "" do
         {:error, %Error{reason: :missing_path, details: %{backend: backend}}}
       else
-        case NIF.nif_open(backend, path, hash) do
+        case NIF.nif_open(backend, path, hash, read_only) do
           {:ok, db_ref} ->
-            {:ok, %__MODULE__{db_ref: db_ref, backend: backend, path: path, hash: hash}}
+            {:ok,
+             %__MODULE__{
+               db_ref: db_ref,
+               backend: backend,
+               path: path,
+               hash: hash,
+               read_only: read_only
+             }}
 
           {:error, reason} ->
             {:error, %Error{reason: reason}}
@@ -424,8 +440,103 @@ defmodule Xitdb do
     end
   end
 
+  @doc """
+  Executes `fun.()` with ambient transaction attribution (`:doc`, `:instant`, `:meta`)
+  automatically merged into every `Xitdb` commit executed on the current process.
+
+  Nested calls merge `:meta` keys over the outer context and restore the previous
+  context when `fun.()` exits. Explicit call-site options override ambient values.
+  """
+  @spec with_tx_context(keyword() | map(), (-> result)) :: result when result: var
+  def with_tx_context(tx_opts, fun)
+      when (is_list(tx_opts) or is_map(tx_opts)) and is_function(fun, 0) do
+    prev = Process.get(@tx_context_key)
+    Process.put(@tx_context_key, merge_tx_context(prev, tx_opts))
+
+    try do
+      fun.()
+    after
+      if prev == nil do
+        Process.delete(@tx_context_key)
+      else
+        Process.put(@tx_context_key, prev)
+      end
+    end
+  end
+
+  @doc """
+  Returns the active ambient transaction attribution context for the current process,
+  or `nil` when unset.
+  """
+  @spec current_tx_context() ::
+          %{doc: String.t() | nil, instant: integer() | nil, meta: map()} | nil
+  def current_tx_context, do: Process.get(@tx_context_key)
+
+  @doc """
+  Reads the `__tx` commit metadata map for `target` (`%Xitdb{}` or `%Xitdb.Cursor{}`)
+  at `moment` (defaulting to the latest moment `-1` for `%Xitdb{}` or the cursor's
+  pinned moment for `%Xitdb.Cursor{}`).
+  """
+  @spec tx_meta(t() | Cursor.t(), integer() | nil) :: {:ok, map()} | {:error, Error.t()}
+  def tx_meta(target, moment \\ nil)
+
+  def tx_meta(%__MODULE__{db_ref: db_ref} = db, nil) do
+    if moment_count(db) == 0 do
+      {:ok, %{}}
+    else
+      fetch_tx_meta(db_ref, -1)
+    end
+  end
+
+  def tx_meta(%__MODULE__{db_ref: db_ref}, moment) when is_integer(moment) do
+    fetch_tx_meta(db_ref, moment)
+  end
+
+  def tx_meta(%Cursor{db_ref: db_ref, moment: cursor_moment}, moment)
+      when is_nil(moment) or is_integer(moment) do
+    target_moment = if is_nil(moment), do: cursor_moment, else: moment
+    fetch_tx_meta(db_ref, target_moment)
+  end
+
+  @doc "Same as `tx_meta/2`, but raises `Xitdb.Error` on failure."
+  @spec tx_meta!(t() | Cursor.t(), integer() | nil) :: map()
+  def tx_meta!(target, moment \\ nil) do
+    target |> tx_meta(moment) |> Error.unwrap!()
+  end
+
+  defp fetch_tx_meta(db_ref, moment) when is_integer(moment) do
+    case NIF.nif_moment_slot(db_ref, moment, true) do
+      {:ok, tuple, resolved_moment} ->
+        base_cursor = Cursor.from_nif_tuple(db_ref, tuple, resolved_moment)
+
+        if base_cursor.tag == :none do
+          {:ok, %{}}
+        else
+          root_cursor = %Cursor{base_cursor | root: true}
+
+          case pull(root_cursor, "{__tx}") do
+            {:ok, %{"__tx" => %{} = meta}} -> {:ok, meta}
+            {:ok, _other} -> {:ok, %{}}
+            {:error, _} = err -> err
+          end
+        end
+
+      {:error, reason} ->
+        {:error, %Error{reason: reason, details: %{moment_index: moment}}}
+    end
+  end
+
   defp do_transact_ops(%__MODULE__{db_ref: db_ref} = db, ops, @default_transact_opts) do
-    do_transact_ops_default(db, db_ref, ops)
+    case Process.get(@tx_context_key) do
+      nil ->
+        do_transact_ops_default(db, db_ref, ops)
+
+      ctx ->
+        with {:ok, updated_db, _moment_idx} <-
+               do_transact_ops_with_context(db, ops, @default_transact_opts, ctx) do
+          {:ok, updated_db}
+        end
+    end
   end
 
   defp do_transact_ops(%__MODULE__{} = db, ops, validated) do
@@ -435,22 +546,46 @@ defmodule Xitdb do
   end
 
   defp do_transact_ops_default(db, db_ref, ops) do
-    case NIF.nif_transact(db_ref, -1, ops, "") do
-      {:ok, _moment_idx} -> {:ok, db}
-      {:error, reason} -> {:error, %Error{reason: reason}}
+    case Process.get(@tx_context_key) do
+      nil ->
+        case NIF.nif_transact(db_ref, -1, ops, "") do
+          {:ok, _moment_idx} -> {:ok, db}
+          {:error, reason} -> {:error, %Error{reason: reason}}
+        end
+
+      ctx ->
+        with {:ok, updated_db, _moment_idx} <-
+               do_transact_ops_with_context(db, ops, @default_transact_opts, ctx) do
+          {:ok, updated_db}
+        end
     end
   end
 
   defp do_transact_ops_with_moment(%__MODULE__{db_ref: db_ref} = db, ops, @default_transact_opts) do
-    case NIF.nif_transact(db_ref, -1, ops, "") do
-      {:ok, moment_idx} -> {:ok, db, moment_idx}
-      {:error, reason} -> {:error, %Error{reason: reason}}
+    case Process.get(@tx_context_key) do
+      nil ->
+        case NIF.nif_transact(db_ref, -1, ops, "") do
+          {:ok, moment_idx} -> {:ok, db, moment_idx}
+          {:error, reason} -> {:error, %Error{reason: reason}}
+        end
+
+      ctx ->
+        do_transact_ops_with_context(db, ops, @default_transact_opts, ctx)
     end
   end
 
-  defp do_transact_ops_with_moment(%__MODULE__{db_ref: db_ref} = db, ops, validated) do
+  defp do_transact_ops_with_moment(%__MODULE__{} = db, ops, validated) do
+    do_transact_ops_with_context(db, ops, validated, Process.get(@tx_context_key))
+  end
+
+  defp do_transact_ops_with_context(%__MODULE__{db_ref: db_ref} = db, ops, validated, ctx) do
     base_moment = validated[:base_moment]
-    doc = validated[:doc]
+
+    doc =
+      case validated[:doc] do
+        d when is_binary(d) and d != "" -> d
+        _ -> (ctx && ctx.doc) || ""
+      end
 
     index_ops =
       case validated[:index_rules] do
@@ -469,19 +604,23 @@ defmodule Xitdb do
           []
       end
 
+    instant = validated[:instant] || (ctx && ctx.instant)
+
     opt_ops =
-      case validated[:instant] do
+      case instant do
         inst when is_integer(inst) -> index_ops ++ [{:instant, inst}]
         _ -> index_ops
       end
 
-    opt_ops =
-      case validated[:meta] do
-        meta when is_map(meta) or (is_list(meta) and meta != []) ->
-          opt_ops ++ Enum.map(meta, fn {k, v} -> {:meta, to_string(k), v} end)
+    ambient_meta = if ctx, do: ctx.meta, else: %{}
+    explicit_meta = normalize_tx_meta(validated[:meta])
+    merged_meta = Map.merge(ambient_meta, explicit_meta)
 
-        _ ->
-          opt_ops
+    opt_ops =
+      if map_size(merged_meta) > 0 do
+        opt_ops ++ Enum.map(merged_meta, fn {k, v} -> {:meta, k, v} end)
+      else
+        opt_ops
       end
 
     all_ops = if opt_ops == [], do: ops, else: opt_ops ++ ops
@@ -491,6 +630,59 @@ defmodule Xitdb do
       {:error, reason} -> {:error, %Error{reason: reason}}
     end
   end
+
+  defp merge_tx_context(prev, tx_opts) do
+    opts_map = Map.new(tx_opts)
+
+    doc =
+      case Map.get(opts_map, :doc) || Map.get(opts_map, "doc") do
+        d when is_binary(d) and d != "" -> d
+        _ -> prev && prev.doc
+      end
+
+    instant =
+      case Map.get(opts_map, :instant) || Map.get(opts_map, "instant") do
+        i when is_integer(i) -> i
+        _ -> prev && prev.instant
+      end
+
+    prev_meta = if prev, do: prev.meta, else: %{}
+    incoming_meta = normalize_tx_meta(Map.get(opts_map, :meta) || Map.get(opts_map, "meta"))
+
+    %{doc: doc, instant: instant, meta: Map.merge(prev_meta, incoming_meta)}
+  end
+
+  defp normalize_tx_meta(nil), do: %{}
+
+  defp normalize_tx_meta(meta) when is_map(meta) or is_list(meta) do
+    Enum.reduce(meta, %{}, fn
+      {_k, nil}, acc ->
+        acc
+
+      {k, v}, acc ->
+        case normalize_tx_meta_value(v) do
+          nil -> acc
+          clean -> Map.put(acc, to_string(k), clean)
+        end
+    end)
+  end
+
+  defp normalize_tx_meta(_other), do: %{}
+
+  defp normalize_tx_meta_value(nil), do: nil
+  defp normalize_tx_meta_value(v) when is_boolean(v), do: v
+  defp normalize_tx_meta_value(v) when is_atom(v), do: Atom.to_string(v)
+
+  defp normalize_tx_meta_value(v) when is_list(v) do
+    v |> Enum.map(&normalize_tx_meta_value/1) |> Enum.reject(&is_nil/1)
+  end
+
+  defp normalize_tx_meta_value(v) when is_map(v) and not is_struct(v) do
+    normalize_tx_meta(v)
+  end
+
+  defp normalize_tx_meta_value(v) when is_binary(v) or is_number(v), do: v
+  defp normalize_tx_meta_value(v), do: to_string(v)
 
   @doc """
   Stages an `O(log N)` insertion into a `Linked_Array_List` at `path_or_selector` and `index`

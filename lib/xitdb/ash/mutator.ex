@@ -57,7 +57,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
               opts
             )
           else
-            run_bulk_creates_single_commit(initial_snapshot, resource, stream, tenant)
+            run_bulk_creates_single_commit(initial_snapshot, resource, stream, tenant, opts)
           end
         end)
 
@@ -103,7 +103,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           cursor_root = Xitdb.as_of(db, moment)
 
           with {:ok, candidates} <- Query.execute(cursor_root, scoped_query, resource) do
-            apply_bulk_updates(initial_snapshot, candidates, resource, scoped_changeset)
+            apply_bulk_updates(initial_snapshot, candidates, resource, scoped_changeset, opts)
           end
         end)
 
@@ -166,7 +166,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           cursor_root = Xitdb.as_of(db, moment)
 
           with {:ok, candidates} <- Query.execute(cursor_root, scoped_query, resource) do
-            apply_bulk_destroys(initial_snapshot, candidates, resource, scoped_changeset)
+            apply_bulk_destroys(initial_snapshot, candidates, resource, scoped_changeset, opts)
           end
         end)
 
@@ -195,21 +195,33 @@ if Code.ensure_loaded?(Ash.DataLayer) do
            {:ok, index_ops} <-
              Indexer.plan_put_ops(cursor_root, resource, nil, record, tenant)
              |> normalize_plan_error(),
-           {:ok, next_snapshot} <- commit_ops({db, moment}, seq_ops ++ index_ops) do
+           {:ok, next_snapshot} <-
+             commit_ops(
+               {db, moment},
+               seq_ops ++ index_ops,
+               build_commit_opts(resource, :create, changeset, nil)
+             ) do
         {:ok, next_snapshot, record}
       end
     end
 
-    defp run_bulk_creates_single_commit({db, moment}, resource, stream, fallback_tenant) do
+    defp run_bulk_creates_single_commit(
+           {db, moment},
+           resource,
+           stream,
+           fallback_tenant,
+           options
+         ) do
       cursor_root = Xitdb.as_of(db, moment)
 
       staged =
         stream
         |> Enum.with_index()
         |> Enum.reduce_while(
-          {:ok, [], [], %{}, %{}, MapSet.new(), MapSet.new()},
+          {:ok, [], [], %{}, %{}, MapSet.new(), MapSet.new(), nil},
           fn {%Ash.Changeset{} = raw_cs, idx},
-             {:ok, rev_records, ops_chunks, seq_state, idx_batch_state, seen_pks, seen_identities} ->
+             {:ok, rev_records, ops_chunks, seq_state, idx_batch_state, seen_pks, seen_identities,
+              sample_cs} ->
             cs =
               if is_nil(raw_cs.tenant) and fallback_tenant != nil do
                 %Ash.Changeset{raw_cs | tenant: fallback_tenant}
@@ -247,7 +259,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
               {:cont,
                {:ok, [tagged | rev_records], [seq_ops ++ index_ops | ops_chunks], next_seq_state,
-                next_idx_batch_state, next_seen_pks, next_seen_identities}}
+                next_idx_batch_state, next_seen_pks, next_seen_identities, sample_cs || cs}}
             else
               {:error, _} = err ->
                 {:halt, err}
@@ -256,10 +268,12 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         )
 
       case staged do
-        {:ok, rev_records, ops_chunks, _seq_state, _idx_batch_state, _seen_pks, _seen_identities} ->
+        {:ok, rev_records, ops_chunks, _seq_state, _idx_batch_state, _seen_pks, _seen_identities,
+         sample_cs} ->
           all_ops = ops_chunks |> Enum.reverse() |> List.flatten()
+          commit_opts = build_commit_opts(resource, :bulk_create, sample_cs, options)
 
-          with {:ok, next_snapshot} <- commit_ops({db, moment}, all_ops) do
+          with {:ok, next_snapshot} <- commit_ops({db, moment}, all_ops, commit_opts) do
             {:ok, next_snapshot, Enum.reverse(rev_records)}
           end
 
@@ -285,9 +299,10 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         stream
         |> Enum.with_index()
         |> Enum.reduce_while(
-          {:ok, [], [], %{}, %{}, MapSet.new(), %{}},
+          {:ok, [], [], %{}, %{}, MapSet.new(), %{}, nil},
           fn {%Ash.Changeset{} = raw_cs, idx},
-             {:ok, rev_records, ops_chunks, seq_state, idx_batch_state, seen_pks, staged_records} ->
+             {:ok, rev_records, ops_chunks, seq_state, idx_batch_state, seen_pks, staged_records,
+              sample_cs} ->
             cs =
               if is_nil(raw_cs.tenant) and fallback_tenant != nil do
                 %Ash.Changeset{raw_cs | tenant: fallback_tenant}
@@ -315,14 +330,14 @@ if Code.ensure_loaded?(Ash.DataLayer) do
               {:ok, :skipped, next_seq, next_idx_batch, next_seen_pks, next_staged} ->
                 {:cont,
                  {:ok, rev_records, ops_chunks, next_seq, next_idx_batch, next_seen_pks,
-                  next_staged}}
+                  next_staged, sample_cs || cs}}
 
               {:ok, record, item_ops, next_seq, next_idx_batch, next_seen_pks, next_staged} ->
                 tagged = attach_bulk_metadata(record, cs, idx)
 
                 {:cont,
                  {:ok, [tagged | rev_records], [item_ops | ops_chunks], next_seq, next_idx_batch,
-                  next_seen_pks, next_staged}}
+                  next_seen_pks, next_staged, sample_cs || cs}}
 
               {:error, _} = err ->
                 {:halt, err}
@@ -331,10 +346,12 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         )
 
       case staged do
-        {:ok, rev_records, ops_chunks, _seq_state, _idx_batch_state, _seen_pks, _staged_records} ->
+        {:ok, rev_records, ops_chunks, _seq_state, _idx_batch_state, _seen_pks, _staged_records,
+         sample_cs} ->
           all_ops = ops_chunks |> Enum.reverse() |> List.flatten()
+          commit_opts = build_commit_opts(resource, :bulk_upsert, sample_cs, opts)
 
-          with {:ok, final_snap} <- commit_ops(initial_snapshot, all_ops) do
+          with {:ok, final_snap} <- commit_ops(initial_snapshot, all_ops, commit_opts) do
             {:ok, final_snap, Enum.reverse(rev_records)}
           end
 
@@ -652,7 +669,12 @@ if Code.ensure_loaded?(Ash.DataLayer) do
                        tenant
                      )
                      |> normalize_plan_error(),
-                   {:ok, next_snapshot} <- commit_ops({db, moment}, seq_ops ++ index_ops) do
+                   {:ok, next_snapshot} <-
+                     commit_ops(
+                       {db, moment},
+                       seq_ops ++ index_ops,
+                       build_commit_opts(resource, :update, changeset, nil)
+                     ) do
                 {:ok, next_snapshot, synced_with_seq}
               end
 
@@ -711,7 +733,12 @@ if Code.ensure_loaded?(Ash.DataLayer) do
                          tenant
                        )
                        |> normalize_plan_error(),
-                     {:ok, next_snapshot} <- commit_ops(snapshot, index_ops) do
+                     {:ok, next_snapshot} <-
+                       commit_ops(
+                         snapshot,
+                         index_ops,
+                         build_commit_opts(resource, :upsert, changeset, bulk_opts)
+                       ) do
                   {:ok, next_snapshot, final_record}
                 end
 
@@ -746,7 +773,14 @@ if Code.ensure_loaded?(Ash.DataLayer) do
                :ok <-
                  verify_atomic_validations(current_record, current_record, resource, changeset),
                {:ok, next_snapshot} <-
-                 cascade_and_delete(snapshot, resource, current_record, tenant, MapSet.new()) do
+                 cascade_and_delete(
+                   snapshot,
+                   resource,
+                   current_record,
+                   tenant,
+                   MapSet.new(),
+                   build_commit_opts(resource, :destroy, changeset, nil)
+                 ) do
             {:ok, next_snapshot, current_record}
           else
             :filtered_out ->
@@ -762,7 +796,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
            {db, moment} = initial_snapshot,
            candidates,
            resource,
-           %Ash.Changeset{} = changeset
+           %Ash.Changeset{} = changeset,
+           options
          ) do
       tenant = changeset.tenant
       cursor_root = Xitdb.as_of(db, moment)
@@ -806,8 +841,9 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       |> case do
         {:ok, ops_chunks, _batch_state, rev_records} ->
           all_ops = ops_chunks |> Enum.reverse() |> List.flatten()
+          commit_opts = build_commit_opts(resource, :bulk_update, changeset, options)
 
-          with {:ok, final_snap} <- commit_ops(initial_snapshot, all_ops) do
+          with {:ok, final_snap} <- commit_ops(initial_snapshot, all_ops, commit_opts) do
             {:ok, final_snap, Enum.reverse(rev_records)}
           end
 
@@ -820,7 +856,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
            {db, moment} = initial_snapshot,
            candidates,
            resource,
-           %Ash.Changeset{} = changeset
+           %Ash.Changeset{} = changeset,
+           options
          ) do
       tenant = changeset.tenant
       cursor_root = Xitdb.as_of(db, moment)
@@ -863,8 +900,9 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       |> case do
         {:ok, ops_chunks, _visited, _batch_state, _staged_records, rev_records} ->
           all_ops = ops_chunks |> Enum.reverse() |> List.flatten()
+          commit_opts = build_commit_opts(resource, :bulk_destroy, changeset, options)
 
-          with {:ok, final_snap} <- commit_ops(initial_snapshot, all_ops) do
+          with {:ok, final_snap} <- commit_ops(initial_snapshot, all_ops, commit_opts) do
             {:ok, final_snap, Enum.reverse(rev_records)}
           end
 
@@ -1686,12 +1724,19 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
     # -- Same-Store Reverse FK `on_delete` Enforcement --
 
-    defp cascade_and_delete({db, moment} = snapshot, resource, record, tenant, visited) do
+    defp cascade_and_delete(
+           {db, moment} = snapshot,
+           resource,
+           record,
+           tenant,
+           visited,
+           commit_opts
+         ) do
       cursor_root = Xitdb.as_of(db, moment)
 
       with {:ok, ops, _next_visited, _next_batch, _next_staged} <-
              stage_cascade_delete(cursor_root, resource, record, tenant, visited, %{}, %{}) do
-        commit_ops(snapshot, ops)
+        commit_ops(snapshot, ops, commit_opts)
       end
     end
 
@@ -2031,13 +2076,179 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
     # -- Commit, Hydration & Metadata Helpers --
 
-    defp commit_ops({db, moment}, []), do: {:ok, {db, moment}}
+    defp commit_ops({db, moment}, [], _commit_opts), do: {:ok, {db, moment}}
 
-    defp commit_ops({db, moment}, ops) when is_list(ops) do
-      case Xitdb.transact_ops_with_moment(db, ops, base_moment: moment) do
+    defp commit_ops({db, moment}, ops, commit_opts)
+         when is_list(ops) and is_list(commit_opts) do
+      tx_opts = Keyword.put(commit_opts, :base_moment, moment)
+
+      case Xitdb.transact_ops_with_moment(db, ops, tx_opts) do
         {:ok, next_db, next_moment} -> {:ok, {next_db, next_moment}}
         {:error, _} = err -> err
       end
+    end
+
+    defp build_commit_opts(resource, action_kind, changeset, opts) do
+      cs_ctx =
+        case changeset do
+          %Ash.Changeset{context: ctx} when is_map(ctx) -> ctx
+          _ -> %{}
+        end
+
+      opts_map =
+        cond do
+          is_map(opts) -> opts
+          is_list(opts) -> Map.new(opts)
+          true -> %{}
+        end
+
+      ambient = Xitdb.current_tx_context()
+      ambient_meta = if ambient, do: ambient.meta, else: %{}
+
+      override = extract_xitdb_override(cs_ctx, opts_map)
+      explicit_meta = extract_explicit_meta(override)
+
+      cs_action_name =
+        case changeset do
+          %Ash.Changeset{action: %{name: name}} when not is_nil(name) -> to_string(name)
+          _ -> nil
+        end
+
+      action_name =
+        Map.get(explicit_meta, "action_name") ||
+          cs_action_name ||
+          Map.get(ambient_meta, "action_name") ||
+          Atom.to_string(action_kind)
+
+      source_system =
+        Map.get(explicit_meta, "source_system") ||
+          Map.get(ambient_meta, "source_system") ||
+          "ash_action"
+
+      actor =
+        get_in(cs_ctx, [:private, :actor]) ||
+          Map.get(opts_map, :actor)
+
+      actor_meta = extract_actor_meta(actor, ambient_meta)
+
+      doc =
+        non_empty_string(fetch_map_opt(override, :doc)) ||
+          (ambient && non_empty_string(ambient.doc)) ||
+          "#{short_resource_name(resource)}.#{action_name}"
+
+      instant =
+        positive_or_zero_int(fetch_map_opt(override, :instant)) ||
+          (ambient && ambient.instant) ||
+          System.os_time(:millisecond)
+
+      meta =
+        ambient_meta
+        |> Map.merge(actor_meta)
+        |> Map.put("source_system", source_system)
+        |> Map.put("action_name", action_name)
+        |> Map.merge(explicit_meta)
+
+      [doc: doc, instant: instant, meta: meta]
+    end
+
+    defp extract_xitdb_override(cs_ctx, opts_map) do
+      dl_ctx = Map.get(cs_ctx, :data_layer)
+      shared_ctx = Map.get(cs_ctx, :shared)
+
+      [
+        Map.get(cs_ctx, :xitdb),
+        if(is_map(dl_ctx), do: Map.get(dl_ctx, :xitdb)),
+        if(is_map(shared_ctx), do: Map.get(shared_ctx, :xitdb)),
+        Map.get(opts_map, :xitdb)
+      ]
+      |> Enum.reduce(%{}, fn
+        item, acc when is_map(item) and not is_struct(item) -> Map.merge(acc, item)
+        item, acc when is_list(item) -> Map.merge(acc, Map.new(item))
+        _, acc -> acc
+      end)
+    end
+
+    defp extract_explicit_meta(override) when is_map(override) do
+      nested_meta =
+        case fetch_map_opt(override, :meta) do
+          m when is_map(m) and not is_struct(m) -> stringify_meta_map(m)
+          l when is_list(l) -> stringify_meta_map(Map.new(l))
+          _ -> %{}
+        end
+
+      top_fields =
+        Enum.reduce(
+          [:actor_id, :actor_email, :source_system, :action_name, :workflow_run_id, :reason],
+          %{},
+          fn key, acc ->
+            case fetch_map_opt(override, key) do
+              nil -> acc
+              val -> Map.put(acc, Atom.to_string(key), stringify_meta_value(val))
+            end
+          end
+        )
+
+      Map.merge(top_fields, nested_meta)
+    end
+
+    defp extract_actor_meta(nil, ambient_meta) do
+      if Map.has_key?(ambient_meta, "actor_id") do
+        %{}
+      else
+        %{"actor_id" => "system"}
+      end
+    end
+
+    defp extract_actor_meta(actor, ambient_meta) when is_map(actor) do
+      base =
+        case Map.get(actor, :id) || Map.get(actor, "id") do
+          nil ->
+            if Map.has_key?(ambient_meta, "actor_id"), do: %{}, else: %{"actor_id" => "system"}
+
+          id ->
+            %{"actor_id" => to_string(id)}
+        end
+
+      case Map.get(actor, :email) || Map.get(actor, "email") do
+        nil -> base
+        email -> Map.put(base, "actor_email", to_string(email))
+      end
+    end
+
+    defp extract_actor_meta(actor, _ambient_meta) when is_binary(actor) or is_atom(actor) do
+      %{"actor_id" => to_string(actor)}
+    end
+
+    defp extract_actor_meta(_actor, _ambient_meta), do: %{"actor_id" => "system"}
+
+    defp stringify_meta_map(map) do
+      Enum.reduce(map, %{}, fn
+        {_k, nil}, acc -> acc
+        {k, v}, acc -> Map.put(acc, to_string(k), stringify_meta_value(v))
+      end)
+    end
+
+    defp stringify_meta_value(v) when is_boolean(v) or is_number(v) or is_binary(v), do: v
+    defp stringify_meta_value(v) when is_atom(v), do: Atom.to_string(v)
+    defp stringify_meta_value(v), do: to_string(v)
+
+    defp fetch_map_opt(map, key) when is_map(map) do
+      Map.get(map, key) || Map.get(map, Atom.to_string(key))
+    end
+
+    defp non_empty_string(val) when is_binary(val) do
+      if val == "", do: nil, else: val
+    end
+
+    defp non_empty_string(_), do: nil
+
+    defp positive_or_zero_int(val) when is_integer(val), do: val
+    defp positive_or_zero_int(_), do: nil
+
+    defp short_resource_name(resource) do
+      resource
+      |> Module.split()
+      |> List.last()
     end
 
     defp load_existing_record(_cursor_root, _resource, nil, _tenant), do: :none
