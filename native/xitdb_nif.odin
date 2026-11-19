@@ -6042,85 +6042,6 @@ odin_nif_diff_moments :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF
 	return make_ok(env, nif_make_list_from_array(env, raw_data(items[:]), c.uint(len(items))))
 }
 
-read_prehashed_steps_slot :: proc(
-	start_cur: xitdb.Read_Cursor,
-	steps: []xitdb.Path_Step,
-	step_hashes: [][]u8,
-) -> (res: xitdb.Slot, err: xitdb.Error) {
-	cur := start_cur
-	for step, i in steps {
-		next_maybe: Maybe(xitdb.Read_Cursor)
-		switch step.kind {
-		case .Hash_Map_Key:
-			tag := cur.slot_ptr.slot.tag
-			#partial switch tag {
-			case .Hash_Map:
-				m := xitdb.read_hash_map_init(cur) or_return
-				next_maybe = xitdb.hash_map_get_cursor_by_hash(m, step_hashes[i]) or_return
-			case .Counted_Hash_Map:
-				m := xitdb.read_counted_hash_map_init(cur) or_return
-				next_maybe = xitdb.hash_map_get_cursor_by_hash(m.read_hash_map, step_hashes[i]) or_return
-			case .Sorted_Map:
-				m := xitdb.read_sorted_map_init(cur) or_return
-				next_maybe = xitdb.sorted_map_get_cursor(m, step.key) or_return
-			case .Hash_Set:
-				s := xitdb.read_hash_set_init(cur) or_return
-				next_maybe = xitdb.hash_set_get_cursor_by_hash(s, step_hashes[i]) or_return
-			case .Counted_Hash_Set:
-				s := xitdb.read_counted_hash_set_init(cur) or_return
-				next_maybe = xitdb.hash_set_get_cursor_by_hash(s.read_hash_set, step_hashes[i]) or_return
-			case .Sorted_Set:
-				s := xitdb.read_sorted_set_init(cur) or_return
-				next_maybe = xitdb.cursor_read_path(
-					s.cursor,
-					[]xitdb.Path_Part{xitdb.Sorted_Map_Get{target = xitdb.Sorted_Map_Get_Key{key = transmute([]u8)step.key}}},
-				) or_return
-			case:
-				return xitdb.Slot{}, .Unexpected_Tag
-			}
-		case .Counted_Hash_Map_Key:
-			m := xitdb.read_counted_hash_map_init(cur) or_return
-			next_maybe = xitdb.hash_map_get_cursor_by_hash(m.read_hash_map, step_hashes[i]) or_return
-		case .Sorted_Map_Key:
-			m := xitdb.read_sorted_map_init(cur) or_return
-			next_maybe = xitdb.sorted_map_get_cursor(m, step.key) or_return
-		case .Array_List_Idx:
-			tag := cur.slot_ptr.slot.tag
-			#partial switch tag {
-			case .Array_List:
-				a := xitdb.read_array_list_init(cur) or_return
-				next_maybe = xitdb.array_list_get_cursor(a, step.index) or_return
-			case .Linked_Array_List:
-				l := xitdb.read_linked_array_list_init(cur) or_return
-				next_maybe = xitdb.linked_array_list_get_cursor(l, step.index) or_return
-			case:
-				return xitdb.Slot{}, .Unexpected_Tag
-			}
-		case .Linked_List_Idx:
-			l := xitdb.read_linked_array_list_init(cur) or_return
-			next_maybe = xitdb.linked_array_list_get_cursor(l, step.index) or_return
-		case .Hash_Set_Member:
-			s := xitdb.read_hash_set_init(cur) or_return
-			next_maybe = xitdb.hash_set_get_cursor_by_hash(s, step_hashes[i]) or_return
-		case .Counted_Set_Member:
-			s := xitdb.read_counted_hash_set_init(cur) or_return
-			next_maybe = xitdb.hash_set_get_cursor_by_hash(s.read_hash_set, step_hashes[i]) or_return
-		case .Sorted_Set_Member:
-			s := xitdb.read_sorted_set_init(cur) or_return
-			next_maybe = xitdb.cursor_read_path(
-				s.cursor,
-				[]xitdb.Path_Part{xitdb.Sorted_Map_Get{target = xitdb.Sorted_Map_Get_Key{key = transmute([]u8)step.key}}},
-			) or_return
-		}
-		next_cur, has_next := next_maybe.?
-		if !has_next {
-			return xitdb.Slot{}, nil
-		}
-		cur = next_cur
-	}
-	return cur.slot_ptr.slot, nil
-}
-
 @(export)
 odin_nif_history_of :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {
 	context = runtime.default_context()
@@ -6170,14 +6091,18 @@ odin_nif_history_of :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_T
 	doc_hash := xitdb.database_digest_string_buf(&handle.db, "doc", doc_hash_buf[:])
 	inst_hash := xitdb.database_digest_string_buf(&handle.db, "tx_instant", inst_hash_buf[:])
 
-	step_hash_bufs := make([][64]u8, len(parsed.steps), context.temp_allocator)
-	step_hashes := make([][]u8, len(parsed.steps), context.temp_allocator)
-	for step, i in parsed.steps {
-		#partial switch step.kind {
-		case .Hash_Map_Key, .Counted_Hash_Map_Key, .Sorted_Map_Key, .Hash_Set_Member, .Counted_Set_Member:
-			step_hashes[i] = xitdb.database_digest_string_buf(&handle.db, step.key, step_hash_bufs[i][:])
-		}
+	inline_hash_bufs: [16][64]u8 = ---
+	inline_hashes: [16][]u8 = ---
+	step_hash_bufs: [][64]u8
+	step_hashes: [][]u8
+	if len(parsed.steps) <= len(inline_hash_bufs) {
+		step_hash_bufs = inline_hash_bufs[:len(parsed.steps)]
+		step_hashes = inline_hashes[:len(parsed.steps)]
+	} else {
+		step_hash_bufs = make([][64]u8, len(parsed.steps), context.temp_allocator)
+		step_hashes = make([][]u8, len(parsed.steps), context.temp_allocator)
 	}
+	xitdb.precompute_step_hashes(&handle.db, parsed.steps, step_hash_bufs, step_hashes)
 
 	keys := [4]ERL_NIF_TERM{
 		ATOM_MOMENT_INDEX,
@@ -6201,7 +6126,7 @@ odin_nif_history_of :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_T
 		}
 		m_idx := it.index - 1
 
-		cur_slot, s_err := read_prehashed_steps_slot(mc, parsed.steps, step_hashes)
+		cur_slot, s_err := xitdb.read_prehashed_steps_slot(mc, parsed.steps, step_hashes, true)
 		if s_err != nil {
 			if s_err == .Unexpected_Tag {
 				cur_slot = xitdb.Slot{}
