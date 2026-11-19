@@ -752,5 +752,162 @@ if Code.ensure_loaded?(Ash.DataLayer) do
                  })
       end
     end
+
+    defmodule TaggedCentsType do
+      use Ash.Type
+
+      @impl true
+      def storage_type(_), do: :binary
+
+      @impl true
+      def cast_input(nil, _), do: {:ok, nil}
+      def cast_input(val, _) when is_integer(val), do: {:ok, val}
+      def cast_input(_, _), do: :error
+
+      @impl true
+      def cast_stored(nil, _), do: {:ok, nil}
+      def cast_stored({:tagged, "ct", <<v::signed-big-64>>}, _), do: {:ok, v}
+      def cast_stored(v, _) when is_integer(v), do: {:ok, v}
+      def cast_stored(_, _), do: :error
+
+      @impl true
+      def dump_to_native(nil, _), do: {:ok, nil}
+
+      def dump_to_native(val, _) when is_integer(val),
+        do: {:ok, {:tagged, "ct", <<val::signed-big-64>>}}
+
+      def dump_to_native(_, _), do: :error
+
+      def xitdb_index_key(val, _constraints) when is_integer(val),
+        do: Xitdb.Key.encode_i64_be(val)
+
+      def xitdb_fixed_width?(_constraints), do: true
+    end
+
+    defmodule BadTaggedType do
+      use Ash.Type
+
+      @impl true
+      def storage_type(_), do: :binary
+
+      @impl true
+      def cast_input(val, _), do: {:ok, val}
+
+      @impl true
+      def cast_stored(val, _), do: {:ok, val}
+
+      @impl true
+      def dump_to_native(val, _), do: {:ok, {:tagged, "too_long", to_string(val)}}
+    end
+
+    defmodule UnsignedAndTaggedRecord do
+      use Ash.Resource,
+        domain: nil,
+        validate_domain_inclusion?: false,
+        extensions: [Xitdb.Ash.Dsl]
+
+      xitdb do
+        store DummyStore
+        collection :u64_and_tagged_records
+        index([:big_uint])
+        index([:cents])
+        index([:cents, :big_uint])
+      end
+
+      attributes do
+        integer_primary_key(:id)
+        attribute(:big_uint, Xitdb.Ash.Types.UnsignedInteger, public?: true)
+        attribute(:cents, TaggedCentsType, public?: true)
+        attribute(:bad_tag, BadTaggedType, public?: true)
+      end
+    end
+
+    describe ":unsigned_integer, {:tagged, ...}, and custom xitdb_index_key/2 hooks" do
+      @max_i64 9_223_372_036_854_775_807
+      @max_u64 18_446_744_073_709_551_615
+
+      test "Codec.dump_attribute/2, load_attribute/2, and to_cursor_map/from_cursor handle :unsigned_integer > max(i64) and {:tagged, ...}" do
+        raw_u64_attr = %Ash.Resource.Attribute{
+          name: :raw_u64,
+          type: :unsigned_integer,
+          constraints: []
+        }
+
+        assert {:ok, 0} = Codec.dump_attribute(raw_u64_attr, 0)
+        assert {:ok, @max_i64} = Codec.dump_attribute(raw_u64_attr, @max_i64)
+
+        above_i64 = @max_i64 + 1
+        above_42 = @max_i64 + 42
+
+        assert {:ok, {:tagged, "u8", <<^above_i64::unsigned-big-64>>}} =
+                 Codec.dump_attribute(raw_u64_attr, above_i64)
+
+        assert {:ok, {:tagged, "u8", <<@max_u64::unsigned-big-64>>}} =
+                 Codec.dump_attribute(raw_u64_attr, @max_u64)
+
+        assert {:ok, @max_u64} =
+                 Codec.load_attribute(
+                   raw_u64_attr,
+                   {:tagged, "u8", <<@max_u64::unsigned-big-64>>}
+                 )
+
+        assert {:error, {:integer_out_of_u64_range, :raw_u64}} =
+                 Codec.dump_attribute(raw_u64_attr, -1)
+
+        assert {:error, {:integer_out_of_u64_range, :raw_u64}} =
+                 Codec.dump_attribute(raw_u64_attr, @max_u64 + 1)
+
+        {:ok, dumped} =
+          Codec.to_cursor_map(UnsignedAndTaggedRecord, %UnsignedAndTaggedRecord{
+            id: 1,
+            big_uint: above_42,
+            cents: -125_000
+          })
+
+        assert dumped["big_uint"] == {:tagged, "u8", <<above_42::unsigned-big-64>>}
+        assert dumped["cents"] == {:tagged, "ct", <<-125_000::signed-big-64>>}
+
+        {:ok, db} = Xitdb.open(backend: :memory)
+        on_exit(fn -> Xitdb.close(db) end)
+
+        {:ok, db} = Xitdb.transact(db, %{"u64" => %{"1" => dumped}})
+
+        assert {:ok, loaded} =
+                 Codec.from_cursor(UnsignedAndTaggedRecord, Xitdb.db(db)["u64"]["1"])
+
+        assert loaded.big_uint == @max_i64 + 42
+        assert loaded.cents == -125_000
+
+        bad_attr = Ash.Resource.Info.attribute(UnsignedAndTaggedRecord, :bad_tag)
+
+        assert {:error, {:invalid_format_tag, :bad_tag}} =
+                 Codec.dump_attribute(bad_attr, "oops")
+      end
+
+      test "encode_scalar_key/2 and encode_index_key/2 invoke custom xitdb_index_key/2 and xitdb_fixed_width?/1" do
+        u_attr = Ash.Resource.Info.attribute(UnsignedAndTaggedRecord, :big_uint)
+        cents_attr = Ash.Resource.Info.attribute(UnsignedAndTaggedRecord, :cents)
+
+        assert Codec.encode_scalar_key(u_attr, @max_i64) <
+                 Codec.encode_scalar_key(u_attr, @max_i64 + 1)
+
+        assert Codec.encode_scalar_key(u_attr, @max_i64 + 1) <
+                 Codec.encode_scalar_key(u_attr, @max_u64)
+
+        assert Codec.encode_scalar_key(cents_attr, -500) <
+                 Codec.encode_scalar_key(cents_attr, 0)
+
+        assert Codec.encode_scalar_key(cents_attr, 0) <
+                 Codec.encode_scalar_key(cents_attr, 500)
+
+        comp_neg = Codec.encode_index_key([cents_attr, u_attr], [-100, @max_u64])
+        comp_pos = Codec.encode_index_key([cents_attr, u_attr], [100, 1])
+
+        # Each component is fixed-width 8 bytes + 1-byte value tag = 18 bytes total
+        assert byte_size(comp_neg) == 18
+        assert byte_size(comp_pos) == 18
+        assert comp_neg < comp_pos
+      end
+    end
   end
 end

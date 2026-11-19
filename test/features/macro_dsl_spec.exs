@@ -1,3 +1,19 @@
+defmodule Xitdb.Features.MacroDslSpec.CustomPayload do
+  @moduledoc false
+  defstruct [:label, :amount]
+end
+
+defimpl Xitdb.Encoder, for: Xitdb.Features.MacroDslSpec.CustomPayload do
+  def encode(%{label: label, amount: amount}) do
+    %{"label" => label, "amount" => amount}
+  end
+end
+
+defmodule Xitdb.Features.MacroDslSpec.UnencodedPayload do
+  @moduledoc false
+  defstruct [:raw]
+end
+
 defmodule Xitdb.Features.MacroDslSpec do
   use Xitdb.FeatureCase, async: true
 
@@ -541,5 +557,67 @@ defmodule Xitdb.Features.MacroDslSpec do
             "e{f}" => 3,
             "g h" => 4
           })
+  end
+
+  scenario "tx DSL encodes Decimal, temporal structs, and custom Xitdb.Encoder structs across put, append, insert, and update" do
+    @given memory_database()
+    @upon executing_dsl_transaction(fn db ->
+            amount = Decimal.new("42.50")
+            day = ~D[2026-11-19]
+            tod = ~T[14:30:05.123456]
+            dt = ~U[2026-11-19 14:30:05.123456Z]
+            ndt = ~N[2026-11-19 14:30:05]
+
+            payload = %Xitdb.Features.MacroDslSpec.CustomPayload{
+              label: "dsl-item",
+              amount: Decimal.new("7.25")
+            }
+
+            tx db do
+              put ledger.amount, amount
+              put ledger.day, day
+              put ledger.time, tod
+              put ledger.dt, dt
+              put ledger.ndt, ndt
+              put ledger.payload, payload
+              put ledger.events, [~D[2026-01-01]]
+              append ledger.events, ~D[2026-01-02]
+              put ledger.list_col, Xitdb.linked_list([~D[2026-02-01]])
+              insert ledger.list_col[[0]], ~D[2025-12-31]
+              update ledger.updated_at, ~D[2026-01-01], fn _prev -> ~D[2026-03-01] end
+            end
+          end)
+
+    @upon attempting_failing_dsl_transaction(fn db ->
+            bad = %Xitdb.Features.MacroDslSpec.UnencodedPayload{raw: :oops}
+
+            tx db do
+              put ledger.bad, bad
+            end
+          end)
+
+    @then access_path_equals(["ledger", "amount"], {:tagged, "dc", "42.50"})
+    @then access_path_equals(["ledger", "day"], {:tagged, "dt", "2026-11-19"})
+    @then access_path_equals(["ledger", "time"], {:tagged, "tm", "14:30:05.123456"})
+    @then access_path_equals(
+            ["ledger", "dt"],
+            {:tagged, "ts",
+             <<DateTime.to_unix(~U[2026-11-19 14:30:05.123456Z], :microsecond)::signed-big-64>>}
+          )
+    @then access_path_equals(["ledger", "ndt"], {:tagged, "nt", "2026-11-19T14:30:05"})
+    @then materialized_subtree_is(
+            ["ledger", "payload"],
+            %{"label" => "dsl-item", "amount" => {:tagged, "dc", "7.25"}}
+          )
+    @then access_path_equals(
+            ["ledger", "events"],
+            [{:tagged, "dt", "2026-01-01"}, {:tagged, "dt", "2026-01-02"}]
+          )
+    @then access_path_equals(
+            ["ledger", "list_col"],
+            [{:tagged, "dt", "2025-12-31"}, {:tagged, "dt", "2026-02-01"}]
+          )
+    @then access_path_equals(["ledger", "updated_at"], {:tagged, "dt", "2026-03-01"})
+    @then last_transaction_failed_with(:transaction_exception)
   end
 end

@@ -168,7 +168,7 @@ todo = Xitdb.select!(db, ~x|.users["101"].todos[1]|)
 
 ### Datomic-Style Pull Projections (`Xitdb.pull/2`)
 
-Prefer `Xitdb.pull/2` with a structural list pattern over `Xitdb.materialize/1` when you only need a subset of fields or a bounded list slice:
+- Prefer `Xitdb.pull/2` with a structural list pattern over `Xitdb.materialize/1` when you only need a subset of fields or a bounded list slice:
 
 ```elixir
 {:ok, user_card} =
@@ -179,6 +179,11 @@ Prefer `Xitdb.pull/2` with a structural list pattern over `Xitdb.materialize/1` 
     profile: [:city]
   ])
 ```
+
+### Order-Preserving Range Keys & Struct Encoding (`Xitdb.Key`, `Xitdb.Encoder`)
+
+- Use `Xitdb.Key` (`encode_i64_be/1`, `encode_u64_be/1`, `encode_f64_be/1`, `encode_decimal_key/1`, `encode_fixed_decimal64_be/2`) when storing numeric or `> max(i64)` range keys in `:sorted_map` collections, and scan bounded windows lazily via `Xitdb.Key.stream_range/2` in `O(log N + K)`.
+- Implement `defimpl Xitdb.Encoder, for: MyStruct` for domain structs written inside `Xitdb.transact/3`, `put_in/3`, `Xitdb.insert_at/4`, or `Xitdb.DSL.tx` blocks (`Decimal`, `Date`, `Time`, `DateTime`, `NaiveDateTime`, and `Xitdb.Ash.Types.RangedUnit` are built in). Remember Xitdb native `Tag.Uint` rejects raw integers exceeding signed `max(i64)`; use `Xitdb.Ash.Types.UnsignedInteger` or `{:tagged, "u8", <<n::unsigned-big-64>>}` for full `u64` values, and prefer `Ash.Query` over native Datalog `<`/`>` for `:tagged` or `> max(i64)` range scans.
 
 ---
 
@@ -366,6 +371,7 @@ Xitdb.Ash.Search.ids(MyApp.Accounts.Profile, "northleaf", as_of: prev_moment)
 - Use `Xitdb.Ash.Info.search_fields(Resource)`, `Xitdb.Ash.Info.indexes(Resource)`, `Xitdb.Ash.Info.counted_set_fields(Resource)`, and `Xitdb.Ash.Info.resolve_store(Resource, context_or_opts)` instead of hardcoding field lists or index maps.
 - Use `Xitdb.Ash.Info.nested_in(Resource)` (and `Xitdb.Ash.Info.nested?(Resource)`) for `Xitdb.Ash.DataLayer` co-located subtrees (which support child secondary indexes).
 - Use `tx_for(db, Resource) do ... end` (`Xitdb.Ash.Tx`) to automatically inject all `index_on` declarations configured on resources so secondary B+Tree indexes never drift on raw transactions.
+- Use `Xitdb.Ash.Types.UnsignedInteger` (`0..2^64-1`), `Xitdb.Ash.Types.FixedDecimal64` (`scale:`, `signed?:`, `representation: :integer | :tagged`), `Xitdb.Ash.Types.RangedUnit` (`to_indexed_fields/2,3`, `overlaps?/2`), or custom `Ash.Type` modules implementing `xitdb_index_key/2` + `xitdb_fixed_width?/1` for order-preserving secondary B+Tree range queries.
 
 ---
 

@@ -332,12 +332,20 @@ defmodule Xitdb do
       when is_map(map) and not is_struct(map) do
     ops = TxCompiler.compile_moment_map(map)
     do_transact_ops_default(db, db_ref, ops)
+  rescue
+    e in Protocol.UndefinedError ->
+      {:error, %Error{reason: :transaction_exception, details: %{exception: e}}}
   end
 
   def transact(%__MODULE__{} = db, map, opts) when is_map(map) and not is_struct(map) do
     with {:ok, validated} <- validate_opts(opts, @transact_schema) do
-      ops = TxCompiler.compile_moment_map(map)
-      do_transact_ops(db, ops, validated)
+      try do
+        ops = TxCompiler.compile_moment_map(map)
+        do_transact_ops(db, ops, validated)
+      rescue
+        e in Protocol.UndefinedError ->
+          {:error, %Error{reason: :transaction_exception, details: %{exception: e}}}
+      end
     end
   end
 
@@ -502,12 +510,13 @@ defmodule Xitdb do
   @spec insert_at(Cursor.t(), String.t() | [term()], integer(), term()) :: Cursor.t()
   def insert_at(%Cursor{} = root, path_or_selector, index, value)
       when (is_list(path_or_selector) or is_binary(path_or_selector)) and is_integer(index) do
-    updated = Cursor.stage_list_insert(root, path_or_selector, index, value)
+    encoded = TxCompiler.encode_value(value)
+    updated = Cursor.stage_list_insert(root, path_or_selector, index, encoded)
 
     %Cursor{
       updated
       | tx_mode: true,
-        staged_ops: [{:insert, path_or_selector, index, value} | updated.staged_ops]
+        staged_ops: [{:insert, path_or_selector, index, encoded} | updated.staged_ops]
     }
   end
 

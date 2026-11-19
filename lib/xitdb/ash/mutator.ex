@@ -1080,6 +1080,22 @@ if Code.ensure_loaded?(Ash.DataLayer) do
        )}
     end
 
+    defp normalize_plan_error({:error, {:integer_out_of_u64_range, field}}) do
+      {:error,
+       InvalidAttribute.exception(
+         field: field,
+         message: "must fit within an unsigned 64-bit integer (0..2^64-1)"
+       )}
+    end
+
+    defp normalize_plan_error({:error, {:invalid_format_tag, field}}) do
+      {:error,
+       InvalidAttribute.exception(
+         field: field,
+         message: "tagged binary values must use a 2-byte tag and binary payload"
+       )}
+    end
+
     defp normalize_plan_error(other), do: other
 
     defp verify_create_filter(_record, _resource, %Ash.Changeset{filter: nil}), do: :ok

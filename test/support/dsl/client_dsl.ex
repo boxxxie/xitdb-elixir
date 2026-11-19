@@ -64,6 +64,10 @@ defmodule Xitdb.TestDSL.ClientDSL do
     ClientDriver.attempt_failing_transact(ctx, fun)
   end
 
+  def attempting_failing_moment(ctx, map, opts \\ []) when is_map(map) do
+    ClientDriver.attempt_failing_transact(ctx, map, opts)
+  end
+
   def executing_dsl_transaction(ctx, fun) when is_function(fun, 1) do
     ClientDriver.execute_dsl_tx(ctx, fun)
   end
@@ -74,6 +78,10 @@ defmodule Xitdb.TestDSL.ClientDSL do
 
   def selecting_path(ctx, result_key, selector) do
     ClientDriver.select_path(ctx, result_key, selector)
+  end
+
+  def seeking_sorted_map_range(ctx, result_key, path_keys, opts \\ []) do
+    ClientDriver.seek_sorted_map_range(ctx, result_key, path_keys, opts)
   end
 
   def pulling_projection(ctx, result_key, selector_or_path, pattern) do

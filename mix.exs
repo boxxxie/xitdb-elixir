@@ -113,6 +113,8 @@ defmodule Xitdb.MixProject do
           Xitdb,
           Xitdb.Cursor,
           Xitdb.Collection,
+          Xitdb.Key,
+          Xitdb.Encoder,
           Xitdb.Error
         ],
         "DSLs, Pull & Sigils": [
@@ -128,6 +130,9 @@ defmodule Xitdb.MixProject do
           Xitdb.Ash.TestSandbox,
           Xitdb.Ash.Info,
           Xitdb.Ash.Tx,
+          Xitdb.Ash.Types.UnsignedInteger,
+          Xitdb.Ash.Types.FixedDecimal64,
+          Xitdb.Ash.Types.RangedUnit,
           Xitdb.Ash.LeaseError
         ],
         "Ash DSL Entities & Internals": [

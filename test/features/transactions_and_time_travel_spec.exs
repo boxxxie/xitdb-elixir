@@ -1,5 +1,23 @@
+defmodule Xitdb.Features.TransactionsAndTimeTravelSpec.CustomPayload do
+  @moduledoc false
+  defstruct [:label, :amount]
+end
+
+defimpl Xitdb.Encoder, for: Xitdb.Features.TransactionsAndTimeTravelSpec.CustomPayload do
+  def encode(%{label: label, amount: amount}) do
+    %{"label" => label, "amount" => amount}
+  end
+end
+
+defmodule Xitdb.Features.TransactionsAndTimeTravelSpec.UnencodedPayload do
+  @moduledoc false
+  defstruct [:raw]
+end
+
 defmodule Xitdb.Features.TransactionsAndTimeTravelSpec do
   use Xitdb.FeatureCase, async: true
+
+  alias Xitdb.Features.TransactionsAndTimeTravelSpec.{CustomPayload, UnencodedPayload}
 
   scenario "client mutates nested structures using put_in/3, update_in/3, and pop_in/2 inside Xitdb.transact/2" do
     @given memory_database()
@@ -78,5 +96,54 @@ defmodule Xitdb.Features.TransactionsAndTimeTravelSpec do
             %{moment: 1, value: 2, doc: "Promote to prod"},
             %{moment: 2, value: 3, doc: "Add region"}
           ])
+  end
+
+  scenario "Xitdb.Encoder encodes Decimal, temporal structs, and custom structs across transact/3, put_in/3, and insert_at/4" do
+    @given memory_database()
+    @given committed_moment(%{
+             "dec" => Decimal.new("199.950"),
+             "date" => ~D[2026-11-19],
+             "time" => ~T[09:15:30],
+             "dt" => ~U[2026-11-19 09:15:30Z],
+             "ndt" => ~N[2026-11-19 09:15:30],
+             "custom" => %CustomPayload{label: "invoice", amount: Decimal.new("10.00")},
+             "queue" => Xitdb.linked_list([~D[2026-11-20]])
+           })
+
+    @upon transacting_with_cursor(fn root ->
+            root
+            |> put_in(["cursor_dec"], Decimal.new("55.25"))
+            |> put_in(
+              ["cursor_custom"],
+              %CustomPayload{label: "cursor", amount: Decimal.new("1.50")}
+            )
+            |> Xitdb.insert_at(["queue"], 0, ~D[2026-11-18])
+          end)
+
+    @upon attempting_failing_moment(%{"bad" => %UnencodedPayload{raw: :nope}})
+
+    @then access_path_equals(["dec"], {:tagged, "dc", "199.950"})
+    @then access_path_equals(["date"], {:tagged, "dt", "2026-11-19"})
+    @then access_path_equals(["time"], {:tagged, "tm", "09:15:30"})
+    @then access_path_equals(
+            ["dt"],
+            {:tagged, "ts",
+             <<DateTime.to_unix(~U[2026-11-19 09:15:30Z], :microsecond)::signed-big-64>>}
+          )
+    @then access_path_equals(["ndt"], {:tagged, "nt", "2026-11-19T09:15:30"})
+    @then materialized_subtree_is(
+            ["custom"],
+            %{"label" => "invoice", "amount" => {:tagged, "dc", "10.00"}}
+          )
+    @then access_path_equals(["cursor_dec"], {:tagged, "dc", "55.25"})
+    @then materialized_subtree_is(
+            ["cursor_custom"],
+            %{"label" => "cursor", "amount" => {:tagged, "dc", "1.50"}}
+          )
+    @then access_path_equals(
+            ["queue"],
+            [{:tagged, "dt", "2026-11-18"}, {:tagged, "dt", "2026-11-20"}]
+          )
+    @then last_transaction_failed_with(:transaction_exception)
   end
 end

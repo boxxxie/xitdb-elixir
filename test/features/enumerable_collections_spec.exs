@@ -1,6 +1,9 @@
 defmodule Xitdb.Features.EnumerableCollectionsSpec do
   use Xitdb.FeatureCase, async: true
 
+  @max_i64 9_223_372_036_854_775_807
+  @max_u64 18_446_744_073_709_551_615
+
   scenario "Enum.count/1, Enum.member?/2, and Enum.slice/2 leverage native xitdb collection structures" do
     @given memory_database()
     @given committed_moment(%{
@@ -98,5 +101,54 @@ defmodule Xitdb.Features.EnumerableCollectionsSpec do
           )
 
     @then cursor_inspect_includes(["team"], ["#Xitdb.Cursor<", "members", "name"])
+  end
+
+  scenario "Xitdb.Key enables exact O(log N + K) :sorted_map range seeks across signed i64 and large unsigned u64 keys" do
+    @given memory_database()
+    @given committed_moment(%{
+             "i64_prices" =>
+               Xitdb.sorted_map([
+                 {Xitdb.Key.encode_i64_be(-50), "loss"},
+                 {Xitdb.Key.encode_i64_be(0), "break-even"},
+                 {Xitdb.Key.encode_i64_be(250), "profit-a"},
+                 {Xitdb.Key.encode_i64_be(900), "profit-b"}
+               ]),
+             "u64_offsets" =>
+               Xitdb.sorted_map([
+                 {Xitdb.Key.encode_u64_be(10), "small"},
+                 {Xitdb.Key.encode_u64_be(@max_i64), "boundary-i64"},
+                 {Xitdb.Key.encode_u64_be(@max_i64 + 1), "above-i64"},
+                 {Xitdb.Key.encode_u64_be(@max_u64), "max-u64"}
+               ])
+           })
+
+    @upon seeking_sorted_map_range(
+            :i64_window,
+            ["i64_prices"],
+            min: Xitdb.Key.encode_i64_be(0),
+            max: Xitdb.Key.encode_i64_be(250),
+            max_inclusive?: true
+          )
+    @upon seeking_sorted_map_range(
+            :u64_tail,
+            ["u64_offsets"],
+            min: Xitdb.Key.encode_u64_be(@max_i64),
+            min_inclusive?: false
+          )
+
+    @then resolved_value_is(
+            :i64_window,
+            [
+              {Xitdb.Key.encode_i64_be(0), "break-even"},
+              {Xitdb.Key.encode_i64_be(250), "profit-a"}
+            ]
+          )
+    @then resolved_value_is(
+            :u64_tail,
+            [
+              {Xitdb.Key.encode_u64_be(@max_i64 + 1), "above-i64"},
+              {Xitdb.Key.encode_u64_be(@max_u64), "max-u64"}
+            ]
+          )
   end
 end

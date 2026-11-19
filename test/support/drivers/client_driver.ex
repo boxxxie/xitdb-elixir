@@ -110,8 +110,8 @@ defmodule Xitdb.TestDrivers.ClientDriver do
     %{ctx | db: db}
   end
 
-  def attempt_failing_transact(ctx, fun) do
-    case Xitdb.transact(ctx.db, fun) do
+  def attempt_failing_transact(ctx, fun_or_map, opts \\ []) do
+    case Xitdb.transact(ctx.db, fun_or_map, opts) do
       {:error, err} ->
         %{ctx | last_error: err}
 
@@ -138,6 +138,17 @@ defmodule Xitdb.TestDrivers.ClientDriver do
   def select_path(ctx, result_key, selector) do
     val = Xitdb.select!(ctx.db, selector)
     %{ctx | results: Map.put(ctx.results, result_key, val)}
+  end
+
+  def seek_sorted_map_range(ctx, result_key, path_keys, opts) do
+    cursor = resolve_path(Xitdb.db(ctx.db), path_keys)
+
+    entries =
+      cursor
+      |> Xitdb.Key.stream_range(opts)
+      |> Enum.map(fn {k, v} -> {k, materialize_if_cursor(v)} end)
+
+    %{ctx | results: Map.put(ctx.results, result_key, entries)}
   end
 
   def pull_projection(ctx, result_key, selector_or_path, pattern) do

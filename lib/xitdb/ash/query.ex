@@ -796,6 +796,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
     @min_i64 -9_223_372_036_854_775_808
     @max_i64 9_223_372_036_854_775_807
+    @max_u64 18_446_744_073_709_551_615
 
     defp indexable_literal?(%Attribute{type: type, constraints: constraints} = attr, val) do
       {kind, _} = Codec.unwrap_type(type, constraints)
@@ -804,6 +805,9 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         case kind do
           :integer ->
             is_integer(val) and val >= @min_i64 and val <= @max_i64
+
+          :unsigned_integer ->
+            is_integer(val) and val >= 0 and val <= @max_u64
 
           :float ->
             is_float(val) or is_integer(val) or is_struct(val, Decimal)

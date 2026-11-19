@@ -9,6 +9,29 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
     @min_i64 -9_223_372_036_854_775_808
     @max_i64 9_223_372_036_854_775_807
+    @max_u64 18_446_744_073_709_551_615
+
+    property ":unsigned_integer attribute index keys preserve strict u64 ordering across 0..2^64-1" do
+      u64_attr = %Attribute{name: :big_u64, type: :unsigned_integer, constraints: []}
+
+      u64_gen =
+        one_of([
+          integer(0..@max_i64),
+          integer((@max_i64 + 1)..@max_u64),
+          member_of([0, 1, @max_i64, @max_i64 + 1, @max_u64 - 1, @max_u64])
+        ])
+
+      check all(a <- u64_gen, b <- u64_gen) do
+        ka = Codec.encode_scalar_key(u64_attr, a)
+        kb = Codec.encode_scalar_key(u64_attr, b)
+        ia = Codec.encode_index_key([u64_attr], [a])
+        ib = Codec.encode_index_key([u64_attr], [b])
+
+        assert byte_size(ka) == 8
+        assert compare_terms(ka, kb) == compare_terms(a, b)
+        assert compare_terms(ia, ib) == compare_terms(a, b)
+      end
+    end
 
     property "encode_i64_be/1 round-trips and preserves strict signed ordering across all 64-bit bounds" do
       i64_gen =
