@@ -387,6 +387,51 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
         assert Enum.map(matching_high, & &1.name) == [f_series_a.name, f_growth.name]
       end
+
+      test "rejects conflicting :exact bounds and prevents arbitrary atom creation in to_indexed_fields" do
+        assert :error =
+                 Ash.Type.cast_stored(
+                   RangedUnit,
+                   %RangedUnit{
+                     bound_kind: :exact,
+                     dimension: :currency,
+                     currency: :usd,
+                     min_val: 10,
+                     max_val: 999
+                   },
+                   []
+                 )
+
+        assert :error =
+                 Ash.Type.cast_stored(
+                   RangedUnit,
+                   %{"b" => "exact", "min" => "10", "max" => "999"},
+                   []
+                 )
+
+        assert {:ok, %RangedUnit{bound_kind: :exact, min_val: d_min, max_val: d_max}} =
+                 Ash.Type.cast_stored(
+                   RangedUnit,
+                   %{"b" => "exact", "min" => "10", "max" => "10.00"},
+                   []
+                 )
+
+        assert Decimal.equal?(d_min, Decimal.new("10"))
+        assert Decimal.equal?(d_max, Decimal.new("10"))
+
+        ru = %RangedUnit{bound_kind: :exact, min_val: Decimal.new("42")}
+
+        assert %{
+                 ticket_min_d64: _,
+                 ticket_max_d64: _,
+                 ticket_bound: "exact",
+                 ticket_unit: "dimensionless"
+               } = RangedUnit.to_indexed_fields(ru, "ticket")
+
+        assert_raise ArgumentError, fn ->
+          RangedUnit.to_indexed_fields(ru, "nonexistent_ranged_prefix_xyz")
+        end
+      end
     end
   end
 end

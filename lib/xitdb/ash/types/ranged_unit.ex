@@ -362,6 +362,9 @@ if Code.ensure_loaded?(Ash.DataLayer) do
            {:ok, cur} <- normalize_currency(ru.currency),
            {:ok, min_d} <- normalize_decimal(ru.min_val),
            {:ok, max_d} <- normalize_decimal(ru.max_val) do
+        exact_consistent? =
+          bk != :exact or min_d == nil or max_d == nil or Decimal.equal?(min_d, max_d)
+
         {norm_min, norm_max} =
           if bk == :exact do
             v = min_d || max_d
@@ -373,7 +376,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         valid_range? =
           cond do
             bk == :exact ->
-              norm_min == nil or norm_max == nil or Decimal.equal?(norm_min, norm_max)
+              exact_consistent?
 
             norm_min != nil and norm_max != nil ->
               Decimal.compare(norm_min, norm_max) != :gt
@@ -539,10 +542,10 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       p = to_string(prefix)
 
       %{
-        String.to_atom("#{p}_min_d64") => min_v,
-        String.to_atom("#{p}_max_d64") => max_v,
-        String.to_atom("#{p}_bound") => bound,
-        String.to_atom("#{p}_unit") => unit
+        String.to_existing_atom("#{p}_min_d64") => min_v,
+        String.to_existing_atom("#{p}_max_d64") => max_v,
+        String.to_existing_atom("#{p}_bound") => bound,
+        String.to_existing_atom("#{p}_unit") => unit
       }
     end
   end
