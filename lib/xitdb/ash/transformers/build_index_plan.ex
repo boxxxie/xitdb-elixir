@@ -360,17 +360,17 @@ if Code.ensure_loaded?(Ash.DataLayer) do
             _ = Application.compile_env(:xitdb, :default_store)
           end
 
-          unless Module.defines?(__MODULE__, {:__xitdb_store__, 0}, :def) do
+          if not Module.defines?(__MODULE__, {:__xitdb_store__, 0}, :def) do
             @doc false
             def __xitdb_store__, do: unquote(Macro.escape(store))
           end
 
-          unless Module.defines?(__MODULE__, {:__xitdb_collection__, 0}, :def) do
+          if not Module.defines?(__MODULE__, {:__xitdb_collection__, 0}, :def) do
             @doc false
             def __xitdb_collection__, do: unquote(Macro.escape(collection))
           end
 
-          unless Module.defines?(__MODULE__, {:__xitdb_indexes__, 0}, :def) do
+          if not Module.defines?(__MODULE__, {:__xitdb_indexes__, 0}, :def) do
             @doc false
             def __xitdb_indexes__, do: unquote(Macro.escape(normalized_indexes))
           end

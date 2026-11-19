@@ -28,8 +28,8 @@ defmodule Xitdb.DSL.PathCompilerTest do
   end
 
   test "raises ArgumentError when a dynamic runtime bracket key is nil or boolean" do
-    id = nil
-    flag = false
+    id = apply(Function, :identity, [nil])
+    flag = apply(Function, :identity, [false])
 
     assert_raise ArgumentError, ~r/Invalid bracket path step nil/, fn ->
       path(users[id])

@@ -1,6 +1,6 @@
 # Tech Stack: `xitdb` Elixir Client
 
-- **Host Language & Runtime:** Elixir `~> 1.18` (tested on Elixir 1.19.6 / Erlang/OTP 28 `[erts-16.4]`)
+- **Host Language & Runtime:** Elixir `~> 1.19` (pinned & verified on Elixir 1.20.5 / Erlang/OTP 29.1.2 `[erts-17.1.1]`)
 - **Native Engine Submodule:** [`native/xitdb-odin`](../native/xitdb-odin) (`git@github.com:boxxxie/odin-xitdb.git`, pure-Odin `v1` wire implementation)
 - **FFI / NIF Bridge:**
   - `native/xitdb_nif.odin` (`package xitdb_nif`, compiled with `odin build ... -build-mode:obj -collection:xitdb=native/xitdb-odin/xitdb -o:speed`)

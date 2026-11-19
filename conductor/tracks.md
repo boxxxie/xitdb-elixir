@@ -2,12 +2,7 @@
 
 This file tracks active development tracks for the `xitdb` Elixir client (`elixir/xitdb`), ordered in recommended execution order.
 
-Completed tracks (**Waves 0–5**, benchmark/optimization tracks, and **bugfix slices 01–07**) are archived locally under `./archive/` (gitignored).
-
----
-
-- [ ] **Track: Upgrade Elixir to 1.20.5 and Erlang/OTP to 29.1.2**
-*Link: [./tracks/elixir_1_20_upgrade_20261118/](./tracks/elixir_1_20_upgrade_20261118/)*
+Completed tracks (**Waves 0–5**, benchmark/optimization tracks, **bugfix slices 01–07**, and **Elixir 1.20.5 / OTP 29.1.2 upgrade**) are archived locally under `./archive/` (gitignored).
 
 ---
 

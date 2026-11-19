@@ -46,7 +46,7 @@ defmodule Xitdb.DSL.DatalogCompilerTest do
   end
 
   test "raises ArgumentError when pinning nil in a Datalog where clause" do
-    bad = nil
+    bad = apply(Function, :identity, [nil])
 
     assert_raise ArgumentError, "cannot match nil in Datalog where clause", fn ->
       datalog do

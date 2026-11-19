@@ -164,11 +164,15 @@ defmodule Mix.Tasks.Compile.OdinNif do
   use Mix.Task.Compiler
 
   @impl true
-  def run(_args) do
+  def run(args) do
     priv_dir = Path.expand("priv")
     File.mkdir_p!(priv_dir)
 
     so_path = Path.join(priv_dir, "xitdb_nif.so")
+    erts_vsn = to_string(:erlang.system_info(:version))
+    erts_stamp_path = Path.join(priv_dir, "xitdb_nif.erts")
+    force? = "--force" in args
+
     c_src = Path.expand("native/nif_entry.c")
     c_obj = Path.expand("native/nif_entry.o")
     odin_src = Path.expand("native/xitdb_nif.odin")
@@ -178,14 +182,14 @@ defmodule Mix.Tasks.Compile.OdinNif do
     xitdb_sources = Path.wildcard(Path.join(xitdb_col_dir, "*.odin"))
     all_sources = [c_src, odin_src | xitdb_sources]
 
-    if needs_compile?(so_path, all_sources) do
+    if force? or erts_changed?(erts_stamp_path, erts_vsn) or needs_compile?(so_path, all_sources) do
       odin_bin = System.find_executable("odin") || Mix.raise("odin compiler not found in PATH")
       cc_bin = System.find_executable("cc") || System.find_executable("gcc") || "cc"
 
       erts_include =
         Path.join([
           to_string(:code.root_dir()),
-          "erts-#{:erlang.system_info(:version)}",
+          "erts-#{erts_vsn}",
           "include"
         ])
 
@@ -220,10 +224,19 @@ defmodule Mix.Tasks.Compile.OdinNif do
       if odin_status != 0 do
         Mix.raise("Failed to compile native/xitdb_nif.odin:\n#{odin_out}")
       end
+
+      File.write!(erts_stamp_path, erts_vsn)
     end
 
     Mix.Project.build_structure()
     {:ok, []}
+  end
+
+  defp erts_changed?(stamp_path, erts_vsn) do
+    case File.read(stamp_path) do
+      {:ok, ^erts_vsn} -> false
+      _ -> true
+    end
   end
 
   defp needs_compile?(target, sources) do

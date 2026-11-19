@@ -626,7 +626,7 @@ defmodule Xitdb.ClientBench do
           File.write!(output_path, new_jsonl)
       end
 
-      unless no_history? do
+      if not no_history? do
         File.write!(history_path, new_jsonl, [:append])
       end
     end
