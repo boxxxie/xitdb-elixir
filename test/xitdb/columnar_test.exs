@@ -160,7 +160,7 @@ defmodule Xitdb.ColumnarTest do
       assert {:tagged, "pg", _} = Xitdb.select!(db, ~s(.activities["150"].body), raw_tagged: true)
 
       # Point read decompresses only 1 page; second read in same page hits ETS cache
-      Columnar.clear_cache()
+      Columnar.clear_cache(db)
       Columnar.reset_stats()
 
       expected_150 =
@@ -178,7 +178,7 @@ defmodule Xitdb.ColumnarTest do
       assert %{page_reads: 1, page_cache_hits: 1} = Columnar.stats()
 
       # Metadata-only pull performs 0 page reads and 0 decompressions
-      Columnar.clear_cache()
+      Columnar.clear_cache(db)
       Columnar.reset_stats()
 
       assert %{"id" => 150, "title" => "Subject 150"} =
@@ -201,6 +201,55 @@ defmodule Xitdb.ColumnarTest do
       assert v1["activities"]["150"]["body"] == expected_150
 
       Xitdb.close(db)
+    end
+
+    test "cached page hits enforce max_decompressed_bytes, clear_cache/1 scopes eviction per db, and missing dictionary falls back to :plain_block" do
+      payload = String.duplicate("Columnar regression payload block. ", 12)
+      rows = [{"1", %{"title" => "Row 1", "body" => payload}}]
+
+      db1 =
+        Xitdb.open!(backend: :memory)
+        |> Columnar.put_rows!("items", rows,
+          columns: [{:body, encoding: :dict_block, dictionary: :unseeded_dict}],
+          codec: :zstd
+        )
+
+      # Unseeded dictionary falls back to :plain_block rather than failing put_rows
+      [{_page_id, page_bin}] = Enum.to_list(db1["__col_pages"]["items"]["body"])
+      assert {:ok, %Page{encoding: :plain_block}} = Page.decode_page(page_bin)
+      assert db1["items"]["1"]["body"] == payload
+
+      # Populate cache on db1, then verify stricter max_decompressed_bytes fails on cache hit
+      Columnar.clear_cache(db1)
+      Columnar.reset_stats()
+      assert db1["items"]["1"]["body"] == payload
+      assert %{page_reads: 1, page_cache_hits: 0} = Columnar.stats()
+
+      assert {:error, %Error{reason: :decompressed_size_exceeded}} =
+               Xitdb.select(db1, ~s(.items["1"].body), max_decompressed_bytes: 16)
+
+      # Rejected hit does not increment page_cache_hits; valid limit still hits cache
+      assert %{page_reads: 1, page_cache_hits: 0} = Columnar.stats()
+      assert Xitdb.select!(db1, ~s(.items["1"].body)) == payload
+      assert %{page_reads: 1, page_cache_hits: 1} = Columnar.stats()
+
+      # Scoped clear_cache(db1) leaves db2 cache entries intact
+      db2 =
+        Xitdb.open!(backend: :memory)
+        |> Columnar.put_rows!("items", rows, columns: [:body], codec: :zstd)
+
+      assert db2["items"]["1"]["body"] == payload
+      Columnar.clear_cache(db1)
+      Columnar.reset_stats()
+
+      assert db2["items"]["1"]["body"] == payload
+      assert %{page_reads: 0, page_cache_hits: 1} = Columnar.stats()
+
+      assert db1["items"]["1"]["body"] == payload
+      assert %{page_reads: 1, page_cache_hits: 1} = Columnar.stats()
+
+      Xitdb.close(db1)
+      Xitdb.close(db2)
     end
   end
 end

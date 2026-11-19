@@ -51,6 +51,12 @@ defmodule Xitdb.Compression do
   def zstd_available?, do: Code.ensure_loaded?(:zstd)
 
   @doc """
+  Returns the default maximum allowed decompressed payload size in bytes (`64 MB`).
+  """
+  @spec default_max_decompressed_bytes() :: pos_integer()
+  def default_max_decompressed_bytes, do: @default_max_decompressed_bytes
+
+  @doc """
   Returns the default value compression codec (`:zstd` when available, otherwise `:zlib`).
   """
   @spec default_codec() :: :zstd | :zlib

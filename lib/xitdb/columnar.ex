@@ -220,13 +220,30 @@ defmodule Xitdb.Columnar do
   end
 
   @doc """
-  Clears all cached decoded column pages from `:xitdb_page_cache`.
+  Clears cached decoded column pages from `:xitdb_page_cache`.
+
+  Pass `:all` (default) to wipe the global cache, or pass a `%Xitdb{}` handle or
+  `%Xitdb.Cursor{}` to evict only entries belonging to that database reference.
   """
-  @spec clear_cache() :: :ok
-  def clear_cache do
+  @spec clear_cache(:all | Xitdb.t() | Cursor.t()) :: :ok
+  def clear_cache(target \\ :all) do
     case :ets.whereis(@page_cache_table) do
-      :undefined -> :ok
-      _tid -> :ets.delete_all_objects(@page_cache_table) && :ok
+      :undefined ->
+        :ok
+
+      _tid when target == :all ->
+        :ets.delete_all_objects(@page_cache_table) && :ok
+
+      _tid ->
+        case extract_db_handle(target) do
+          {db_ref, _} when is_reference(db_ref) ->
+            ref_id = :erlang.ref_to_list(db_ref)
+            :ets.match_delete(@page_cache_table, {{ref_id, :_, :_, :_, :_}, :_, :_, :_})
+            :ok
+
+          _ ->
+            :ok
+        end
     end
   end
 
@@ -348,7 +365,7 @@ defmodule Xitdb.Columnar do
             true ->
               case Compression.fetch_dictionary_bytes(db_ref, moment, dict_str) do
                 {:ok, bytes} -> {:cont, {:ok, Map.put(cache, dict_str, bytes)}}
-                {:error, _} = err -> {:halt, err}
+                {:error, %Error{reason: :missing_compression_dictionary}} -> {:cont, {:ok, cache}}
               end
           end
       end
@@ -501,13 +518,30 @@ defmodule Xitdb.Columnar do
 
   defp fetch_or_decode_page(col, field, page_id, db_ref, moment, opts) do
     ensure_page_cache_table()
-    cache_key = {col, field, page_id, :erlang.phash2(db_ref)}
+
+    max_bytes =
+      Keyword.get(opts, :max_decompressed_bytes, Compression.default_max_decompressed_bytes())
+
+    cache_key = {:erlang.ref_to_list(db_ref), moment, col, field, page_id}
 
     case :ets.lookup(@page_cache_table, cache_key) do
-      [{^cache_key, %Page{} = page, _ts}] ->
-        :ets.update_element(@page_cache_table, cache_key, {3, System.monotonic_time(:nanosecond)})
-        bump_stat(:page_cache_hits)
-        {:ok, page}
+      [{^cache_key, %Page{} = page, raw_len, _ts}] ->
+        if raw_len > max_bytes do
+          {:error,
+           %Error{
+             reason: :decompressed_size_exceeded,
+             details: %{raw_len: raw_len, max_decompressed_bytes: max_bytes}
+           }}
+        else
+          :ets.update_element(
+            @page_cache_table,
+            cache_key,
+            {4, System.monotonic_time(:nanosecond)}
+          )
+
+          bump_stat(:page_cache_hits)
+          {:ok, page}
+        end
 
       [] ->
         bump_stat(:page_reads)
@@ -522,7 +556,8 @@ defmodule Xitdb.Columnar do
             bump_stat(:page_decompressions)
 
             with {:ok, %Page{} = page} <- Page.decode_page(page_bin, decode_opts) do
-              insert_cached_page(cache_key, page)
+              <<_::binary-size(11), raw_len::unsigned-little-32, _::binary>> = page_bin
+              insert_cached_page(cache_key, page, raw_len)
               {:ok, page}
             end
 
@@ -542,7 +577,7 @@ defmodule Xitdb.Columnar do
     end
   end
 
-  defp insert_cached_page(cache_key, %Page{} = page) do
+  defp insert_cached_page(cache_key, %Page{} = page, raw_len) do
     ensure_page_cache_table()
 
     if :ets.info(@page_cache_table, :size) >= @page_cache_limit do
@@ -551,12 +586,18 @@ defmodule Xitdb.Columnar do
           :ok
 
         entries ->
-          {oldest_key, _page, _ts} = Enum.min_by(entries, fn {_k, _p, ts} -> ts end)
+          {oldest_key, _page, _raw_len, _ts} =
+            Enum.min_by(entries, fn {_k, _p, _len, ts} -> ts end)
+
           :ets.delete(@page_cache_table, oldest_key)
       end
     end
 
-    :ets.insert(@page_cache_table, {cache_key, page, System.monotonic_time(:nanosecond)})
+    :ets.insert(
+      @page_cache_table,
+      {cache_key, page, raw_len, System.monotonic_time(:nanosecond)}
+    )
+
     :ok
   end
 

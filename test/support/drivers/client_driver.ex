@@ -89,7 +89,7 @@ defmodule Xitdb.TestDrivers.ClientDriver do
   end
 
   def reset_columnar_probe(ctx) do
-    Xitdb.Columnar.clear_cache()
+    Xitdb.Columnar.clear_cache(ctx.db)
     Xitdb.Columnar.reset_stats()
     ctx
   end
