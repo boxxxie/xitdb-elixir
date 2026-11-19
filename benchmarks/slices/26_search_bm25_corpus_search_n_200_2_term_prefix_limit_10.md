@@ -8,9 +8,9 @@
 
 | Metric | Elixir NIF Wrapper | Raw Odin Baseline | Comparison |
 | :--- | ---: | ---: | ---: |
-| **Median (`ns/op`)** | 236.97 µs (236967.0 ns) | 157.66 µs (157662.0 ns) | **`1.50x`** NIF Ratio |
-| **Mean ± σ (CV)** | 238.20 µs ± 3.17 µs (1.3%) | 157.88 µs ± 676.9 ns (0.4%) | Welch `z` = `55.38` |
-| **p95 / Max (`ns/op`)** | 242.51 µs / 243.77 µs | 158.80 µs / 159.06 µs | `5` vs `5` pooled samples |
+| **Median (`ns/op`)** | 421.17 µs (421170.0 ns) | 197.24 µs (197241.0 ns) | **`2.14x`** NIF Ratio |
+| **Mean ± σ (CV)** | 396.96 µs ± 46.65 µs (11.8%) | 206.42 µs ± 27.17 µs (13.2%) | Welch `z` = `7.89` |
+| **p95 / Max (`ns/op`)** | 433.92 µs / 435.46 µs | 238.60 µs / 240.97 µs | `5` vs `5` pooled samples |
 
 ## Benchmark Harnesses (Elixir vs. Raw Odin)
 
@@ -36,7 +36,7 @@
        end},
 ```
 
-### Raw Odin Harness ([`bench_client.odin#L1423-L1451`](../bench_client.odin#L1423-L1451))
+### Raw Odin Harness ([`bench_client.odin#L1444-L1472`](../bench_client.odin#L1444-L1472))
 
 ```odin
 	// #26: Search: BM25 corpus search (N=200, 2-term prefix, limit=10)
@@ -71,7 +71,7 @@
 ```
 
 <details>
-<summary>Raw Odin BM25 Helper <code>bench_raw_bm25_search</code> (<a href="../bench_client.odin#L618-L753">bench_client.odin#L618-L753</a>)</summary>
+<summary>Raw Odin BM25 Helper <code>bench_raw_bm25_search</code> (<a href="../bench_client.odin#L626-L761">bench_client.odin#L626-L761</a>)</summary>
 
 ```odin
 bench_raw_bm25_search :: proc(root_map: xitdb.Read_Hash_Map, collection: string, query_terms: []string, k_limit: int, allocator := context.temp_allocator) -> []Bench_BM25_Hit {
@@ -217,7 +217,7 @@ bench_raw_bm25_search :: proc(root_map: xitdb.Read_Hash_Map, collection: string,
 ## Elixir Wrapper & NIF Bridge
 
 <details>
-<summary>Elixir <code>nif_bm25_search</code> — <a href="../../lib/xitdb/nif.ex#L103-L112">lib/xitdb/nif.ex#L103-L112</a></summary>
+<summary>Elixir <code>nif_bm25_search</code> — <a href="../../lib/xitdb/nif.ex#L113-L122">lib/xitdb/nif.ex#L113-L122</a></summary>
 
 ```elixir
   def nif_bm25_search(
@@ -235,7 +235,7 @@ bench_raw_bm25_search :: proc(root_map: xitdb.Read_Hash_Map, collection: string,
 </details>
 
 <details>
-<summary>Elixir <code>score_collection_nif</code> — <a href="../../lib/xitdb/ash/search.ex#L348-L390">lib/xitdb/ash/search.ex#L348-L390</a></summary>
+<summary>Elixir <code>score_collection_nif</code> — <a href="../../lib/xitdb/ash/search.ex#L354-L396">lib/xitdb/ash/search.ex#L354-L396</a></summary>
 
 ```elixir
     defp score_collection_nif(db, collection, tokens, opts, resource) do
@@ -286,7 +286,7 @@ bench_raw_bm25_search :: proc(root_map: xitdb.Read_Hash_Map, collection: string,
 </details>
 
 <details>
-<summary>NIF <code>odin_nif_bm25_search</code> — <a href="../../native/xitdb_nif.odin#L8532-L8860">native/xitdb_nif.odin#L8532-L8860</a></summary>
+<summary>NIF <code>odin_nif_bm25_search</code> — <a href="../../native/xitdb_nif.odin#L8830-L9161">native/xitdb_nif.odin#L8830-L9161</a></summary>
 
 ```odin
 odin_nif_bm25_search :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {
@@ -497,13 +497,16 @@ odin_nif_bm25_search :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_
 				if !strings.has_prefix(matched_term, q_tok) {
 					break
 				}
+				if matched_term == "__tx" {
+					continue
+				}
 				mult := opts.exact_boost if matched_term == q_tok else opts.prefix_weight
 				if cp_err := collect_postings_into_map(val_cur, mult, &merged, arena_alloc); cp_err != nil {
 					return make_xitdb_err(env, cp_err)
 				}
 				scanned += 1
 			}
-		} else {
+		} else if q_tok != "__tx" {
 			p_maybe, p_err := xitdb.sorted_map_get_cursor(terms_sm, q_tok)
 			if p_err != nil {
 				return make_xitdb_err(env, p_err)
@@ -623,7 +626,7 @@ odin_nif_bm25_search :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_
 </details>
 
 <details>
-<summary>NIF <code>parse_bm25_opts</code> — <a href="../../native/xitdb_nif.odin#L8025-L8111">native/xitdb_nif.odin#L8025-L8111</a></summary>
+<summary>NIF <code>parse_bm25_opts</code> — <a href="../../native/xitdb_nif.odin#L8323-L8409">native/xitdb_nif.odin#L8323-L8409</a></summary>
 
 ```odin
 parse_bm25_opts :: proc(env: ErlNifEnv, opts_term: ERL_NIF_TERM) -> (opts: BM25_Opts, ok: bool) {
@@ -718,7 +721,7 @@ parse_bm25_opts :: proc(env: ErlNifEnv, opts_term: ERL_NIF_TERM) -> (opts: BM25_
 </details>
 
 <details>
-<summary>NIF <code>resolve_snapshot_root_cursor</code> — <a href="../../native/xitdb_nif.odin#L7992-L8011">native/xitdb_nif.odin#L7992-L8011</a></summary>
+<summary>NIF <code>resolve_snapshot_root_cursor</code> — <a href="../../native/xitdb_nif.odin#L8290-L8309">native/xitdb_nif.odin#L8290-L8309</a></summary>
 
 ```odin
 resolve_snapshot_root_cursor :: proc(
@@ -746,7 +749,7 @@ resolve_snapshot_root_cursor :: proc(
 </details>
 
 <details>
-<summary>NIF <code>read_hash_map_nonneg_int</code> — <a href="../../native/xitdb_nif.odin#L7978-L7989">native/xitdb_nif.odin#L7978-L7989</a></summary>
+<summary>NIF <code>read_hash_map_nonneg_int</code> — <a href="../../native/xitdb_nif.odin#L8276-L8287">native/xitdb_nif.odin#L8276-L8287</a></summary>
 
 ```odin
 read_hash_map_nonneg_int :: proc(hm: xitdb.Read_Hash_Map, key: string) -> (val: i64, err: xitdb.Error) {
@@ -766,7 +769,7 @@ read_hash_map_nonneg_int :: proc(hm: xitdb.Read_Hash_Map, key: string) -> (val: 
 </details>
 
 <details>
-<summary>NIF <code>read_key_cursor_string</code> — <a href="../../native/xitdb_nif.odin#L435-L463">native/xitdb_nif.odin#L435-L463</a></summary>
+<summary>NIF <code>read_key_cursor_string</code> — <a href="../../native/xitdb_nif.odin#L440-L468">native/xitdb_nif.odin#L440-L468</a></summary>
 
 ```odin
 read_key_cursor_string :: proc(cur: xitdb.Read_Cursor, sb_buf: []u8) -> (s: string, err: xitdb.Error) {
@@ -803,7 +806,7 @@ read_key_cursor_string :: proc(cur: xitdb.Read_Cursor, sb_buf: []u8) -> (s: stri
 </details>
 
 <details>
-<summary>NIF <code>collect_postings_into_map</code> — <a href="../../native/xitdb_nif.odin#L8113-L8143">native/xitdb_nif.odin#L8113-L8143</a></summary>
+<summary>NIF <code>collect_postings_into_map</code> — <a href="../../native/xitdb_nif.odin#L8411-L8441">native/xitdb_nif.odin#L8411-L8441</a></summary>
 
 ```odin
 collect_postings_into_map :: proc(
@@ -842,7 +845,7 @@ collect_postings_into_map :: proc(
 </details>
 
 <details>
-<summary>NIF <code>bm25_heap_push</code> — <a href="../../native/xitdb_nif.odin#L7908-L7945">native/xitdb_nif.odin#L7908-L7945</a></summary>
+<summary>NIF <code>bm25_heap_push</code> — <a href="../../native/xitdb_nif.odin#L8203-L8240">native/xitdb_nif.odin#L8203-L8240</a></summary>
 
 ```odin
 bm25_heap_push :: proc(heap: ^[dynamic]BM25_Hit, item: BM25_Hit, k: int) {
@@ -888,7 +891,7 @@ bm25_heap_push :: proc(heap: ^[dynamic]BM25_Hit, item: BM25_Hit, k: int) {
 </details>
 
 <details>
-<summary>NIF <code>read_cursor_nonneg_int</code> — <a href="../../native/xitdb_nif.odin#L7962-L7976">native/xitdb_nif.odin#L7962-L7976</a></summary>
+<summary>NIF <code>read_cursor_nonneg_int</code> — <a href="../../native/xitdb_nif.odin#L8257-L8274">native/xitdb_nif.odin#L8257-L8274</a></summary>
 
 ```odin
 read_cursor_nonneg_int :: proc(cur: xitdb.Read_Cursor) -> (val: i64, ok: bool, err: xitdb.Error) {
@@ -896,6 +899,9 @@ read_cursor_nonneg_int :: proc(cur: xitdb.Read_Cursor) -> (val: i64, ok: bool, e
 	#partial switch slot_ptr.slot.tag {
 	case .Uint:
 		u := xitdb.cursor_read_uint(cur) or_return
+		if u > u64(max(i64)) {
+			return max(i64), true, nil
+		}
 		return i64(u), true, nil
 	case .Int:
 		i := xitdb.cursor_read_int(cur) or_return
@@ -913,7 +919,7 @@ read_cursor_nonneg_int :: proc(cur: xitdb.Read_Cursor) -> (val: i64, ok: bool, e
 ## Reachable `xitdb` Core Procedures
 
 <details>
-<summary><code>xitdb.core_destroy</code> — <a href="../../native/xitdb-odin/xitdb/core.odin#L347-L376">core.odin#L347-L376</a></summary>
+<summary><code>xitdb.core_destroy</code> — <a href="../../native/xitdb-odin/xitdb/core.odin#L351-L380">core.odin#L351-L380</a></summary>
 
 ```odin
 core_destroy :: proc(c: ^Core, close_file := false) -> Error {
@@ -987,7 +993,7 @@ core_memory_init :: proc(allocator := context.allocator, reserve_size: int = DEF
 </details>
 
 <details>
-<summary><code>xitdb.database_init</code> — <a href="../../native/xitdb-odin/xitdb/database.odin#L182-L234">database.odin#L182-L234</a></summary>
+<summary><code>xitdb.database_init</code> — <a href="../../native/xitdb-odin/xitdb/database.odin#L182-L247">database.odin#L182-L247</a></summary>
 
 ```odin
 database_init :: proc(core: ^Core, hasher := Hasher{}) -> (db: Database, err: Error) {
@@ -1013,6 +1019,22 @@ database_init :: proc(core: ^Core, hasher := Hasher{}) -> (db: Database, err: Er
 	core_seek_to(core, 0) or_return
 	length := core_length(core) or_return
 
+	// A database whose first commit never finished holds nothing. If it is no
+	// bigger than a new database, it was interrupted while being created, so
+	// it is created again. Otherwise it is a full copy that was interrupted
+	// (see `database_apply_replicated`), which is left for the next sync to replace.
+	has_commit := false
+	if length > 0 {
+		db.header = database_read_and_validate_header(&db) or_return
+		fsize := database_read_file_size(&db) or_return
+		has_commit = fsize > 0
+		new_size := database_file_size_start(db.header.version) + 8 + ROOT_TRAILER_LENGTH
+		if !has_commit && length <= new_size {
+			core_set_length(core, 0) or_return
+			length = 0
+		}
+	}
+
 	if length == 0 {
 		file_id := h.file_id
 		if file_id == 0 {
@@ -1030,13 +1052,10 @@ database_init :: proc(core: ^Core, hasher := Hasher{}) -> (db: Database, err: Er
 			padding      = 0,
 			magic_number = MAGIC_NUMBER,
 		}
-		header_write(db.header, core) or_return
-		rh_bytes := root_header_to_bytes(Root_Header{file_size = 0, root = Slot{}})
-		core_write_all(core, rh_bytes[:]) or_return
+		database_write_headers(&db) or_return
 		database_commit_root(&db, Slot{}, 0) or_return
 		core_sync(core) or_return
-	} else {
-		db.header = database_read_and_validate_header(&db) or_return
+	} else if has_commit {
 		_ = database_committed_size(&db) or_return
 	}
 
@@ -1048,7 +1067,7 @@ database_init :: proc(core: ^Core, hasher := Hasher{}) -> (db: Database, err: Er
 </details>
 
 <details>
-<summary><code>xitdb.sha1_hasher</code> — <a href="../../native/xitdb-odin/xitdb/types.odin#L826-L835">types.odin#L826-L835</a></summary>
+<summary><code>xitdb.sha1_hasher</code> — <a href="../../native/xitdb-odin/xitdb/types.odin#L828-L837">types.odin#L828-L837</a></summary>
 
 ```odin
 sha1_hasher :: proc(id: u32 = 0, file_id: u64 = 0) -> Hasher {
@@ -1066,7 +1085,7 @@ sha1_hasher :: proc(id: u32 = 0, file_id: u64 = 0) -> Hasher {
 </details>
 
 <details>
-<summary><code>xitdb.database_root_cursor</code> — <a href="../../native/xitdb-odin/xitdb/database.odin#L281-L296">database.odin#L281-L296</a></summary>
+<summary><code>xitdb.database_root_cursor</code> — <a href="../../native/xitdb-odin/xitdb/database.odin#L324-L339">database.odin#L324-L339</a></summary>
 
 ```odin
 database_root_cursor :: proc(db: ^Database) -> Write_Cursor {
@@ -1176,7 +1195,7 @@ sorted_map_iterator_from_string :: proc(m: Read_Sorted_Map, start_key: string) -
 </details>
 
 <details>
-<summary><code>xitdb.cursor_iterator_next</code> — <a href="../../native/xitdb-odin/xitdb/cursor.odin#L1535-L1556">cursor.odin#L1535-L1556</a></summary>
+<summary><code>xitdb.cursor_iterator_next</code> — <a href="../../native/xitdb-odin/xitdb/cursor.odin#L1614-L1635">cursor.odin#L1614-L1635</a></summary>
 
 ```odin
 cursor_iterator_next :: proc(it: ^Cursor_Iterator) -> (res: Maybe(Read_Cursor), err: Error) {

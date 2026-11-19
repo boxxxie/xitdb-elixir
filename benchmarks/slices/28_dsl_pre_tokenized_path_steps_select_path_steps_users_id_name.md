@@ -8,9 +8,9 @@
 
 | Metric | Elixir NIF Wrapper | Raw Odin Baseline | Comparison |
 | :--- | ---: | ---: | ---: |
-| **Median (`ns/op`)** | 1.97 µs (1967.0 ns) | 873.0 ns (873.0 ns) | **`2.25x`** NIF Ratio |
-| **Mean ± σ (CV)** | 1.97 µs ± 14.5 ns (0.7%) | 873.2 ns ± 10.0 ns (1.1%) | Welch `z` = `138.96` |
-| **p95 / Max (`ns/op`)** | 1.99 µs / 1.99 µs | 885.6 ns / 888.0 ns | `5` vs `5` pooled samples |
+| **Median (`ns/op`)** | 2.79 µs (2788.0 ns) | 913.0 ns (913.0 ns) | **`3.05x`** NIF Ratio |
+| **Mean ± σ (CV)** | 2.99 µs ± 678.4 ns (22.7%) | 936.8 ns ± 61.9 ns (6.6%) | Welch `z` = `6.74` |
+| **p95 / Max (`ns/op`)** | 3.80 µs / 3.87 µs | 1.02 µs / 1.05 µs | `5` vs `5` pooled samples |
 
 ## Benchmark Harnesses (Elixir vs. Raw Odin)
 
@@ -28,11 +28,12 @@
        end}
 ```
 
-### Raw Odin Harness ([`bench_client.odin#L1533-L1556`](../bench_client.odin#L1533-L1556))
+### Raw Odin Harness ([`bench_client.odin#L1554-L1583`](../bench_client.odin#L1554-L1583))
 
 ```odin
 	// #28: DSL: Pre-tokenized path_steps select(path_steps(users[id].name))
 	if r28 {
+		acc: u64 = 0
 		for r in 0 ..< (g_warmup + g_runs) {
 			t0 := time.now()
 			for i in 0 ..< 500 {
@@ -46,13 +47,18 @@
 				hist_cur, _ := xitdb.read_array_list_init(rc)
 				mc_maybe, _ := xitdb.array_list_get_cursor(hist_cur, -1)
 				c_maybe, _ := xitdb.read_steps_cursor(mc_maybe.?, steps[:])
-				_, _ = xitdb.cursor_read_string(c_maybe.?, 0, context.temp_allocator)
+				s, _ := xitdb.cursor_read_string(c_maybe.?, 0, context.temp_allocator)
+				acc += u64(len(s))
+				if len(s) > 0 {
+					acc += u64(s[0])
+				}
 			}
 			if r >= g_warmup {
 				samples[r - g_warmup] = f64(time.duration_nanoseconds(time.since(t0))) / 500.0
 			}
 			free_all(context.temp_allocator)
 		}
+		intrinsics.volatile_store(&g_bench_sink, g_bench_sink + acc)
 		record_samples(28, "DSL: Pre-tokenized path_steps select(path_steps(users[id].name))", 500, samples)
 	}
 ```
@@ -60,7 +66,7 @@
 ## Elixir Wrapper & NIF Bridge
 
 <details>
-<summary>Elixir <code>path_steps</code> — <a href="../../lib/xitdb/dsl.ex#L80-L82">lib/xitdb/dsl.ex#L80-L82</a></summary>
+<summary>Elixir <code>path_steps</code> — <a href="../../lib/xitdb/dsl.ex#L86-L88">lib/xitdb/dsl.ex#L86-L88</a></summary>
 
 ```elixir
   defmacro path_steps(expr) do
@@ -84,7 +90,7 @@
 </details>
 
 <details>
-<summary>Elixir <code>select!</code> — <a href="../../lib/xitdb.ex#L688-L703">lib/xitdb.ex#L688-L703</a></summary>
+<summary>Elixir <code>select!</code> — <a href="../../lib/xitdb.ex#L714-L729">lib/xitdb.ex#L714-L729</a></summary>
 
 ```elixir
   def select!(%__MODULE__{db_ref: db_ref}, selector)
@@ -108,7 +114,7 @@
 </details>
 
 <details>
-<summary>Elixir <code>do_select</code> — <a href="../../lib/xitdb.ex#L624-L635">lib/xitdb.ex#L624-L635</a></summary>
+<summary>Elixir <code>do_select</code> — <a href="../../lib/xitdb.ex#L637-L648">lib/xitdb.ex#L637-L648</a></summary>
 
 ```elixir
   defp do_select(db_ref, moment, selector) do
@@ -128,7 +134,7 @@
 </details>
 
 <details>
-<summary>Elixir <code>do_select!</code> — <a href="../../lib/xitdb.ex#L705-L716">lib/xitdb.ex#L705-L716</a></summary>
+<summary>Elixir <code>do_select!</code> — <a href="../../lib/xitdb.ex#L731-L742">lib/xitdb.ex#L731-L742</a></summary>
 
 ```elixir
   defp do_select!(db_ref, moment, selector) do
@@ -148,7 +154,7 @@
 </details>
 
 <details>
-<summary>NIF <code>odin_nif_select</code> — <a href="../../native/xitdb_nif.odin#L5038-L5118">native/xitdb_nif.odin#L5038-L5118</a></summary>
+<summary>NIF <code>odin_nif_select</code> — <a href="../../native/xitdb_nif.odin#L5333-L5413">native/xitdb_nif.odin#L5333-L5413</a></summary>
 
 ```odin
 odin_nif_select :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {
@@ -237,7 +243,7 @@ odin_nif_select :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM)
 </details>
 
 <details>
-<summary>NIF <code>decode_selector_term_buf</code> — <a href="../../native/xitdb_nif.odin#L2223-L2319">native/xitdb_nif.odin#L2223-L2319</a></summary>
+<summary>NIF <code>decode_selector_term_buf</code> — <a href="../../native/xitdb_nif.odin#L2276-L2372">native/xitdb_nif.odin#L2276-L2372</a></summary>
 
 ```odin
 decode_selector_term_buf :: proc(
@@ -342,7 +348,7 @@ decode_selector_term_buf :: proc(
 </details>
 
 <details>
-<summary>NIF <code>decode_steps_term_buf</code> — <a href="../../native/xitdb_nif.odin#L2174-L2203">native/xitdb_nif.odin#L2174-L2203</a></summary>
+<summary>NIF <code>decode_steps_term_buf</code> — <a href="../../native/xitdb_nif.odin#L2227-L2256">native/xitdb_nif.odin#L2227-L2256</a></summary>
 
 ```odin
 decode_steps_term_buf :: proc(
@@ -380,7 +386,7 @@ decode_steps_term_buf :: proc(
 </details>
 
 <details>
-<summary>NIF <code>read_steps_cursor_adaptive</code> — <a href="../../native/xitdb_nif.odin#L3833-L3892">native/xitdb_nif.odin#L3833-L3892</a></summary>
+<summary>NIF <code>read_steps_cursor_adaptive</code> — <a href="../../native/xitdb_nif.odin#L3984-L4043">native/xitdb_nif.odin#L3984-L4043</a></summary>
 
 ```odin
 read_steps_cursor_adaptive :: proc(root: xitdb.Read_Cursor, steps: []xitdb.Path_Step) -> (res: Maybe(xitdb.Read_Cursor), hit_scalar: bool, err: xitdb.Error) {
@@ -448,7 +454,7 @@ read_steps_cursor_adaptive :: proc(root: xitdb.Read_Cursor, steps: []xitdb.Path_
 </details>
 
 <details>
-<summary>NIF <code>slot_to_term</code> — <a href="../../native/xitdb_nif.odin#L354-L429">native/xitdb_nif.odin#L354-L429</a></summary>
+<summary>NIF <code>slot_to_term</code> — <a href="../../native/xitdb_nif.odin#L353-L434">native/xitdb_nif.odin#L353-L434</a></summary>
 
 ```odin
 slot_to_term :: proc(env: ErlNifEnv, db: ^xitdb.Database, slot: xitdb.Slot) -> (res: ERL_NIF_TERM, err: xitdb.Error) {
@@ -487,12 +493,18 @@ slot_to_term :: proc(env: ErlNifEnv, db: ^xitdb.Database, slot: xitdb.Slot) -> (
 			val_size = validate_bytes_slot_bounds(db, slot) or_return
 		}
 		if slot.full {
-			stack_buf: [128]u8 = ---
-			obj, buf_err := xitdb.cursor_read_bytes_buf(cur, stack_buf[:])
-			if buf_err != nil {
-				if buf_err != xitdb.Xitdb_Error.Stream_Too_Long {
+			obj: xitdb.Bytes
+			if slot.tag == .Short_Bytes || val_size <= 128 {
+				stack_buf: [128]u8 = ---
+				buf_obj, buf_err := xitdb.cursor_read_bytes_buf(cur, stack_buf[:])
+				if buf_err == nil {
+					obj = buf_obj
+				} else if buf_err != xitdb.Xitdb_Error.Stream_Too_Long {
 					return ATOM_NIL, buf_err
+				} else {
+					obj = xitdb.cursor_read_bytes_object(cur, 0, context.temp_allocator) or_return
 				}
+			} else {
 				obj = xitdb.cursor_read_bytes_object(cur, 0, context.temp_allocator) or_return
 			}
 			if len(obj.format_tag) == 2 && obj.format_tag[0] == 'b' && obj.format_tag[1] == 'l' {
@@ -532,7 +544,7 @@ slot_to_term :: proc(env: ErlNifEnv, db: ^xitdb.Database, slot: xitdb.Slot) -> (
 </details>
 
 <details>
-<summary>NIF <code>parse_escaped_selector_buf</code> — <a href="../../native/xitdb_nif.odin#L1907-L1942">native/xitdb_nif.odin#L1907-L1942</a></summary>
+<summary>NIF <code>parse_escaped_selector_buf</code> — <a href="../../native/xitdb_nif.odin#L1952-L1987">native/xitdb_nif.odin#L1952-L1987</a></summary>
 
 ```odin
 parse_escaped_selector_buf :: proc(
@@ -576,7 +588,7 @@ parse_escaped_selector_buf :: proc(
 </details>
 
 <details>
-<summary>NIF <code>convert_raw_steps_buf</code> — <a href="../../native/xitdb_nif.odin#L2080-L2126">native/xitdb_nif.odin#L2080-L2126</a></summary>
+<summary>NIF <code>convert_raw_steps_buf</code> — <a href="../../native/xitdb_nif.odin#L2133-L2179">native/xitdb_nif.odin#L2133-L2179</a></summary>
 
 ```odin
 convert_raw_steps_buf :: proc(
@@ -631,7 +643,7 @@ convert_raw_steps_buf :: proc(
 </details>
 
 <details>
-<summary>NIF <code>decode_steps_list_buf</code> — <a href="../../native/xitdb_nif.odin#L2128-L2136">native/xitdb_nif.odin#L2128-L2136</a></summary>
+<summary>NIF <code>decode_steps_list_buf</code> — <a href="../../native/xitdb_nif.odin#L2181-L2189">native/xitdb_nif.odin#L2181-L2189</a></summary>
 
 ```odin
 decode_steps_list_buf :: proc(
@@ -650,7 +662,7 @@ decode_steps_list_buf :: proc(
 ## Reachable `xitdb` Core Procedures
 
 <details>
-<summary><code>xitdb.database_root_cursor</code> — <a href="../../native/xitdb-odin/xitdb/database.odin#L281-L296">database.odin#L281-L296</a></summary>
+<summary><code>xitdb.database_root_cursor</code> — <a href="../../native/xitdb-odin/xitdb/database.odin#L324-L339">database.odin#L324-L339</a></summary>
 
 ```odin
 database_root_cursor :: proc(db: ^Database) -> Write_Cursor {
@@ -702,7 +714,7 @@ array_list_get_cursor :: proc(a: Read_Array_List, index: i64) -> (Maybe(Read_Cur
 </details>
 
 <details>
-<summary><code>xitdb.read_steps_cursor</code> — <a href="../../native/xitdb-odin/xitdb/dsl.odin#L317-L407">dsl.odin#L317-L407</a></summary>
+<summary><code>xitdb.read_steps_cursor</code> — <a href="../../native/xitdb-odin/xitdb/dsl.odin#L467-L557">dsl.odin#L467-L557</a></summary>
 
 ```odin
 read_steps_cursor :: proc(start: Read_Cursor, steps: []Path_Step) -> (res: Maybe(Read_Cursor), err: Error) {

@@ -8,9 +8,9 @@
 
 | Metric | Elixir NIF Wrapper | Raw Odin Baseline | Comparison |
 | :--- | ---: | ---: | ---: |
-| **Median (`ns/op`)** | 25.93 µs (25929.0 ns) | 18.91 µs (18915.0 ns) | **`1.37x`** NIF Ratio |
-| **Mean ± σ (CV)** | 26.63 µs ± 1.72 µs (6.4%) | 18.66 µs ± 586.2 ns (3.1%) | Welch `z` = `9.81` |
-| **p95 / Max (`ns/op`)** | 28.91 µs / 29.32 µs | 19.17 µs / 19.22 µs | `5` vs `5` pooled samples |
+| **Median (`ns/op`)** | 47.54 µs (47536.0 ns) | 28.73 µs (28735.0 ns) | **`1.65x`** NIF Ratio |
+| **Mean ± σ (CV)** | 456.48 µs ± 921.08 µs (201.8%) | 28.88 µs ± 1.41 µs (4.9%) | Welch `z` = `1.04` |
+| **p95 / Max (`ns/op`)** | 1.69 ms / 2.10 ms | 30.67 µs / 30.95 µs | `5` vs `5` pooled samples |
 
 ## Benchmark Harnesses (Elixir vs. Raw Odin)
 
@@ -31,7 +31,7 @@
        end},
 ```
 
-### Raw Odin Harness ([`bench_client.odin#L1276-L1296`](../bench_client.odin#L1276-L1296))
+### Raw Odin Harness ([`bench_client.odin#L1283-L1303`](../bench_client.odin#L1283-L1303))
 
 ```odin
 	// #20: compact/1 100-moment database deduplication
@@ -60,7 +60,7 @@
 ## Elixir Wrapper & NIF Bridge
 
 <details>
-<summary>Elixir <code>compact</code> — <a href="../../lib/xitdb.ex#L842-L855">lib/xitdb.ex#L842-L855</a></summary>
+<summary>Elixir <code>compact</code> — <a href="../../lib/xitdb.ex#L883-L896">lib/xitdb.ex#L883-L896</a></summary>
 
 ```elixir
   def compact(%__MODULE__{db_ref: db_ref, hash: hash}, opts \\ []) do
@@ -82,7 +82,7 @@
 </details>
 
 <details>
-<summary>NIF <code>odin_nif_compact</code> — <a href="../../native/xitdb_nif.odin#L7801-L7866">native/xitdb_nif.odin#L7801-L7866</a></summary>
+<summary>NIF <code>odin_nif_compact</code> — <a href="../../native/xitdb_nif.odin#L8096-L8161">native/xitdb_nif.odin#L8096-L8161</a></summary>
 
 ```odin
 odin_nif_compact :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {
@@ -194,7 +194,7 @@ core_memory_init :: proc(allocator := context.allocator, reserve_size: int = DEF
 </details>
 
 <details>
-<summary><code>xitdb.database_compact</code> — <a href="../../native/xitdb-odin/xitdb/compact_replicate.odin#L720-L797">compact_replicate.odin#L720-L797</a></summary>
+<summary><code>xitdb.database_compact</code> — <a href="../../native/xitdb-odin/xitdb/compact_replicate.odin#L741-L818">compact_replicate.odin#L741-L818</a></summary>
 
 ```odin
 database_compact :: proc(db: ^Database, target_core: ^Core, offset_map: ^Offset_Map = nil) -> (target: Database, err: Error) {
@@ -280,7 +280,7 @@ database_compact :: proc(db: ^Database, target_core: ^Core, offset_map: ^Offset_
 </details>
 
 <details>
-<summary><code>xitdb.core_length</code> — <a href="../../native/xitdb-odin/xitdb/core.odin#L407-L429">core.odin#L407-L429</a></summary>
+<summary><code>xitdb.core_length</code> — <a href="../../native/xitdb-odin/xitdb/core.odin#L411-L433">core.odin#L411-L433</a></summary>
 
 ```odin
 core_length :: proc(c: ^Core) -> (length: i64, err: Error) {
@@ -311,7 +311,7 @@ core_length :: proc(c: ^Core) -> (length: i64, err: Error) {
 </details>
 
 <details>
-<summary><code>xitdb.core_destroy</code> — <a href="../../native/xitdb-odin/xitdb/core.odin#L347-L376">core.odin#L347-L376</a></summary>
+<summary><code>xitdb.core_destroy</code> — <a href="../../native/xitdb-odin/xitdb/core.odin#L351-L380">core.odin#L351-L380</a></summary>
 
 ```odin
 core_destroy :: proc(c: ^Core, close_file := false) -> Error {
@@ -361,7 +361,7 @@ core_buffered_file_open :: proc(path: string, buffer_size: i64 = DEFAULT_BUFFER_
 </details>
 
 <details>
-<summary><code>xitdb.core_sync</code> — <a href="../../native/xitdb-odin/xitdb/core.odin#L481-L500">core.odin#L481-L500</a></summary>
+<summary><code>xitdb.core_sync</code> — <a href="../../native/xitdb-odin/xitdb/core.odin#L485-L504">core.odin#L485-L504</a></summary>
 
 ```odin
 core_sync :: proc(c: ^Core) -> Error {
@@ -438,7 +438,7 @@ offset_map_reset :: proc(om: ^Offset_Map) -> Error {
 </details>
 
 <details>
-<summary><code>xitdb.database_init</code> — <a href="../../native/xitdb-odin/xitdb/database.odin#L182-L234">database.odin#L182-L234</a></summary>
+<summary><code>xitdb.database_init</code> — <a href="../../native/xitdb-odin/xitdb/database.odin#L182-L247">database.odin#L182-L247</a></summary>
 
 ```odin
 database_init :: proc(core: ^Core, hasher := Hasher{}) -> (db: Database, err: Error) {
@@ -464,6 +464,22 @@ database_init :: proc(core: ^Core, hasher := Hasher{}) -> (db: Database, err: Er
 	core_seek_to(core, 0) or_return
 	length := core_length(core) or_return
 
+	// A database whose first commit never finished holds nothing. If it is no
+	// bigger than a new database, it was interrupted while being created, so
+	// it is created again. Otherwise it is a full copy that was interrupted
+	// (see `database_apply_replicated`), which is left for the next sync to replace.
+	has_commit := false
+	if length > 0 {
+		db.header = database_read_and_validate_header(&db) or_return
+		fsize := database_read_file_size(&db) or_return
+		has_commit = fsize > 0
+		new_size := database_file_size_start(db.header.version) + 8 + ROOT_TRAILER_LENGTH
+		if !has_commit && length <= new_size {
+			core_set_length(core, 0) or_return
+			length = 0
+		}
+	}
+
 	if length == 0 {
 		file_id := h.file_id
 		if file_id == 0 {
@@ -481,13 +497,10 @@ database_init :: proc(core: ^Core, hasher := Hasher{}) -> (db: Database, err: Er
 			padding      = 0,
 			magic_number = MAGIC_NUMBER,
 		}
-		header_write(db.header, core) or_return
-		rh_bytes := root_header_to_bytes(Root_Header{file_size = 0, root = Slot{}})
-		core_write_all(core, rh_bytes[:]) or_return
+		database_write_headers(&db) or_return
 		database_commit_root(&db, Slot{}, 0) or_return
 		core_sync(core) or_return
-	} else {
-		db.header = database_read_and_validate_header(&db) or_return
+	} else if has_commit {
 		_ = database_committed_size(&db) or_return
 	}
 
@@ -499,7 +512,7 @@ database_init :: proc(core: ^Core, hasher := Hasher{}) -> (db: Database, err: Er
 </details>
 
 <details>
-<summary><code>xitdb.database_read_root_slot</code> — <a href="../../native/xitdb-odin/xitdb/database.odin#L374-L377">database.odin#L374-L377</a></summary>
+<summary><code>xitdb.database_read_root_slot</code> — <a href="../../native/xitdb-odin/xitdb/database.odin#L424-L427">database.odin#L424-L427</a></summary>
 
 ```odin
 database_read_root_slot :: proc(db: ^Database) -> (res: Slot, err: Error) {
@@ -511,7 +524,7 @@ database_read_root_slot :: proc(db: ^Database) -> (res: Slot, err: Error) {
 </details>
 
 <details>
-<summary><code>xitdb.slot_empty</code> — <a href="../../native/xitdb-odin/xitdb/types.odin#L856-L858">types.odin#L856-L858</a></summary>
+<summary><code>xitdb.slot_empty</code> — <a href="../../native/xitdb-odin/xitdb/types.odin#L858-L860">types.odin#L858-L860</a></summary>
 
 ```odin
 slot_empty :: proc(s: Slot) -> bool {
