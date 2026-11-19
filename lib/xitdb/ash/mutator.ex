@@ -326,7 +326,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
                  :ok <- verify_create_filter(record, resource, cs),
                  {:ok, next_seen_identities} <-
                    track_batch_identities(resource, record, tenant, seen_identities),
-                 {:ok, raw_cursor_map} <- Codec.to_cursor_map(resource, record),
+                 {:ok, raw_cursor_map} <-
+                   resource |> Codec.to_cursor_map(record) |> normalize_plan_error(),
                  {:ok, val_cursor_map, item_blob_ops, next_comp_batch} <-
                    Indexer.compress_cursor_map(
                      cursor_root,

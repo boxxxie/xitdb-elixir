@@ -965,78 +965,266 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       if Info.compression_configs(resource) == [] do
         :all
       else
-        has_module_calc? =
-          Enum.any?(query.calculations, fn {calc, expr} ->
-            is_nil(expr) and calc.module != Ash.Resource.Calculation.Expression and
-              not function_exported?(calc.module, :expression, 2)
-          end)
+        resolve_hydration_attributes(query, select, resource, tenant_attr)
+      end
+    end
 
-        if has_module_calc? do
+    defp resolve_hydration_attributes(query, select, resource, tenant_attr) do
+      pk_fields = Ash.Resource.Info.primary_key(resource)
+
+      always_selected =
+        resource
+        |> Ash.Resource.Info.attributes()
+        |> Enum.filter(&Map.get(&1, :always_select?, false))
+        |> Enum.map(& &1.name)
+
+      rel_source_attrs =
+        resource
+        |> Ash.Resource.Info.relationships()
+        |> Enum.map(& &1.source_attribute)
+        |> Enum.reject(&is_nil/1)
+
+      tenant_attrs = if is_nil(tenant_attr), do: [], else: [tenant_attr]
+
+      base_set =
+        MapSet.new(select ++ pk_fields ++ always_selected ++ rel_source_attrs ++ tenant_attrs)
+        |> collect_expr_ref_names(query.filter)
+        |> collect_sort_or_distinct_names(query.sort)
+        |> collect_sort_or_distinct_names(query.distinct)
+        |> collect_sort_or_distinct_names(query.distinct_sort)
+
+      {extra_calcs, has_extra_agg?} =
+        collect_extra_calcs_and_aggs(query.filter, [
+          query.sort,
+          query.distinct,
+          query.distinct_sort
+        ])
+
+      if has_extra_agg? do
+        :all
+      else
+        expand_hydration_deps(
+          query.calculations ++ extra_calcs,
+          base_set,
+          MapSet.new(),
+          MapSet.new(),
+          query,
+          resource
+        )
+      end
+    end
+
+    defp expand_hydration_deps([], acc_set, visited_calcs, checked_atoms, query, resource) do
+      unchecked_atoms =
+        acc_set
+        |> Enum.filter(fn item -> is_atom(item) and not MapSet.member?(checked_atoms, item) end)
+
+      if unchecked_atoms == [] do
+        acc_set
+      else
+        next_checked = Enum.reduce(unchecked_atoms, checked_atoms, &MapSet.put(&2, &1))
+
+        has_agg? =
+          Enum.any?(unchecked_atoms, &(Ash.Resource.Info.aggregate(resource, &1) != nil))
+
+        if has_agg? do
           :all
         else
-          pk_fields = Ash.Resource.Info.primary_key(resource)
+          atom_calcs =
+            Enum.flat_map(unchecked_atoms, fn atom ->
+              case Ash.Resource.Info.calculation(resource, atom) do
+                nil ->
+                  []
 
-          always_selected =
-            resource
-            |> Ash.Resource.Info.attributes()
-            |> Enum.filter(&Map.get(&1, :always_select?, false))
-            |> Enum.map(& &1.name)
-
-          rel_source_attrs =
-            resource
-            |> Ash.Resource.Info.relationships()
-            |> Enum.map(& &1.source_attribute)
-            |> Enum.reject(&is_nil/1)
-
-          tenant_attrs = if is_nil(tenant_attr), do: [], else: [tenant_attr]
-
-          base_set =
-            MapSet.new(select ++ pk_fields ++ always_selected ++ rel_source_attrs ++ tenant_attrs)
-            |> collect_expr_ref_names(query.filter)
-            |> collect_sort_or_distinct_names(query.sort)
-            |> collect_sort_or_distinct_names(query.distinct)
-            |> collect_sort_or_distinct_names(query.distinct_sort)
-
-          seed_set =
-            Enum.reduce(query.calculations, base_set, fn {calc, _expr}, acc ->
-              acc
-              |> add_calc_key(calc.name)
-              |> add_calc_key(calc.load)
-              |> collect_calc_opts_expr_refs(calc.opts)
-            end)
-
-          resolved_set =
-            Enum.reduce_while(query.calculations, seed_set, fn {calc, expr}, acc ->
-              eff_expr =
-                cond do
-                  expr != nil ->
-                    expr
-
-                  function_exported?(calc.module, :expression, 2) ->
-                    calc.module.expression(calc.opts, calc.context)
-
-                  true ->
-                    nil
-                end
-
-              cond do
-                not is_nil(eff_expr) ->
-                  {:cont, collect_expr_ref_names(acc, eff_expr)}
-
-                calc.module == Ash.Resource.Calculation.Expression ->
-                  {:cont, acc}
-
-                true ->
-                  {:halt, :all}
+                res_calc ->
+                  [synthetic_query_calc(res_calc, query, resource)]
               end
             end)
 
-          case resolved_set do
-            :all -> :all
-            %MapSet{} = final_seed -> expand_calc_dependencies(final_seed, query.calculations)
+          if atom_calcs == [] do
+            acc_set
+          else
+            expand_hydration_deps(
+              atom_calcs,
+              acc_set,
+              visited_calcs,
+              next_checked,
+              query,
+              resource
+            )
           end
         end
       end
+    end
+
+    defp expand_hydration_deps(
+           [entry | rest],
+           acc_set,
+           visited_calcs,
+           checked_atoms,
+           query,
+           resource
+         ) do
+      {calc, expr} =
+        case entry do
+          {%Calculation{} = c, e} -> {c, e}
+          %Calculation{} = c -> {c, nil}
+        end
+
+      dedup_key = {calc.name, calc.load, calc.module, calc.opts, calc.context, not is_nil(expr)}
+
+      if MapSet.member?(visited_calcs, dedup_key) do
+        expand_hydration_deps(rest, acc_set, visited_calcs, checked_atoms, query, resource)
+      else
+        next_visited = MapSet.put(visited_calcs, dedup_key)
+
+        next_acc =
+          acc_set
+          |> add_calc_key(calc.name)
+          |> add_calc_keys(List.wrap(calc.load))
+          |> collect_calc_opts_expr_refs(calc.opts)
+
+        eff_expr = resolve_calc_expr(calc, expr)
+
+        cond do
+          is_nil(eff_expr) and calc.module != Ash.Resource.Calculation.Expression ->
+            :all
+
+          is_nil(eff_expr) ->
+            {opt_calcs, opt_agg?} =
+              extract_expr_calcs_and_aggs(
+                if(is_list(calc.opts), do: Keyword.get(calc.opts, :expr), else: nil)
+              )
+
+            if opt_agg? do
+              :all
+            else
+              expand_hydration_deps(
+                opt_calcs ++ rest,
+                next_acc,
+                next_visited,
+                checked_atoms,
+                query,
+                resource
+              )
+            end
+
+          true ->
+            {nested_calcs, nested_agg?} = extract_expr_calcs_and_aggs(eff_expr)
+
+            if nested_agg? do
+              :all
+            else
+              next_acc = collect_expr_ref_names(next_acc, eff_expr)
+
+              expand_hydration_deps(
+                nested_calcs ++ rest,
+                next_acc,
+                next_visited,
+                checked_atoms,
+                query,
+                resource
+              )
+            end
+        end
+      end
+    end
+
+    defp resolve_calc_expr(%Calculation{} = calc, expr) do
+      cond do
+        expr != nil ->
+          expr
+
+        calc.module == Ash.Resource.Calculation.Expression ->
+          if is_list(calc.opts), do: Keyword.get(calc.opts, :expr), else: nil
+
+        function_exported?(calc.module, :expression, 2) ->
+          calc.module.expression(calc.opts, calc.context)
+
+        true ->
+          nil
+      end
+    end
+
+    defp synthetic_query_calc(%Ash.Resource.Calculation{} = res_calc, query, resource) do
+      {mod, opts} =
+        case res_calc.calculation do
+          {m, o} when is_atom(m) and is_list(o) -> {m, o}
+          m when is_atom(m) -> {m, []}
+        end
+
+      calc = %Calculation{
+        name: res_calc.name,
+        load: res_calc.load,
+        module: mod,
+        opts: opts,
+        type: res_calc.type,
+        constraints: res_calc.constraints,
+        context: %Ash.Resource.Calculation.Context{
+          resource: resource,
+          domain: query.domain,
+          tenant: query.tenant,
+          type: res_calc.type,
+          constraints: res_calc.constraints,
+          arguments: %{},
+          source_context: query.context || %{}
+        }
+      }
+
+      {calc, nil}
+    end
+
+    defp collect_extra_calcs_and_aggs(filter, sort_lists) do
+      {filter_calcs, filter_agg?} = extract_expr_calcs_and_aggs(filter)
+
+      Enum.reduce(sort_lists, {filter_calcs, filter_agg?}, fn
+        items, {calcs_acc, agg_acc?} when is_list(items) ->
+          Enum.reduce(items, {calcs_acc, agg_acc?}, fn item, {c_acc, a_acc?} ->
+            key =
+              case item do
+                {k, _dir} -> k
+                k -> k
+              end
+
+            case key do
+              %Calculation{} = calc -> {[{calc, nil} | c_acc], a_acc?}
+              %Aggregate{} -> {c_acc, true}
+              _ -> {c_acc, a_acc?}
+            end
+          end)
+
+        _other, acc ->
+          acc
+      end)
+    end
+
+    defp extract_expr_calcs_and_aggs(nil), do: {[], false}
+
+    defp extract_expr_calcs_and_aggs(%Ash.Filter{expression: expr}),
+      do: extract_expr_calcs_and_aggs(expr)
+
+    defp extract_expr_calcs_and_aggs(expr) do
+      expr
+      |> Ash.Filter.list_refs()
+      |> Enum.reduce({[], false}, fn
+        %Ref{attribute: %Calculation{} = calc}, {calcs, agg?} ->
+          {opt_calcs, opt_agg?} =
+            extract_expr_calcs_and_aggs(
+              if(is_list(calc.opts), do: Keyword.get(calc.opts, :expr), else: nil)
+            )
+
+          {[{calc, nil} | opt_calcs ++ calcs], agg? or opt_agg?}
+
+        %Ref{attribute: %Aggregate{}}, {calcs, _agg?} ->
+          {calcs, true}
+
+        _, acc ->
+          acc
+      end)
+    end
+
+    defp add_calc_keys(set, keys) do
+      Enum.reduce(keys, set, &add_calc_key(&2, &1))
     end
 
     # ==========================================================================

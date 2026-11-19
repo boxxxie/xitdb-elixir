@@ -173,11 +173,71 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       end
     end
 
+    defmodule ExprBodyLenCalc do
+      use Ash.Resource.Calculation
+
+      @impl true
+      def expression(_opts, _context) do
+        expr(string_length(body))
+      end
+    end
+
+    defmodule ModBodyTagCalc do
+      use Ash.Resource.Calculation
+
+      @impl true
+      def calculate(records, _opts, _context) do
+        Enum.map(records, fn record ->
+          "len:" <> Integer.to_string(byte_size(record.body))
+        end)
+      end
+    end
+
+    defmodule CalcSelectEmail do
+      use Ash.Resource,
+        domain: Xitdb.Ash.CompressionTest.MailDomain,
+        data_layer: Xitdb.Ash.DataLayer
+
+      xitdb do
+        store CompMemStore
+        collection :calc_select_emails
+
+        compress([:body, :secret_body],
+          mode: :row_group,
+          row_group_size: 64,
+          codec: :zstd
+        )
+      end
+
+      actions do
+        defaults([:read, :destroy])
+
+        create :create do
+          primary?(true)
+          accept([:title, :seq_no, :body, :secret_body])
+        end
+      end
+
+      attributes do
+        integer_primary_key(:id)
+        attribute(:title, :string, allow_nil?: false, public?: true)
+        attribute(:seq_no, :integer, public?: true)
+        attribute(:body, :string, public?: true)
+        attribute(:secret_body, :string, public?: true)
+      end
+
+      calculations do
+        calculate(:body_len_expr, :integer, ExprBodyLenCalc, public?: true)
+        calculate(:body_tag_mod, :string, ModBodyTagCalc, public?: true)
+      end
+    end
+
     defmodule MailDomain do
       use Ash.Domain, validate_config_inclusion?: false
 
       resources do
         resource(EmailActivity)
+        resource(CalcSelectEmail)
       end
     end
 
@@ -360,7 +420,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         assert rec_77.attachment_blob == shared_attachment
 
         # Selective read omitting compressed columns performs ZERO page reads & decompressions
-        Columnar.clear_cache()
+        Columnar.clear_cache(CompMemStore.root())
         Columnar.reset_stats()
 
         projected =
@@ -383,7 +443,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         assert %{page_reads: 0, page_cache_hits: 0, page_decompressions: 0} = Columnar.stats()
 
         # BM25 Search matches keyword tokenized BEFORE body compression
-        Columnar.clear_cache()
+        Columnar.clear_cache(CompMemStore.root())
         Columnar.reset_stats()
 
         hits = Search.ids(EmailActivity, "xenolith_alpha_marker")
@@ -478,6 +538,104 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         raw_bytes = File.stat!(raw_path).size
 
         assert comp_bytes * 4 < raw_bytes
+      end
+
+      test "bulk_create falls back when dictionary is unseeded, normalizes columnar range errors, and filter/sort calculations hydrate compressed attributes" do
+        # Unseeded dictionary falls back cleanly on Ash.bulk_create! (matching single-row create)
+        unseeded_inputs = [
+          %{
+            title: "Unseeded #1",
+            header_properties: "Content-Type: text/plain",
+            body: sample_body(1, "unseeded_marker"),
+            html_edit_body: sample_edit_body(1),
+            attachment_blob: "small"
+          },
+          %{
+            title: "Unseeded #2",
+            header_properties: "Content-Type: text/plain",
+            body: sample_body(2, "other"),
+            html_edit_body: sample_edit_body(2),
+            attachment_blob: "small"
+          }
+        ]
+
+        %Ash.BulkResult{status: :success, records: created_unseeded} =
+          Ash.bulk_create!(unseeded_inputs, EmailActivity, :create, return_records?: true)
+
+        assert length(created_unseeded) == 2
+
+        assert Ash.get!(EmailActivity, hd(created_unseeded).id).body ==
+                 sample_body(1, "unseeded_marker")
+
+        # Out-of-range integer on columnar resource normalizes into InvalidAttribute (not raw tuple)
+        bad_bulk =
+          Ash.bulk_create(
+            [
+              %{
+                title: "Bad seq",
+                seq_no: Integer.pow(2, 65),
+                body: String.duplicate("Bulk range body ", 12),
+                secret_body: String.duplicate("Bulk secret body ", 12)
+              }
+            ],
+            CalcSelectEmail,
+            :create,
+            return_errors?: true
+          )
+
+        assert %Ash.BulkResult{status: :error, errors: [err]} = bad_bulk
+
+        assert %Ash.Error.Invalid{errors: [%Ash.Error.Changes.InvalidAttribute{field: :seq_no}]} =
+                 err
+
+        # Seed CalcSelectEmail rows with distinct body lengths and compress both :body and :secret_body
+        short_body = String.duplicate("S", 140)
+        mid_body = String.duplicate("M", 220)
+        long_body = String.duplicate("L", 340)
+        secret_pad = String.duplicate("Secret annex block ", 15)
+
+        %Ash.BulkResult{status: :success} =
+          Ash.bulk_create!(
+            [
+              %{title: "Mid", body: mid_body, secret_body: secret_pad},
+              %{title: "Short", body: short_body, secret_body: secret_pad},
+              %{title: "Long", body: long_body, secret_body: secret_pad}
+            ],
+            CalcSelectEmail,
+            :create
+          )
+
+        # expression/2 calculation in filter & sort with select([:id, :title]) hydrates :body (1 page read) and skips :secret_body
+        Columnar.clear_cache(CompMemStore.root())
+        Columnar.reset_stats()
+
+        expr_filtered =
+          CalcSelectEmail
+          |> Ash.Query.filter(body_len_expr >= 200)
+          |> Ash.Query.sort(body_len_expr: :desc)
+          |> Ash.Query.select([:id, :title])
+          |> Ash.read!()
+
+        assert Enum.map(expr_filtered, & &1.title) == ["Long", "Mid"]
+        assert Enum.all?(expr_filtered, &match?(%Ash.NotLoaded{field: :body}, &1.body))
+
+        assert Enum.all?(
+                 expr_filtered,
+                 &match?(%Ash.NotLoaded{field: :secret_body}, &1.secret_body)
+               )
+
+        assert %{page_reads: 1, page_decompressions: 1} = Columnar.stats()
+
+        # calculate/3-only module calculation in filter with select([:id, :title]) hydrates :body cleanly
+        mod_filtered =
+          CalcSelectEmail
+          |> Ash.Query.filter(body_tag_mod in ["len:140", "len:340"])
+          |> Ash.Query.sort(:id)
+          |> Ash.Query.select([:id, :title])
+          |> Ash.read!()
+
+        assert Enum.map(mod_filtered, & &1.title) == ["Short", "Long"]
+        assert Enum.all?(mod_filtered, &match?(%Ash.NotLoaded{field: :body}, &1.body))
       end
     end
   end
