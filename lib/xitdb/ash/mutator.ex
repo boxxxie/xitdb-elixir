@@ -184,11 +184,20 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     defp create_in_snapshot({db, moment}, resource, %Ash.Changeset{} = changeset) do
       cursor_root = Xitdb.as_of(db, moment)
       tenant = changeset.tenant
+      allow_existing? = allow_existing_cursor?(changeset)
 
       with {:ok, after_atomics} <- apply_create_record(resource, changeset),
            {:ok, record_with_pk, seq_ops, _seq_map} <-
              Sequences.plan_pk(cursor_root, resource, after_atomics, tenant, %{}),
-           :ok <- verify_pk_unused(cursor_root, resource, record_with_pk, tenant, MapSet.new()),
+           :ok <-
+             verify_pk_unused(
+               cursor_root,
+               resource,
+               record_with_pk,
+               tenant,
+               MapSet.new(),
+               allow_existing?
+             ),
            record <- finalize_loaded_record(resource, record_with_pk, tenant),
            :ok <- verify_atomic_validations(record, record, resource, changeset),
            :ok <- verify_create_filter(record, resource, changeset),
@@ -235,7 +244,15 @@ if Code.ensure_loaded?(Ash.DataLayer) do
             with {:ok, after_atomics} <- apply_create_record(resource, cs),
                  {:ok, record_with_pk, seq_ops, next_seq_state} <-
                    Sequences.plan_pk(cursor_root, resource, after_atomics, tenant, seq_state),
-                 :ok <- verify_pk_unused(cursor_root, resource, record_with_pk, tenant, seen_pks),
+                 :ok <-
+                   verify_pk_unused(
+                     cursor_root,
+                     resource,
+                     record_with_pk,
+                     tenant,
+                     seen_pks,
+                     allow_existing_cursor?(cs)
+                   ),
                  record <- finalize_loaded_record(resource, record_with_pk, tenant),
                  :ok <- verify_atomic_validations(record, record, resource, cs),
                  :ok <- verify_create_filter(record, resource, cs),
@@ -1551,7 +1568,21 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
     # -- Duplicate-PK, Intra-Batch Identity & Upsert Target Lookup --
 
-    defp verify_pk_unused(cursor_root, resource, record, tenant, seen_pks) do
+    defp allow_existing_cursor?(%Ash.Changeset{context: ctx}) when is_map(ctx) do
+      Map.get(ctx, :mdm_materializer, false) == true or
+        match?(%{allow_existing_cursor?: true}, Map.get(ctx, :xitdb))
+    end
+
+    defp allow_existing_cursor?(_changeset), do: false
+
+    defp verify_pk_unused(
+           cursor_root,
+           resource,
+           record,
+           tenant,
+           seen_pks,
+           allow_existing? \\ false
+         ) do
       [pk_name | _] = Ash.Resource.Info.primary_key(resource)
       pk_val = Map.get(record, pk_name)
 
@@ -1562,17 +1593,23 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         doc_id = Codec.encode_pk_doc_id(pk_attr, pk_val)
         scoped_col = Codec.scoped_collection(resource, tenant)
 
-        if MapSet.member?(seen_pks, {scoped_col, doc_id}) do
-          {:error, InvalidChanges.exception(fields: [pk_name], message: "has already been taken")}
-        else
-          case Indexer.fetch_cursor(cursor_root, resource, pk_val, tenant) do
-            :none ->
-              :ok
+        cond do
+          MapSet.member?(seen_pks, {scoped_col, doc_id}) ->
+            {:error,
+             InvalidChanges.exception(fields: [pk_name], message: "has already been taken")}
 
-            {:ok, _existing} ->
-              {:error,
-               InvalidChanges.exception(fields: [pk_name], message: "has already been taken")}
-          end
+          allow_existing? ->
+            :ok
+
+          true ->
+            case Indexer.fetch_cursor(cursor_root, resource, pk_val, tenant) do
+              :none ->
+                :ok
+
+              {:ok, _existing} ->
+                {:error,
+                 InvalidChanges.exception(fields: [pk_name], message: "has already been taken")}
+            end
         end
       end
     end
@@ -2147,6 +2184,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         |> Map.put("source_system", source_system)
         |> Map.put("action_name", action_name)
         |> Map.merge(explicit_meta)
+        |> Map.put_new("actor_id", "system")
 
       [doc: doc, instant: instant, meta: meta]
     end

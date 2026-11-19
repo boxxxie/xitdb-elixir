@@ -185,18 +185,21 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     def put_record({%Xitdb{} = db, moment}, resource, old_record, %_{} = new_record, tenant)
         when is_atom(resource) and is_integer(moment) do
       cursor_root = Xitdb.as_of(db, moment)
+      tx_opts = reindex_tx_opts("put_record", resource, base_moment: moment)
 
       with {:ok, ops} <- plan_put_ops(cursor_root, resource, old_record, new_record, tenant),
            {:ok, next_db, next_moment} <-
-             Xitdb.transact_ops_with_moment(db, ops, base_moment: moment) do
+             Xitdb.transact_ops_with_moment(db, ops, tx_opts) do
         {:ok, {next_db, next_moment}}
       end
     end
 
     def put_record(%Xitdb{} = db, resource, old_record, %_{} = new_record, tenant)
         when is_atom(resource) do
+      tx_opts = reindex_tx_opts("put_record", resource)
+
       with {:ok, ops} <- plan_put_ops(db, resource, old_record, new_record, tenant),
-           {:ok, next_db} <- Xitdb.transact_ops(db, ops) do
+           {:ok, next_db} <- Xitdb.transact_ops(db, ops, tx_opts) do
         {:ok, next_db}
       end
     end
@@ -217,14 +220,38 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         when is_atom(resource) and is_integer(moment) do
       cursor_root = Xitdb.as_of(db, moment)
       {:ok, ops} = plan_delete_ops(cursor_root, resource, record, tenant)
-      {:ok, next_db, next_moment} = Xitdb.transact_ops_with_moment(db, ops, base_moment: moment)
+      tx_opts = reindex_tx_opts("delete_record", resource, base_moment: moment)
+      {:ok, next_db, next_moment} = Xitdb.transact_ops_with_moment(db, ops, tx_opts)
       {:ok, {next_db, next_moment}}
     end
 
     def delete_record(%Xitdb{} = db, resource, %_{} = record, tenant) when is_atom(resource) do
       {:ok, ops} = plan_delete_ops(db, resource, record, tenant)
-      {:ok, next_db} = Xitdb.transact_ops(db, ops)
+      tx_opts = reindex_tx_opts("delete_record", resource)
+      {:ok, next_db} = Xitdb.transact_ops(db, ops, tx_opts)
       {:ok, next_db}
+    end
+
+    defp reindex_tx_opts(op_name, resource, extra \\ []) do
+      ctx = Xitdb.current_tx_context()
+
+      doc =
+        case ctx && ctx.doc do
+          d when is_binary(d) and d != "" -> d
+          _ -> "#{op_name} #{resource |> Module.split() |> List.last()}"
+        end
+
+      instant = (ctx && ctx.instant) || System.os_time(:millisecond)
+
+      meta =
+        %{
+          "source_system" => "xitdb_indexer",
+          "action_name" => "reindex",
+          "actor_id" => "system"
+        }
+        |> Map.merge((ctx && ctx.meta) || %{})
+
+      Keyword.merge([doc: doc, instant: instant, meta: meta], extra)
     end
 
     # -- Point, Identity & B+Tree Read Operations --

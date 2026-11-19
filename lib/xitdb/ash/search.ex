@@ -976,11 +976,16 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         end)
 
       ops = meta_ops ++ doc_ops ++ term_ops
+      base_opts = search_reindex_tx_opts(collection)
 
       case db do
         {%Xitdb{} = raw_db, moment} when is_integer(moment) ->
           {:ok, new_db, next_moment} =
-            Xitdb.transact_ops_with_moment(raw_db, ops, base_moment: moment)
+            Xitdb.transact_ops_with_moment(
+              raw_db,
+              ops,
+              Keyword.put(base_opts, :base_moment, moment)
+            )
 
           {new_db, next_moment}
 
@@ -989,9 +994,9 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
           opts =
             if is_integer(moment) and moment >= 0 do
-              [base_moment: moment]
+              Keyword.put(base_opts, :base_moment, moment)
             else
-              []
+              base_opts
             end
 
           {:ok, new_db, next_moment} = Xitdb.transact_ops_with_moment(raw_db, ops, opts)
@@ -1001,9 +1006,31 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           stage_search_ops(cursor, ops)
 
         %Xitdb{} = raw_db ->
-          {:ok, new_db} = Xitdb.transact_ops(raw_db, ops)
+          {:ok, new_db} = Xitdb.transact_ops(raw_db, ops, base_opts)
           new_db
       end
+    end
+
+    defp search_reindex_tx_opts(collection) do
+      ctx = Xitdb.current_tx_context()
+
+      doc =
+        case ctx && ctx.doc do
+          d when is_binary(d) and d != "" -> d
+          _ -> "reindex search #{collection}"
+        end
+
+      instant = (ctx && ctx.instant) || System.os_time(:millisecond)
+
+      meta =
+        %{
+          "source_system" => "xitdb_indexer",
+          "action_name" => "reindex",
+          "actor_id" => "system"
+        }
+        |> Map.merge((ctx && ctx.meta) || %{})
+
+      [doc: doc, instant: instant, meta: meta]
     end
 
     @doc false

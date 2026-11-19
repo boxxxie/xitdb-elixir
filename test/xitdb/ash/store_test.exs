@@ -504,5 +504,170 @@ if Code.ensure_loaded?(Ash.DataLayer) do
                }
              ] = Store.reverse_fks(store, NestedParentOrg)
     end
+
+    test "supports explicit :lease_timeout override and records self-documenting __tx metadata on seed and rollbacks" do
+      # Store.ensure_seeded! stamps moment 0 with source/action/actor/instant
+      {short_store, _short_pid} = start_ephemeral_store(lease_timeout: 25)
+      seed_meta = Xitdb.tx_meta!(Store.current_db(short_store), 0)
+      assert seed_meta["doc"] == "initialize store metadata"
+      assert is_integer(seed_meta["tx_instant"]) and seed_meta["tx_instant"] > 0
+      assert seed_meta["source_system"] == "xitdb_store"
+      assert seed_meta["action_name"] == "init_store"
+      assert seed_meta["actor_id"] == "system"
+
+      # Baseline: opts[:timeout] does NOT extend state.lease_timeout when :lease_timeout is omitted
+      assert {:error, %LeaseError{store: ^short_store, reason: :lease_expired}} =
+               Store.transact(
+                 short_store,
+                 fn ->
+                   Process.sleep(60)
+                   :late
+                 end,
+                 timeout: 500
+               )
+
+      # Explicit :lease_timeout overrides the store default for heavy transactions
+      assert {:ok, :extended_ok} =
+               Store.transact(
+                 short_store,
+                 fn ->
+                   Process.sleep(60)
+                   :extended_ok
+                 end,
+                 lease_timeout: 500
+               )
+
+      # Rollbacks via Store.rollback/2, :lease_expired, and :DOWN stamp full rollback attribution
+      {rb_store, _rb_pid} = start_ephemeral_store(lease_timeout: 25)
+
+      assert {:ok, :seeded} =
+               Store.mutate(rb_store, fn {db, moment} ->
+                 {:ok, db2} =
+                   Xitdb.transact_ops(
+                     db,
+                     [{:init_col, "items", "hash_map"}, {:put, "items[\"k\"]", "v0"}],
+                     base_moment: moment,
+                     doc: "seed item",
+                     instant: 1_700_000_001_000
+                   )
+
+                 {:ok, {db2, Xitdb.moment_count(db2) - 1}, :seeded}
+               end)
+
+      assert {:error, :abort_rb} =
+               Store.transact(rb_store, fn ->
+                 {:ok, _} =
+                   Store.mutate(rb_store, fn {db, moment} ->
+                     {:ok, db2} =
+                       Xitdb.transact_ops(
+                         db,
+                         [{:put, "items[\"k\"]", "corrupt1"}],
+                         base_moment: moment,
+                         doc: "uncommitted corrupt1",
+                         instant: 1_700_000_002_000
+                       )
+
+                     {:ok, {db2, Xitdb.moment_count(db2) - 1}, :corrupt1}
+                   end)
+
+                 Store.rollback(rb_store, :abort_rb)
+               end)
+
+      aborted_meta = Xitdb.tx_meta!(Store.current_db(rb_store))
+      assert aborted_meta["doc"] =~ "rollback tip from moment"
+      assert aborted_meta["doc"] =~ "(aborted)"
+      assert aborted_meta["tx_instant"] > 1_700_000_002_000
+      assert aborted_meta["restored_moment"] == 1
+      assert aborted_meta["rolled_back_from"] == 2
+      assert aborted_meta["rollback_reason"] == "aborted"
+      assert aborted_meta["source_system"] == "xitdb_store"
+      assert aborted_meta["action_name"] == "rollback_tip"
+
+      # Lease expiration rollback
+      prev_tip = Store.current_db(rb_store).moment
+
+      assert {:error, %LeaseError{store: ^rb_store, reason: :lease_expired}} =
+               Store.transact(
+                 rb_store,
+                 fn ->
+                   {:ok, _} =
+                     Store.mutate(rb_store, fn {db, moment} ->
+                       {:ok, db2} =
+                         Xitdb.transact_ops(
+                           db,
+                           [{:put, "items[\"k\"]", "corrupt2"}],
+                           base_moment: moment,
+                           doc: "uncommitted corrupt2",
+                           instant: 1_700_000_003_000
+                         )
+
+                       {:ok, {db2, Xitdb.moment_count(db2) - 1}, :corrupt2}
+                     end)
+
+                   Process.sleep(60)
+                   :late
+                 end,
+                 timeout: 500
+               )
+
+      expired_meta = Xitdb.tx_meta!(Store.current_db(rb_store))
+      assert expired_meta["doc"] =~ "rollback tip from moment"
+      assert expired_meta["doc"] =~ "(lease_expired)"
+      assert expired_meta["restored_moment"] == prev_tip
+      assert expired_meta["rollback_reason"] == "lease_expired"
+      assert expired_meta["action_name"] == "rollback_tip"
+
+      # Process crash (:DOWN) rollback
+      parent = self()
+      {crash_store, _crash_pid} = start_ephemeral_store(lease_timeout: 500)
+
+      {:ok, :seeded} =
+        Store.mutate(crash_store, fn {db, moment} ->
+          {:ok, db2} =
+            Xitdb.transact_ops(
+              db,
+              [{:init_col, "items", "hash_map"}, {:put, "items[\"k\"]", "ok"}],
+              base_moment: moment,
+              doc: "seed crash store",
+              instant: 1_700_000_004_000
+            )
+
+          {:ok, {db2, Xitdb.moment_count(db2) - 1}, :seeded}
+        end)
+
+      crasher =
+        spawn(fn ->
+          Store.transact(crash_store, fn ->
+            {:ok, _} =
+              Store.mutate(crash_store, fn {db, moment} ->
+                {:ok, db2} =
+                  Xitdb.transact_ops(
+                    db,
+                    [{:put, "items[\"k\"]", "crashed_write"}],
+                    base_moment: moment,
+                    doc: "uncommitted crash write",
+                    instant: 1_700_000_005_000
+                  )
+
+                {:ok, {db2, Xitdb.moment_count(db2) - 1}, :crashed}
+              end)
+
+            send(parent, :crasher_ready)
+            Process.exit(self(), :kill)
+          end)
+        end)
+
+      ref = Process.monitor(crasher)
+      assert_receive :crasher_ready, 1_000
+      assert_receive {:DOWN, ^ref, :process, ^crasher, :killed}, 1_000
+
+      assert {:ok, :recovered} = Store.transact(crash_store, fn -> :recovered end)
+      down_meta = Xitdb.tx_meta!(Store.current_db(crash_store))
+      assert down_meta["doc"] =~ "(process_down)"
+      assert down_meta["rollback_reason"] == "process_down"
+      assert down_meta["restored_moment"] == 1
+      assert down_meta["rolled_back_from"] == 2
+      assert down_meta["action_name"] == "rollback_tip"
+    end
   end
 end

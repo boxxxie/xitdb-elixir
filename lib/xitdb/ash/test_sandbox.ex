@@ -187,13 +187,21 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     end
 
     @doc false
-    @spec transact(module(), (-> term()), timeout()) :: {:ok, term()} | {:error, term()}
-    def transact(store, fun, call_timeout) when is_atom(store) and is_function(fun, 0) do
+    @spec transact(module(), (-> term()), timeout(), timeout() | nil) ::
+            {:ok, term()} | {:error, term()}
+    def transact(store, fun, call_timeout, explicit_lease_timeout \\ nil)
+        when is_atom(store) and is_function(fun, 0) do
       case checkout_owner(store) do
         {:ok, _owner, coord_pid} ->
           req_ref = make_ref()
 
-          case acquire_sandbox_lease(coord_pid, store, req_ref, call_timeout) do
+          case acquire_sandbox_lease(
+                 coord_pid,
+                 store,
+                 req_ref,
+                 call_timeout,
+                 explicit_lease_timeout
+               ) do
             {:ok, lease_ref, initial_snapshot} ->
               commit_fn = fn final_snapshot ->
                 GenServer.call(
@@ -241,8 +249,12 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
     # -- Internal Resolution & Helpers --
 
-    defp acquire_sandbox_lease(coord_pid, store, req_ref, call_timeout) do
-      GenServer.call(coord_pid, {:acquire, store, req_ref, call_timeout}, call_timeout)
+    defp acquire_sandbox_lease(coord_pid, store, req_ref, call_timeout, explicit_lease_timeout) do
+      GenServer.call(
+        coord_pid,
+        {:acquire, store, req_ref, call_timeout, explicit_lease_timeout},
+        call_timeout
+      )
     catch
       :exit, {:timeout, _} ->
         GenServer.cast(coord_pid, {:cancel_waiter, store, req_ref})
@@ -440,9 +452,22 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     end
 
     def handle_call({:acquire, store, req_ref, call_timeout}, from, %__MODULE__{} = state) do
+      handle_call({:acquire, store, req_ref, call_timeout, nil}, from, state)
+    end
+
+    def handle_call(
+          {:acquire, store, req_ref, call_timeout, explicit_lease_timeout},
+          from,
+          %__MODULE__{} = state
+        ) do
       case {Map.fetch(state.queues, store), Map.fetch(state.snapshots, store)} do
         {{:ok, queue}, {:ok, snapshot}} ->
-          lease_timeout = Store.min_timeout(state.lease_timeout, call_timeout)
+          lease_timeout =
+            if explicit_lease_timeout == nil do
+              Store.min_timeout(state.lease_timeout, call_timeout)
+            else
+              explicit_lease_timeout
+            end
 
           case LeaseQueue.acquire(
                  queue,
@@ -477,7 +502,9 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         {:ok, queue} ->
           case LeaseQueue.verify_holder(queue, lease_ref, caller_pid) do
             :ok ->
-              {committed_db, committed_moment} = Backend.reconcile_tip(new_db, new_moment)
+              {committed_db, committed_moment} =
+                Backend.reconcile_tip(new_db, new_moment, :reconcile_commit)
+
               next_snapshot = {committed_db, committed_moment}
 
               :ets.insert(
@@ -499,7 +526,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
               next_state =
                 if is_nil(queue.active) do
                   {db, moment} = Map.fetch!(state.snapshots, store)
-                  restored_snap = Backend.reconcile_tip(db, moment)
+                  restored_snap = Backend.reconcile_tip(db, moment, :sandbox_checkin)
                   %__MODULE__{state | snapshots: Map.put(state.snapshots, store, restored_snap)}
                 else
                   state
@@ -542,7 +569,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
                                                                       {snaps_acc, queues_acc} ->
           if match?(%{monitor_ref: ^mref}, queue.active) do
             {db, moment} = Map.fetch!(snaps_acc, store)
-            {restored_db, restored_moment} = Backend.reconcile_tip(db, moment)
+            {restored_db, restored_moment} = Backend.reconcile_tip(db, moment, :sandbox_checkin)
             restored_snap = {restored_db, restored_moment}
             {:matched, updated} = LeaseQueue.handle_down(queue, mref, store, restored_snap)
             {Map.put(snaps_acc, store, restored_snap), Map.put(queues_acc, store, updated)}
@@ -559,7 +586,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         {:ok, queue} ->
           if match?(%{ref: ^lease_ref}, queue.active) do
             {db, moment} = Map.fetch!(state.snapshots, store)
-            {restored_db, restored_moment} = Backend.reconcile_tip(db, moment)
+            {restored_db, restored_moment} = Backend.reconcile_tip(db, moment, :sandbox_checkin)
             restored_snap = {restored_db, restored_moment}
 
             {:matched, next_queue} =
@@ -602,7 +629,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           case LeaseQueue.verify_holder(queue, lease_ref, caller_pid) do
             :ok ->
               {db, moment} = Map.fetch!(state.snapshots, store)
-              {restored_db, restored_moment} = Backend.reconcile_tip(db, moment)
+              {restored_db, restored_moment} = Backend.reconcile_tip(db, moment, :sandbox_checkin)
               restored_snap = {restored_db, restored_moment}
               next_queue = LeaseQueue.release_and_grant_next(queue, store, restored_snap)
 

@@ -136,5 +136,57 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       assert bulk_destroy_meta["actor_id"] == "7"
       assert bulk_destroy_meta["tx_instant"] > 0
     end
+
+    test "Ash.create with mdm_materializer: true projects onto pre-existing cursor in-place preserving non-Ash fields" do
+      {:ok, :seeded} =
+        Store.mutate(MdmStore, fn {db, moment} ->
+          {:ok, db2, m2} =
+            Xitdb.transact_ops_with_moment(
+              db,
+              [
+                {:init_col, ".organizations", "hash_map"},
+                {:init_col, ".organizations[\"901\"]", "hash_map"},
+                {:put, ".organizations[\"901\"].id", "901"},
+                {:put, ".organizations[\"901\"].name", "Pre-Seeded Capital"},
+                {:put, ".organizations[\"901\"].normalized_name", "pre seeded capital"},
+                {:init_col, ".organizations[\"901\"].sources", "counted_hash_set"},
+                {:put, ".organizations[\"901\"].sources", Xitdb.counted_set(["creatio:acc-901"])}
+              ],
+              base_moment: moment,
+              doc: "seed pre-existing MDM org cursor",
+              instant: System.os_time(:millisecond)
+            )
+
+          {:ok, {db2, m2}, :seeded}
+        end)
+
+      org =
+        Organization
+        |> Ash.Changeset.for_create(
+          :register,
+          %{
+            name: "Pre-Seeded Capital",
+            domain: "preseeded.example",
+            slug: "pre-seeded-capital",
+            mandate: "Direct lending"
+          },
+          context: %{mdm_materializer: true}
+        )
+        |> Ash.Changeset.force_change_attribute(:id, 901)
+        |> Ash.create!(authorize?: false)
+
+      assert org.id == 901
+
+      root = Store.root(MdmStore)
+      cur = root["organizations"]["901"]
+      assert cur["normalized_name"] == "pre seeded capital"
+      assert Enum.to_list(cur["sources"]) == ["creatio:acc-901"]
+      assert cur["slug"] == "pre-seeded-capital"
+
+      meta = Xitdb.tx_meta!(Store.current_db(MdmStore))
+      assert meta["actor_id"] == "system"
+      assert meta["source_system"] == "ash_action"
+      assert meta["action_name"] == "register"
+    end
   end
 end

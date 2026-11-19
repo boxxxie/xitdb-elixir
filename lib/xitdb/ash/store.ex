@@ -288,7 +288,13 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     @spec transact(module(), (-> term()), keyword()) :: {:ok, term()} | {:error, term()}
     def transact(store, fun, opts \\ [])
         when is_atom(store) and is_function(fun, 0) and is_list(opts) do
-      timeout = normalize_timeout(opts[:timeout])
+      explicit_lease_timeout = normalize_optional_timeout(opts[:lease_timeout])
+
+      call_timeout =
+        case opts[:timeout] do
+          nil -> max_timeout(normalize_timeout(nil), explicit_lease_timeout)
+          t -> normalize_timeout(t)
+        end
 
       {mode, exec} =
         cond do
@@ -296,10 +302,12 @@ if Code.ensure_loaded?(Ash.DataLayer) do
             {:savepoint, fn -> run_savepoint(store, fun) end}
 
           match?({:ok, _, _}, TestSandbox.checkout_owner(store)) ->
-            {:sandbox, fn -> TestSandbox.transact(store, fun, timeout) end}
+            {:sandbox,
+             fn -> TestSandbox.transact(store, fun, call_timeout, explicit_lease_timeout) end}
 
           true ->
-            {:leased, fn -> run_leased_transaction(store, fun, timeout) end}
+            {:leased,
+             fn -> run_leased_transaction(store, fun, call_timeout, explicit_lease_timeout) end}
         end
 
       meta = %{store: store, mode: mode}
@@ -353,7 +361,21 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
     @impl GenServer
     def handle_call({:acquire_lease, req_ref, call_timeout}, from, %State{} = state) do
-      lease_timeout = min_timeout(state.lease_timeout, call_timeout)
+      handle_call({:acquire_lease, req_ref, call_timeout, nil}, from, state)
+    end
+
+    def handle_call(
+          {:acquire_lease, req_ref, call_timeout, explicit_lease_timeout},
+          from,
+          %State{} = state
+        ) do
+      lease_timeout =
+        if explicit_lease_timeout == nil do
+          min_timeout(state.lease_timeout, call_timeout)
+        else
+          normalize_timeout(explicit_lease_timeout)
+        end
+
       snapshot = {state.db, state.moment}
 
       case LeaseQueue.acquire(
@@ -380,7 +402,9 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         ) do
       case LeaseQueue.verify_holder(state.queue, lease_ref, caller_pid) do
         :ok ->
-          {committed_db, committed_moment} = Backend.reconcile_tip(new_db, new_moment)
+          {committed_db, committed_moment} =
+            Backend.reconcile_tip(new_db, new_moment, :reconcile_commit)
+
           :ok = Backend.publish_commit(state.name, state.moment, committed_moment)
           next_snapshot = {committed_db, committed_moment}
           next_queue = LeaseQueue.release_and_grant_next(state.queue, state.name, next_snapshot)
@@ -391,7 +415,9 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         {:error, :lease_expired} = err ->
           next_state =
             if is_nil(state.queue.active) do
-              {restored_db, restored_moment} = Backend.reconcile_tip(state.db, state.moment)
+              {restored_db, restored_moment} =
+                Backend.reconcile_tip(state.db, state.moment, :lease_expired)
+
               :ok = Backend.publish_commit(state.name, state.moment, restored_moment)
               %State{state | db: restored_db, moment: restored_moment}
             else
@@ -420,7 +446,9 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     @impl GenServer
     def handle_info({:DOWN, mref, :process, _pid, _reason}, %State{} = state) do
       if match?(%{monitor_ref: ^mref}, state.queue.active) do
-        {restored_db, restored_moment} = Backend.reconcile_tip(state.db, state.moment)
+        {restored_db, restored_moment} =
+          Backend.reconcile_tip(state.db, state.moment, :process_down)
+
         :ok = Backend.publish_commit(state.name, state.moment, restored_moment)
         snapshot = {restored_db, restored_moment}
         {:matched, next_queue} = LeaseQueue.handle_down(state.queue, mref, state.name, snapshot)
@@ -432,7 +460,9 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
     def handle_info({:xitdb_lease_expired, name, lease_ref}, %State{name: name} = state) do
       if match?(%{ref: ^lease_ref}, state.queue.active) do
-        {restored_db, restored_moment} = Backend.reconcile_tip(state.db, state.moment)
+        {restored_db, restored_moment} =
+          Backend.reconcile_tip(state.db, state.moment, :lease_expired)
+
         :ok = Backend.publish_commit(state.name, state.moment, restored_moment)
         snapshot = {restored_db, restored_moment}
 
@@ -452,7 +482,9 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       final_db =
         case state.db do
           %Xitdb{} = db when is_integer(state.moment) and state.moment >= 0 ->
-            {reconciled_db, _restored_moment} = Backend.reconcile_tip(db, state.moment)
+            {reconciled_db, _restored_moment} =
+              Backend.reconcile_tip(db, state.moment, :terminate)
+
             reconciled_db
 
           other ->
@@ -467,7 +499,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     defp release_aborted_lease(%State{} = state, lease_ref, caller_pid) do
       case LeaseQueue.verify_holder(state.queue, lease_ref, caller_pid) do
         :ok ->
-          {restored_db, restored_moment} = Backend.reconcile_tip(state.db, state.moment)
+          {restored_db, restored_moment} = Backend.reconcile_tip(state.db, state.moment, :aborted)
           :ok = Backend.publish_commit(state.name, state.moment, restored_moment)
           snapshot = {restored_db, restored_moment}
           next_queue = LeaseQueue.release_and_grant_next(state.queue, state.name, snapshot)
@@ -542,10 +574,10 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       end
     end
 
-    defp run_leased_transaction(store, fun, call_timeout) do
+    defp run_leased_transaction(store, fun, call_timeout, explicit_lease_timeout) do
       req_ref = make_ref()
 
-      case acquire_store_lease(store, req_ref, call_timeout) do
+      case acquire_store_lease(store, req_ref, call_timeout, explicit_lease_timeout) do
         {:ok, lease_ref, initial_snapshot} ->
           commit_fn = fn final_snapshot ->
             GenServer.call(store, {:commit_lease, lease_ref, final_snapshot}, :infinity)
@@ -569,8 +601,12 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       end
     end
 
-    defp acquire_store_lease(store, req_ref, call_timeout) do
-      GenServer.call(store, {:acquire_lease, req_ref, call_timeout}, call_timeout)
+    defp acquire_store_lease(store, req_ref, call_timeout, explicit_lease_timeout) do
+      GenServer.call(
+        store,
+        {:acquire_lease, req_ref, call_timeout, explicit_lease_timeout},
+        call_timeout
+      )
     catch
       :exit, {:timeout, _} ->
         GenServer.cast(store, {:cancel_waiter, req_ref})
@@ -735,9 +771,16 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
     defp resource_nested?(resource), do: resolve_nested_specs(resource) != []
 
+    defp normalize_optional_timeout(nil), do: nil
+    defp normalize_optional_timeout(t), do: normalize_timeout(t)
+
     defp normalize_timeout(nil), do: 15_000
     defp normalize_timeout(:infinity), do: :infinity
     defp normalize_timeout(ms) when is_integer(ms) and ms >= 0, do: ms
+
+    defp max_timeout(a, nil), do: a
+    defp max_timeout(_a, :infinity), do: :infinity
+    defp max_timeout(a, b), do: max(a, b)
 
     @doc false
     def min_timeout(:infinity, b), do: b
@@ -762,7 +805,17 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         case Xitdb.moment_count(db) do
           0 ->
             {:ok, seeded_db, moment} =
-              Xitdb.transact_ops_with_moment(db, [{:init_col, ".meta", "hash_map"}])
+              Xitdb.transact_ops_with_moment(
+                db,
+                [{:init_col, ".meta", "hash_map"}],
+                doc: "initialize store metadata",
+                instant: System.os_time(:millisecond),
+                meta: %{
+                  "source_system" => "xitdb_store",
+                  "action_name" => "init_store",
+                  "actor_id" => "system"
+                }
+              )
 
             {seeded_db, moment}
 
@@ -774,16 +827,30 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       @spec latest_moment(Xitdb.t()) :: integer()
       def latest_moment(%Xitdb{} = db), do: Xitdb.moment_count(db) - 1
 
-      @spec reconcile_tip(Xitdb.t(), non_neg_integer()) :: {Xitdb.t(), non_neg_integer()}
-      def reconcile_tip(%Xitdb{} = db, target_moment) when is_integer(target_moment) do
+      @spec reconcile_tip(Xitdb.t(), non_neg_integer(), atom() | String.t()) ::
+              {Xitdb.t(), non_neg_integer()}
+      def reconcile_tip(%Xitdb{} = db, target_moment, reason \\ :rollback)
+          when is_integer(target_moment) do
         tail_moment = latest_moment(db)
 
         if tail_moment > target_moment do
+          reason_str = to_string(reason)
+
           {:ok, restored_db, restored_moment} =
             Xitdb.transact_ops_with_moment(
               db,
               [{:meta, "restored_moment", target_moment}],
-              base_moment: target_moment
+              base_moment: target_moment,
+              doc: "rollback tip from moment #{tail_moment} to #{target_moment} (#{reason_str})",
+              instant: System.os_time(:millisecond),
+              meta: %{
+                "restored_moment" => target_moment,
+                "rolled_back_from" => tail_moment,
+                "rollback_reason" => reason_str,
+                "source_system" => "xitdb_store",
+                "action_name" => "rollback_tip",
+                "actor_id" => "system"
+              }
             )
 
           {restored_db, restored_moment}
