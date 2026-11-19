@@ -1030,28 +1030,36 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         if has_agg? do
           :all
         else
-          atom_calcs =
-            Enum.flat_map(unchecked_atoms, fn atom ->
+          atom_calcs_res =
+            Enum.reduce_while(unchecked_atoms, {:ok, []}, fn atom, {:ok, acc} ->
               case Ash.Resource.Info.calculation(resource, atom) do
                 nil ->
-                  []
+                  {:cont, {:ok, acc}}
 
                 res_calc ->
-                  [synthetic_query_calc(res_calc, query, resource)]
+                  case synthetic_query_calc(res_calc, query, resource) do
+                    {:ok, entry} -> {:cont, {:ok, [entry | acc]}}
+                    :error -> {:halt, :error}
+                  end
               end
             end)
 
-          if atom_calcs == [] do
-            acc_set
-          else
-            expand_hydration_deps(
-              atom_calcs,
-              acc_set,
-              visited_calcs,
-              next_checked,
-              query,
-              resource
-            )
+          case atom_calcs_res do
+            :error ->
+              :all
+
+            {:ok, []} ->
+              acc_set
+
+            {:ok, rev_calcs} ->
+              expand_hydration_deps(
+                Enum.reverse(rev_calcs),
+                acc_set,
+                visited_calcs,
+                next_checked,
+                query,
+                resource
+              )
           end
         end
       end
@@ -1082,6 +1090,9 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           acc_set
           |> add_calc_key(calc.name)
           |> add_calc_keys(List.wrap(calc.load))
+          |> add_calc_keys(List.wrap(calc.required_loads))
+          |> add_calc_keys(List.wrap(calc.select))
+          |> add_calc_keys(calc_module_load_and_select(calc, query, resource))
           |> collect_calc_opts_expr_refs(calc.opts)
 
         eff_expr = resolve_calc_expr(calc, expr)
@@ -1138,40 +1149,86 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         calc.module == Ash.Resource.Calculation.Expression ->
           if is_list(calc.opts), do: Keyword.get(calc.opts, :expr), else: nil
 
-        function_exported?(calc.module, :expression, 2) ->
-          calc.module.expression(calc.opts, calc.context)
+        has_calc_expression?(calc.module) ->
+          Ash.Resource.Calculation.expression(calc.module, calc.opts, calc.context)
 
         true ->
           nil
       end
     end
 
+    defp has_calc_expression?(mod) when is_atom(mod) and not is_nil(mod) do
+      if function_exported?(mod, :has_expression?, 0) do
+        Ash.Resource.Calculation.has_expression?(mod)
+      else
+        function_exported?(mod, :expression, 2)
+      end
+    end
+
+    defp has_calc_expression?(_mod), do: false
+
+    defp calc_module_load_and_select(%Calculation{module: mod} = calc, query, resource)
+         when is_atom(mod) and not is_nil(mod) do
+      if function_exported?(mod, :load, 3) or function_exported?(mod, :select, 3) do
+        ash_query = Ash.Query.new(resource) |> Ash.Query.set_tenant(query.tenant)
+
+        loads =
+          if function_exported?(mod, :load, 3) do
+            try do
+              mod
+              |> Ash.Resource.Calculation.load(ash_query, calc.opts, calc.context)
+              |> List.wrap()
+            rescue
+              _ -> []
+            end
+          else
+            []
+          end
+
+        selects =
+          if function_exported?(mod, :select, 3) do
+            try do
+              mod.select(ash_query, calc.opts, calc.context) |> List.wrap()
+            rescue
+              _ -> []
+            end
+          else
+            []
+          end
+
+        loads ++ selects
+      else
+        []
+      end
+    end
+
+    defp calc_module_load_and_select(_calc, _query, _resource), do: []
+
     defp synthetic_query_calc(%Ash.Resource.Calculation{} = res_calc, query, resource) do
-      {mod, opts} =
-        case res_calc.calculation do
-          {m, o} when is_atom(m) and is_list(o) -> {m, o}
-          m when is_atom(m) -> {m, []}
-        end
+      case Calculation.from_resource_calculation(
+             resource,
+             res_calc,
+             source_context: query.context || %{}
+           ) do
+        {:ok, %Calculation{} = calc} ->
+          updated_ctx = %{
+            calc.context
+            | resource: resource,
+              domain: query.domain,
+              tenant: query.tenant || calc.context.tenant
+          }
 
-      calc = %Calculation{
-        name: res_calc.name,
-        load: res_calc.load,
-        module: mod,
-        opts: opts,
-        type: res_calc.type,
-        constraints: res_calc.constraints,
-        context: %Ash.Resource.Calculation.Context{
-          resource: resource,
-          domain: query.domain,
-          tenant: query.tenant,
-          type: res_calc.type,
-          constraints: res_calc.constraints,
-          arguments: %{},
-          source_context: query.context || %{}
-        }
-      }
+          updated_calc = %Calculation{
+            calc
+            | load: res_calc.load,
+              context: updated_ctx
+          }
 
-      {calc, nil}
+          {:ok, {updated_calc, nil}}
+
+        {:error, _} ->
+          :error
+      end
     end
 
     defp collect_extra_calcs_and_aggs(filter, sort_lists) do

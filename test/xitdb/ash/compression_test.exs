@@ -182,6 +182,20 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       end
     end
 
+    defmodule InitMapExprCalc do
+      use Ash.Resource.Calculation
+
+      @impl true
+      def init(opts) do
+        {:ok, %{target: Keyword.fetch!(opts, :target)}}
+      end
+
+      @impl true
+      def expression(%{target: :body}, _context) do
+        expr(string_length(body))
+      end
+    end
+
     defmodule ModBodyTagCalc do
       use Ash.Resource.Calculation
 
@@ -228,6 +242,10 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
       calculations do
         calculate(:body_len_expr, :integer, ExprBodyLenCalc, public?: true)
+        calculate(:body_init_expr, :integer, {InitMapExprCalc, target: :body}, public?: true)
+
+        calculate(:body_init_loaded, :boolean, expr(body_init_expr >= 200), public?: true)
+
         calculate(:body_tag_mod, :string, ModBodyTagCalc, public?: true)
       end
     end
@@ -636,6 +654,27 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
         assert Enum.map(mod_filtered, & &1.title) == ["Short", "Long"]
         assert Enum.all?(mod_filtered, &match?(%Ash.NotLoaded{field: :body}, &1.body))
+
+        # Nested resource calculation with init/1 transforming opts into a map hydrates :body cleanly and skips :secret_body
+        Columnar.clear_cache(CompMemStore.root())
+        Columnar.reset_stats()
+
+        init_filtered =
+          CalcSelectEmail
+          |> Ash.Query.filter(body_init_loaded == true)
+          |> Ash.Query.sort(:id)
+          |> Ash.Query.select([:id, :title])
+          |> Ash.read!()
+
+        assert Enum.map(init_filtered, & &1.title) == ["Mid", "Long"]
+        assert Enum.all?(init_filtered, &match?(%Ash.NotLoaded{field: :body}, &1.body))
+
+        assert Enum.all?(
+                 init_filtered,
+                 &match?(%Ash.NotLoaded{field: :secret_body}, &1.secret_body)
+               )
+
+        assert %{page_reads: 1, page_decompressions: 1} = Columnar.stats()
       end
     end
   end

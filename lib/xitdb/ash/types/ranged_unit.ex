@@ -541,12 +541,32 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     defp build_indexed_map(prefix, min_v, max_v, bound, unit) do
       p = to_string(prefix)
 
-      %{
-        String.to_existing_atom("#{p}_min_d64") => min_v,
-        String.to_existing_atom("#{p}_max_d64") => max_v,
-        String.to_existing_atom("#{p}_bound") => bound,
-        String.to_existing_atom("#{p}_unit") => unit
-      }
+      acc =
+        [
+          {"#{p}_min_d64", min_v},
+          {"#{p}_max_d64", max_v},
+          {"#{p}_bound", bound},
+          {"#{p}_unit", unit}
+        ]
+        |> Enum.reduce(%{}, fn {key_str, val}, map ->
+          case maybe_existing_atom(key_str) do
+            {:ok, key_atom} -> Map.put(map, key_atom, val)
+            :error -> map
+          end
+        end)
+
+      if map_size(acc) == 0 do
+        raise ArgumentError,
+              "no existing indexed RangedUnit atoms found for prefix #{inspect(prefix)}"
+      end
+
+      acc
+    end
+
+    defp maybe_existing_atom(str) do
+      {:ok, String.to_existing_atom(str)}
+    rescue
+      ArgumentError -> :error
     end
   end
 

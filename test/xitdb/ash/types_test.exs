@@ -428,6 +428,16 @@ if Code.ensure_loaded?(Ash.DataLayer) do
                  ticket_unit: "dimensionless"
                } = RangedUnit.to_indexed_fields(ru, "ticket")
 
+        # Partial prefix where only min_d64/max_d64 atoms exist does not raise ArgumentError
+        _partial_atoms = [:partial_ru_min_d64, :partial_ru_max_d64]
+
+        assert %{partial_ru_min_d64: p_min, partial_ru_max_d64: p_max} =
+                 partial_map = RangedUnit.to_indexed_fields(ru, :partial_ru)
+
+        assert map_size(partial_map) == 2
+        assert Decimal.equal?(p_min, Decimal.new("42"))
+        assert Decimal.equal?(p_max, Decimal.new("42"))
+
         assert_raise ArgumentError, fn ->
           RangedUnit.to_indexed_fields(ru, "nonexistent_ranged_prefix_xyz")
         end
