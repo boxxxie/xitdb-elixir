@@ -1,3 +1,17 @@
+defmodule Xitdb.CompressionTest.EncoderBox do
+  defstruct [:payload, :mode]
+end
+
+defimpl Xitdb.Encoder, for: Xitdb.CompressionTest.EncoderBox do
+  def encode(%Xitdb.CompressionTest.EncoderBox{payload: payload, mode: :directive}) do
+    {:compressed, payload, codec: :zstd, min_bytes: 0}
+  end
+
+  def encode(%Xitdb.CompressionTest.EncoderBox{payload: payload, mode: :plain}) do
+    %{"nested_text" => payload}
+  end
+end
+
 defmodule Xitdb.CompressionTest do
   use ExUnit.Case, async: true
   use ExUnitProperties
@@ -587,6 +601,220 @@ defmodule Xitdb.CompressionTest do
       assert Xitdb.select!(comp2, ".__dicts") == nil
       assert Xitdb.select!(comp2, ".__col_pages") == nil
       Xitdb.close(comp2)
+    end
+  end
+
+  describe "regression coverage for datalog, GC containers, Xitdb.Encoder, and TxRuntime" do
+    alias Xitdb.CompressionTest.EncoderBox
+
+    test "Datalog predicates, joins, historical as_of, raw_tagged: true, and error propagation across all compression tags" do
+      head =
+        "Alpha <!DOCTYPE html><html><head><style>.mail{font-family:sans-serif;color:#1f2937}</style></head><body><div class=\"mail\">"
+
+      tail =
+        "</div><footer>Confidentiality Notice: Internal CAASA CRM Archive Disclosure.</footer></body></html>"
+
+      dict_samples = for i <- 1..15, do: head <> " CRM Dict item ##{i}" <> tail
+
+      cz_match = String.duplicate("Alpha CRM zlib match block. ", 15)
+      zs_match = String.duplicate("Alpha CRM zstd match block. ", 15)
+      zd_match = head <> " CRM dict match #3" <> tail
+      bp_match = String.duplicate("Alpha CRM interned zstd blob block. ", 20)
+      pg_match = String.duplicate("Alpha CRM columnar cell payload. ", 15)
+      other_zs = String.duplicate("Beta archive unrelated zstd payload. ", 15)
+
+      db = Xitdb.open!(backend: :memory)
+      {:ok, db, _} = Dictionary.train_and_put(db, :dl_dict, dict_samples, target_size: 4_096)
+
+      # Moment 1: commit cz, zs, zd, bp(zstd)
+      db =
+        tx! db do
+          put docs["cz"].body, {:compressed, cz_match, codec: :zlib}
+          put docs["zs"].body, {:compressed, zs_match, codec: :zstd}
+          put docs["zd"].body, {:compressed, zd_match, dictionary: :dl_dict}
+          put docs["bp"].body, {:compressed, bp_match, intern: true, codec: :zstd}
+          put docs["other"].body, {:compressed, other_zs, codec: :zstd}
+          put index_ref[zs_match], "zs"
+        end
+
+      # Moment 2: add columnar page row + update index_ref
+      db =
+        Xitdb.Columnar.put_rows!(
+          db,
+          "col_docs",
+          [{"p1", %{"title" => "Col 1", "body" => pg_match}}],
+          columns: [:body],
+          codec: :zstd
+        )
+
+      m_with_bp = Xitdb.moment_count(db) - 1
+
+      # Moment 3: overwrite bp entry in latest moment to remove bp ref (while Moment 2 retains it)
+      db =
+        tx! db do
+          put docs["bp"].body, "replaced plaintext"
+        end
+
+      # Datalog contains / starts_with / equality predicates across cz, zs, zd, pg
+      assert {:ok, %{rows: matched_ids}} =
+               Xitdb.query(
+                 db,
+                 ~s{find ?id where .docs[?id].body = ?b, contains(?b, "CRM"), starts_with(?b, "Alpha")}
+               )
+
+      assert Enum.sort(matched_ids) == [["cz"], ["zd"], ["zs"]]
+
+      assert {:ok, %{rows: [["p1"]]}} =
+               Xitdb.query(
+                 db,
+                 ~s{find ?id where .col_docs[?id].body = ?b, ?b == "#{pg_match}"}
+               )
+
+      # Cross-clause join unifying compressed zs field against map key
+      assert {:ok, %{rows: [["zs"]]}} =
+               Xitdb.query(
+                 db,
+                 ~s{find ?hit where .docs["zs"].body = ?b, .index_ref[?b] = ?hit}
+               )
+
+      # Historical as_of query resolves __blobs & __dicts at target moment even after later overwrite
+      assert {:ok, %{rows: [["bp"]]}} =
+               Xitdb.query(
+                 Xitdb.as_of(db, m_with_bp),
+                 ~s{find ?id where .docs[?id].body = ?b, contains(?b, "interned zstd")},
+                 []
+               )
+
+      # Verify historical bp value returns exact plaintext
+      assert {:ok, %{rows: [[^bp_match]]}} =
+               Xitdb.query(
+                 db,
+                 ~s{find ?b where @#{m_with_bp}.docs["bp"].body = ?b}
+               )
+
+      # raw_tagged: true returns {:tagged, tag, _} uniformly for cz, zs, zd, bp, and pg
+      assert {:ok, %{rows: raw_rows}} =
+               Xitdb.query(
+                 db,
+                 ~s{find ?id, ?b where @#{m_with_bp}.docs[?id].body = ?b},
+                 raw_tagged: true
+               )
+
+      raw_by_id = Map.new(raw_rows, fn [k, v] -> {k, v} end)
+      assert {:tagged, "cz", _} = raw_by_id["cz"]
+      assert {:tagged, "zs", _} = raw_by_id["zs"]
+      assert {:tagged, "zd", _} = raw_by_id["zd"]
+      assert {:tagged, "bp", _} = raw_by_id["bp"]
+
+      assert {:ok, %{rows: [["p1", {:tagged, "pg", _}]]}} =
+               Xitdb.query(db, ~s{find ?id, ?b where .col_docs[?id].body = ?b}, raw_tagged: true)
+
+      # Error propagation in Datalog: max_decompressed_bytes & corrupt payloads (not :unexpected_tag)
+      assert {:error, %Error{reason: :decompressed_size_exceeded}} =
+               Xitdb.query(
+                 db,
+                 ~s{find ?b where .docs["cz"].body = ?b},
+                 max_decompressed_bytes: 16
+               )
+
+      assert {:error, %Error{reason: :decompressed_size_exceeded}} =
+               Xitdb.query(
+                 db,
+                 ~s{find ?b where .docs["zs"].body = ?b},
+                 max_decompressed_bytes: 16
+               )
+
+      db =
+        Xitdb.transact!(db, %{
+          "corrupt_dl" => %{
+            "bad_cz" => {:tagged, "cz", <<0x10, 500::unsigned-little-32, 1, 2, 3>>},
+            "bad_zs" => {:tagged, "zs", <<0x10, 500::unsigned-little-32, 1, 2, 3>>}
+          }
+        })
+
+      assert {:error, %Error{reason: :corrupt_compressed_payload}} =
+               Xitdb.query(db, ~s{find ?v where .corrupt_dl.bad_cz = ?v, contains(?v, "x")})
+
+      assert {:error, %Error{reason: :corrupt_compressed_payload}} =
+               Xitdb.query(db, ~s{find ?v where .corrupt_dl.bad_zs = ?v, contains(?v, "x")})
+
+      Xitdb.close(db)
+    end
+
+    test "GC compact/2 handles nested non-default containers and leaves source handle intact" do
+      tmp =
+        Path.join(System.tmp_dir!(), "xitdb_gc_containers_#{System.unique_integer([:positive])}")
+
+      File.mkdir_p!(tmp)
+      on_exit(fn -> File.rm_rf(tmp) end)
+
+      live_blob = String.duplicate("Counted map live interned payload. ", 25)
+      dead_blob = String.duplicate("Removed counted map dead interned payload. ", 40)
+
+      db = Xitdb.open!(backend: :buffered_file, path: Path.join(tmp, "src.xit"))
+
+      db =
+        Xitdb.transact!(db, %{
+          "bucket" =>
+            Xitdb.counted_map(%{
+              "keep" => {:compressed, live_blob, intern: true, codec: :zstd},
+              "drop" => {:compressed, dead_blob, intern: true, codec: :zstd}
+            })
+        })
+
+      db =
+        tx! db do
+          put bucket["drop"], "cleared"
+        end
+
+      assert Enum.count(db["__blobs"]) == 2
+      assert {:ok, comp} = Xitdb.compact(db, path: Path.join(tmp, "comp.xit"))
+
+      assert Enum.count(comp["__blobs"]) == 1
+      assert comp["bucket"]["keep"] == live_blob
+      assert comp["bucket"]["drop"] == "cleared"
+      # Source handle remains readable and retains pre-GC blobs
+      assert db["bucket"]["keep"] == live_blob
+      assert Enum.count(db["__blobs"]) == 2
+
+      Xitdb.close(comp)
+      Xitdb.close(db)
+    end
+
+    test "Xitdb.transact/3 encodes Xitdb.Encoder structs before Compression.prepare_write/3 and TxRuntime materializes compressed put in staged_log" do
+      long_a = String.duplicate("Encoder directive compression payload. ", 20)
+      long_b = String.duplicate("Encoder plain auto-compressed payload. ", 20)
+      staged_bin = String.duplicate("TxRuntime staged compression payload. ", 15)
+
+      db = Xitdb.open!(backend: :memory)
+
+      db =
+        Xitdb.transact!(db, %{
+          "dir_box" => %EncoderBox{payload: long_a, mode: :directive}
+        })
+
+      assert db["dir_box"] == long_a
+      assert {:tagged, "zs", _} = Xitdb.select!(db, ".dir_box", raw_tagged: true)
+
+      db =
+        Xitdb.transact!(
+          db,
+          %{"plain_box" => %EncoderBox{payload: long_b, mode: :plain}},
+          compress: [codec: :zstd, min_bytes: 32, min_savings: 8]
+        )
+
+      assert db["plain_box"]["nested_text"] == long_b
+      assert {:tagged, "zs", _} = Xitdb.select!(db, ".plain_box.nested_text", raw_tagged: true)
+
+      # TxRuntime.put records plaintext (not {:compressed, ...} tuple) in staged_log for subsequent update/fork
+      db =
+        tx! db do
+          put staged.doc, {:compressed, staged_bin, codec: :zstd, min_bytes: 0}
+          update staged.doc, fn current -> current <> " [UPDATED]" end
+        end
+
+      assert db["staged"]["doc"] == staged_bin <> " [UPDATED]"
+      Xitdb.close(db)
     end
   end
 end

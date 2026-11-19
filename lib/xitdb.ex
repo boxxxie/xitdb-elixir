@@ -222,7 +222,8 @@ defmodule Xitdb do
 
   @doc "Flushes and closes the underlying `xitdb` storage handle."
   @spec close(t()) :: :ok
-  def close(%__MODULE__{db_ref: db_ref}) do
+  def close(%__MODULE__{db_ref: db_ref} = db) do
+    Xitdb.Columnar.clear_cache(db)
     NIF.nif_close(db_ref)
   end
 
@@ -346,12 +347,14 @@ defmodule Xitdb do
 
   def transact(%__MODULE__{db_ref: db_ref} = db, map, [])
       when is_map(map) and not is_struct(map) do
-    if Compression.needs_prepare?(map, false) do
-      {:ok, prepared_map, blob_ops} = Compression.prepare_write(db, map, false)
+    encoded_map = TxCompiler.encode_value(map)
+
+    if Compression.needs_prepare?(encoded_map, false) do
+      {:ok, prepared_map, blob_ops} = Compression.prepare_write(db, encoded_map, false)
       ops = blob_ops ++ TxCompiler.compile_moment_map(prepared_map)
       do_transact_ops_default(db, db_ref, ops)
     else
-      ops = TxCompiler.compile_moment_map(map)
+      ops = TxCompiler.compile_moment_map(encoded_map)
       do_transact_ops_default(db, db_ref, ops)
     end
   rescue
@@ -363,14 +366,18 @@ defmodule Xitdb do
     with {:ok, validated} <- validate_opts(opts, @transact_schema) do
       try do
         compress_opt = validated[:compress]
+        encoded_map = TxCompiler.encode_value(map)
 
-        if Compression.needs_prepare?(map, compress_opt) do
+        if Compression.needs_prepare?(encoded_map, compress_opt) do
           target = if validated[:base_moment] == -1, do: db, else: {db, validated[:base_moment]}
-          {:ok, prepared_map, blob_ops} = Compression.prepare_write(target, map, compress_opt)
+
+          {:ok, prepared_map, blob_ops} =
+            Compression.prepare_write(target, encoded_map, compress_opt)
+
           ops = blob_ops ++ TxCompiler.compile_moment_map(prepared_map)
           do_transact_ops(db, ops, Keyword.put(validated, :compress, false))
         else
-          ops = TxCompiler.compile_moment_map(map)
+          ops = TxCompiler.compile_moment_map(encoded_map)
           do_transact_ops(db, ops, validated)
         end
       rescue
@@ -1020,15 +1027,78 @@ defmodule Xitdb do
   end
 
   defp do_query(db_ref, moment, query_str, validated) do
-    with {:ok, %{vars: _vars, rows: rows} = res} <-
-           db_ref |> NIF.nif_query_datalog(moment, query_str) |> Error.wrap() do
-      if Keyword.get(validated, :raw_tagged, false) do
-        {:ok, res}
-      else
-        with {:ok, resolved_rows} <- Compression.resolve_term(rows, db_ref, moment, validated) do
-          {:ok, %{res | rows: resolved_rows}}
+    raw_tagged = Keyword.get(validated, :raw_tagged, false)
+
+    max_bytes =
+      Keyword.get(
+        validated,
+        :max_decompressed_bytes,
+        Compression.default_max_decompressed_bytes()
+      )
+
+    run_datalog_loop(db_ref, moment, query_str, raw_tagged, max_bytes, validated, %{}, 16)
+  end
+
+  defp run_datalog_loop(
+         db_ref,
+         moment,
+         query_str,
+         raw_tagged,
+         max_bytes,
+         validated,
+         predecoded,
+         rounds_left
+       ) do
+    case NIF.nif_query_datalog(db_ref, moment, query_str, raw_tagged, max_bytes, predecoded) do
+      {:ok, %{vars: _vars, rows: rows} = res} ->
+        if raw_tagged do
+          {:ok, res}
+        else
+          with {:ok, resolved_rows} <- Compression.resolve_term(rows, db_ref, moment, validated) do
+            {:ok, %{res | rows: resolved_rows}}
+          end
         end
-      end
+
+      {:need_decode, missing} ->
+        if rounds_left <= 0 do
+          {:error,
+           %Error{
+             reason: :corrupt_compressed_payload,
+             details: %{reason: :max_decode_rounds_exceeded}
+           }}
+        else
+          resolved_predecoded =
+            Enum.reduce_while(missing, {:ok, predecoded}, fn {m, tag, payload}, {:ok, acc} ->
+              case Compression.resolve_tagged(tag, payload, db_ref, m, validated) do
+                {:ok, decoded} ->
+                  cache_key = <<m::signed-little-64, tag::binary-size(2), payload::binary>>
+                  {:cont, {:ok, Map.put(acc, cache_key, decoded)}}
+
+                {:error, _} = err ->
+                  {:halt, err}
+              end
+            end)
+
+          case resolved_predecoded do
+            {:ok, next_predecoded} ->
+              run_datalog_loop(
+                db_ref,
+                moment,
+                query_str,
+                raw_tagged,
+                max_bytes,
+                validated,
+                next_predecoded,
+                rounds_left - 1
+              )
+
+            {:error, _} = err ->
+              err
+          end
+        end
+
+      other ->
+        Error.wrap(other)
     end
   end
 

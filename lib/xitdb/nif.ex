@@ -50,6 +50,17 @@ defmodule Xitdb.NIF do
 
   def nif_history_of(_db_ref, _selector), do: :erlang.nif_error(:nif_not_loaded)
   def nif_query_datalog(_db_ref, _moment_idx, _query_str), do: :erlang.nif_error(:nif_not_loaded)
+
+  def nif_query_datalog(
+        _db_ref,
+        _moment_idx,
+        _query_str,
+        _raw_tagged,
+        _max_decompressed_bytes,
+        _predecoded
+      ),
+      do: :erlang.nif_error(:nif_not_loaded)
+
   def nif_compact(_db_ref, _target_path), do: :erlang.nif_error(:nif_not_loaded)
 
   @typedoc """

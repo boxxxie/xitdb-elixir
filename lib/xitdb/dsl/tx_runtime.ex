@@ -46,8 +46,11 @@ defmodule Xitdb.DSL.TxRuntime do
 
         staged_log =
           case state.staged_log do
-            nil -> nil
-            log -> [{:put, parse_selector_steps(selector), encoded} | log]
+            nil ->
+              nil
+
+            log ->
+              [{:put, parse_selector_steps(selector), materialize_staged_value(encoded)} | log]
           end
 
         Process.put(tx_ref, %__MODULE__{state | ops: [op | state.ops], staged_log: staged_log})

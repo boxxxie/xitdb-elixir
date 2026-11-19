@@ -416,6 +416,7 @@ static ErlNifFunc nif_funcs[] = {
     {"nif_diff_moments",     4, odin_nif_diff_moments,     ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_history_of",       2, odin_nif_history_of,       ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_query_datalog",    3, odin_nif_query_datalog,    ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_query_datalog",    6, odin_nif_query_datalog,    ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_compact",          2, odin_nif_compact,          ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"nif_sorted_map_seek",  5, odin_nif_sorted_map_seek,  ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_sorted_map_seek",  6, odin_nif_sorted_map_seek,  ERL_NIF_DIRTY_JOB_CPU_BOUND},

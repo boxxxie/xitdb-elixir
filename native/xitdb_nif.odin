@@ -126,6 +126,7 @@ ATOM_DOC:              ERL_NIF_TERM
 ATOM_INSTANT:          ERL_NIF_TERM
 ATOM_VARS:                  ERL_NIF_TERM
 ATOM_ROWS:                  ERL_NIF_TERM
+ATOM_NEED_DECODE:           ERL_NIF_TERM
 ATOM_MATCH:                 ERL_NIF_TERM
 ATOM_ALL:                   ERL_NIF_TERM
 ATOM_ANY:                   ERL_NIF_TERM
@@ -200,6 +201,7 @@ odin_nif_init_atoms :: proc "c" (env: ErlNifEnv) {
 	ATOM_INSTANT      = make_atom(env, "instant")
 	ATOM_VARS                  = make_atom(env, "vars")
 	ATOM_ROWS                  = make_atom(env, "rows")
+	ATOM_NEED_DECODE           = make_atom(env, "need_decode")
 	ATOM_MATCH                 = make_atom(env, "match")
 	ATOM_ALL                   = make_atom(env, "all")
 	ATOM_ANY                   = make_atom(env, "any")
@@ -353,7 +355,11 @@ validate_bytes_slot_bounds :: proc(db: ^xitdb.Database, slot: xitdb.Slot) -> (va
 
 MAX_NIF_DECOMPRESSED_BYTES :: 64 * 1024 * 1024
 
-decode_cz_bytes :: proc(payload: []u8, allocator: mem.Allocator) -> (out: []u8, err_atom: string) {
+decode_cz_bytes :: proc(
+	payload: []u8,
+	allocator: mem.Allocator,
+	max_bytes: u64 = MAX_NIF_DECOMPRESSED_BYTES,
+) -> (out: []u8, err_atom: string) {
 	if len(payload) < 5 {
 		return nil, "corrupt_compressed_payload"
 	}
@@ -361,7 +367,7 @@ decode_cz_bytes :: proc(payload: []u8, allocator: mem.Allocator) -> (out: []u8, 
 		return nil, "corrupt_compressed_payload"
 	}
 	raw_len := u64(payload[1]) | (u64(payload[2]) << 8) | (u64(payload[3]) << 16) | (u64(payload[4]) << 24)
-	if raw_len > MAX_NIF_DECOMPRESSED_BYTES {
+	if raw_len > max_bytes {
 		return nil, "decompressed_size_exceeded"
 	}
 	comp := payload[5:]
@@ -6447,12 +6453,29 @@ NIF_Datalog_Clause :: struct {
 	reach_edge:      ^NIF_Datalog_Clause,
 }
 
+NIF_DL_Missing_Tag :: struct {
+	moment:  i64,
+	tag:     [2]u8,
+	payload: []u8,
+}
+
+NIF_DL_Decode_Ctx :: struct {
+	raw_tagged:             bool,
+	allow_defer:            bool,
+	max_decompressed_bytes: u64,
+	predecoded:             map[string]Maybe(string),
+	missing_seen:           map[string]bool,
+	missing:                [dynamic]NIF_DL_Missing_Tag,
+	codec_err:              string,
+}
+
 NIF_Datalog_Query :: struct {
 	var_names:      [NIF_MAX_DATALOG_VARS]string,
 	var_count:      int,
 	find_items:     [dynamic]xitdb.Datalog_Find_Item,
 	clauses:        [dynamic]NIF_Datalog_Clause,
 	has_aggregates: bool,
+	dl_ctx:         ^NIF_DL_Decode_Ctx,
 	allocator:      runtime.Allocator,
 }
 
@@ -7452,22 +7475,112 @@ nif_dl_slice_contains :: proc(list: []xitdb.Pull_Value, target: xitdb.Pull_Value
 	return false
 }
 
+map_key_step_kind :: #force_inline proc(tag: xitdb.Tag) -> xitdb.Step_Kind {
+	#partial switch tag {
+	case .Counted_Hash_Map:
+		return .Counted_Hash_Map_Key
+	case .Sorted_Map:
+		return .Sorted_Map_Key
+	}
+	return .Hash_Map_Key
+}
+
+nif_dl_is_compression_tag :: #force_inline proc(tag: []u8) -> bool {
+	if len(tag) != 2 {
+		return false
+	}
+	t0, t1 := tag[0], tag[1]
+	return (t0 == 'c' && t1 == 'z') ||
+	       (t0 == 'z' && (t1 == 's' || t1 == 'd')) ||
+	       (t0 == 'b' && t1 == 'p') ||
+	       (t0 == 'p' && t1 == 'g')
+}
+
+nif_dl_make_cache_key :: proc(
+	moment_idx: i64,
+	tag: []u8,
+	payload: []u8,
+	allocator: runtime.Allocator,
+) -> string {
+	buf := make([]u8, 10 + len(payload), allocator)
+	u := transmute(u64)moment_idx
+	for i in 0 ..< 8 {
+		buf[i] = u8(u >> uint(i * 8))
+	}
+	buf[8] = tag[0]
+	buf[9] = tag[1]
+	copy(buf[10:], payload)
+	return string(buf)
+}
+
+nif_dl_lookup_or_defer :: proc(
+	ctx: ^NIF_DL_Decode_Ctx,
+	moment_idx: i64,
+	tag: []u8,
+	payload: []u8,
+	fallback: xitdb.Pull_Value,
+	allocator: runtime.Allocator,
+) -> xitdb.Pull_Value {
+	if ctx == nil {
+		return fallback
+	}
+	if len(tag) == 2 {
+		cache_key := nif_dl_make_cache_key(moment_idx, tag, payload, allocator)
+		if val_maybe, found := ctx.predecoded[cache_key]; found {
+			if s, has_s := val_maybe.?; has_s {
+				return s
+			}
+			return nil
+		}
+		if ctx.allow_defer && !(cache_key in ctx.missing_seen) {
+			ctx.missing_seen[cache_key] = true
+			append(&ctx.missing, NIF_DL_Missing_Tag{
+				moment  = moment_idx,
+				tag     = {tag[0], tag[1]},
+				payload = payload,
+			})
+		}
+	}
+	return fallback
+}
+
 nif_dl_unwrap_pull_value :: proc(
-	cur: xitdb.Read_Cursor,
+	ctx: ^NIF_DL_Decode_Ctx,
+	active_moment: i64,
+	moment_cur: xitdb.Read_Cursor,
 	pv: xitdb.Pull_Value,
 	allocator: runtime.Allocator,
 ) -> (res: xitdb.Pull_Value, err: xitdb.Error) {
+	if ctx != nil && ctx.raw_tagged {
+		return pv, nil
+	}
 	#partial switch v in pv {
 	case xitdb.Bytes:
-		if len(v.format_tag) == 2 && v.format_tag[0] == 'c' && v.format_tag[1] == 'z' {
-			decoded, cz_err := decode_cz_bytes(v.value, allocator)
+		if !nif_dl_is_compression_tag(v.format_tag) {
+			return pv, nil
+		}
+		max_b := ctx.max_decompressed_bytes if ctx != nil else MAX_NIF_DECOMPRESSED_BYTES
+		t0, t1 := v.format_tag[0], v.format_tag[1]
+		if t0 == 'c' && t1 == 'z' {
+			decoded, cz_err := decode_cz_bytes(v.value, allocator, max_b)
 			if cz_err != "" {
-				return nil, .Unexpected_Tag
+				if ctx != nil && len(ctx.codec_err) == 0 {
+					ctx.codec_err = cz_err
+				}
+				return nil, nil
 			}
 			return string(decoded), nil
 		}
-		if len(v.format_tag) == 2 && v.format_tag[0] == 'b' && v.format_tag[1] == 'p' &&
-		   len(v.value) == 33 && v.value[0] == 0x10 && cur.db != nil {
+		if t0 == 'b' && t1 == 'p' {
+			if len(v.value) != 33 || v.value[0] != 0x10 {
+				if ctx != nil && len(ctx.codec_err) == 0 {
+					ctx.codec_err = "corrupt_compressed_payload"
+				}
+				return nil, nil
+			}
+			if moment_cur.db == nil {
+				return nif_dl_lookup_or_defer(ctx, active_moment, v.format_tag, v.value, pv, allocator), nil
+			}
 			hex_chars := "0123456789abcdef"
 			hex_buf: [64]u8 = ---
 			for i in 0 ..< 32 {
@@ -7476,36 +7589,52 @@ nif_dl_unwrap_pull_value :: proc(
 				hex_buf[i * 2 + 1] = hex_chars[bt & 0x0F]
 			}
 			sha_hex := string(hex_buf[:])
-			rc := xitdb.database_root_cursor(cur.db).read_cursor
-			if history, h_err := xitdb.read_array_list_init(rc); h_err == nil {
-				if cnt, c_err := xitdb.array_list_count(history); c_err == nil && cnt > 0 {
-					if mc_maybe, mc_err := xitdb.array_list_get_cursor(history, cnt - 1); mc_err == nil {
-						if mc, has_mc := mc_maybe.?; has_mc {
-							steps := [2]xitdb.Path_Step{xitdb.hm("__blobs"), xitdb.hm(sha_hex)}
-							if blob_cur_maybe, bc_err := xitdb.read_steps_cursor(mc, steps[:]); bc_err == nil {
-								if blob_cur, has_blob := blob_cur_maybe.?; has_blob {
-									inner_val := xitdb.pull(blob_cur, "*", allocator) or_return
-									if inner_b, is_ib := inner_val.(xitdb.Bytes); is_ib {
-										if len(inner_b.format_tag) == 2 && inner_b.format_tag[0] == 'c' && inner_b.format_tag[1] == 'z' {
-											decoded, cz_err := decode_cz_bytes(inner_b.value, allocator)
-											if cz_err != "" {
-												return nil, .Unexpected_Tag
-											}
-											return string(decoded), nil
-										}
-									}
-									return inner_val, nil
+			moment_slot := xitdb.cursor_slot(moment_cur) or_return
+			blobs_step := xitdb.Path_Step{kind = map_key_step_kind(moment_slot.tag), key = "__blobs"}
+			blobs_cur_maybe, b1_err := xitdb.read_steps_cursor(moment_cur, []xitdb.Path_Step{blobs_step})
+			if b1_err != nil && b1_err != .Unexpected_Tag {
+				return nil, b1_err
+			}
+			if blobs_cur, has_blobs := blobs_cur_maybe.?; has_blobs && b1_err == nil {
+				blobs_slot := xitdb.cursor_slot(blobs_cur) or_return
+				sha_step := xitdb.Path_Step{kind = map_key_step_kind(blobs_slot.tag), key = sha_hex}
+				blob_cur_maybe, b2_err := xitdb.read_steps_cursor(blobs_cur, []xitdb.Path_Step{sha_step})
+				if b2_err != nil && b2_err != .Unexpected_Tag {
+					return nil, b2_err
+				}
+				if blob_cur, has_blob := blob_cur_maybe.?; has_blob && b2_err == nil {
+					inner_val := xitdb.pull(blob_cur, "*", allocator) or_return
+					if inner_b, is_ib := inner_val.(xitdb.Bytes); is_ib {
+						if len(inner_b.format_tag) == 2 && inner_b.format_tag[0] == 'c' && inner_b.format_tag[1] == 'z' {
+							decoded, cz_err := decode_cz_bytes(inner_b.value, allocator, max_b)
+							if cz_err != "" {
+								if ctx != nil && len(ctx.codec_err) == 0 {
+									ctx.codec_err = cz_err
 								}
+								return nil, nil
 							}
+							return string(decoded), nil
+						}
+						if nif_dl_is_compression_tag(inner_b.format_tag) {
+							return nif_dl_lookup_or_defer(ctx, active_moment, v.format_tag, v.value, pv, allocator), nil
 						}
 					}
+					return inner_val, nil
 				}
 			}
+			if ctx != nil && len(ctx.codec_err) == 0 {
+				ctx.codec_err = "missing_interned_blob"
+			}
+			return nil, nil
 		}
+		return nif_dl_lookup_or_defer(ctx, active_moment, v.format_tag, v.value, pv, allocator), nil
 	case xitdb.Pull_List:
 		out_list := make([]xitdb.Pull_Value, len(v), allocator)
 		for elem, i in v {
-			out_list[i] = nif_dl_unwrap_pull_value(cur, elem, allocator) or_return
+			out_list[i] = nif_dl_unwrap_pull_value(ctx, active_moment, moment_cur, elem, allocator) or_return
+			if ctx != nil && len(ctx.codec_err) > 0 {
+				return nil, nil
+			}
 		}
 		return xitdb.Pull_List(out_list), nil
 	case xitdb.Pull_Map:
@@ -7513,7 +7642,10 @@ nif_dl_unwrap_pull_value :: proc(
 		for entry, i in v {
 			out_map[i] = xitdb.Pull_Map_Entry{
 				key = entry.key,
-				val = nif_dl_unwrap_pull_value(cur, entry.val, allocator) or_return,
+				val = nif_dl_unwrap_pull_value(ctx, active_moment, moment_cur, entry.val, allocator) or_return,
+			}
+			if ctx != nil && len(ctx.codec_err) > 0 {
+				return nil, nil
 			}
 		}
 		return xitdb.Pull_Map(out_map), nil
@@ -7521,10 +7653,16 @@ nif_dl_unwrap_pull_value :: proc(
 	return pv, nil
 }
 
-nif_dl_read_cursor_value :: proc(cur: xitdb.Read_Cursor, allocator: runtime.Allocator) -> (res: xitdb.Pull_Value, err: xitdb.Error) {
+nif_dl_read_cursor_value :: proc(
+	ctx: ^NIF_DL_Decode_Ctx,
+	active_moment: i64,
+	moment_cur: xitdb.Read_Cursor,
+	cur: xitdb.Read_Cursor,
+	allocator: runtime.Allocator,
+) -> (res: xitdb.Pull_Value, err: xitdb.Error) {
 	// `xitdb.pull` handles scalars AND nested containers cleanly
 	raw := xitdb.pull(cur, "*", allocator) or_return
-	return nif_dl_unwrap_pull_value(cur, raw, allocator)
+	return nif_dl_unwrap_pull_value(ctx, active_moment, moment_cur, raw, allocator)
 }
 
 nif_dl_find_prefix_hint :: proc(q: ^NIF_Datalog_Query, var_idx: int) -> (string, bool) {
@@ -7639,6 +7777,7 @@ nif_dl_eval_reach :: proc(
 		var_count  = q.var_count,
 		find_items = make([dynamic]xitdb.Datalog_Find_Item, 1, 1, allocator),
 		clauses    = make([dynamic]NIF_Datalog_Clause, 1, 1, allocator),
+		dl_ctx     = q.dl_ctx,
 		allocator  = allocator,
 	}
 	step_q.clauses[0] = clause.reach_edge^
@@ -7654,6 +7793,9 @@ nif_dl_eval_reach :: proc(
 		seed_env.bound[clause.reach_from_var] = false
 		seed_env.bound[clause.reach_to_var] = false
 		_ = nif_dl_eval_pattern_moment(db, step_q, clause.reach_edge, 0, default_moment, seed_env, &seed_rows, nil, false, allocator) or_return
+		if q.dl_ctx != nil && len(q.dl_ctx.codec_err) > 0 {
+			return false, nil
+		}
 		for sr in seed_rows {
 			if !nif_dl_slice_contains(seeds[:], sr[0]) {
 				append(&seeds, sr[0])
@@ -7682,6 +7824,9 @@ nif_dl_eval_reach :: proc(
 
 				neighbor_rows := make([dynamic][]xitdb.Pull_Value, 0, 4, allocator)
 				_ = nif_dl_eval_pattern_moment(db, step_q, clause.reach_edge, 0, default_moment, edge_env, &neighbor_rows, nil, false, allocator) or_return
+				if q.dl_ctx != nil && len(q.dl_ctx.codec_err) > 0 {
+					return false, nil
+				}
 
 				for nrow in neighbor_rows {
 					next_node := nrow[0]
@@ -7718,6 +7863,9 @@ nif_dl_eval_reach :: proc(
 				if merr != nil {
 					return false, merr
 				}
+				if q.dl_ctx != nil && len(q.dl_ctx.codec_err) > 0 {
+					return false, nil
+				}
 				if m {
 					matched_any = true
 					if stop_after_first {
@@ -7747,6 +7895,9 @@ nif_dl_eval_reach :: proc(
 
 			neighbor_rows := make([dynamic][]xitdb.Pull_Value, 0, 4, allocator)
 			_ = nif_dl_eval_pattern_moment(db, step_q, clause.reach_edge, 0, default_moment, edge_env, &neighbor_rows, nil, false, allocator) or_return
+			if q.dl_ctx != nil && len(q.dl_ctx.codec_err) > 0 {
+				return false, nil
+			}
 
 			for nrow in neighbor_rows {
 				next_node := nrow[0]
@@ -7777,6 +7928,9 @@ nif_dl_eval_reach :: proc(
 				}
 
 				m := nif_dl_eval_clauses(db, q, clause_idx + 1, default_moment, next_env, out_rows, out_envs, stop_after_first, allocator) or_return
+				if q.dl_ctx != nil && len(q.dl_ctx.codec_err) > 0 {
+					return false, nil
+				}
 				if m {
 					matched_any = true
 					if stop_after_first {
@@ -7796,6 +7950,8 @@ nif_dl_eval_pattern_steps :: proc(
 	clause: ^NIF_Datalog_Clause,
 	start_step_idx: int,
 	start_cur: xitdb.Read_Cursor,
+	active_moment: i64,
+	active_moment_cur: xitdb.Read_Cursor,
 	clause_idx: int,
 	default_moment: i64,
 	env: ^NIF_Datalog_Env,
@@ -7893,11 +8049,14 @@ nif_dl_eval_pattern_steps :: proc(
 				env.bound[var_idx] = true
 				env.vals[var_idx] = k_str
 				child_cur := key_cur if slot.tag == .Sorted_Set else val_cur
-				m, merr := nif_dl_eval_pattern_steps(db, q, clause, step_idx + 1, child_cur, clause_idx, default_moment, env, out_rows, out_envs, check_only, allocator)
+				m, merr := nif_dl_eval_pattern_steps(db, q, clause, step_idx + 1, child_cur, active_moment, active_moment_cur, clause_idx, default_moment, env, out_rows, out_envs, check_only, allocator)
 				env.bound[var_idx] = false
 				env.vals[var_idx] = nil
 				if merr != nil {
 					return false, merr
+				}
+				if q.dl_ctx != nil && len(q.dl_ctx.codec_err) > 0 {
+					return false, nil
 				}
 				if m {
 					matched_any = true
@@ -7925,11 +8084,14 @@ nif_dl_eval_pattern_steps :: proc(
 				env.bound[var_idx] = true
 				env.vals[var_idx] = k_str
 				child_cur := key_cur if is_set else val_cur
-				m, merr := nif_dl_eval_pattern_steps(db, q, clause, step_idx + 1, child_cur, clause_idx, default_moment, env, out_rows, out_envs, check_only, allocator)
+				m, merr := nif_dl_eval_pattern_steps(db, q, clause, step_idx + 1, child_cur, active_moment, active_moment_cur, clause_idx, default_moment, env, out_rows, out_envs, check_only, allocator)
 				env.bound[var_idx] = false
 				env.vals[var_idx] = nil
 				if merr != nil {
 					return false, merr
+				}
+				if q.dl_ctx != nil && len(q.dl_ctx.codec_err) > 0 {
+					return false, nil
 				}
 				if m {
 					matched_any = true
@@ -7952,11 +8114,14 @@ nif_dl_eval_pattern_steps :: proc(
 				env.bound[var_idx] = true
 				env.vals[var_idx] = idx
 				idx += 1
-				m, merr := nif_dl_eval_pattern_steps(db, q, clause, step_idx + 1, c, clause_idx, default_moment, env, out_rows, out_envs, check_only, allocator)
+				m, merr := nif_dl_eval_pattern_steps(db, q, clause, step_idx + 1, c, active_moment, active_moment_cur, clause_idx, default_moment, env, out_rows, out_envs, check_only, allocator)
 				env.bound[var_idx] = false
 				env.vals[var_idx] = nil
 				if merr != nil {
 					return false, merr
+				}
+				if q.dl_ctx != nil && len(q.dl_ctx.codec_err) > 0 {
+					return false, nil
 				}
 				if m {
 					matched_any = true
@@ -7976,12 +8141,18 @@ nif_dl_eval_pattern_steps :: proc(
 	switch clause.rhs_kind {
 	case .None:
 	case .Literal:
-		actual := nif_dl_read_cursor_value(cur, allocator) or_return
+		actual := nif_dl_read_cursor_value(q.dl_ctx, active_moment, active_moment_cur, cur, allocator) or_return
+		if q.dl_ctx != nil && len(q.dl_ctx.codec_err) > 0 {
+			return false, nil
+		}
 		if !nif_dl_value_equals(actual, clause.rhs_lit) {
 			return false, nil
 		}
 	case .Var:
-		actual := nif_dl_read_cursor_value(cur, allocator) or_return
+		actual := nif_dl_read_cursor_value(q.dl_ctx, active_moment, active_moment_cur, cur, allocator) or_return
+		if q.dl_ctx != nil && len(q.dl_ctx.codec_err) > 0 {
+			return false, nil
+		}
 		if env.bound[clause.rhs_var] {
 			if !nif_dl_value_equals(env.vals[clause.rhs_var], actual) {
 				return false, nil
@@ -8027,7 +8198,7 @@ nif_dl_eval_pattern_moment :: proc(
 		if root_slot.tag == .None {
 			return false, nil
 		}
-		return nif_dl_eval_pattern_steps(db, q, clause, 0, rc, clause_idx, default_moment, env, out_rows, out_envs, check_only, allocator)
+		return nif_dl_eval_pattern_steps(db, q, clause, 0, rc, -1, rc, clause_idx, default_moment, env, out_rows, out_envs, check_only, allocator)
 	}
 
 	history := xitdb.read_array_list_init(rc) or_return
@@ -8047,7 +8218,7 @@ nif_dl_eval_pattern_moment :: proc(
 		if !ok {
 			return false, nil
 		}
-		return nif_dl_eval_pattern_steps(db, q, clause, 0, mc, clause_idx, default_moment, env, out_rows, out_envs, check_only, allocator)
+		return nif_dl_eval_pattern_steps(db, q, clause, 0, mc, resolved, mc, clause_idx, default_moment, env, out_rows, out_envs, check_only, allocator)
 
 	case .Literal_Moment:
 		resolved := clause.moment_lit if clause.moment_lit >= 0 else moment_count + clause.moment_lit
@@ -8059,7 +8230,7 @@ nif_dl_eval_pattern_moment :: proc(
 		if !ok {
 			return false, nil
 		}
-		return nif_dl_eval_pattern_steps(db, q, clause, 0, mc, clause_idx, default_moment, env, out_rows, out_envs, check_only, allocator)
+		return nif_dl_eval_pattern_steps(db, q, clause, 0, mc, resolved, mc, clause_idx, default_moment, env, out_rows, out_envs, check_only, allocator)
 
 	case .Var_Moment:
 		if env.bound[clause.moment_var] {
@@ -8076,7 +8247,7 @@ nif_dl_eval_pattern_moment :: proc(
 			if !has_mc {
 				return false, nil
 			}
-			return nif_dl_eval_pattern_steps(db, q, clause, 0, mc, clause_idx, default_moment, env, out_rows, out_envs, check_only, allocator)
+			return nif_dl_eval_pattern_steps(db, q, clause, 0, mc, resolved, mc, clause_idx, default_moment, env, out_rows, out_envs, check_only, allocator)
 		}
 		v := clause.moment_var
 		for m_idx: i64 = 0; m_idx < moment_count; m_idx += 1 {
@@ -8087,11 +8258,14 @@ nif_dl_eval_pattern_moment :: proc(
 			}
 			env.bound[v] = true
 			env.vals[v] = m_idx
-			m_matched, merr := nif_dl_eval_pattern_steps(db, q, clause, 0, mc, clause_idx, default_moment, env, out_rows, out_envs, check_only, allocator)
+			m_matched, merr := nif_dl_eval_pattern_steps(db, q, clause, 0, mc, m_idx, mc, clause_idx, default_moment, env, out_rows, out_envs, check_only, allocator)
 			env.bound[v] = false
 			env.vals[v] = nil
 			if merr != nil {
 				return false, merr
+			}
+			if q.dl_ctx != nil && len(q.dl_ctx.codec_err) > 0 {
+				return false, nil
 			}
 			if m_matched {
 				matched_any = true
@@ -8116,6 +8290,9 @@ nif_dl_eval_clauses :: proc(
 	stop_after_first: bool,
 	allocator: runtime.Allocator,
 ) -> (matched_any: bool, err: xitdb.Error) {
+	if q.dl_ctx != nil && len(q.dl_ctx.codec_err) > 0 {
+		return false, nil
+	}
 	if clause_idx >= len(q.clauses) {
 		if !stop_after_first {
 			if q.has_aggregates && out_envs != nil {
@@ -8152,6 +8329,9 @@ nif_dl_eval_clauses :: proc(
 		neg_env := new(NIF_Datalog_Env, allocator)
 		neg_env^ = env^
 		has_match := nif_dl_eval_pattern_moment(db, q, neg_clause, -1, default_moment, neg_env, out_rows, out_envs, true, allocator) or_return
+		if q.dl_ctx != nil && len(q.dl_ctx.codec_err) > 0 {
+			return false, nil
+		}
 		if has_match {
 			return false, nil
 		}
@@ -8287,7 +8467,7 @@ odin_nif_query_datalog :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NI
 	context = runtime.default_context()
 	defer free_all(context.temp_allocator)
 
-	if argc != 3 {
+	if argc != 3 && argc != 6 {
 		return make_err(env, "badarg")
 	}
 	moment_idx: i64 = -1
@@ -8299,12 +8479,63 @@ odin_nif_query_datalog :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NI
 		return make_err(env, "badarg")
 	}
 
+	raw_tagged := false
+	allow_defer := argc == 6
+	max_decompressed_bytes: u64 = MAX_NIF_DECOMPRESSED_BYTES
+	predecoded := make(map[string]Maybe(string), 8, context.temp_allocator)
+
+	if argc == 6 {
+		rt_val, ok_rt := parse_bool_arg(argv[3])
+		if !ok_rt {
+			return make_err(env, "badarg")
+		}
+		raw_tagged = rt_val
+
+		max_b_i64: i64 = 0
+		if nif_get_int64(env, argv[4], &max_b_i64) == 0 || max_b_i64 <= 0 {
+			return make_err(env, "badarg")
+		}
+		max_decompressed_bytes = u64(max_b_i64)
+
+		if nif_is_map(env, argv[5]) == 0 {
+			return make_err(env, "badarg")
+		}
+		it: Nif_Map_Iter
+		if nif_map_iter_create(env, argv[5], &it) == 0 {
+			return make_err(env, "badarg")
+		}
+		defer nif_map_iter_destroy(env, &it)
+		k_term, v_term: ERL_NIF_TERM
+		for nif_map_iter_get_and_next(env, &it, &k_term, &v_term) != 0 {
+			k_str, ok_k := get_string_from_binary(env, k_term)
+			if !ok_k {
+				return make_err(env, "badarg")
+			}
+			if v_term == ATOM_NIL {
+				predecoded[k_str] = Maybe(string)(nil)
+			} else if v_str, ok_v := get_string_from_binary(env, v_term); ok_v {
+				predecoded[k_str] = v_str
+			} else {
+				return make_err(env, "badarg")
+			}
+		}
+	}
+
 	q_val, q_err := nif_dl_parse_query(query_str, context.temp_allocator)
 	if q_err != "" {
 		return make_err(env, q_err)
 	}
+	dl_ctx := NIF_DL_Decode_Ctx{
+		raw_tagged             = raw_tagged,
+		allow_defer            = allow_defer,
+		max_decompressed_bytes = max_decompressed_bytes,
+		predecoded             = predecoded,
+		missing_seen           = make(map[string]bool, 8, context.temp_allocator),
+		missing                = make([dynamic]NIF_DL_Missing_Tag, 0, 8, context.temp_allocator),
+	}
 	q := new(NIF_Datalog_Query, context.temp_allocator)
 	q^ = q_val
+	q.dl_ctx = &dl_ctx
 
 	handle, ok := acquire_rlock(env, argv[0])
 	if !ok {
@@ -8317,8 +8548,24 @@ odin_nif_query_datalog :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NI
 	dl_env := new(NIF_Datalog_Env, context.temp_allocator)
 
 	_, exec_err := nif_dl_eval_clauses(&handle.db, q, 0, moment_idx, dl_env, &raw_rows, &matched_envs, false, context.temp_allocator)
+	if len(dl_ctx.codec_err) > 0 {
+		return make_err(env, dl_ctx.codec_err)
+	}
 	if exec_err != nil {
 		return make_xitdb_err(env, exec_err)
+	}
+	if len(dl_ctx.missing) > 0 {
+		missing_terms := make([]ERL_NIF_TERM, len(dl_ctx.missing), context.temp_allocator)
+		for &m, idx in dl_ctx.missing {
+			missing_terms[idx] = nif_make_tuple3(
+				env,
+				nif_make_int64(env, m.moment),
+				make_bytes_binary(env, m.tag[:]),
+				make_bytes_binary(env, m.payload),
+			)
+		}
+		missing_list := nif_make_list_from_array(env, raw_data(missing_terms), c.uint(len(missing_terms)))
+		return nif_make_tuple2(env, ATOM_NEED_DECODE, missing_list)
 	}
 
 	final_rows := raw_rows[:]
@@ -8342,7 +8589,7 @@ odin_nif_query_datalog :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NI
 	for row, r_idx in final_rows {
 		cols := make([]ERL_NIF_TERM, len(row), context.temp_allocator)
 		for cell, c_idx in row {
-			cols[c_idx] = pull_value_to_term(env, cell, false, &codec_err)
+			cols[c_idx] = pull_value_to_term(env, cell, raw_tagged, &codec_err)
 			if len(codec_err) > 0 {
 				return make_err(env, codec_err)
 			}
@@ -8519,12 +8766,17 @@ gc_collect_slot :: proc(
 	return nil
 }
 
-gc_make_rm_steps :: proc(allocator: runtime.Allocator, parts: ..string) -> []xitdb.Path_Step {
-	steps := make([]xitdb.Path_Step, len(parts), allocator)
-	for p, i in parts {
+GC_Rm_Segment :: struct {
+	kind: xitdb.Step_Kind,
+	key:  string,
+}
+
+gc_make_rm_steps :: proc(allocator: runtime.Allocator, segs: ..GC_Rm_Segment) -> []xitdb.Path_Step {
+	steps := make([]xitdb.Path_Step, len(segs), allocator)
+	for seg, i in segs {
 		steps[i] = xitdb.Path_Step{
-			kind = .Hash_Map_Key,
-			key  = strings.clone(p, allocator),
+			kind = seg.kind,
+			key  = strings.clone(seg.key, allocator),
 		}
 	}
 	return steps
@@ -8536,13 +8788,19 @@ gc_collect_dead_compression_ops :: proc(
 ) -> (dead_ops: [dynamic]xitdb.Tx_Op, has_compression_roots: bool, err: xitdb.Error) {
 	dead_ops = make([dynamic]xitdb.Tx_Op, 0, 8, allocator)
 
+	db_root := xitdb.database_read_root_slot(&handle.db) or_return
+	if db_root.tag != .Array_List {
+		return dead_ops, false, nil
+	}
+
 	root_slot, _, is_empty, r_err, err_reason := resolve_slot_arg(handle, -1, -1)
 	if r_err != nil || err_reason != "" || is_empty {
 		return dead_ops, false, r_err
 	}
-	if root_slot.tag != .Hash_Map && root_slot.tag != .Counted_Hash_Map && root_slot.tag != .Sorted_Map {
+	if root_slot.tag != .Hash_Map {
 		return dead_ops, false, nil
 	}
+	root_kind := map_key_step_kind(root_slot.tag)
 
 	root_cur := xitdb.Read_Cursor{
 		slot_ptr = xitdb.Slot_Pointer{position = nil, slot = root_slot},
@@ -8599,6 +8857,7 @@ gc_collect_dead_compression_ops :: proc(
 
 	// Inspect __blobs for dead entries and transitive live_dicts from live "zd" blobs
 	if bs, has_blobs := blobs_slot.?; has_blobs && is_container_tag(bs.tag) {
+		blobs_kind := map_key_step_kind(bs.tag)
 		b_cur := xitdb.Read_Cursor{
 			slot_ptr = xitdb.Slot_Pointer{position = nil, slot = bs},
 			db       = &handle.db,
@@ -8626,16 +8885,23 @@ gc_collect_dead_compression_ops :: proc(
 			}
 		}
 		if live_blob_count == 0 {
-			append(&dead_ops, xitdb.Tx_Op{kind = .Remove, steps = gc_make_rm_steps(allocator, "__blobs")})
+			append(&dead_ops, xitdb.Tx_Op{
+				kind  = .Remove,
+				steps = gc_make_rm_steps(allocator, GC_Rm_Segment{root_kind, "__blobs"}),
+			})
 		} else {
 			for k in dead_blob_keys {
-				append(&dead_ops, xitdb.Tx_Op{kind = .Remove, steps = gc_make_rm_steps(allocator, "__blobs", k)})
+				append(&dead_ops, xitdb.Tx_Op{
+					kind  = .Remove,
+					steps = gc_make_rm_steps(allocator, GC_Rm_Segment{root_kind, "__blobs"}, GC_Rm_Segment{blobs_kind, k}),
+				})
 			}
 		}
 	}
 
 	// Inspect __col_pages for dead pages and transitive live_dicts from "XCP1" headers
 	if ps, has_pages := pages_slot.?; has_pages && is_container_tag(ps.tag) {
+		pages_kind := map_key_step_kind(ps.tag)
 		p_cur := xitdb.Read_Cursor{
 			slot_ptr = xitdb.Slot_Pointer{position = nil, slot = ps},
 			db       = &handle.db,
@@ -8655,10 +8921,14 @@ gc_collect_dead_compression_ops :: proc(
 			col_name := strings.clone(col_name_raw, allocator)
 			col_val_slot := col_val_cur.slot_ptr.slot
 			if !is_container_tag(col_val_slot.tag) {
-				append(&dead_col_ops, xitdb.Tx_Op{kind = .Remove, steps = gc_make_rm_steps(allocator, "__col_pages", col_name)})
+				append(&dead_col_ops, xitdb.Tx_Op{
+					kind  = .Remove,
+					steps = gc_make_rm_steps(allocator, GC_Rm_Segment{root_kind, "__col_pages"}, GC_Rm_Segment{pages_kind, col_name}),
+				})
 				continue
 			}
 
+			col_kind := map_key_step_kind(col_val_slot.tag)
 			field_it := xitdb.cursor_iterator(col_val_cur) or_return
 			dead_field_ops := make([dynamic]xitdb.Tx_Op, 0, 8, allocator)
 			live_in_col := 0
@@ -8674,10 +8944,14 @@ gc_collect_dead_compression_ops :: proc(
 				field_name := strings.clone(field_name_raw, allocator)
 				field_val_slot := field_val_cur.slot_ptr.slot
 				if !is_container_tag(field_val_slot.tag) {
-					append(&dead_field_ops, xitdb.Tx_Op{kind = .Remove, steps = gc_make_rm_steps(allocator, "__col_pages", col_name, field_name)})
+					append(&dead_field_ops, xitdb.Tx_Op{
+						kind  = .Remove,
+						steps = gc_make_rm_steps(allocator, GC_Rm_Segment{root_kind, "__col_pages"}, GC_Rm_Segment{pages_kind, col_name}, GC_Rm_Segment{col_kind, field_name}),
+					})
 					continue
 				}
 
+				field_kind := map_key_step_kind(field_val_slot.tag)
 				page_it := xitdb.cursor_iterator(field_val_cur) or_return
 				dead_page_ids := make([dynamic]string, 0, 8, allocator)
 				live_in_field := 0
@@ -8711,17 +8985,26 @@ gc_collect_dead_compression_ops :: proc(
 				}
 
 				if live_in_field == 0 {
-					append(&dead_field_ops, xitdb.Tx_Op{kind = .Remove, steps = gc_make_rm_steps(allocator, "__col_pages", col_name, field_name)})
+					append(&dead_field_ops, xitdb.Tx_Op{
+						kind  = .Remove,
+						steps = gc_make_rm_steps(allocator, GC_Rm_Segment{root_kind, "__col_pages"}, GC_Rm_Segment{pages_kind, col_name}, GC_Rm_Segment{col_kind, field_name}),
+					})
 				} else {
 					live_in_col += live_in_field
 					for pid in dead_page_ids {
-						append(&dead_field_ops, xitdb.Tx_Op{kind = .Remove, steps = gc_make_rm_steps(allocator, "__col_pages", col_name, field_name, pid)})
+						append(&dead_field_ops, xitdb.Tx_Op{
+							kind  = .Remove,
+							steps = gc_make_rm_steps(allocator, GC_Rm_Segment{root_kind, "__col_pages"}, GC_Rm_Segment{pages_kind, col_name}, GC_Rm_Segment{col_kind, field_name}, GC_Rm_Segment{field_kind, pid}),
+						})
 					}
 				}
 			}
 
 			if live_in_col == 0 {
-				append(&dead_col_ops, xitdb.Tx_Op{kind = .Remove, steps = gc_make_rm_steps(allocator, "__col_pages", col_name)})
+				append(&dead_col_ops, xitdb.Tx_Op{
+					kind  = .Remove,
+					steps = gc_make_rm_steps(allocator, GC_Rm_Segment{root_kind, "__col_pages"}, GC_Rm_Segment{pages_kind, col_name}),
+				})
 			} else {
 				live_total_pages += live_in_col
 				for op in dead_field_ops {
@@ -8731,7 +9014,10 @@ gc_collect_dead_compression_ops :: proc(
 		}
 
 		if live_total_pages == 0 {
-			append(&dead_ops, xitdb.Tx_Op{kind = .Remove, steps = gc_make_rm_steps(allocator, "__col_pages")})
+			append(&dead_ops, xitdb.Tx_Op{
+				kind  = .Remove,
+				steps = gc_make_rm_steps(allocator, GC_Rm_Segment{root_kind, "__col_pages"}),
+			})
 		} else {
 			for op in dead_col_ops {
 				append(&dead_ops, op)
@@ -8741,6 +9027,7 @@ gc_collect_dead_compression_ops :: proc(
 
 	// Inspect __dicts after transitive marks from __blobs and __col_pages
 	if ds, has_dicts := dicts_slot.?; has_dicts && is_container_tag(ds.tag) {
+		dicts_kind := map_key_step_kind(ds.tag)
 		d_cur := xitdb.Read_Cursor{
 			slot_ptr = xitdb.Slot_Pointer{position = nil, slot = ds},
 			db       = &handle.db,
@@ -8763,10 +9050,16 @@ gc_collect_dead_compression_ops :: proc(
 			}
 		}
 		if live_dict_count == 0 {
-			append(&dead_ops, xitdb.Tx_Op{kind = .Remove, steps = gc_make_rm_steps(allocator, "__dicts")})
+			append(&dead_ops, xitdb.Tx_Op{
+				kind  = .Remove,
+				steps = gc_make_rm_steps(allocator, GC_Rm_Segment{root_kind, "__dicts"}),
+			})
 		} else {
 			for k in dead_dict_keys {
-				append(&dead_ops, xitdb.Tx_Op{kind = .Remove, steps = gc_make_rm_steps(allocator, "__dicts", k)})
+				append(&dead_ops, xitdb.Tx_Op{
+					kind  = .Remove,
+					steps = gc_make_rm_steps(allocator, GC_Rm_Segment{root_kind, "__dicts"}, GC_Rm_Segment{dicts_kind, k}),
+				})
 			}
 		}
 	}
@@ -8830,15 +9123,33 @@ odin_nif_compact :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM
 	if !has_comp_roots || len(dead_ops) == 0 {
 		comp_handle.db, comp_err = xitdb.database_compact(&handle.db, &comp_handle.core)
 	} else {
-		stage_core := xitdb.core_memory_init(context.allocator)
-		defer _ = xitdb.core_destroy(&stage_core, close_file = false)
-
-		stage_db, sc_err := xitdb.database_compact(&handle.db, &stage_core)
-		if sc_err != nil {
+		base_sz, sz_err := xitdb.database_committed_size(&handle.db)
+		if sz_err != nil {
 			_ = xitdb.core_destroy(&comp_handle.core, close_file = true)
 			comp_handle.is_closed = true
 			_ = nif_make_db_resource(env, raw_res)
-			return make_xitdb_err(env, sc_err)
+			return make_xitdb_err(env, sz_err)
+		}
+
+		stage_core, ov_err := xitdb.core_overlay_init(handle.db.core, base_sz, context.allocator)
+		if ov_err != nil {
+			_ = xitdb.core_destroy(&comp_handle.core, close_file = true)
+			comp_handle.is_closed = true
+			_ = nif_make_db_resource(env, raw_res)
+			return make_xitdb_err(env, ov_err)
+		}
+		defer _ = xitdb.core_destroy(&stage_core, close_file = false)
+
+		h := handle.db.hasher
+		h.id = handle.db.header.hash_id
+		h.hash_size = handle.db.header.hash_size
+		h.file_id = 0
+		stage_db, db_err := xitdb.database_init(&stage_core, h)
+		if db_err != nil {
+			_ = xitdb.core_destroy(&comp_handle.core, close_file = true)
+			comp_handle.is_closed = true
+			_ = nif_make_db_resource(env, raw_res)
+			return make_xitdb_err(env, db_err)
 		}
 
 		tx := xitdb.tx_init(&stage_db, base_moment = -1, track_changes = false, allocator = context.temp_allocator)
