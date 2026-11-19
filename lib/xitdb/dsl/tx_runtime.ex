@@ -310,6 +310,8 @@ defmodule Xitdb.DSL.TxRuntime do
     struct |> TxCompiler.encode_value() |> materialize_staged_value()
   end
 
+  defp materialize_staged_value({:compressed, bin}) when is_binary(bin), do: bin
+  defp materialize_staged_value({:compressed, bin, _opts}) when is_binary(bin), do: bin
   defp materialize_staged_value(scalar), do: scalar
 
   defp read_current_value(%__MODULE__{staged_log: staged_log, db: db, opts: opts}, selector) do

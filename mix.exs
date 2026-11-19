@@ -117,6 +117,12 @@ defmodule Xitdb.MixProject do
           Xitdb.Encoder,
           Xitdb.Error
         ],
+        "Compression & Columnar Storage": [
+          Xitdb.Compression,
+          Xitdb.Compression.Dictionary,
+          Xitdb.Columnar,
+          Xitdb.Columnar.Page
+        ],
         "DSLs, Pull & Sigils": [
           Xitdb.DSL,
           Xitdb.Pull,
@@ -136,6 +142,7 @@ defmodule Xitdb.MixProject do
           Xitdb.Ash.LeaseError
         ],
         "Ash DSL Entities & Internals": [
+          Xitdb.Ash.Compress,
           Xitdb.Ash.Index,
           Xitdb.Ash.SearchField,
           Xitdb.Ash.Reference,
@@ -226,7 +233,7 @@ defmodule Mix.Tasks.Compile.OdinNif do
             "-build-mode:shared",
             "-out:#{so_path}",
             "-collection:xitdb=#{xitdb_col_dir}",
-            "-extra-linker-flags:#{c_obj}",
+            "-extra-linker-flags:#{c_obj} -lz",
             "-o:speed"
           ],
           stderr_to_stdout: true

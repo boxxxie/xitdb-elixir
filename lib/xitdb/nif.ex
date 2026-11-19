@@ -28,10 +28,26 @@ defmodule Xitdb.NIF do
     do: :erlang.nif_error(:nif_not_loaded)
 
   def nif_slot_materialize(_db_ref, _tag_id, _val, _full), do: :erlang.nif_error(:nif_not_loaded)
+
+  def nif_slot_materialize(_db_ref, _tag_id, _val, _full, _raw_tagged),
+    do: :erlang.nif_error(:nif_not_loaded)
+
   def nif_transact(_db_ref, _base_moment, _ops, _doc), do: :erlang.nif_error(:nif_not_loaded)
   def nif_select(_db_ref, _moment_idx, _selector), do: :erlang.nif_error(:nif_not_loaded)
+
+  def nif_select(_db_ref, _moment_idx, _selector, _raw_tagged),
+    do: :erlang.nif_error(:nif_not_loaded)
+
   def nif_pull(_db_ref, _tag_id, _val, _pattern), do: :erlang.nif_error(:nif_not_loaded)
+
+  def nif_pull(_db_ref, _tag_id, _val, _pattern, _raw_tagged),
+    do: :erlang.nif_error(:nif_not_loaded)
+
   def nif_diff_moments(_db_ref, _moment_a, _moment_b), do: :erlang.nif_error(:nif_not_loaded)
+
+  def nif_diff_moments(_db_ref, _moment_a, _moment_b, _raw_tagged),
+    do: :erlang.nif_error(:nif_not_loaded)
+
   def nif_history_of(_db_ref, _selector), do: :erlang.nif_error(:nif_not_loaded)
   def nif_query_datalog(_db_ref, _moment_idx, _query_str), do: :erlang.nif_error(:nif_not_loaded)
   def nif_compact(_db_ref, _target_path), do: :erlang.nif_error(:nif_not_loaded)

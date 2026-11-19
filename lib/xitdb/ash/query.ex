@@ -923,14 +923,15 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     # Stage 2: Cursor Hydration & Attribute Multitenancy Enforcement
     # ==========================================================================
 
-    defp stage2_hydrate(raw_cursors, %__MODULE__{tenant: tenant}, resource) do
+    defp stage2_hydrate(raw_cursors, %__MODULE__{tenant: tenant} = query, resource) do
       strategy = Ash.Resource.Info.multitenancy_strategy(resource)
       global? = Ash.Resource.Info.multitenancy_global?(resource)
       tenant_attr = Ash.Resource.Info.multitenancy_attribute(resource)
+      only_attrs = needed_attributes_for_hydration(query, resource, tenant_attr)
 
       raw_cursors
       |> Enum.reduce_while({:ok, []}, fn {_doc_id, cursor}, {:ok, acc} ->
-        case Codec.from_cursor(resource, cursor, tenant) do
+        case Codec.from_cursor(resource, cursor, tenant, only_attrs) do
           {:ok, record} ->
             if Codec.matches_attribute_tenant?(record, strategy, tenant_attr, global?, tenant) do
               {:cont, {:ok, [record | acc]}}
@@ -943,6 +944,99 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         end
       end)
       |> reverse_ok()
+    end
+
+    defp needed_attributes_for_hydration(%__MODULE__{select: nil}, _resource, _tenant_attr),
+      do: :all
+
+    defp needed_attributes_for_hydration(
+           %__MODULE__{aggregates: [_ | _]},
+           _resource,
+           _tenant_attr
+         ),
+         do: :all
+
+    defp needed_attributes_for_hydration(
+           %__MODULE__{select: select} = query,
+           resource,
+           tenant_attr
+         )
+         when is_list(select) do
+      if Info.compression_configs(resource) == [] do
+        :all
+      else
+        has_module_calc? =
+          Enum.any?(query.calculations, fn {calc, expr} ->
+            is_nil(expr) and calc.module != Ash.Resource.Calculation.Expression and
+              not function_exported?(calc.module, :expression, 2)
+          end)
+
+        if has_module_calc? do
+          :all
+        else
+          pk_fields = Ash.Resource.Info.primary_key(resource)
+
+          always_selected =
+            resource
+            |> Ash.Resource.Info.attributes()
+            |> Enum.filter(&Map.get(&1, :always_select?, false))
+            |> Enum.map(& &1.name)
+
+          rel_source_attrs =
+            resource
+            |> Ash.Resource.Info.relationships()
+            |> Enum.map(& &1.source_attribute)
+            |> Enum.reject(&is_nil/1)
+
+          tenant_attrs = if is_nil(tenant_attr), do: [], else: [tenant_attr]
+
+          base_set =
+            MapSet.new(select ++ pk_fields ++ always_selected ++ rel_source_attrs ++ tenant_attrs)
+            |> collect_expr_ref_names(query.filter)
+            |> collect_sort_or_distinct_names(query.sort)
+            |> collect_sort_or_distinct_names(query.distinct)
+            |> collect_sort_or_distinct_names(query.distinct_sort)
+
+          seed_set =
+            Enum.reduce(query.calculations, base_set, fn {calc, _expr}, acc ->
+              acc
+              |> add_calc_key(calc.name)
+              |> add_calc_key(calc.load)
+              |> collect_calc_opts_expr_refs(calc.opts)
+            end)
+
+          resolved_set =
+            Enum.reduce_while(query.calculations, seed_set, fn {calc, expr}, acc ->
+              eff_expr =
+                cond do
+                  expr != nil ->
+                    expr
+
+                  function_exported?(calc.module, :expression, 2) ->
+                    calc.module.expression(calc.opts, calc.context)
+
+                  true ->
+                    nil
+                end
+
+              cond do
+                not is_nil(eff_expr) ->
+                  {:cont, collect_expr_ref_names(acc, eff_expr)}
+
+                calc.module == Ash.Resource.Calculation.Expression ->
+                  {:cont, acc}
+
+                true ->
+                  {:halt, :all}
+              end
+            end)
+
+          case resolved_set do
+            :all -> :all
+            %MapSet{} = final_seed -> expand_calc_dependencies(final_seed, query.calculations)
+          end
+        end
+      end
     end
 
     # ==========================================================================

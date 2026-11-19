@@ -163,6 +163,11 @@ defmodule Xitdb.Cursor do
     Map.new(map, fn {k, v} -> {k, unwrap_nif_value(db_ref, v, moment, path_steps)} end)
   end
 
+  def unwrap_nif_value(db_ref, {:tagged, tag, payload}, moment, _path_steps)
+      when tag in ["cz", "zs", "zd", "bp", "pg"] and is_binary(payload) do
+    Xitdb.Compression.resolve_tagged!(tag, payload, db_ref, moment)
+  end
+
   def unwrap_nif_value(_db_ref, scalar, _moment, _path_steps), do: scalar
 
   @doc false
@@ -329,6 +334,11 @@ defmodule Xitdb.Cursor do
 
   defp handle_fetch_result({:ok, {:cursor, _, _, _, _} = tuple}, cursor) do
     {:ok, from_nif_tuple(cursor.db_ref, tuple, cursor.moment)}
+  end
+
+  defp handle_fetch_result({:ok, {:tagged, tag, payload}}, cursor)
+       when tag in ["cz", "zs", "zd", "bp", "pg"] and is_binary(payload) do
+    {:ok, Xitdb.Compression.resolve_tagged!(tag, payload, cursor.db_ref, cursor.moment)}
   end
 
   defp handle_fetch_result({:ok, scalar}, _cursor), do: {:ok, scalar}
@@ -756,6 +766,11 @@ defmodule Xitdb.Cursor do
     virtual_staged_cursor(cursor, child_steps, :array_list)
   end
 
+  defp wrap_staged_val(_cursor, _child_steps, {:compressed, bin}) when is_binary(bin), do: bin
+
+  defp wrap_staged_val(_cursor, _child_steps, {:compressed, bin, _opts}) when is_binary(bin),
+    do: bin
+
   defp wrap_staged_val(_cursor, _child_steps, scalar), do: scalar
 
   defp virtual_staged_cursor(cursor, child_steps, tag, value \\ 0) do
@@ -904,7 +919,9 @@ defmodule Xitdb.Cursor do
                 [{:put, selector, nil}]
 
               is_binary(encoded_val) or is_number(encoded_val) or is_boolean(encoded_val) or
-                  match?({:tagged, <<_, _>>, bin} when is_binary(bin), encoded_val) ->
+                match?({:tagged, <<_, _>>, bin} when is_binary(bin), encoded_val) or
+                match?({:compressed, bin} when is_binary(bin), encoded_val) or
+                  match?({:compressed, bin, o} when is_binary(bin) and is_list(o), encoded_val) ->
                 [{:put, selector, encoded_val}]
 
               true ->
@@ -2278,6 +2295,10 @@ defmodule Xitdb.Cursor do
   defp materialize_staged_val(list) when is_list(list) do
     Enum.map(list, &materialize_staged_val/1)
   end
+
+  defp materialize_staged_val({:compressed, bin}) when is_binary(bin), do: bin
+
+  defp materialize_staged_val({:compressed, bin, _opts}) when is_binary(bin), do: bin
 
   defp materialize_staged_val(other), do: other
 

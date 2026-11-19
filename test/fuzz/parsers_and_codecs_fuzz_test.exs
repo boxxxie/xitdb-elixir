@@ -3,8 +3,9 @@ defmodule Xitdb.Fuzz.ParsersAndCodecsFuzzTest do
   use ExFuzz
 
   alias Ash.Resource.Attribute
-  alias Xitdb.{Pull, Selector, Sigils}
+  alias Xitdb.{Columnar, Compression, Error, Pull, Selector, Sigils}
   alias Xitdb.Ash.{Codec, Search}
+  alias Xitdb.Columnar.Page
 
   @moduletag timeout: 500
 
@@ -225,6 +226,72 @@ defmodule Xitdb.Fuzz.ParsersAndCodecsFuzzTest do
       k2 = Codec.encode_index_key(attrs, [s2, n2])
 
       assert compare_terms(k1, k2) == compare_terms({s1, n1}, {s2, n2})
+    end
+  end
+
+  @fuzz_plain_page_seed Page.encode_page!(["alpha", "beta", nil, "gamma", "alpha"],
+                          encoding: :plain_block,
+                          codec: :zlib
+                        )
+  @fuzz_rle_page_seed Page.encode_page!(["h1", "h1", nil, "h2", "h2"],
+                        encoding: :dict_rle,
+                        codec: :zlib
+                      )
+
+  fuzz "Compression decompress, resolve_tagged, and Columnar parse_pointer bounds safety",
+       data <- binary(),
+       seeds: [
+         <<0x10, 4::unsigned-little-32, 0x78, 0x9C, 0x00>>,
+         <<0x10, 50_000_000::unsigned-little-32, 0x78, 0x9C>>,
+         <<0x10, 10::unsigned-little-32, 5, "dname", 1, 2, 3>>,
+         <<0x10, 0::256>>,
+         <<0x10, 3::16-little, "col", 4::16-little, "body", 2, "p1", 0::32-little>>,
+         <<>>
+       ] do
+    case Compression.decompress(data, max_decompressed_bytes: 65_536) do
+      {:ok, bin} -> assert is_binary(bin) and byte_size(bin) <= 65_536
+      {:error, %Error{}} -> :ok
+    end
+
+    for tag <- ["cz", "zs", "zd", "bp", "pg"] do
+      case Compression.resolve_tagged(tag, data, nil, -1, max_decompressed_bytes: 65_536) do
+        {:ok, val} -> assert is_nil(val) or (is_binary(val) and byte_size(val) <= 65_536)
+        {:error, %Error{}} -> :ok
+      end
+    end
+
+    case Columnar.parse_pointer(data) do
+      {:ok, col, field, page_id, row_idx} ->
+        assert byte_size(col) > 0 and byte_size(field) > 0 and byte_size(page_id) > 0 and
+                 row_idx >= 0
+
+      {:error, %Error{}} ->
+        :ok
+    end
+  end
+
+  fuzz "Columnar.Page decode_page and decode_row bounds safety on mutated XCP1 frames",
+       data <- binary(),
+       seeds: [
+         @fuzz_plain_page_seed,
+         @fuzz_rle_page_seed,
+         <<"XCP1", 1, 1, 1, 10::32-little, 50_000_000::32-little, 0, 1, 2, 3>>,
+         <<"XCP1", 2, 0, 1, 3::32-little, 16::32-little, 0, 0, 99, 1, 2, 3>>,
+         <<"XCP1", 99, 0, 0, 0::64, 0>>,
+         <<"NOPE">>
+       ] do
+    case Page.decode_page(data, max_decompressed_bytes: 65_536) do
+      {:ok, %Page{} = page} ->
+        case Page.decode_row(page, 0) do
+          {:ok, v} -> assert is_nil(v) or is_binary(v)
+          {:error, %Error{}} -> :ok
+        end
+
+        assert {:error, %Error{reason: :corrupt_column_page}} =
+                 Page.decode_row(page, page.row_count)
+
+      {:error, %Error{}} ->
+        :ok
     end
   end
 

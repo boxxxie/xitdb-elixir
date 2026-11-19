@@ -199,7 +199,12 @@ old_val = v0["config"]["version"]
 
 # Inspect the historical lineage of a specific path across all moments
 {:ok, lineage} = Xitdb.history_of(db, path(config.version))
+
+# Compact obsolete moments & garbage-collect orphaned __blobs, __dicts, and __col_pages without re-inflating live tags
+{:ok, compacted} = Xitdb.compact(db, path: "/var/data/store.compacted.xit")
 ```
+
+- Use `Xitdb.Compression.Dictionary.train_and_put/4` + `{:compressed, bin, opts}` / `transact(db, term, compress: [...])` or `Xitdb.Columnar.put_rows/4` (`row_group_size: 128`) for repetitive HTML/text payloads; use `Ash.Query.select/2` or `Xitdb.pull/2` omitting compressed columns to achieve `0` page decompressions on metadata scans.
 
 ---
 
@@ -266,6 +271,9 @@ defmodule MyApp.Accounts.Profile do
       resolver: fn profile, db ->
         Xitdb.Ash.Search.lookup_field(db, :organizations, profile.organization_id, "name")
       end
+
+    # Transparent compression (`mode: :value` or batch `:row_group` columnar pages on `Ash.bulk_create!`)
+    compress [:headline], mode: :value, codec: :zstd, intern_above: 4096
 
     # Same-store incoming/outgoing foreign key actions (:nothing | :delete | :nilify | :restrict)
     references do
@@ -369,6 +377,7 @@ Xitdb.Ash.Search.ids(MyApp.Accounts.Profile, "northleaf", as_of: prev_moment)
 ### Introspection Helpers (`Xitdb.Ash.Info`)
 
 - Use `Xitdb.Ash.Info.search_fields(Resource)`, `Xitdb.Ash.Info.indexes(Resource)`, `Xitdb.Ash.Info.counted_set_fields(Resource)`, and `Xitdb.Ash.Info.resolve_store(Resource, context_or_opts)` instead of hardcoding field lists or index maps.
+- Use `Xitdb.Ash.Info.compression_configs(Resource)` and `Xitdb.Ash.Info.compression_for_field(Resource, field)` to inspect attribute compression rules (`:value` or `:row_group`).
 - Use `Xitdb.Ash.Info.nested_in(Resource)` (and `Xitdb.Ash.Info.nested?(Resource)`) for `Xitdb.Ash.DataLayer` co-located subtrees (which support child secondary indexes).
 - Use `tx_for(db, Resource) do ... end` (`Xitdb.Ash.Tx`) to automatically inject all `index_on` declarations configured on resources so secondary B+Tree indexes never drift on raw transactions.
 - Use `Xitdb.Ash.Types.UnsignedInteger` (`0..2^64-1`), `Xitdb.Ash.Types.FixedDecimal64` (`scale:`, `signed?:`, `representation: :integer | :tagged`), `Xitdb.Ash.Types.RangedUnit` (`to_indexed_fields/2,3`, `overlaps?/2`), or custom `Ash.Type` modules implementing `xitdb_index_key/2` + `xitdb_fixed_width?/1` for order-preserving secondary B+Tree range queries.

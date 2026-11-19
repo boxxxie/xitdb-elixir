@@ -7,8 +7,9 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     """
 
     alias Ash.Error.Changes.InvalidChanges
-    alias Xitdb.Ash.{Codec, Info, Search, Store}
+    alias Xitdb.Ash.{Codec, Compress, Info, Search, Store}
     alias Xitdb.Ash.Indexer.Storage
+    alias Xitdb.Compression
 
     @parent_slot "_parent"
     @search_weight_scale 100
@@ -50,7 +51,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
             struct() | nil,
             struct(),
             term(),
-            batch_state()
+            batch_state(),
+            keyword()
           ) :: {:ok, [tuple()], batch_state()} | {:error, Exception.t()}
     def plan_put_ops_batched(
           db_or_cursor,
@@ -58,9 +60,10 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           old_record,
           %_{} = new_record,
           tenant,
-          batch_state
+          batch_state,
+          opts \\ []
         )
-        when is_atom(resource) and is_map(batch_state) do
+        when is_atom(resource) and is_map(batch_state) and is_list(opts) do
       collection = Codec.scoped_collection(resource, tenant)
       pk_attr = pk_attribute(resource)
       doc_id = Codec.encode_pk_doc_id(pk_attr, Map.fetch!(new_record, pk_attr.name))
@@ -74,7 +77,14 @@ if Code.ensure_loaded?(Ash.DataLayer) do
                tenant,
                batch_state
              ),
-           {:ok, cursor_map} <- Codec.to_cursor_map(resource, new_record),
+           {:ok, cursor_map, extra_blob_ops, batch_after_comp} <-
+             build_or_compress_cursor_map(
+               db_or_cursor,
+               resource,
+               new_record,
+               batch_after_evict,
+               opts
+             ),
            {:ok, identity_ops} <-
              plan_identity_ops(
                db_or_cursor,
@@ -82,7 +92,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
                effective_old,
                new_record,
                tenant,
-               batch_after_evict
+               batch_after_comp
              ),
            {:ok, locator_plan} <-
              plan_entity_location(db_or_cursor, resource, effective_old, new_record, tenant) do
@@ -97,7 +107,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
             locator_plan,
             identity_ops,
             secondary_ops,
-            batch_after_evict,
+            batch_after_comp,
             removed_fields
           )
 
@@ -109,7 +119,85 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           |> Map.delete({:deleted_doc, collection, doc_id})
           |> track_nested_one_put(resource, effective_old, new_record, tenant)
 
-        {:ok, pre_evict_ops ++ entity_and_idx_ops ++ search_ops, next_batch}
+        {:ok, pre_evict_ops ++ extra_blob_ops ++ entity_and_idx_ops ++ search_ops, next_batch}
+      end
+    end
+
+    @doc """
+    Applies declarative `Xitdb.Ash.Compress` rules to `cursor_map` and accumulates
+    deduplicated `__blobs` puts inside `batch_state`.
+
+    When `mode_filter` is `:value`, only attributes with `mode: :value` are compressed
+    (leaving `:row_group` attributes as plaintext binaries for page batching).
+    """
+    @spec compress_cursor_map(term(), module(), map(), batch_state(), :all | :value) ::
+            {:ok, map(), [tuple()], batch_state()}
+    def compress_cursor_map(
+          db_or_cursor,
+          resource,
+          cursor_map,
+          batch_state,
+          mode_filter \\ :all
+        ) do
+      compress_map = Info.compression_by_field(resource)
+
+      if map_size(compress_map) == 0 do
+        {:ok, cursor_map, [], batch_state}
+      else
+        init_comp_state =
+          Map.get(batch_state, :compression_state, %{
+            dicts: %{},
+            seen_blobs: %{},
+            existing_blobs: :unloaded
+          })
+
+        {updated_map, blob_ops_rev, final_comp_state} =
+          Enum.reduce(compress_map, {cursor_map, [], init_comp_state}, fn
+            {field_atom, %Compress{} = cfg}, {map_acc, ops_acc, comp_st} ->
+              include_mode? = mode_filter == :all or cfg.mode == mode_filter
+
+              if include_mode? and cfg.codec != :none do
+                field_str = Atom.to_string(field_atom)
+
+                case Map.fetch(map_acc, field_str) do
+                  {:ok, bin} when is_binary(bin) ->
+                    comp_opts = [
+                      codec: cfg.codec,
+                      level: cfg.level,
+                      min_bytes: cfg.min_bytes,
+                      min_savings: cfg.min_savings,
+                      dictionary: cfg.dictionary,
+                      intern_above: cfg.intern_above
+                    ]
+
+                    {encoded_val, blob_ops, next_comp_st} =
+                      Compression.compress_for_write(db_or_cursor, bin, comp_opts, comp_st)
+
+                    {Map.put(map_acc, field_str, encoded_val), Enum.reverse(blob_ops, ops_acc),
+                     next_comp_st}
+
+                  _ ->
+                    {map_acc, ops_acc, comp_st}
+                end
+              else
+                {map_acc, ops_acc, comp_st}
+              end
+          end)
+
+        next_batch = Map.put(batch_state, :compression_state, final_comp_state)
+        {:ok, updated_map, Enum.reverse(blob_ops_rev), next_batch}
+      end
+    end
+
+    defp build_or_compress_cursor_map(db_or_cursor, resource, new_record, batch_state, opts) do
+      case Keyword.get(opts, :prebuilt_cursor_map) do
+        prebuilt when is_map(prebuilt) ->
+          {:ok, prebuilt, [], batch_state}
+
+        nil ->
+          with {:ok, raw_cursor_map} <- Codec.to_cursor_map(resource, new_record) do
+            compress_cursor_map(db_or_cursor, resource, raw_cursor_map, batch_state, :all)
+          end
       end
     end
 

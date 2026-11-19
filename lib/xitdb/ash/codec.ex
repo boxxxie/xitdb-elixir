@@ -66,24 +66,41 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
     @doc """
     Hydrates a Xitdb entity cursor back into a loaded `%Resource{}` struct.
+
+    When `only_attrs` is a `MapSet` (or list) of attribute names, attributes outside
+    `only_attrs` are left as `%Ash.NotLoaded{type: :attribute, field: name}` without
+    reading or decompressing their underlying cursor slots.
     """
-    @spec from_cursor(module(), term(), term()) :: {:ok, struct()} | {:error, term()}
-    def from_cursor(resource, cursor, tenant \\ nil) when is_atom(resource) do
+    @spec from_cursor(module(), term(), term(), :all | MapSet.t(atom()) | [atom()]) ::
+            {:ok, struct()} | {:error, term()}
+    def from_cursor(resource, cursor, tenant \\ nil, only_attrs \\ :all) when is_atom(resource) do
       counted_sets = counted_set_fields(resource)
+
+      allowed_attrs =
+        case only_attrs do
+          :all -> :all
+          %MapSet{} = set -> set
+          list when is_list(list) -> MapSet.new(list)
+        end
 
       attrs_result =
         resource
         |> Ash.Resource.Info.attributes()
         |> Enum.reduce_while({:ok, %{}}, fn %Attribute{} = attr, {:ok, acc} ->
-          raw = fetch_cursor_field(cursor, Atom.to_string(attr.name))
-          as_counted_set? = MapSet.member?(counted_sets, attr.name)
+          if allowed_attrs == :all or MapSet.member?(allowed_attrs, attr.name) do
+            raw = fetch_cursor_field(cursor, Atom.to_string(attr.name))
+            as_counted_set? = MapSet.member?(counted_sets, attr.name)
 
-          case load_attribute(attr, raw, as_counted_set?) do
-            {:ok, loaded} ->
-              {:cont, {:ok, Map.put(acc, attr.name, loaded)}}
+            case load_attribute(attr, raw, as_counted_set?) do
+              {:ok, loaded} ->
+                {:cont, {:ok, Map.put(acc, attr.name, loaded)}}
 
-            {:error, _reason} = err ->
-              {:halt, err}
+              {:error, _reason} = err ->
+                {:halt, err}
+            end
+          else
+            {:cont,
+             {:ok, Map.put(acc, attr.name, %Ash.NotLoaded{type: :attribute, field: attr.name})}}
           end
         end)
 

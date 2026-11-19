@@ -265,6 +265,7 @@ Use `Xitdb.Ash.Info` to inspect resource configuration at runtime or compile tim
 - `Xitdb.Ash.Info.references/1`
 - `Xitdb.Ash.Info.counted_set_fields/1`
 - `Xitdb.Ash.Info.nested_in/1` / `nested?/1`
+- `Xitdb.Ash.Info.compression_configs/1` / `compression_for_field/2`
 
 At compile time, Spark runs:
 1. **`Xitdb.Ash.Transformers.BuildIndexPlan`** — validates `store`, `collection`, primary keys, `nested_in`, explicit/auto-`belongs_to` `index`es, `counted_set_fields`, and `search_field`s, generating `__xitdb_store__/0`, `__xitdb_collection__/0`, and `__xitdb_indexes__/0`.
@@ -284,3 +285,49 @@ At compile time, Spark runs:
 
 > [!NOTE]
 > Native Odin Datalog comparisons (`<`, `>`, `<=`, `>=` in `Xitdb.DSL.query`) compare un-tagged `i64`/`f64`/`string` fields inside `native/xitdb-odin`, whereas `Ash.Query` + `Xitdb.Ash.Indexer.scan_secondary_range/5` handle both `u64 > max(i64)` and `:tagged`-backed `FixedDecimal64` attributes in Elixir using `Xitdb.Key`.
+
+---
+
+## 9. Declarative Payload Compression (`compress`)
+
+Declare `compress` inside `xitdb do ... end` (`Xitdb.Ash.Dsl`) to store large email bodies, headers, and attachments using `:value` codecs (`:zstd` / `:zlib`, optional `intern_above:` deduplication in `__blobs`) or Parquet-style `:row_group` columnar pages on `Ash.bulk_create!`:
+
+```elixir
+defmodule MyApp.CRM.EmailActivity do
+  use Ash.Resource,
+    domain: MyApp.CRM,
+    data_layer: Xitdb.Ash.DataLayer
+
+  xitdb do
+    store MyApp.AppStore
+    collection :email_activities
+
+    compress [:body, :html_edit_body],
+      mode: :row_group,
+      row_group_size: 128,
+      codec: :zstd,
+      encoding: :dict_block,
+      dictionary: :email_html
+
+    compress [:header_properties],
+      mode: :row_group,
+      row_group_size: 128,
+      encoding: :dict_rle
+
+    compress :attachment_blob,
+      mode: :value,
+      codec: :zstd,
+      intern_above: 4096
+
+    search_field :title, boost: 3.0
+    search_field :body, boost: 2.0
+  end
+  # ...
+end
+```
+
+Key operational guarantees:
+- **Shared dictionaries on a Store**: call `Xitdb.Compression.Dictionary.train_and_put(MyApp.AppStore, :email_html, sample_bodies)` inside store startup/backfill to seed `.__dicts.email_html`.
+- **BM25 Search Compatibility**: `idx.search` tokenizes plaintext attribute values **before** compression or page packing, so `Xitdb.Ash.Search.query/3` works without scanning or decompressing body blobs.
+- **Zero-Decompression `select`**: when a query specifies `Ash.Query.select([:id, :title])`, `Xitdb.Ash.Query` hydrates only needed attributes and leaves unselected compressed attributes as `%Ash.NotLoaded{}`—performing `0` page reads and `0` decompressions.
+- **Atomic `create`/`update` History**: single-record writes and updates compress individual attributes atomically while preserving earlier `Xitdb.Columnar` row-group pages across `Store.with_as_of/3` snapshots.

@@ -9,7 +9,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
     alias Spark.Dsl.Transformer
     alias Spark.Error.DslError
-    alias Xitdb.Ash.{Index, NestedIn, Reference, SearchField}
+    alias Xitdb.Ash.{Compress, Index, NestedIn, Reference, SearchField}
 
     @impl Spark.Dsl.Transformer
     def after?(Ash.Resource.Transformers.BelongsToAttribute), do: true
@@ -47,6 +47,11 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           %SearchField{s | __identifier__: nil, __spark_metadata__: nil}
         end
 
+      compress_entries =
+        for %Compress{} = c <- entities do
+          %Compress{c | __identifier__: nil, __spark_metadata__: nil}
+        end
+
       uses_default_store? = is_nil(Transformer.get_option(dsl_state, [:xitdb], :store))
 
       with {:ok, store} <- validate_store(module, dsl_state),
@@ -56,6 +61,14 @@ if Code.ensure_loaded?(Ash.DataLayer) do
            :ok <- validate_explicit_indexes(module, explicit_indexes, attr_names),
            :ok <- validate_counted_set_fields(module, dsl_state, attrs_by_name),
            :ok <- validate_search_fields(module, search_fields, attr_names),
+           {:ok, compress_by_field} <-
+             validate_compress_entries(
+               module,
+               compress_entries,
+               attrs_by_name,
+               pk_fields,
+               nesting_plan
+             ),
            all_indexes = maybe_append_relationship_indexes(dsl_state, explicit_indexes, pk_fields),
            :ok <- validate_all_index_slots(module, all_indexes) do
         normalized_indexes = build_tx_for_indexes(collection, all_indexes)
@@ -68,8 +81,17 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           |> Transformer.persist(:xitdb_indexes, all_indexes)
           |> Transformer.persist(:xitdb_search_fields, search_fields)
           |> Transformer.persist(:xitdb_references, references)
+          |> Transformer.persist(:xitdb_compress_configs, compress_entries)
+          |> Transformer.persist(:xitdb_compress_by_field, compress_by_field)
           |> Transformer.persist(:xitdb_normalized_indexes, normalized_indexes)
-          |> define_direct_callbacks(store, collection, normalized_indexes, uses_default_store?)
+          |> define_direct_callbacks(
+            store,
+            collection,
+            normalized_indexes,
+            compress_entries,
+            compress_by_field,
+            uses_default_store?
+          )
 
         {:ok, updated_state}
       end
@@ -307,6 +329,101 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       end)
     end
 
+    defp validate_compress_entries(
+           module,
+           compress_entries,
+           attrs_by_name,
+           pk_fields,
+           nesting_plan
+         ) do
+      pk_set = MapSet.new(pk_fields)
+
+      compress_entries
+      |> Enum.reduce_while({:ok, %{}}, fn %Compress{
+                                            fields: fields,
+                                            mode: mode,
+                                            row_group_size: rgs
+                                          } = cfg,
+                                          {:ok, by_field} ->
+        cond do
+          fields == [] ->
+            {:halt,
+             {:error,
+              DslError.exception(
+                module: module,
+                path: [:xitdb, :compress],
+                message: "compress `fields` cannot be empty"
+              )}}
+
+          rgs < 1 or rgs > 65_536 ->
+            {:halt,
+             {:error,
+              DslError.exception(
+                module: module,
+                path: [:xitdb, :compress, :row_group_size],
+                message:
+                  "compress `row_group_size` must be between 1 and 65_536, got #{inspect(rgs)}"
+              )}}
+
+          mode == :row_group and not is_nil(nesting_plan) ->
+            {:halt,
+             {:error,
+              DslError.exception(
+                module: module,
+                path: [:xitdb, :compress],
+                message:
+                  "`mode: :row_group` is only supported on top-level collections (cannot be combined with `nested_in` on #{inspect(module)})"
+              )}}
+
+          true ->
+            validate_compress_entry_fields(module, fields, cfg, attrs_by_name, pk_set, by_field)
+        end
+      end)
+    end
+
+    defp validate_compress_entry_fields(module, fields, cfg, attrs_by_name, pk_set, by_field) do
+      Enum.reduce_while(fields, {:ok, by_field}, fn field, {:ok, acc} ->
+        cond do
+          not Map.has_key?(attrs_by_name, field) ->
+            {:halt,
+             {:error,
+              DslError.exception(
+                module: module,
+                path: [:xitdb, :compress, field],
+                message:
+                  "unknown attribute #{inspect(field)} in `xitdb.compress` on #{inspect(module)}"
+              )}}
+
+          MapSet.member?(pk_set, field) ->
+            {:halt,
+             {:error,
+              DslError.exception(
+                module: module,
+                path: [:xitdb, :compress, field],
+                message:
+                  "primary key attribute #{inspect(field)} cannot be compressed in `xitdb.compress` on #{inspect(module)}"
+              )}}
+
+          Map.has_key?(acc, field) ->
+            {:halt,
+             {:error,
+              DslError.exception(
+                module: module,
+                path: [:xitdb, :compress, field],
+                message:
+                  "duplicate `compress` configuration for attribute #{inspect(field)} on #{inspect(module)}"
+              )}}
+
+          true ->
+            {:cont, {:ok, Map.put(acc, field, cfg)}}
+        end
+      end)
+      |> case do
+        {:ok, updated_by_field} -> {:cont, {:ok, updated_by_field}}
+        {:error, _} = err -> {:halt, err}
+      end
+    end
+
     defp maybe_append_relationship_indexes(dsl_state, explicit_indexes, pk_fields) do
       index_rels? =
         Transformer.get_option(dsl_state, [:xitdb], :index_relationships?, true)
@@ -345,6 +462,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
            store,
            collection,
            normalized_indexes,
+           compress_entries,
+           compress_by_field,
            uses_default_store?
          ) do
       Transformer.eval(
@@ -353,6 +472,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           store: store,
           collection: collection,
           normalized_indexes: normalized_indexes,
+          compress_entries: compress_entries,
+          compress_by_field: compress_by_field,
           uses_default_store?: uses_default_store?
         ],
         quote do
@@ -373,6 +494,16 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           if not Module.defines?(__MODULE__, {:__xitdb_indexes__, 0}, :def) do
             @doc false
             def __xitdb_indexes__, do: unquote(Macro.escape(normalized_indexes))
+          end
+
+          if not Module.defines?(__MODULE__, {:__xitdb_compress_configs__, 0}, :def) do
+            @doc false
+            def __xitdb_compress_configs__, do: unquote(Macro.escape(compress_entries))
+          end
+
+          if not Module.defines?(__MODULE__, {:__xitdb_compress_by_field__, 0}, :def) do
+            @doc false
+            def __xitdb_compress_by_field__, do: unquote(Macro.escape(compress_by_field))
           end
         end
       )
