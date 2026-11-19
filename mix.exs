@@ -22,7 +22,12 @@ defmodule Xitdb.MixProject do
       source_url: @source_url,
       homepage_url: @source_url,
       package: package(),
-      docs: docs()
+      docs: docs(),
+      ex_fuzz: [
+        corpus_dir: "test/fixtures/fuzz",
+        cache_dir: "_build/ex_fuzz/corpus",
+        crash_dump_dir: "_build/ex_fuzz"
+      ]
     ]
   end
 
@@ -34,7 +39,7 @@ defmodule Xitdb.MixProject do
 
   def cli do
     [
-      preferred_envs: [precommit: :test]
+      preferred_envs: [precommit: :test, fuzz: :test]
     ]
   end
 
@@ -50,6 +55,7 @@ defmodule Xitdb.MixProject do
       {:ash_phoenix, "~> 2.1", only: :test},
       {:simple_sat, "~> 0.1", only: :test},
       {:stream_data, "~> 1.1", optional: true},
+      {:ex_fuzz, "~> 0.1.0", only: [:dev, :test]},
       {:ex_doc, "~> 0.35", only: :dev, runtime: false}
     ]
   end

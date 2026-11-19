@@ -2,12 +2,7 @@
 
 This file tracks active development tracks for the `xitdb` Elixir client (`elixir/xitdb`), ordered in recommended execution order.
 
-Completed tracks (**Waves 0–5**, benchmark/optimization tracks, **bugfix slices 01–07**, and **Elixir 1.20.5 / OTP 29.1.2 upgrade**) are archived locally under `./archive/` (gitignored).
-
----
-
-- [ ] **Track: Integrate ExFuzz Coverage-Guided Fuzz Testing for Parsers, Codecs, Search, NIF Boundaries & Stateful Cursor/Tx**
-*Link: [./tracks/ex_fuzz_coverage_fuzzing_20261118/](./tracks/ex_fuzz_coverage_fuzzing_20261118/)*
+Completed tracks (**Waves 0–5**, benchmark/optimization tracks, **bugfix slices 01–07**, **Elixir 1.20.5 / OTP 29.1.2 upgrade**, and **ExFuzz coverage-guided fuzzing**) are archived locally under `./archive/` (gitignored).
 
 ---
 

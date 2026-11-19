@@ -10,6 +10,7 @@
   - `nimble_options` (`~> 1.1`) — Compile-time option validation
   - `telemetry` (`~> 1.3`) — Span instrumentation
   - `stream_data` (`~> 1.1`, `:test` only) — Property-based testing (`ExUnitProperties`)
+  - `ex_fuzz` (`~> 0.1.0`, `:dev`/`:test` only) — Coverage-guided fuzz testing (`mix fuzz` & regression corpus replay)
   - `ex_doc` (`~> 0.34`, `:dev` only) — Documentation generation
-- **Test Architecture:** 4-Layer ATDD Suite (`ExUnit` + `Xitdb.FeatureCase` `@given`/`@upon`/`@then` scenarios + `ExUnitProperties`)
+- **Test Architecture:** 4-Layer ATDD Suite (`ExUnit` + `Xitdb.FeatureCase` `@given`/`@upon`/`@then` scenarios + `ExUnitProperties` + `ExFuzz` targets in `test/fuzz/`)
 - **Benchmarking Harness:** Statistical multi-sample JSONL runner (`benchmarks/bench_elixir.exs` vs. `benchmarks/bench_client.odin`), `benchmarks/compare_1v1.py` (Welch's $t$/$z$-test, p50/p95/p99, IQR, CV%), and `benchmarks/update_readme.sh`.

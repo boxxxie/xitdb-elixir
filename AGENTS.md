@@ -29,6 +29,7 @@ This document provides the architecture, build/test/benchmark commands, and deve
   - Layer 1 (`test/features/*_spec.exs`, `test/features/*_test.exs`, including [`test/features/ash_data_layer_workflows_test.exs`](test/features/ash_data_layer_workflows_test.exs)): Domain specifications and `StreamData` property tests.
   - Layer 2 ([`test/support/dsl/client_dsl.ex`](test/support/dsl/client_dsl.ex), [`test/support/dsl/workspace_dsl.ex`](test/support/dsl/workspace_dsl.ex), [`test/support/feature_case.ex`](test/support/feature_case.ex), [`test/support/ash_case.ex`](test/support/ash_case.ex)): `@given`, `@upon`, `@whenever`, `@then` macro DSLs (`ClientDSL`, `WorkspaceDSL`).
   - Layer 3 ([`test/support/drivers/client_driver.ex`](test/support/drivers/client_driver.ex), [`test/support/drivers/workspace_driver.ex`](test/support/drivers/workspace_driver.ex)): Protocol drivers (`ClientDriver`, `WorkspaceDriver`) isolating `Xitdb` and `Ash` calls and assertions.
+  - Coverage-guided fuzz suites (`test/fuzz/*_fuzz_test.exs`) with persisted regression seeds in `test/fixtures/fuzz/`.
 - **`benchmarks/`** — 1v1 Client Statistical Benchmark Suite (Elixir Wrapper vs. Raw Odin):
   - [`benchmarks/bench_elixir.exs`](benchmarks/bench_elixir.exs): Elixir client benchmark runner (`benchmarks/elixir.jsonl`).
   - [`benchmarks/bench_client.odin`](benchmarks/bench_client.odin): Equivalent Raw Odin client baseline (`benchmarks/odin.jsonl`).
@@ -52,6 +53,10 @@ mix test --trace
 # 4. Run the 1v1 Client Statistical Benchmark Suite and update benchmarks/README.md
 ./benchmarks/compare_1v1.py --runs 5 --warmup 1
 ./benchmarks/update_readme.sh
+
+# 5. Run ExFuzz regression corpus & bounded coverage-guided fuzzing
+mix test --only fuzz
+mix fuzz test/fuzz/parsers_and_codecs_fuzz_test.exs:90 --max-runs 50000
 ```
 
 ---

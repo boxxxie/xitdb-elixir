@@ -250,4 +250,8 @@ mix precommit
 
 # Run the specification and property test suite with trace
 mix test --trace
+
+# Replay ExFuzz regression seeds or run a bounded coverage-guided fuzz campaign
+mix test --only fuzz
+mix fuzz test/fuzz/parsers_and_codecs_fuzz_test.exs:90 --max-runs 50000
 ```

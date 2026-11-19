@@ -2975,10 +2975,33 @@ structured_op_callback :: proc(moment_cur: ^xitdb.Write_Cursor, user_data: rawpt
 	case .Insert:
 		target_cur := xitdb.write_steps_cursor(moment_cur^, sc.steps) or_return
 		ll := xitdb.write_linked_array_list_init(target_cur) or_return
-		elem_cur := xitdb.linked_array_list_insert_cursor(&ll, sc.index) or_return
+		cnt := xitdb.linked_array_list_count(ll.read_linked_array_list) or_return
+		elem_cur: xitdb.Write_Cursor
+		if sc.index == cnt {
+			elem_cur = xitdb.linked_array_list_append_cursor(&ll) or_return
+		} else {
+			elem_cur = xitdb.linked_array_list_insert_cursor(&ll, sc.index) or_return
+		}
 		return write_term_to_cursor(sc.env, &elem_cur, sc.term, sc.validation_err, sc.err_reason)
 	}
 	return nil
+}
+
+Insert_Op_Ctx :: struct {
+	steps: []xitdb.Path_Step,
+	index: i64,
+	val:   xitdb.Writeable_Data,
+}
+
+insert_op_callback :: proc(moment_cur: ^xitdb.Write_Cursor, user_data: rawptr) -> xitdb.Error {
+	ic := (^Insert_Op_Ctx)(user_data)
+	target_cur := xitdb.write_steps_cursor(moment_cur^, ic.steps) or_return
+	ll := xitdb.write_linked_array_list_init(target_cur) or_return
+	cnt := xitdb.linked_array_list_count(ll.read_linked_array_list) or_return
+	if ic.index == cnt {
+		return xitdb.linked_array_list_append(&ll, ic.val)
+	}
+	return xitdb.linked_array_list_insert(&ll, ic.index, ic.val)
 }
 
 Slice_Op_Ctx :: struct {
@@ -4658,6 +4681,16 @@ adapt_tx_ops_for_base_moment :: proc(handle: ^Db_Handle, tx: ^xitdb.Tx) -> bool 
 				if len(sc.steps) >= 1 && adapt_steps_for_base_moment(base_cur, base_empty, sc.steps, pending_tags, fork_aliases) {
 					adapted = true
 				}
+			} else if op.callback == insert_op_callback && op.user_data != nil {
+				ic := (^Insert_Op_Ctx)(op.user_data)
+				if len(ic.steps) >= 1 && adapt_steps_for_base_moment(base_cur, base_empty, ic.steps, pending_tags, fork_aliases) {
+					adapted = true
+				}
+				ensure_ancestor_pending_tags(ic.steps, &pending_tags)
+				k := pending_path_key(ic.steps)
+				if pt, has_pt := pending_tags[k]; has_pt && pt == .None {
+					pending_tags[k] = .Linked_Array_List
+				}
 			} else if op.callback == init_col_callback && op.user_data != nil {
 				ic := (^Init_Col_Ctx)(op.user_data)
 				if len(ic.steps) >= 1 && adapt_steps_for_base_moment(base_cur, base_empty, ic.steps, pending_tags, fork_aliases) {
@@ -5015,7 +5048,9 @@ parse_tx_ops :: proc(
 				return "invalid_insert_op", nil
 			}
 			if val, ok_v := decode_writeable_value(env, elems[3]); ok_v {
-				append(&tx.ops, xitdb.Tx_Op{kind = .Insert, steps = steps, offset = idx_val, val = val})
+				ic := new(Insert_Op_Ctx, tx.allocator)
+				ic^ = Insert_Op_Ctx{steps = steps, index = idx_val, val = val}
+				xitdb.tx_with_cursor(tx, insert_op_callback, ic)
 			} else if is_structured_write_candidate(env, elems[3]) {
 				sc := new(Structured_Op_Ctx, tx.allocator)
 				sc^ = Structured_Op_Ctx{

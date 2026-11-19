@@ -497,7 +497,11 @@ defmodule Xitdb.Selector do
   def bare_key?(_), do: false
 
   defp do_bare_key?(<<>>), do: true
-  defp do_bare_key?(<<b, _rest::binary>>) when b in @special_bytes, do: false
+
+  defp do_bare_key?(<<b, _rest::binary>>)
+       when b < 0x21 or b > 0x7E or b in @special_bytes,
+       do: false
+
   defp do_bare_key?(<<_b, rest::binary>>), do: do_bare_key?(rest)
 
   defp needs_escape?(<<>>), do: false
