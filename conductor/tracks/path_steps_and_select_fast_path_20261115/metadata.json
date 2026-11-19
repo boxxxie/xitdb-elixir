@@ -1,8 +1,0 @@
-{
-  "track_id": "path_steps_and_select_fast_path_20261115",
-  "type": "chore",
-  "status": "completed",
-  "created_at": "2026-11-15T10:47:00Z",
-  "updated_at": "2026-11-15T11:38:00Z",
-  "description": "Fast-Path Decoding for path_steps/1 and Xitdb.select/2"
-}

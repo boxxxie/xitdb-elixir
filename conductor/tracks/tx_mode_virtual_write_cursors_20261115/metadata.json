@@ -1,8 +1,0 @@
-{
-  "track_id": "tx_mode_virtual_write_cursors_20261115",
-  "type": "chore",
-  "status": "completed",
-  "created_at": "2026-11-15T10:47:00Z",
-  "updated_at": "2026-11-15T11:38:00Z",
-  "description": "Write-Only Virtual Path Staging in tx_mode Access.get_and_update/3"
-}

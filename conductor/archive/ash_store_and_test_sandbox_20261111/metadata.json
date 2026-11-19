@@ -1,8 +1,0 @@
-{
-  "track_id": "ash_store_and_test_sandbox_20261111",
-  "type": "feature",
-  "status": "new",
-  "created_at": "2026-11-11T20:05:00Z",
-  "updated_at": "2026-11-12T23:30:00Z",
-  "description": "Track 10 [Wave 2]: Single-Writer Xitdb.Ash.Store GenServer, Monitored Writer Leases, Savepoints & TestSandbox"
-}

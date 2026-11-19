@@ -1,8 +1,0 @@
-{
-  "track_id": "slice_03_bugfixes_20261116",
-  "type": "bugfix",
-  "status": "completed",
-  "created_at": "2026-11-16T04:20:00Z",
-  "updated_at": "2026-11-16T05:45:00Z",
-  "description": "Slice 03 Bugfixes: Batch C path_steps Unpacking & Inline Select (BUG-03-01..BUG-03-07)"
-}

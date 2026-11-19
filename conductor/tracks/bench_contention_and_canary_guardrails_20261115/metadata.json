@@ -1,8 +1,0 @@
-{
-  "track_id": "bench_contention_and_canary_guardrails_20261115",
-  "type": "chore",
-  "status": "completed",
-  "created_at": "2026-11-15T13:35:00Z",
-  "updated_at": "2026-11-15T14:20:00Z",
-  "description": "Automated Host-Load, Canary & Skew Contention Guardrails in compare_1v1.py"
-}

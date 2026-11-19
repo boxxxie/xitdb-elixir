@@ -16,3 +16,4 @@ erl_crash.dump
 /benchmarks/bench_client_bin
 /tmp/
 /.tmp/
+/conductor/archive/

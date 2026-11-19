@@ -1,8 +1,0 @@
-{
-  "track_id": "slice_02_bugfixes_20261116",
-  "type": "bugfix",
-  "status": "completed",
-  "created_at": "2026-11-16T04:20:00Z",
-  "updated_at": "2026-11-16T05:45:00Z",
-  "description": "Slice 02 Bugfixes: Compact 3-Tuple Cursors & Fused B+Tree Seek (BUG-02-01..BUG-02-07)"
-}

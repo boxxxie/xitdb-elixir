@@ -1,8 +1,0 @@
-{
-  "track_id": "compact_cursor_slot_tuples_20261115",
-  "type": "chore",
-  "status": "completed",
-  "created_at": "2026-11-15T10:47:00Z",
-  "updated_at": "2026-11-15T11:38:00Z",
-  "description": "Universal Compact 3-Tuple {:cursor, tag_id, slot_val} in slot_to_term"
-}
