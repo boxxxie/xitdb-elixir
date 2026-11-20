@@ -325,48 +325,19 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           expr =
             Query.preresolve_unrelated_exists(db, resource, raw_expr, tenant, domain, source_ctx)
 
-          case Ash.Expr.eval(expr, base_eval_opts) do
-            {:ok, value} ->
-              {:cont, {:ok, [value | acc]}}
-
-            :unknown ->
-              case Ash.Filter.hydrate_refs(expr, %{resource: resource, public?: false}) do
-                {:ok, hydrated} ->
-                  case Ash.Expr.eval_hydrated(hydrated, base_eval_opts) do
-                    {:ok, val} ->
-                      {:cont, {:ok, [val | acc]}}
-
-                    :unknown ->
-                      case eval_relational_fallback(
-                             hydrated,
-                             record,
-                             base_eval_opts,
-                             domain,
-                             actor,
-                             tenant
-                           ) do
-                        {:ok, val} ->
-                          {:cont, {:ok, [val | acc]}}
-
-                        :unknown ->
-                          {:halt,
-                           {:error,
-                            "unable to evaluate expression #{inspect(raw_expr)} without a loaded record"}}
-
-                        {:error, _} = err ->
-                          {:halt, err}
-                      end
-
-                    {:error, _} = err ->
-                      {:halt, err}
-                  end
-
-                {:error, _} = err ->
-                  {:halt, err}
-              end
-
-            {:error, _} = err ->
-              {:halt, err}
+          case evaluate_calculate_expr(
+                 expr,
+                 raw_expr,
+                 record,
+                 resource,
+                 domain,
+                 actor,
+                 tenant,
+                 source_ctx,
+                 base_eval_opts
+               ) do
+            {:ok, value} -> {:cont, {:ok, [value | acc]}}
+            {:error, _} = err -> {:halt, err}
           end
         end)
         |> case do
@@ -374,6 +345,103 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           {:error, _} = err -> err
         end
       end)
+    end
+
+    defp evaluate_calculate_expr(
+           expr,
+           raw_expr,
+           record,
+           resource,
+           domain,
+           actor,
+           tenant,
+           source_ctx,
+           base_eval_opts
+         )
+         when is_map(record) do
+      hydrate_ctx = %{resource: resource, public?: false, source_context: source_ctx}
+
+      with {:ok, hydrated} <- Ash.Filter.hydrate_refs(expr, hydrate_ctx),
+           external_loads = Query.external_loads_for_expression(hydrated, resource, [record]),
+           {:ok, [eval_record]} <-
+             Query.load_external_deps(
+               [record],
+               external_loads,
+               resource,
+               domain,
+               tenant,
+               actor,
+               source_ctx
+             ) do
+        eval_opts =
+          base_eval_opts
+          |> Keyword.delete(:domain)
+          |> Keyword.put(:record, eval_record)
+
+        case Ash.Expr.eval_hydrated(hydrated, eval_opts) do
+          {:ok, val} ->
+            {:ok, val}
+
+          :unknown ->
+            case eval_relational_fallback(
+                   hydrated,
+                   eval_record,
+                   base_eval_opts,
+                   domain,
+                   actor,
+                   tenant
+                 ) do
+              {:ok, val} ->
+                {:ok, val}
+
+              :unknown ->
+                {:error,
+                 "unable to evaluate expression #{inspect(raw_expr)} without a loaded record"}
+
+              {:error, _} = err ->
+                err
+            end
+
+          {:error, _} = err ->
+            err
+        end
+      end
+    end
+
+    defp evaluate_calculate_expr(
+           expr,
+           raw_expr,
+           nil,
+           resource,
+           _domain,
+           _actor,
+           _tenant,
+           _source_ctx,
+           base_eval_opts
+         ) do
+      case Ash.Expr.eval(expr, base_eval_opts) do
+        {:ok, value} ->
+          {:ok, value}
+
+        :unknown ->
+          with {:ok, hydrated} <-
+                 Ash.Filter.hydrate_refs(expr, %{resource: resource, public?: false}) do
+            case Ash.Expr.eval_hydrated(hydrated, base_eval_opts) do
+              {:ok, val} ->
+                {:ok, val}
+
+              :unknown ->
+                {:error,
+                 "unable to evaluate expression #{inspect(raw_expr)} without a loaded record"}
+
+              {:error, _} = err ->
+                err
+            end
+          end
+
+        {:error, _} = err ->
+          err
+      end
     end
 
     defp with_context_db(context, resource, fun) do
@@ -412,8 +480,6 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     rescue
       _ -> nil
     end
-
-    defp eval_relational_fallback(_expr, nil, _eval_opts, _domain, _actor, _tenant), do: :unknown
 
     defp eval_relational_fallback(expr, record, eval_opts, domain, actor, tenant)
          when is_map(record) do
