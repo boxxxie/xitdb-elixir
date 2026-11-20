@@ -860,6 +860,113 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         assert Xitdb.db(db)["idx"]["search"]["nested_sessions"]["meta"]["doc_count"] == 1
         assert Indexer.all_cursors(db, NestedSession) |> Enum.map(&elem(&1, 0)) == ["3"]
       end
+
+      test "compile_set_ops handles put, duplicate put, non-last delete, last delete, and delete-then-reput in batch",
+           %{db: db} do
+        [status_idx] = Info.indexes_for_field(Article, :status)
+        status_attr = Ash.Resource.Info.attribute(Article, :status)
+        raw_key = Codec.encode_index_key([status_attr], [:published])
+        hex_key = Base.encode16(raw_key, case: :lower)
+
+        a1 = %Article{id: 1, slug: Ash.CiString.new("set-1"), status: :published, title: "Alpha"}
+        a2 = %Article{id: 2, slug: Ash.CiString.new("set-2"), status: :published, title: "Beta"}
+
+        # Seed a1 and a2 via put_record + duplicate put via batched plan
+        {:ok, db} = Indexer.put_record(db, Article, nil, a1)
+        {:ok, db} = Indexer.put_record(db, Article, nil, a2)
+        assert Indexer.count_by_attribute(db, Article, :status, :published) == 2
+
+        # Duplicate put + delete non-last (a1 removed, a2 remains) in a single commit
+        {:ok, ops_a1_dup, b1} = Indexer.plan_put_ops_batched(db, Article, a1, a1, nil, %{})
+        {:ok, ops_a1_del, _b2} = Indexer.plan_delete_ops_batched(db, Article, a1, nil, b1)
+        {:ok, db} = Xitdb.transact_ops(db, ops_a1_dup ++ ops_a1_del)
+
+        assert Indexer.count_by_attribute(db, Article, :status, :published) == 1
+
+        assert Indexer.lookup_secondary_eq(db, Article, status_idx, [:published]) ==
+                 MapSet.new(["2"])
+
+        assert Xitdb.db(db)["idx"]["articles"]["attr_status"][hex_key] != nil
+
+        # Delete last member (a2) -> container key must be removed from B+Tree
+        {:ok, db} = Indexer.delete_record(db, Article, a2)
+        assert Indexer.count_by_attribute(db, Article, :status, :published) == 0
+        assert Indexer.lookup_secondary_eq(db, Article, status_idx, [:published]) == MapSet.new()
+        assert Xitdb.db(db)["idx"]["articles"]["attr_status"][hex_key] == nil
+
+        # Re-seed a1 alone, then delete-last-then-reput inside a single batched transaction
+        {:ok, db} = Indexer.put_record(db, Article, nil, a1)
+        a3 = %Article{id: 3, slug: Ash.CiString.new("set-3"), status: :published, title: "Gamma"}
+
+        {:ok, del_ops, b_after_del} = Indexer.plan_delete_ops_batched(db, Article, a1, nil, %{})
+
+        {:ok, put_a3_ops, b_after_put} =
+          Indexer.plan_put_ops_batched(db, Article, nil, a3, nil, b_after_del)
+
+        {:ok, put_a1_ops, _} =
+          Indexer.plan_put_ops_batched(db, Article, nil, a1, nil, b_after_put)
+
+        {:ok, db} = Xitdb.transact_ops(db, del_ops ++ put_a3_ops ++ put_a1_ops)
+
+        assert Indexer.count_by_attribute(db, Article, :status, :published) == 2
+
+        assert Indexer.lookup_secondary_eq(db, Article, status_idx, [:published]) ==
+                 MapSet.new(["1", "3"])
+      end
+
+      test "compile_search_diff_ops and Search.Storage.apply_diff preserve multi-doc terms and remove last posting",
+           %{db: db} do
+        a1 = %Article{
+          id: 10,
+          slug: Ash.CiString.new("srch-10"),
+          status: :published,
+          title: "Sovereign Wealth",
+          summary: "UniqueOneToken"
+        }
+
+        a2 = %Article{
+          id: 11,
+          slug: Ash.CiString.new("srch-11"),
+          status: :published,
+          title: "Sovereign Capital",
+          summary: "UniqueTwoToken"
+        }
+
+        # Batch create both in 1 commit, then test deleting 1 of 2 sharing "sovereign" and 1 unique
+        {:ok, ops1, b1} = Indexer.plan_put_ops_batched(db, Article, nil, a1, nil, %{})
+        {:ok, ops2, _b2} = Indexer.plan_put_ops_batched(db, Article, nil, a2, nil, b1)
+        {:ok, db} = Xitdb.transact_ops(db, ops1 ++ ops2)
+
+        assert Enum.sort(Search.ids(Article, "sovereign", db: db)) == [10, 11]
+        assert Search.ids(Article, "uniqueonetoken", db: db) == [10]
+
+        # Delete a1 via batched op -> "sovereign" kept for 11, "uniqueonetoken" deleted completely
+        {:ok, del_ops1, b_del} = Indexer.plan_delete_ops_batched(db, Article, a1, nil, %{})
+        # Also test add+delete of "transient" in same batch!
+        a3 = %Article{
+          id: 12,
+          slug: Ash.CiString.new("srch-12"),
+          status: :published,
+          title: "Transient",
+          summary: ""
+        }
+
+        {:ok, put3, b_put3} = Indexer.plan_put_ops_batched(db, Article, nil, a3, nil, b_del)
+        {:ok, del3, _b_fin} = Indexer.plan_delete_ops_batched(db, Article, a3, nil, b_put3)
+        {:ok, db} = Xitdb.transact_ops(db, del_ops1 ++ put3 ++ del3)
+
+        assert Xitdb.db(db)["idx"]["search"]["articles"]["terms"]["uniqueonetoken"] == nil
+        assert Xitdb.db(db)["idx"]["search"]["articles"]["terms"]["transient"] == nil
+
+        assert Enum.to_list(Xitdb.db(db)["idx"]["search"]["articles"]["terms"]["sovereign"]) == [
+                 {"11", 200}
+               ]
+
+        # Direct Search.Storage.apply_diff removes last posting on a2
+        db = Search.remove_record(db, Article, a2.id)
+        assert Xitdb.db(db)["idx"]["search"]["articles"]["terms"]["sovereign"] == nil
+        assert Search.ids(Article, "sovereign", db: db) == []
+      end
     end
   end
 end

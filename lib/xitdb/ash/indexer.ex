@@ -87,7 +87,16 @@ if Code.ensure_loaded?(Ash.DataLayer) do
            {:ok, locator_plan} <-
              plan_entity_location(db_or_cursor, resource, effective_old, new_record, tenant) do
         secondary_ops = plan_secondary_ops(resource, effective_old, new_record)
-        removed_fields = removed_attribute_fields(resource, effective_old, cursor_map)
+
+        removed_fields =
+          removed_attribute_fields(
+            db_or_cursor,
+            collection,
+            locator_plan,
+            resource,
+            effective_old,
+            cursor_map
+          )
 
         {entity_and_idx_ops, batch_after_idx} =
           Storage.compile_put_ops(
@@ -1080,9 +1089,51 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       end)
     end
 
-    defp removed_attribute_fields(_resource, nil, _cursor_map), do: []
+    defp removed_attribute_fields(
+           db_or_cursor,
+           collection,
+           {:top_level, doc_id},
+           resource,
+           nil,
+           cursor_map
+         ) do
+      case Storage.fetch_top_level_cursor(db_or_cursor, collection, doc_id) do
+        {:ok, %Xitdb.Cursor{} = existing_cur} ->
+          resource
+          |> Ash.Resource.Info.attributes()
+          |> Enum.reduce([], fn %{name: name}, acc ->
+            field_str = Atom.to_string(name)
 
-    defp removed_attribute_fields(resource, old_record, cursor_map) do
+            if not Map.has_key?(cursor_map, field_str) and not is_nil(existing_cur[field_str]) do
+              [field_str | acc]
+            else
+              acc
+            end
+          end)
+
+        _ ->
+          []
+      end
+    end
+
+    defp removed_attribute_fields(
+           _db_or_cursor,
+           _collection,
+           _locator_plan,
+           _resource,
+           nil,
+           _cursor_map
+         ),
+         do: []
+
+    defp removed_attribute_fields(
+           _db_or_cursor,
+           _collection,
+           _locator_plan,
+           resource,
+           old_record,
+           cursor_map
+         ) do
       resource
       |> Ash.Resource.Info.attributes()
       |> Enum.reduce([], fn %{name: name}, acc ->
@@ -1572,41 +1623,49 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         {term_ops, final_batch} =
           Enum.flat_map_reduce(term_diffs, next_batch, fn
             {:put, term, weight}, b_acc ->
-              term_key = {:search_term_docs, collection, term}
+              term_key = {:search_term_delta, collection, term}
 
-              docs_set =
-                Map.get_lazy(b_acc, term_key, fn ->
-                  db_or_cursor
-                  |> Xitdb.Ash.Search.Storage.lookup_term(collection, term)
-                  |> MapSet.new(&elem(&1, 0))
-                end)
+              delta =
+                Map.get(b_acc, term_key, %{added: MapSet.new(), removed: MapSet.new()})
+
+              next_delta = %{
+                added: MapSet.put(delta.added, doc_key),
+                removed: MapSet.delete(delta.removed, doc_key)
+              }
 
               term_str = TxCompiler.format_key(term)
 
               {[{:put, terms_prefix <> "$" <> term_str <> "." <> doc_str, weight}],
-               Map.put(b_acc, term_key, MapSet.put(docs_set, doc_key))}
+               Map.put(b_acc, term_key, next_delta)}
 
             {:delete, term}, b_acc ->
-              term_key = {:search_term_docs, collection, term}
+              term_key = {:search_term_delta, collection, term}
 
-              docs_set =
-                Map.get_lazy(b_acc, term_key, fn ->
-                  db_or_cursor
-                  |> Xitdb.Ash.Search.Storage.lookup_term(collection, term)
-                  |> MapSet.new(&elem(&1, 0))
-                end)
+              delta =
+                Map.get(b_acc, term_key, %{added: MapSet.new(), removed: MapSet.new()})
 
-              remaining = MapSet.delete(docs_set, doc_key)
+              next_added = MapSet.delete(delta.added, doc_key)
+              next_removed = MapSet.put(delta.removed, doc_key)
+
+              has_remaining? =
+                MapSet.size(next_added) > 0 or
+                  Xitdb.Ash.Search.Storage.term_has_doc_outside?(
+                    db_or_cursor,
+                    collection,
+                    term,
+                    next_removed
+                  )
+
               term_str = TxCompiler.format_key(term)
 
               op =
-                if MapSet.size(remaining) == 0 do
-                  {:rm, terms_prefix <> "$" <> term_str}
-                else
+                if has_remaining? do
                   {:rm, terms_prefix <> "$" <> term_str <> "." <> doc_str}
+                else
+                  {:rm, terms_prefix <> "$" <> term_str}
                 end
 
-              {[op], Map.put(b_acc, term_key, remaining)}
+              {[op], Map.put(b_acc, term_key, %{added: next_added, removed: next_removed})}
           end)
 
         {meta_ops ++ doc_ops ++ term_ops, final_batch}
@@ -1848,7 +1907,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           slot_path = ".idx" <> col_step <> TxCompiler.format_step(:hash_map, slot)
           set_path = slot_path <> "$" <> hex_key
           init_key = {:init_slot, collection, slot}
-          members_key = {:set_members, collection, slot, raw_key}
+          delta_key = {:set_delta, collection, slot, raw_key}
 
           {init_btree, b_init} =
             if Map.has_key?(b_acc, init_key) or
@@ -1858,19 +1917,22 @@ if Code.ensure_loaded?(Ash.DataLayer) do
               {[{:init_col, slot_path, "sorted_map"}], Map.put(b_acc, init_key, true)}
             end
 
-          cur_members =
-            Map.get_lazy(b_init, members_key, fn ->
-              db_or_cursor |> lookup_set(collection, slot, raw_key) |> MapSet.new()
+          state =
+            Map.get_lazy(b_init, delta_key, fn ->
+              load_set_state(db_or_cursor, collection, slot, raw_key)
             end)
 
-          b_next = Map.put(b_init, members_key, MapSet.put(cur_members, doc_id))
-
           init_set =
-            if MapSet.size(cur_members) == 0 do
-              [{:init_col, set_path, "counted_hash_set"}]
-            else
-              []
-            end
+            if not state.exists?, do: [{:init_col, set_path, "counted_hash_set"}], else: []
+
+          next_state = %{
+            state
+            | exists?: true,
+              added: MapSet.put(state.added, doc_id),
+              removed: MapSet.delete(state.removed, doc_id)
+          }
+
+          b_next = Map.put(b_init, delta_key, next_state)
 
           ops_out =
             init_btree ++
@@ -1882,32 +1944,192 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           {ops_out, b_next}
 
         {:del_set, slot, raw_key, doc_id}, b_acc ->
-          members_key = {:set_members, collection, slot, raw_key}
+          delta_key = {:set_delta, collection, slot, raw_key}
 
-          cur_members =
-            Map.get_lazy(b_acc, members_key, fn ->
-              db_or_cursor |> lookup_set(collection, slot, raw_key) |> MapSet.new()
+          state =
+            Map.get_lazy(b_acc, delta_key, fn ->
+              load_set_state(db_or_cursor, collection, slot, raw_key)
             end)
 
-          if MapSet.member?(cur_members, doc_id) do
-            remaining = MapSet.delete(cur_members, doc_id)
+          if set_contains_staged?(state, db_or_cursor, collection, slot, raw_key, doc_id) do
+            next_added = MapSet.delete(state.added, doc_id)
+            next_removed = MapSet.put(state.removed, doc_id)
+
+            remaining? =
+              set_still_non_empty?(
+                %{state | added: next_added, removed: next_removed},
+                db_or_cursor,
+                collection,
+                slot,
+                raw_key
+              )
+
             hex_key = encode_btree_key(raw_key)
             slot_path = ".idx" <> col_step <> TxCompiler.format_step(:hash_map, slot)
             set_path = slot_path <> "$" <> hex_key
 
-            rm_op =
-              if MapSet.size(remaining) == 0 do
-                {:rm, set_path}
+            {rm_op, next_exists?, next_exists_in_db?} =
+              if remaining? do
+                {{:rm, set_path <> TxCompiler.format_step(:counted_hash_set, doc_id)}, true,
+                 state.exists_in_db?}
               else
-                {:rm, set_path <> TxCompiler.format_step(:counted_hash_set, doc_id)}
+                {{:rm, set_path}, false, false}
               end
 
-            {[rm_op], Map.put(b_acc, members_key, remaining)}
+            next_state =
+              if next_exists_in_db? do
+                %{
+                  state
+                  | exists_in_db?: true,
+                    exists?: next_exists?,
+                    added: next_added,
+                    removed: next_removed
+                }
+              else
+                %{
+                  exists_in_db?: false,
+                  exists?: false,
+                  added: MapSet.new(),
+                  removed: MapSet.new()
+                }
+              end
+
+            {[rm_op], Map.put(b_acc, delta_key, next_state)}
           else
-            {[], b_acc}
+            {[], Map.put_new(b_acc, delta_key, state)}
           end
       end)
     end
+
+    defp load_set_state(db_or_cursor, collection, slot, raw_key) do
+      hex_key = encode_btree_key(raw_key)
+
+      exists_in_db? =
+        with %Xitdb.Cursor{} = btree <- get_index_slot(db_or_cursor, collection, slot),
+             set when not is_nil(set) <- btree[hex_key] do
+          true
+        else
+          _ -> false
+        end
+
+      %{
+        exists_in_db?: exists_in_db?,
+        exists?: exists_in_db?,
+        added: MapSet.new(),
+        removed: MapSet.new()
+      }
+    end
+
+    defp set_contains_staged?(state, db_or_cursor, collection, slot, raw_key, doc_id) do
+      cond do
+        MapSet.member?(state.added, doc_id) -> true
+        MapSet.member?(state.removed, doc_id) -> false
+        not state.exists_in_db? -> false
+        true -> set_member?(db_or_cursor, collection, slot, raw_key, doc_id)
+      end
+    end
+
+    defp set_still_non_empty?(
+           %{added: added, exists_in_db?: exists_in_db?, removed: removed},
+           db_or_cursor,
+           collection,
+           slot,
+           raw_key
+         ) do
+      cond do
+        MapSet.size(added) > 0 ->
+          true
+
+        not exists_in_db? ->
+          false
+
+        true ->
+          hex_key = encode_btree_key(raw_key)
+
+          with %Xitdb.Cursor{} = btree <- get_index_slot(db_or_cursor, collection, slot),
+               set when not is_nil(set) <- btree[hex_key] do
+            set_has_member_outside?(set, removed)
+          else
+            _ -> false
+          end
+      end
+    end
+
+    defp set_member?(db_or_cursor, collection, slot, raw_key, doc_id) do
+      hex_key = encode_btree_key(raw_key)
+
+      with %Xitdb.Cursor{} = btree <- get_index_slot(db_or_cursor, collection, slot),
+           set when not is_nil(set) <- btree[hex_key] do
+        set_container_member?(set, doc_id)
+      else
+        _ -> false
+      end
+    end
+
+    defp set_has_member_outside?(
+           %Xitdb.Cursor{
+             tx_mode: false,
+             db_ref: db_ref,
+             tag_id: tag_id,
+             value: val,
+             moment: moment
+           },
+           excluded
+         )
+         when tag_id in [11, 13, 15] do
+      excluded_count = MapSet.size(excluded)
+
+      case Xitdb.NIF.nif_slot_count(db_ref, tag_id, val) do
+        {:ok, cnt} when cnt > excluded_count ->
+          true
+
+        _ ->
+          limit = max(excluded_count + 1, 1)
+
+          case Xitdb.NIF.nif_slot_entries(db_ref, tag_id, val, 0, limit) do
+            {:ok, raw_entries} ->
+              db_ref
+              |> Xitdb.Cursor.unwrap_nif_entries(raw_entries, moment)
+              |> Enum.any?(fn
+                {k, _v} -> not MapSet.member?(excluded, to_string(k))
+                k -> not MapSet.member?(excluded, to_string(k))
+              end)
+
+            _ ->
+              false
+          end
+      end
+    end
+
+    defp set_has_member_outside?(%MapSet{} = set, excluded) do
+      Enum.any?(set, fn k -> not MapSet.member?(excluded, k) end)
+    end
+
+    defp set_has_member_outside?(%Xitdb.Collection{data: data}, excluded) do
+      Enum.any?(data, fn k -> not MapSet.member?(excluded, k) end)
+    end
+
+    defp set_has_member_outside?(other, excluded) do
+      Enum.any?(other, fn k -> not MapSet.member?(excluded, to_string(k)) end)
+    end
+
+    defp set_container_member?(
+           %Xitdb.Cursor{tx_mode: false, db_ref: db_ref, tag_id: tag_id, value: val},
+           doc_id
+         )
+         when tag_id in [11, 13, 15] and is_binary(doc_id) do
+      case Xitdb.NIF.nif_slot_contains(db_ref, tag_id, val, doc_id) do
+        {:ok, bool} -> bool
+        _ -> false
+      end
+    end
+
+    defp set_container_member?(%MapSet{} = set, doc_id), do: MapSet.member?(set, doc_id)
+
+    defp set_container_member?(%Xitdb.Collection{data: data}, doc_id),
+      do: Enum.member?(data, doc_id)
+
+    defp set_container_member?(other, doc_id), do: Enum.member?(other, doc_id)
 
     defp diff_search_terms(old_terms, new_terms) do
       deletes_and_updates =

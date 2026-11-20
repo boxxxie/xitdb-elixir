@@ -919,6 +919,10 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       send(parent, {:telemetry_event, event, meta})
     end
 
+    def handle_telemetry_with_measurements(event, measurements, meta, parent) do
+      send(parent, {:telemetry_detailed, event, measurements, meta})
+    end
+
     describe "can?/2 hybrid boundary guards and telemetry spans" do
       test "scopes join/filter/aggregate relationship capabilities to Xitdb.Ash.DataLayer, rejects :composite_primary_key, and emits telemetry" do
         assert Xitdb.Ash.DataLayer.can?(User, {:join, Profile}) == true
@@ -971,6 +975,95 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
         assert_received {:telemetry_event, [:xitdb, :ash, :aggregate_query, :stop],
                          %{resource: User, collection: :users, status: :ok}}
+      end
+
+      test "emits [:xitdb, :tx, :commit], [:xitdb, :ash, :mutation, *], and narrowing_strategy on [:xitdb, :ash, :query, :stop]" do
+        handler_id = "datalayer-detailed-telemetry-#{System.unique_integer([:positive])}"
+
+        :telemetry.attach_many(
+          handler_id,
+          [
+            [:xitdb, :tx, :commit],
+            [:xitdb, :ash, :mutation, :start],
+            [:xitdb, :ash, :mutation, :stop],
+            [:xitdb, :ash, :query, :stop]
+          ],
+          &__MODULE__.handle_telemetry_with_measurements/4,
+          self()
+        )
+
+        on_exit(fn -> :telemetry.detach(handler_id) end)
+
+        u1 = TestDomain.create_user!(%{email: unique_email("mut-tel")}, authorize?: false)
+
+        assert_received {:telemetry_detailed, [:xitdb, :tx, :commit],
+                         %{duration: tx_dur, op_count: tx_ops}, %{backend: :memory, doc: _}}
+
+        assert is_integer(tx_dur) and tx_dur >= 0 and is_integer(tx_ops) and tx_ops > 0
+
+        assert_received {:telemetry_detailed, [:xitdb, :ash, :mutation, :start],
+                         %{monotonic_time: _, system_time: _},
+                         %{resource: User, collection: :users, action: :create}}
+
+        assert_received {:telemetry_detailed, [:xitdb, :ash, :mutation, :stop],
+                         %{
+                           duration: m_dur,
+                           plan_duration: plan_dur,
+                           commit_duration: commit_dur,
+                           op_count: m_ops,
+                           record_count: 1
+                         }, %{resource: User, collection: :users, action: :create, status: :ok}}
+
+        assert m_dur >= 0 and plan_dur >= 0 and commit_dur >= 0 and m_ops > 0
+
+        # Query narrowing strategies: :pk, :secondary_index, and :full_scan
+        ev =
+          TestDomain.create_event!(
+            %{title: "Tel Event", start_time: ~U[2026-11-20 12:00:00Z]},
+            authorize?: false
+          )
+
+        _ =
+          TestDomain.create_session!(
+            %{event_id: ev.id, title: "Tel Session", room: "Suite-42"},
+            authorize?: false
+          )
+
+        _ = User |> Ash.Query.filter(id == ^u1.id) |> Ash.read!(authorize?: false)
+
+        assert_received {:telemetry_detailed, [:xitdb, :ash, :query, :stop], %{duration: _},
+                         %{
+                           resource: User,
+                           collection: :users,
+                           status: :ok,
+                           narrowing_strategy: :pk,
+                           candidate_count: 1,
+                           result_count: 1
+                         }}
+
+        _ = AgendaSession |> Ash.Query.filter(room == "Suite-42") |> Ash.read!(authorize?: false)
+
+        assert_received {:telemetry_detailed, [:xitdb, :ash, :query, :stop], %{duration: _},
+                         %{
+                           resource: AgendaSession,
+                           collection: :agenda_sessions,
+                           status: :ok,
+                           narrowing_strategy: :secondary_index,
+                           candidate_count: 1,
+                           result_count: 1
+                         }}
+
+        _ = Ash.read!(User, domain: TestDomain, authorize?: false)
+
+        assert_received {:telemetry_detailed, [:xitdb, :ash, :query, :stop], %{duration: _},
+                         %{
+                           resource: User,
+                           collection: :users,
+                           status: :ok,
+                           narrowing_strategy: :full_scan,
+                           candidate_count: _,
+                           result_count: _
+                         }}
       end
     end
 

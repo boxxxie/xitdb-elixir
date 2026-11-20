@@ -548,9 +548,9 @@ defmodule Xitdb do
   defp do_transact_ops_default(db, db_ref, ops) do
     case Process.get(@tx_context_key) do
       nil ->
-        case NIF.nif_transact(db_ref, -1, ops, "") do
+        case timed_nif_transact(db, db_ref, -1, ops, length(ops), "") do
           {:ok, _moment_idx} -> {:ok, db}
-          {:error, reason} -> {:error, %Error{reason: reason}}
+          {:error, _} = err -> err
         end
 
       ctx ->
@@ -564,9 +564,9 @@ defmodule Xitdb do
   defp do_transact_ops_with_moment(%__MODULE__{db_ref: db_ref} = db, ops, @default_transact_opts) do
     case Process.get(@tx_context_key) do
       nil ->
-        case NIF.nif_transact(db_ref, -1, ops, "") do
+        case timed_nif_transact(db, db_ref, -1, ops, length(ops), "") do
           {:ok, moment_idx} -> {:ok, db, moment_idx}
-          {:error, reason} -> {:error, %Error{reason: reason}}
+          {:error, _} = err -> err
         end
 
       ctx ->
@@ -625,9 +625,29 @@ defmodule Xitdb do
 
     all_ops = if opt_ops == [], do: ops, else: opt_ops ++ ops
 
-    case NIF.nif_transact(db_ref, base_moment, all_ops, doc) do
+    case timed_nif_transact(db, db_ref, base_moment, all_ops, length(ops), doc) do
       {:ok, moment_idx} -> {:ok, db, moment_idx}
-      {:error, reason} -> {:error, %Error{reason: reason}}
+      {:error, _} = err -> err
+    end
+  end
+
+  defp timed_nif_transact(db, db_ref, base_moment, nif_ops, user_op_count, doc) do
+    started = System.monotonic_time()
+
+    case NIF.nif_transact(db_ref, base_moment, nif_ops, doc) do
+      {:ok, moment_idx} ->
+        duration = System.monotonic_time() - started
+
+        :telemetry.execute(
+          [:xitdb, :tx, :commit],
+          %{duration: duration, op_count: user_op_count},
+          %{backend: db.backend, doc: doc}
+        )
+
+        {:ok, moment_idx}
+
+      {:error, reason} ->
+        {:error, %Error{reason: reason}}
     end
   end
 

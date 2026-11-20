@@ -179,15 +179,38 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     for `resource` using the 6-stage pipeline.
     """
     @spec execute(term(), t(), module()) :: {:ok, [struct()]} | {:error, term()}
-    def execute(_db_or_cursor, %__MODULE__{context: %{__stub_empty__: true}}, _resource) do
-      {:ok, []}
+    def execute(db_or_cursor, %__MODULE__{} = query, resource) when is_atom(resource) do
+      case execute_with_stats(db_or_cursor, query, resource) do
+        {:ok, results, _stats} -> {:ok, results}
+        {:error, _} = err -> err
+      end
     end
 
-    def execute(db_or_cursor, %__MODULE__{} = query, resource) when is_atom(resource) do
+    @doc false
+    @spec execute_with_stats(term(), t(), module()) ::
+            {:ok, [struct()],
+             %{
+               narrowing_strategy: atom(),
+               candidate_count: non_neg_integer(),
+               result_count: non_neg_integer()
+             }}
+            | {:error, term()}
+    def execute_with_stats(
+          _db_or_cursor,
+          %__MODULE__{context: %{__stub_empty__: true}},
+          _resource
+        ) do
+      {:ok, [], %{narrowing_strategy: :empty, candidate_count: 0, result_count: 0}}
+    end
+
+    def execute_with_stats(db_or_cursor, %__MODULE__{} = query, resource)
+        when is_atom(resource) do
       bind_snapshot_if_needed(db_or_cursor, resource, fn ->
         %__MODULE__{} = query = normalize_domain(query, resource)
 
-        with {:ok, raw_cursors} <- stage1_narrow(db_or_cursor, query, resource),
+        with {:ok, raw_cursors, strategy} <-
+               stage1_narrow_with_stats(db_or_cursor, query, resource),
+             candidate_count = length(raw_cursors),
              {:ok, hydrated} <- stage2_hydrate(raw_cursors, query, resource),
              {:ok, prefiltered, residual_filter} <-
                stage3_prefilter(db_or_cursor, hydrated, query, resource),
@@ -204,7 +227,14 @@ if Code.ensure_loaded?(Ash.DataLayer) do
              ordered = stage5_order_and_slice(enriched_and_filtered, query, resource),
              {:ok, post_enriched} <-
                attach_derived(db_or_cursor, ordered, post_slice_query, resource) do
-          {:ok, stage6_project(post_enriched, query, resource)}
+          projected = stage6_project(post_enriched, query, resource)
+
+          {:ok, projected,
+           %{
+             narrowing_strategy: strategy,
+             candidate_count: candidate_count,
+             result_count: length(projected)
+           }}
         end
       end)
     end
@@ -271,38 +301,52 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     # Stage 1: Index / Primary-Key / Unique-Identity Narrowing
     # ==========================================================================
 
-    defp stage1_narrow(_db_or_cursor, %__MODULE__{filter: %Ash.Filter{expression: false}}, _res) do
-      {:ok, []}
+    defp stage1_narrow_with_stats(
+           _db_or_cursor,
+           %__MODULE__{filter: %Ash.Filter{expression: false}},
+           _res
+         ) do
+      {:ok, [], :empty}
     end
 
-    defp stage1_narrow(db_or_cursor, %__MODULE__{filter: filter, tenant: tenant}, resource) do
+    defp stage1_narrow_with_stats(
+           db_or_cursor,
+           %__MODULE__{filter: filter, tenant: tenant},
+           resource
+         ) do
       conjuncts = extract_top_level_conjuncts(filter)
 
       if Enum.any?(conjuncts, &(&1 == false)) do
-        {:ok, []}
+        {:ok, [], :empty}
       else
-        case plan_narrowing(db_or_cursor, resource, conjuncts, tenant) do
-          {:empty} ->
-            {:ok, []}
+        {plan, strategy} = plan_narrowing_with_stats(db_or_cursor, resource, conjuncts, tenant)
 
-          {:cursors, cursors} ->
-            {:ok, cursors}
+        cursors =
+          case plan do
+            {:empty} ->
+              []
 
-          {:doc_ids, doc_ids} ->
-            {:ok, doc_ids_to_cursors(db_or_cursor, resource, doc_ids, tenant)}
+            {:cursors, c} ->
+              c
 
-          :full_scan ->
-            {:ok, Indexer.all_cursors(db_or_cursor, resource, tenant)}
-        end
+            {:doc_ids, doc_ids} ->
+              doc_ids_to_cursors(db_or_cursor, resource, doc_ids, tenant)
+
+            :full_scan ->
+              Indexer.all_cursors(db_or_cursor, resource, tenant)
+          end
+
+        {:ok, cursors, strategy}
       end
     end
 
-    defp plan_narrowing(_db_or_cursor, _resource, [], _tenant), do: :full_scan
+    defp plan_narrowing_with_stats(_db_or_cursor, _resource, [], _tenant),
+      do: {:full_scan, :full_scan}
 
-    defp plan_narrowing(db_or_cursor, resource, conjuncts, tenant) do
+    defp plan_narrowing_with_stats(db_or_cursor, resource, conjuncts, tenant) do
       case collect_predicates(conjuncts, resource) do
         :contradiction ->
-          {:empty}
+          {{:empty}, :empty}
 
         {eq_map, range_map} ->
           [pk_name | _] = Ash.Resource.Info.primary_key(resource)
@@ -311,12 +355,13 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           cond do
             # 1. Primary-key equality / `in` -> O(1) cursor fetch
             Map.has_key?(eq_map, pk_name) ->
-              resolve_pk_candidates(db_or_cursor, resource, Map.fetch!(eq_map, pk_name), tenant)
+              {resolve_pk_candidates(db_or_cursor, resource, Map.fetch!(eq_map, pk_name), tenant),
+               :pk}
 
             # 2. Unconditional unique identity equality -> O(log N) B+Tree lookup
             (identity_hit = try_unique_identity_lookup(db_or_cursor, resource, eq_map, tenant)) !=
                 :no_match ->
-              identity_hit
+              {identity_hit, :identity}
 
             # 3. `nested_in` parent FK equality -> O(1) subtree jump
             nested_fk != nil and Map.has_key?(eq_map, nested_fk) ->
@@ -325,19 +370,32 @@ if Code.ensure_loaded?(Ash.DataLayer) do
               nested_cursors =
                 fetch_nested_parent_cursors(db_or_cursor, resource, parent_vals, tenant)
 
-              intersect_cursors_with_secondary(
-                db_or_cursor,
-                resource,
-                nested_cursors,
-                eq_map,
-                range_map,
-                nested_fk,
-                tenant
-              )
+              plan =
+                intersect_cursors_with_secondary(
+                  db_or_cursor,
+                  resource,
+                  nested_cursors,
+                  eq_map,
+                  range_map,
+                  nested_fk,
+                  tenant
+                )
+
+              {plan, :nested_fk}
 
             # 4. Secondary B+Tree equality, `in`, or composite prefix + range intersection
             true ->
-              intersect_secondary_indexes(db_or_cursor, resource, eq_map, range_map, nil, tenant)
+              case intersect_secondary_indexes(
+                     db_or_cursor,
+                     resource,
+                     eq_map,
+                     range_map,
+                     nil,
+                     tenant
+                   ) do
+                :full_scan -> {:full_scan, :full_scan}
+                other -> {other, :secondary_index}
+              end
           end
       end
     end

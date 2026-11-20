@@ -12,6 +12,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
     @type snapshot :: {Xitdb.t(), non_neg_integer()}
 
+    @mutation_stats_key :xitdb_ash_mutation_stats
+
     # -- Public DataLayer Mutation Entrypoints --
 
     @doc """
@@ -23,8 +25,17 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     def create(resource, %Ash.Changeset{} = changeset) when is_atom(resource) do
       store = Info.store!(resource)
 
-      Store.mutate(store, fn snapshot ->
-        create_in_snapshot(snapshot, resource, changeset)
+      emit_mutation_telemetry(resource, :create, fn ->
+        case Store.mutate(store, fn snapshot ->
+               create_in_snapshot(snapshot, resource, changeset)
+             end) do
+          {:ok, _record} = ok ->
+            put_mutation_record_count(1)
+            ok
+
+          {:error, _} = err ->
+            err
+        end
       end)
     end
 
@@ -43,31 +54,35 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       upsert_keys = Map.get(opts, :upsert_keys) || Ash.Resource.Info.primary_key(resource)
       identity = Map.get(opts, :identity)
       tenant = Map.get(opts, :tenant)
+      action_kind = if upsert?, do: :bulk_upsert, else: :bulk_create
 
-      result =
-        Store.mutate(store, fn initial_snapshot ->
-          if upsert? do
-            run_bulk_upserts(
-              initial_snapshot,
-              resource,
-              stream,
-              upsert_keys,
-              identity,
-              tenant,
-              opts
-            )
-          else
-            run_bulk_creates_single_commit(initial_snapshot, resource, stream, tenant, opts)
-          end
-        end)
+      emit_mutation_telemetry(resource, action_kind, fn ->
+        result =
+          Store.mutate(store, fn initial_snapshot ->
+            if upsert? do
+              run_bulk_upserts(
+                initial_snapshot,
+                resource,
+                stream,
+                upsert_keys,
+                identity,
+                tenant,
+                opts
+              )
+            else
+              run_bulk_creates_single_commit(initial_snapshot, resource, stream, tenant, opts)
+            end
+          end)
 
-      case result do
-        {:ok, records} ->
-          if return_records?, do: {:ok, records}, else: :ok
+        case result do
+          {:ok, records} ->
+            put_mutation_record_count(length(records))
+            if return_records?, do: {:ok, records}, else: :ok
 
-        {:error, _} = err ->
-          err
-      end
+          {:error, _} = err ->
+            err
+        end
+      end)
     end
 
     @doc """
@@ -79,8 +94,17 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     def update(resource, %Ash.Changeset{} = changeset) when is_atom(resource) do
       store = Info.store!(resource)
 
-      Store.mutate(store, fn snapshot ->
-        update_in_snapshot(snapshot, resource, changeset)
+      emit_mutation_telemetry(resource, :update, fn ->
+        case Store.mutate(store, fn snapshot ->
+               update_in_snapshot(snapshot, resource, changeset)
+             end) do
+          {:ok, _record} = ok ->
+            put_mutation_record_count(1)
+            ok
+
+          {:error, _} = err ->
+            err
+        end
       end)
     end
 
@@ -98,22 +122,25 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       scoped_query = %Query{query | select: nil, tenant: effective_tenant}
       scoped_changeset = %Ash.Changeset{changeset | tenant: effective_tenant}
 
-      result =
-        Store.mutate(store, fn {db, moment} = initial_snapshot ->
-          cursor_root = Xitdb.as_of(db, moment)
+      emit_mutation_telemetry(resource, :update_query, fn ->
+        result =
+          Store.mutate(store, fn {db, moment} = initial_snapshot ->
+            cursor_root = Xitdb.as_of(db, moment)
 
-          with {:ok, candidates} <- Query.execute(cursor_root, scoped_query, resource) do
-            apply_bulk_updates(initial_snapshot, candidates, resource, scoped_changeset, opts)
-          end
-        end)
+            with {:ok, candidates} <- Query.execute(cursor_root, scoped_query, resource) do
+              apply_bulk_updates(initial_snapshot, candidates, resource, scoped_changeset, opts)
+            end
+          end)
 
-      case result do
-        {:ok, updated_records} ->
-          if return_records?, do: {:ok, updated_records}, else: :ok
+        case result do
+          {:ok, updated_records} ->
+            put_mutation_record_count(length(updated_records))
+            if return_records?, do: {:ok, updated_records}, else: :ok
 
-        {:error, _} = err ->
-          err
-      end
+          {:error, _} = err ->
+            err
+        end
+      end)
     end
 
     @doc """
@@ -126,8 +153,18 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         when is_atom(resource) and is_list(keys) do
       store = Info.store!(resource)
 
-      Store.mutate(store, fn snapshot ->
-        upsert_in_snapshot(snapshot, resource, changeset, keys, identity, %{})
+      emit_mutation_telemetry(resource, :upsert, fn ->
+        case Store.mutate(store, fn snapshot ->
+               upsert_in_snapshot(snapshot, resource, changeset, keys, identity, %{})
+             end) do
+          {:ok, record} = ok ->
+            count = if Ash.Resource.get_metadata(record, :upsert_skipped) == true, do: 0, else: 1
+            put_mutation_record_count(count)
+            ok
+
+          {:error, _} = err ->
+            err
+        end
       end)
     end
 
@@ -139,12 +176,18 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     def destroy(resource, %Ash.Changeset{} = changeset) when is_atom(resource) do
       store = Info.store!(resource)
 
-      case Store.mutate(store, fn snapshot ->
-             destroy_in_snapshot(snapshot, resource, changeset)
-           end) do
-        {:ok, _deleted_record} -> :ok
-        {:error, _} = err -> err
-      end
+      emit_mutation_telemetry(resource, :destroy, fn ->
+        case Store.mutate(store, fn snapshot ->
+               destroy_in_snapshot(snapshot, resource, changeset)
+             end) do
+          {:ok, _deleted_record} ->
+            put_mutation_record_count(1)
+            :ok
+
+          {:error, _} = err ->
+            err
+        end
+      end)
     end
 
     @doc """
@@ -161,22 +204,25 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       scoped_query = %Query{query | select: nil, tenant: effective_tenant}
       scoped_changeset = %Ash.Changeset{changeset | tenant: effective_tenant}
 
-      result =
-        Store.mutate(store, fn {db, moment} = initial_snapshot ->
-          cursor_root = Xitdb.as_of(db, moment)
+      emit_mutation_telemetry(resource, :destroy_query, fn ->
+        result =
+          Store.mutate(store, fn {db, moment} = initial_snapshot ->
+            cursor_root = Xitdb.as_of(db, moment)
 
-          with {:ok, candidates} <- Query.execute(cursor_root, scoped_query, resource) do
-            apply_bulk_destroys(initial_snapshot, candidates, resource, scoped_changeset, opts)
-          end
-        end)
+            with {:ok, candidates} <- Query.execute(cursor_root, scoped_query, resource) do
+              apply_bulk_destroys(initial_snapshot, candidates, resource, scoped_changeset, opts)
+            end
+          end)
 
-      case result do
-        {:ok, destroyed_records} ->
-          if return_records?, do: {:ok, destroyed_records}, else: :ok
+        case result do
+          {:ok, destroyed_records} ->
+            put_mutation_record_count(length(destroyed_records))
+            if return_records?, do: {:ok, destroyed_records}, else: :ok
 
-        {:error, _} = err ->
-          err
-      end
+          {:error, _} = err ->
+            err
+        end
+      end)
     end
 
     # -- Internal Snapshot Create / Bulk Create / Update / Upsert / Destroy --
@@ -2113,15 +2159,112 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
     # -- Commit, Hydration & Metadata Helpers --
 
+    defp emit_mutation_telemetry(resource, action_kind, fun) do
+      collection = Info.collection!(resource)
+      start_time = System.monotonic_time()
+      prev_stats = Process.get(@mutation_stats_key)
+
+      Process.put(@mutation_stats_key, %{commit_duration: 0, op_count: 0, record_count: 0})
+
+      meta = %{resource: resource, collection: collection, action: action_kind}
+
+      :telemetry.execute(
+        [:xitdb, :ash, :mutation, :start],
+        %{monotonic_time: start_time, system_time: System.system_time()},
+        meta
+      )
+
+      try do
+        result = fun.()
+        duration = System.monotonic_time() - start_time
+
+        stats =
+          Process.get(@mutation_stats_key) || %{commit_duration: 0, op_count: 0, record_count: 0}
+
+        plan_duration = max(duration - stats.commit_duration, 0)
+
+        status =
+          case result do
+            {:error, _} -> :error
+            _ -> :ok
+          end
+
+        :telemetry.execute(
+          [:xitdb, :ash, :mutation, :stop],
+          %{
+            duration: duration,
+            monotonic_time: System.monotonic_time(),
+            plan_duration: plan_duration,
+            commit_duration: stats.commit_duration,
+            op_count: stats.op_count,
+            record_count: stats.record_count
+          },
+          Map.put(meta, :status, status)
+        )
+
+        result
+      rescue
+        exception ->
+          emit_mutation_exception(start_time, meta, :error, exception, __STACKTRACE__)
+          reraise exception, __STACKTRACE__
+      catch
+        kind, reason ->
+          emit_mutation_exception(start_time, meta, kind, reason, __STACKTRACE__)
+          :erlang.raise(kind, reason, __STACKTRACE__)
+      after
+        if prev_stats == nil do
+          Process.delete(@mutation_stats_key)
+        else
+          Process.put(@mutation_stats_key, prev_stats)
+        end
+      end
+    end
+
+    defp emit_mutation_exception(start_time, meta, kind, reason, stacktrace) do
+      duration = System.monotonic_time() - start_time
+
+      :telemetry.execute(
+        [:xitdb, :ash, :mutation, :exception],
+        %{duration: duration, monotonic_time: System.monotonic_time()},
+        Map.merge(meta, %{kind: kind, reason: reason, stacktrace: stacktrace})
+      )
+    end
+
+    defp put_mutation_record_count(count) when is_integer(count) do
+      case Process.get(@mutation_stats_key) do
+        %{} = stats -> Process.put(@mutation_stats_key, %{stats | record_count: count})
+        nil -> :ok
+      end
+    end
+
+    defp record_commit_stats(op_count, commit_duration) do
+      case Process.get(@mutation_stats_key) do
+        %{} = stats ->
+          Process.put(@mutation_stats_key, %{
+            stats
+            | op_count: stats.op_count + op_count,
+              commit_duration: stats.commit_duration + commit_duration
+          })
+
+        nil ->
+          :ok
+      end
+    end
+
     defp commit_ops({db, moment}, [], _commit_opts), do: {:ok, {db, moment}}
 
     defp commit_ops({db, moment}, ops, commit_opts)
          when is_list(ops) and is_list(commit_opts) do
       tx_opts = Keyword.put(commit_opts, :base_moment, moment)
+      started = System.monotonic_time()
 
       case Xitdb.transact_ops_with_moment(db, ops, tx_opts) do
-        {:ok, next_db, next_moment} -> {:ok, {next_db, next_moment}}
-        {:error, _} = err -> err
+        {:ok, next_db, next_moment} ->
+          record_commit_stats(length(ops), System.monotonic_time() - started)
+          {:ok, {next_db, next_moment}}
+
+        {:error, _} = err ->
+          err
       end
     end
 

@@ -193,13 +193,18 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       meta = %{resource: resource, collection: Info.collection!(resource)}
 
       :telemetry.span([:xitdb, :ash, :query], meta, fn ->
-        result =
-          with_query_db(query, resource, fn db ->
-            Query.execute(db, query, resource)
-          end)
+        case with_query_db(query, resource, fn db ->
+               Query.execute_with_stats(db, query, resource)
+             end) do
+          {:ok, records, query_stats} ->
+            {{:ok, records},
+             meta
+             |> Map.merge(query_stats)
+             |> Map.put(:status, :ok)}
 
-        status = if match?({:ok, _}, result), do: :ok, else: :error
-        {result, Map.put(meta, :status, status)}
+          {:error, _} = err ->
+            {err, Map.put(meta, :status, :error)}
+        end
       end)
     end
 

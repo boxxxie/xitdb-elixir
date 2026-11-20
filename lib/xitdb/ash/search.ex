@@ -707,6 +707,53 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       end
     end
 
+    @doc false
+    @spec term_has_doc_outside?(term(), String.t(), String.t(), MapSet.t(String.t())) ::
+            boolean()
+    def term_has_doc_outside?(db, collection, term, %MapSet{} = excluded) do
+      with root when not is_nil(root) <- root_cursor(db),
+           postings when not is_nil(postings) <-
+             read_path(root, [
+               {:hash_map, "idx"},
+               {:hash_map, "search"},
+               {:hash_map, collection},
+               {:hash_map, "terms"},
+               {:sorted_map, term}
+             ]) do
+        postings_has_other_doc?(postings, excluded)
+      else
+        _ -> false
+      end
+    end
+
+    defp postings_has_other_doc?(
+           %Xitdb.Cursor{
+             tx_mode: false,
+             db_ref: db_ref,
+             tag_id: tag_id,
+             value: val,
+             moment: moment
+           },
+           excluded
+         )
+         when tag_id > 0 do
+      limit = max(MapSet.size(excluded) + 1, 1)
+
+      case Xitdb.NIF.nif_slot_entries(db_ref, tag_id, val, 0, limit) do
+        {:ok, raw_entries} ->
+          db_ref
+          |> Xitdb.Cursor.unwrap_nif_entries(raw_entries, moment)
+          |> Enum.any?(fn {k, _v} -> not MapSet.member?(excluded, to_string(k)) end)
+
+        {:error, _reason} ->
+          false
+      end
+    end
+
+    defp postings_has_other_doc?(postings, excluded) do
+      Enum.any?(postings, fn {k, _v} -> not MapSet.member?(excluded, to_string(k)) end)
+    end
+
     @spec scan_prefix_cursors(term(), String.t(), String.t(), pos_integer()) ::
             {[{String.t(), Xitdb.Cursor.t()}], String.t() | nil}
     def scan_prefix_cursors(db, collection, prefix, limit) do
@@ -966,12 +1013,11 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
           {:delete, term} ->
             term_str = Selector.format_key(term)
-            postings = lookup_term(db, collection, term)
 
-            if length(postings) <= 1 do
-              [{:rm, terms_prefix <> "$" <> term_str}]
-            else
+            if term_has_doc_outside?(db, collection, term, MapSet.new([doc_key])) do
               [{:rm, terms_prefix <> "$" <> term_str <> "." <> doc_str}]
+            else
+              [{:rm, terms_prefix <> "$" <> term_str}]
             end
         end)
 
