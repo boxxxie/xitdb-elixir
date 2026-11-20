@@ -2,6 +2,30 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.2.0] - 2026-11-20
+
+### Added
+- **Read-Only Mode, Transaction Metadata & Scoped Attribution (`Xitdb`, `Xitdb.Ash.Mutator`):**
+  - Added `read_only: true` support to `Xitdb.open/1`, `Xitdb.tx_meta/2` / `Xitdb.tx_meta!/2` for inspecting commit metadata, and `Xitdb.with_tx_context/2` / `Xitdb.current_tx_context/0` for process-scoped `__tx` attribution (`doc`, `tx_instant`, `actor_id`, `source_system`, and custom metadata).
+- **Query & Transaction Telemetry (`Xitdb.Ash.Query`, `Xitdb.Ash.DataLayer`):**
+  - Added `Xitdb.Ash.Query.execute_with_stats/3` emitting query narrowing telemetry (`narrowing_strategy`, `candidate_count`, and `result_count`) alongside transaction attribution telemetry.
+- **Storage Modeling & Bulk Batching Guidance (`usage-rules.md`):**
+  - Documented HAMT storage amplification vs. packed leaf blobs and `Xitdb.Columnar`, consistent collection tag modifiers across writers, off-lock encoding/serialization, and coarse bulk batching.
+
+### Changed
+- **Bulk Ash Indexer/Mutator Optimizations & Lease Overrides (`Xitdb.Ash.*`):**
+  - Optimized bulk indexing and mutation pipelines across `Xitdb.Ash.Indexer`, `Xitdb.Ash.Mutator`, and `Xitdb.Ash.Search`.
+  - Propagated per-transaction `:lease_timeout` overrides across `Xitdb.Ash.Store` and `Xitdb.Ash.TestSandbox`, and added support for in-place `Ash.create` projections (`mdm_materializer` / `allow_existing_cursor?`).
+- **Updated Mix Dependencies:**
+  - Updated dependencies to latest Hex releases (`ash` `3.37.7`, `spark` `2.7.10`, `telemetry` `1.4.3`, `plug` `1.20.4`, `reactor` `1.0.8`, `ex_doc` `0.40.5`, `ex_fuzz` `0.1.1`).
+
+### Fixed
+- **Ash `3.37.5+` Expression Calculation Infinite Recursion (`Xitdb.Ash.Query`, `Xitdb.Ash.DataLayer`, `Xitdb.Ash.Mutator`):**
+  - Prevented re-entrant `Ash.load!/3` infinite recursion caused by `Ash.Filter.Runtime.paths_to_load/3` under `ash 3.37.5+` when resources with read preparations (`prepare build(load: [...])`) evaluate dependent expression calculations.
+  - Updated `Xitdb.Ash.Query` (`eval_expression_calculation/10`, `external_loads_for_expression/3`, `load_external_deps/7`, `build_isolated_load_query/6`, `maybe_load_calc_deps/7`), `Xitdb.Ash.DataLayer.calculate/3`, and `Xitdb.Ash.Mutator` (`eval_boolean_condition/6`, `eval_value_expr/6`) to expand inlineable `Xitdb.Ash.DataLayer` expression calculations against a clean `base_records` snapshot, batch-load external dependencies via an isolated `for_read` + `Ash.Query.unset` query, and evaluate hydrated expressions without `:domain` (passing `unknown_on_unknown_refs?: has_custom_calculate?` so optional `nil` relationships resolve properly).
+- **Rollback, Seed & Reindex `__tx` Metadata (`Xitdb.Ash.Store`, `Xitdb.Ash.Mutator`, `Xitdb.Ash.Indexer`, `Xitdb.Ash.Search`):**
+  - Recorded `restored_moment`, `rolled_back_from`, `rollback_reason`, fresh `doc` / `tx_instant`, and actor/source metadata in `Store.Backend.reconcile_tip/3` and `ensure_seeded!/1`, defaulted Mutator `actor_id` to `"system"`, and attributed `Indexer` and `Search` reindex commits in `__tx`.
+
 ## [2.1.0] - 2026-11-19
 
 ### Added
