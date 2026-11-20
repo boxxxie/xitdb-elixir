@@ -57,6 +57,18 @@ By default, plain Elixir maps (`%{}`) are stored as `:hash_map` (`Tag.Hash_Map`)
 | `Xitdb.counted_set(enum)` | `#%member` | 16-way HAMT set + count | Sets needing `O(1)` `Enum.count/1` and `Enum.member?/2` |
 | `Xitdb.sorted_set(enum)` | `^member` | Lexicographical B+Tree set | Ordered unique tags/badges |
 
+### Storage Modeling: Structured HAMT Maps vs. Packed Leaf Blobs
+
+- **Account for nested HAMT amplification:** Every plain Elixir map written via `put(col[id], map)` or `Xitdb.transact/3` allocates its own 16-way HAMT trie (`144 B` index blocks plus per-key hashes and 9-byte slot headers). For wide `N`-key rows, storing nested maps multiplies writes by `N×` and causes `~10–15×` disk amplification across immutable moments.
+
+  | Pattern | Storage Shape | Best For |
+  | :--- | :--- | :--- |
+  | **Structured nested maps** (`:hash_map` / Ash resources) | Native XitDB subtrees (`put(users[id], map)`) | Canonical domain entities (tens to tens of thousands of records) needing field-level mutations, Datalog/Ash queries, secondary indexes, or field-level `diff_moments/3` & `history_of/2` time travel |
+  | **Packed leaf blobs** or `Xitdb.Columnar` | One compact binary per key (`Jason.encode!/1`, `:erlang.term_to_binary/1`, or `{:compressed, bin, codec: :zstd}`) at `col[id]`, or `Xitdb.Columnar.put_rows/4` | High-volume (`> 50k` rows), wide, write-whole / read-whole raw API staging, webhook payloads, or audit dumps never queried field-by-field in Datalog/Ash |
+
+- **Keep collection tag modifiers consistent (`:hash_map` vs. `:counted_hash_map` / `:sorted_map`):** Never mix plain `[key]` / `.key` (`:hash_map`) writes with `#key` (`:counted_hash_map`) or `$key` (`:sorted_map`) on an already-typed slot — mismatched path step tags raise `.Unexpected_Tag`. Match the declared collection modifier across every writer, or stick to `:hash_map` when dynamic callers write with `[key]`.
+- **Keep non-document workloads out of transactional `.xit` history:** Store dense vector ANN indexes, high-volume ephemeral telemetry logs, and analytical dumps in purpose-built stores (such as embedded vector DBs or Parquet/DuckDB) rather than the append-only `.xit` log.
+
 ---
 
 ## 4. Writing Data & Transactions
@@ -90,6 +102,8 @@ use Xitdb.DSL
 - To roll back from inside a `tx` block, call `abort :reason`.
 - **Never mutate `%Xitdb{}` directly** outside `Xitdb.transact/3` or `tx` (`put_in(db["a"], 1)` raises `ArgumentError`).
 - **Single-writer concurrency**: Concurrent readers are lock-free, while read-modify-write transactions (`update` in `tx` and `Xitdb.transact/3` callbacks) must serialize through `Xitdb.Ash.Store` or a single owner `GenServer`.
+- **Serialize outside the write lock**: When writing packed JSON/ETF/compressed leaf blobs, run sanitization and encoding in caller/worker processes *before* entering `tx` or `Xitdb.Ash.Store.mutate/2` so the serialized writer only executes flat `put(col[id], binary)` operations.
+- **Batch bulk writes & isolate ephemeral staging**: Because XitDB is copy-on-write and append-only, every `tx` rewrites modified `144 B` HAMT spine nodes into a new moment. Never commit `1` row per `tx` in bulk imports — batch into coarse transactions (`5,000–25,000` flat puts per `tx`). If bulk staging tables (`> 100k` rows) are repeatedly re-ingested, keep them in a dedicated `.xit` file or run `Xitdb.compact/2` periodically so superseded staging moments do not bloat domain history.
 
 ### 2. Top-Level Map Transactions (`Xitdb.transact/3`)
 
