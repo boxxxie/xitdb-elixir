@@ -602,6 +602,57 @@ defmodule Xitdb.CompressionTest do
       assert Xitdb.select!(comp2, ".__col_pages") == nil
       Xitdb.close(comp2)
     end
+
+    test "compact/2 handles deeply nested maps (depth >= 25) with live + dead dicts and columnar pages without stack overflow" do
+      tmp_dir =
+        Path.join(System.tmp_dir!(), "xitdb_deep_gc_#{System.unique_integer([:positive])}")
+
+      File.mkdir_p!(tmp_dir)
+      on_exit(fn -> File.rm_rf(tmp_dir) end)
+
+      samples = for i <- 1..20, do: @html_header <> "Deep nested GC sample ##{i}" <> @html_footer
+      live_val = @html_header <> "Deeply nested compressed email body payload" <> @html_footer
+      col_val = @html_header <> "Deep columnar cell payload" <> @html_footer
+
+      db = Xitdb.open!(backend: :buffered_file, path: Path.join(tmp_dir, "deep.xit"))
+      {:ok, db, _} = Dictionary.train_and_put(db, :deep_zd_dict, samples, target_size: 4_096)
+      {:ok, db, _} = Dictionary.train_and_put(db, :deep_col_dict, samples, target_size: 4_096)
+      {:ok, db, _} = Dictionary.train_and_put(db, :deep_dead_dict, samples, target_size: 4_096)
+
+      # Build a 25-level nested map wrapper containing a live "zd" value
+      nested =
+        Enum.reduce(
+          25..1//-1,
+          {:compressed, live_val, dictionary: :deep_zd_dict, codec: :zstd},
+          fn lvl, acc ->
+            %{"lvl_#{lvl}" => acc}
+          end
+        )
+
+      db = Xitdb.transact!(db, %{"deep" => nested})
+
+      db =
+        Xitdb.Columnar.put_rows!(db, "deep_cols", [{"r1", %{"body" => col_val}}],
+          columns: [{"body", encoding: :dict_block, codec: :zstd, dictionary: :deep_col_dict}]
+        )
+
+      comp_path = Path.join(tmp_dir, "deep_comp.xit")
+      {:ok, comp_db} = Xitdb.compact(db, path: comp_path)
+      Xitdb.close(db)
+
+      try do
+        leaf =
+          Enum.reduce(1..25, Xitdb.db(comp_db)["deep"], fn lvl, cur -> cur["lvl_#{lvl}"] end)
+
+        assert leaf == live_val
+        assert Xitdb.db(comp_db)["deep_cols"]["r1"]["body"] == col_val
+        assert Dictionary.get(comp_db, :deep_zd_dict) != nil
+        assert Dictionary.get(comp_db, :deep_col_dict) != nil
+        assert Dictionary.get(comp_db, :deep_dead_dict) == nil
+      after
+        Xitdb.close(comp_db)
+      end
+    end
   end
 
   describe "regression coverage for datalog, GC containers, Xitdb.Encoder, and TxRuntime" do

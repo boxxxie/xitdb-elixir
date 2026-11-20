@@ -9875,28 +9875,65 @@ GC_Ref_State :: struct {
 	live_pages: map[string]bool,
 }
 
-gc_encode_sha256_hex :: proc(raw: []u8, allocator: runtime.Allocator) -> string {
+gc_encode_sha256_hex_buf :: proc(raw: []u8, buf: []u8) -> string {
 	hex_chars := "0123456789abcdef"
-	buf := make([]u8, 64, allocator)
 	for b, i in raw {
 		buf[i * 2] = hex_chars[b >> 4]
 		buf[i * 2 + 1] = hex_chars[b & 0x0F]
 	}
-	return string(buf)
+	return string(buf[:len(raw) * 2])
 }
 
-gc_mark_tagged_bytes :: proc(state: ^GC_Ref_State, b_obj: xitdb.Bytes, allocator: runtime.Allocator) {
-	if len(b_obj.format_tag) != 2 {
+gc_mark_page_ref :: proc(state: ^GC_Ref_State, col: string, field: string, page_id: string, allocator: runtime.Allocator) {
+	key_len := len(col) + 1 + len(field) + 1 + len(page_id)
+	if key_len <= 512 {
+		key_buf: [512]u8 = ---
+		off := 0
+		copy(key_buf[off:], col)
+		off += len(col)
+		key_buf[off] = 0
+		off += 1
+		copy(key_buf[off:], field)
+		off += len(field)
+		key_buf[off] = 0
+		off += 1
+		copy(key_buf[off:], page_id)
+		key_str := string(key_buf[:key_len])
+		if !(key_str in state.live_pages) {
+			state.live_pages[strings.clone(key_str, allocator)] = true
+		}
 		return
 	}
-	t0 := b_obj.format_tag[0]
-	t1 := b_obj.format_tag[1]
-	val := b_obj.value
+
+	tmp := fmt.aprintf("%s\x00%s\x00%s", col, field, page_id)
+	if tmp in state.live_pages {
+		delete(tmp, context.allocator)
+	} else {
+		defer delete(tmp, context.allocator)
+		state.live_pages[strings.clone(tmp, allocator)] = true
+	}
+}
+
+gc_mark_dict_ref :: proc(state: ^GC_Ref_State, dname: string, allocator: runtime.Allocator) {
+	if len(dname) > 0 && !(dname in state.live_dicts) {
+		state.live_dicts[strings.clone(dname, allocator)] = true
+	}
+}
+
+gc_mark_tagged_bytes :: proc(state: ^GC_Ref_State, format_tag: []u8, val: []u8, allocator: runtime.Allocator) {
+	if len(format_tag) != 2 {
+		return
+	}
+	t0 := format_tag[0]
+	t1 := format_tag[1]
 
 	if t0 == 'b' && t1 == 'p' {
 		if len(val) == 33 && val[0] == 0x10 {
-			sha_hex := gc_encode_sha256_hex(val[1:33], allocator)
-			state.live_blobs[sha_hex] = true
+			hex_buf: [64]u8 = ---
+			sha_hex := gc_encode_sha256_hex_buf(val[1:33], hex_buf[:])
+			if !(sha_hex in state.live_blobs) {
+				state.live_blobs[strings.clone(sha_hex, allocator)] = true
+			}
 		}
 		return
 	}
@@ -9905,8 +9942,7 @@ gc_mark_tagged_bytes :: proc(state: ^GC_Ref_State, b_obj: xitdb.Bytes, allocator
 		if len(val) >= 7 && (val[0] == 0x10 || val[0] == 0x12) {
 			dlen := int(val[5])
 			if dlen > 0 && len(val) >= 6 + dlen {
-				dname := strings.clone(string(val[6:6 + dlen]), allocator)
-				state.live_dicts[dname] = true
+				gc_mark_dict_ref(state, string(val[6:6 + dlen]), allocator)
 			}
 		}
 		return
@@ -9938,91 +9974,215 @@ gc_mark_tagged_bytes :: proc(state: ^GC_Ref_State, b_obj: xitdb.Bytes, allocator
 			}
 			page_id := string(val[off:off + page_id_len])
 
-			state.live_pages[fmt.tprintf("%s\x00%s\x00%s", col, field, page_id)] = true
+			gc_mark_page_ref(state, col, field, page_id, allocator)
 		}
 		return
 	}
 }
 
-gc_collect_slot :: proc(
+gc_mark_tagged_slot :: proc(
 	db: ^xitdb.Database,
 	slot: xitdb.Slot,
 	state: ^GC_Ref_State,
-	pool: ^Nif_Iter_Pool,
 	allocator: runtime.Allocator,
 ) -> xitdb.Error {
-	if slot.tag == .Bytes || slot.tag == .Short_Bytes {
-		if !slot.full {
-			return nil
-		}
+	if (slot.tag != .Bytes && slot.tag != .Short_Bytes) || !slot.full {
+		return nil
+	}
+
+	if slot.tag == .Short_Bytes {
+		sb_buf: [8]u8 = ---
 		cur := xitdb.Read_Cursor{
 			slot_ptr = xitdb.Slot_Pointer{position = nil, slot = slot},
 			db       = db,
 		}
-		if slot.tag == .Bytes {
-			_ = validate_bytes_slot_bounds(db, slot) or_return
+		b_obj := xitdb.cursor_read_bytes_buf(cur, sb_buf[:]) or_return
+		gc_mark_tagged_bytes(state, b_obj.format_tag, b_obj.value, allocator)
+		return nil
+	}
+
+	val_size := validate_bytes_slot_bounds(db, slot) or_return
+	tag_buf: [2]u8 = ---
+	xitdb.core_read_exact_at(db.core, slot.value + 8 + val_size, tag_buf[:]) or_return
+	t0 := tag_buf[0]
+	t1 := tag_buf[1]
+
+	if t0 == 'b' && t1 == 'p' {
+		if val_size == 33 {
+			bp_buf: [33]u8 = ---
+			xitdb.core_read_exact_at(db.core, slot.value + 8, bp_buf[:]) or_return
+			gc_mark_tagged_bytes(state, tag_buf[:], bp_buf[:], allocator)
 		}
-		b_obj := xitdb.cursor_read_bytes_object(cur, 0, allocator) or_return
-		gc_mark_tagged_bytes(state, b_obj, allocator)
 		return nil
 	}
 
-	if !is_container_tag(slot.tag) {
+	if t0 == 'z' && t1 == 'd' {
+		if val_size >= 7 {
+			to_read := min(int(val_size), 264)
+			zd_buf: [264]u8 = ---
+			xitdb.core_read_exact_at(db.core, slot.value + 8, zd_buf[:to_read]) or_return
+			gc_mark_tagged_bytes(state, tag_buf[:], zd_buf[:to_read], allocator)
+		}
 		return nil
 	}
 
+	if t0 == 'p' && t1 == 'g' {
+		// Max valid "pg" payload: 1 (ver) + 2 + 65535 (col) + 2 + 65535 (field) + 1 + 255 (page_id) + 4 (row_idx)
+		if val_size >= 13 && val_size <= 131_335 {
+			if val_size <= 512 {
+				pg_buf: [512]u8 = ---
+				n := int(val_size)
+				xitdb.core_read_exact_at(db.core, slot.value + 8, pg_buf[:n]) or_return
+				gc_mark_tagged_bytes(state, tag_buf[:], pg_buf[:n], allocator)
+			} else {
+				tmp := make([]u8, int(val_size), context.allocator)
+				defer delete(tmp, context.allocator)
+				xitdb.core_read_exact_at(db.core, slot.value + 8, tmp) or_return
+				gc_mark_tagged_bytes(state, tag_buf[:], tmp, allocator)
+			}
+		}
+		return nil
+	}
+
+	return nil
+}
+
+gc_mark_col_page_dict :: proc(
+	db: ^xitdb.Database,
+	slot: xitdb.Slot,
+	state: ^GC_Ref_State,
+	allocator: runtime.Allocator,
+) -> xitdb.Error {
+	if slot.tag != .Bytes {
+		return nil
+	}
+	val_size := validate_bytes_slot_bounds(db, slot) or_return
+	if val_size < 16 {
+		return nil
+	}
+	to_read := min(int(val_size), 272)
+	hdr_buf: [272]u8 = ---
+	xitdb.core_read_exact_at(db.core, slot.value + 8, hdr_buf[:to_read]) or_return
+	if hdr_buf[0] == 'X' && hdr_buf[1] == 'C' && hdr_buf[2] == 'P' && hdr_buf[3] == '1' {
+		dlen := int(hdr_buf[15])
+		if dlen > 0 && to_read >= 16 + dlen {
+			gc_mark_dict_ref(state, string(hdr_buf[16:16 + dlen]), allocator)
+		}
+	}
+	return nil
+}
+
+gc_lookup_page_live :: proc(state: ^GC_Ref_State, col: string, field: string, page_id: string) -> bool {
+	key_len := len(col) + 1 + len(field) + 1 + len(page_id)
+	if key_len <= 512 {
+		key_buf: [512]u8 = ---
+		off := 0
+		copy(key_buf[off:], col)
+		off += len(col)
+		key_buf[off] = 0
+		off += 1
+		copy(key_buf[off:], field)
+		off += len(field)
+		key_buf[off] = 0
+		off += 1
+		copy(key_buf[off:], page_id)
+		return string(key_buf[:key_len]) in state.live_pages
+	}
+	tmp := fmt.aprintf("%s\x00%s\x00%s", col, field, page_id)
+	defer delete(tmp, context.allocator)
+	return tmp in state.live_pages
+}
+
+gc_enqueue_or_mark_slot :: proc(
+	db: ^xitdb.Database,
+	slot: xitdb.Slot,
+	state: ^GC_Ref_State,
+	worklist: ^[dynamic]xitdb.Slot,
+	allocator: runtime.Allocator,
+) -> xitdb.Error {
+	if slot.tag == .Bytes || slot.tag == .Short_Bytes {
+		if slot.full {
+			gc_mark_tagged_slot(db, slot, state, allocator) or_return
+		}
+		return nil
+	}
+	if !is_container_tag(slot.tag) || slot.value == 0 {
+		return nil
+	}
 	visit_key := (u64(u8(slot.tag)) << 56) | u64(slot.value)
 	if visit_key in state.visited {
 		return nil
 	}
 	state.visited[visit_key] = true
+	append(worklist, slot)
+	return nil
+}
 
-	cur := xitdb.Read_Cursor{
-		slot_ptr = xitdb.Slot_Pointer{position = nil, slot = slot},
-		db       = db,
+gc_collect_slots_iterative :: proc(
+	db: ^xitdb.Database,
+	root_slots: []xitdb.Slot,
+	state: ^GC_Ref_State,
+	pool: ^Nif_Iter_Pool,
+	allocator: runtime.Allocator,
+) -> xitdb.Error {
+	if len(root_slots) == 0 {
+		return nil
 	}
 
-	#partial switch slot.tag {
-	case .Array_List, .Linked_Array_List:
-		it := nif_iter_pool_acquire(pool) or_return
-		defer nif_iter_pool_release(pool, it)
-		xitdb.cursor_iterator_init(it, cur) or_return
-		for {
-			next_maybe := xitdb.cursor_iterator_next(it) or_return
-			elem_cur, ok := next_maybe.?
-			if !ok {
-				break
-			}
-			elem_slot := xitdb.cursor_slot(elem_cur) or_return
-			gc_collect_slot(db, elem_slot, state, pool, allocator) or_return
+	worklist := make([dynamic]xitdb.Slot, 0, max(len(root_slots), 256), allocator)
+	for rs in root_slots {
+		gc_enqueue_or_mark_slot(db, rs, state, &worklist, allocator) or_return
+	}
+	if len(worklist) == 0 {
+		return nil
+	}
+
+	it := nif_iter_pool_acquire(pool) or_return
+	defer nif_iter_pool_release(pool, it)
+
+	for len(worklist) > 0 {
+		slot := pop(&worklist)
+		cur := xitdb.Read_Cursor{
+			slot_ptr = xitdb.Slot_Pointer{position = nil, slot = slot},
+			db       = db,
 		}
 
-	case .Hash_Set, .Counted_Hash_Set, .Sorted_Set:
-		it := nif_iter_pool_acquire(pool) or_return
-		defer nif_iter_pool_release(pool, it)
-		xitdb.cursor_iterator_init(it, cur) or_return
-		for {
-			next_maybe := xitdb.cursor_iterator_next(it) or_return
-			elem_cur, ok := next_maybe.?
-			if !ok {
-				break
+		#partial switch slot.tag {
+		case .Array_List, .Linked_Array_List:
+			xitdb.cursor_iterator_init(it, cur) or_return
+			for {
+				next_maybe := xitdb.cursor_iterator_next(it) or_return
+				elem_cur, ok := next_maybe.?
+				if !ok {
+					break
+				}
+				elem_slot := xitdb.cursor_slot(elem_cur) or_return
+				gc_enqueue_or_mark_slot(db, elem_slot, state, &worklist, allocator) or_return
 			}
-			key_cur, _ := xitdb.cursor_read_kv_pair_slots(elem_cur) or_return
-			gc_collect_slot(db, key_cur.slot_ptr.slot, state, pool, allocator) or_return
-		}
 
-	case .Hash_Map, .Counted_Hash_Map, .Sorted_Map:
-		it := nif_iter_pool_acquire(pool) or_return
-		defer nif_iter_pool_release(pool, it)
-		xitdb.cursor_iterator_init(it, cur) or_return
-		for {
-			next_maybe := xitdb.cursor_iterator_next(it) or_return
-			elem_cur, ok := next_maybe.?
-			if !ok {
-				break
+		case .Hash_Set, .Counted_Hash_Set, .Sorted_Set:
+			xitdb.cursor_iterator_init(it, cur) or_return
+			for {
+				next_maybe := xitdb.cursor_iterator_next(it) or_return
+				elem_cur, ok := next_maybe.?
+				if !ok {
+					break
+				}
+				key_cur, _ := xitdb.cursor_read_kv_pair_slots(elem_cur) or_return
+				gc_enqueue_or_mark_slot(db, key_cur.slot_ptr.slot, state, &worklist, allocator) or_return
 			}
-			_, val_cur := xitdb.cursor_read_kv_pair_slots(elem_cur) or_return
-			gc_collect_slot(db, val_cur.slot_ptr.slot, state, pool, allocator) or_return
+
+		case .Hash_Map, .Counted_Hash_Map, .Sorted_Map:
+			xitdb.cursor_iterator_init(it, cur) or_return
+			for {
+				next_maybe := xitdb.cursor_iterator_next(it) or_return
+				elem_cur, ok := next_maybe.?
+				if !ok {
+					break
+				}
+				_, val_cur := xitdb.cursor_read_kv_pair_slots(elem_cur) or_return
+				gc_enqueue_or_mark_slot(db, val_cur.slot_ptr.slot, state, &worklist, allocator) or_return
+			}
 		}
 	}
 
@@ -10117,9 +10277,7 @@ gc_collect_dead_compression_ops :: proc(
 		live_pages = make(map[string]bool, 32, allocator),
 	}
 
-	for s in user_slots {
-		gc_collect_slot(&handle.db, s, &state, &pool, allocator) or_return
-	}
+	gc_collect_slots_iterative(&handle.db, user_slots[:], &state, &pool, allocator) or_return
 
 	// Inspect __blobs for dead entries and transitive live_dicts from live "zd" blobs
 	if bs, has_blobs := blobs_slot.?; has_blobs && is_container_tag(bs.tag) {
@@ -10144,10 +10302,7 @@ gc_collect_dead_compression_ops :: proc(
 			if sha_key in state.live_blobs {
 				live_blob_count += 1
 				v_slot := val_cur.slot_ptr.slot
-				if (v_slot.tag == .Bytes || v_slot.tag == .Short_Bytes) && v_slot.full {
-					v_obj := xitdb.cursor_read_bytes_object(val_cur, 0, allocator) or_return
-					gc_mark_tagged_bytes(&state, v_obj, allocator)
-				}
+				gc_mark_tagged_slot(&handle.db, v_slot, &state, allocator) or_return
 			} else {
 				append(&dead_blob_keys, strings.clone(sha_key, allocator))
 			}
@@ -10238,23 +10393,12 @@ gc_collect_dead_compression_ops :: proc(
 					}
 					page_key_cur, page_val_cur := xitdb.cursor_read_kv_pair_slots(page_elem) or_return
 					page_id_raw := read_key_cursor_string(page_key_cur, sb_buf[:]) or_return
-					page_id := strings.clone(page_id_raw, allocator)
-					lookup_key := fmt.tprintf("%s\x00%s\x00%s", col_name, field_name, page_id)
-					if lookup_key in state.live_pages {
+					if gc_lookup_page_live(&state, col_name, field_name, page_id_raw) {
 						live_in_field += 1
 						pv_slot := page_val_cur.slot_ptr.slot
-						if pv_slot.tag == .Bytes || pv_slot.tag == .Short_Bytes {
-							p_obj := xitdb.cursor_read_bytes_object(page_val_cur, 0, allocator) or_return
-							pv := p_obj.value
-							if len(pv) >= 16 && pv[0] == 'X' && pv[1] == 'C' && pv[2] == 'P' && pv[3] == '1' {
-								dlen := int(pv[15])
-								if dlen > 0 && len(pv) >= 16 + dlen {
-									state.live_dicts[strings.clone(string(pv[16:16 + dlen]), allocator)] = true
-								}
-							}
-						}
+						gc_mark_col_page_dict(&handle.db, pv_slot, &state, allocator) or_return
 					} else {
-						append(&dead_page_ids, page_id)
+						append(&dead_page_ids, strings.clone(page_id_raw, allocator))
 					}
 				}
 
