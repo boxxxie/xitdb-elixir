@@ -1590,42 +1590,61 @@ if Code.ensure_loaded?(Ash.DataLayer) do
            actor,
            conflicting_upsert_values
          ) do
-      eval_opts = [
-        record: record_struct,
+      hydrate_ctx = %{
         resource: resource,
-        domain: changeset.domain,
-        actor: actor,
-        tenant: changeset.tenant,
-        context: changeset.context,
-        unknown_on_unknown_refs?: true
-      ]
+        public?: false,
+        conflicting_upsert_values: conflicting_upsert_values
+      }
 
-      case Ash.Expr.eval(expr, eval_opts) do
-        {:ok, truthy} when truthy not in [false, nil] ->
-          {:ok, true}
+      with {:ok, hydrated} <- Ash.Filter.hydrate_refs(expr, hydrate_ctx),
+           external_loads =
+             Query.external_loads_for_expression(hydrated, resource, [record_struct]),
+           {:ok, [eval_record]} <-
+             Query.load_external_deps(
+               [record_struct],
+               external_loads,
+               resource,
+               changeset.domain,
+               changeset.tenant,
+               actor,
+               changeset.context
+             ) do
+        eval_opts = [
+          record: eval_record,
+          resource: resource,
+          actor: actor,
+          tenant: changeset.tenant,
+          context: changeset.context,
+          unknown_on_unknown_refs?: true
+        ]
 
-        {:ok, _false_or_nil} ->
-          {:ok, false}
+        case Ash.Expr.eval_hydrated(hydrated, eval_opts) do
+          {:ok, truthy} when truthy not in [false, nil] ->
+            {:ok, true}
 
-        :unknown ->
-          # Relational / cross-store expressions (e.g. `exists(organization.profiles, ...)`)
-          # return `:unknown` from pure `Ash.Expr.eval/2`. NEVER map `:unknown` to `{:ok, nil}`!
-          case Ash.Filter.Runtime.filter_matches(
-                 changeset.domain,
-                 [record_struct],
-                 expr,
-                 actor: actor,
-                 tenant: changeset.tenant,
-                 authorize?: false,
-                 conflicting_upsert_values: conflicting_upsert_values
-               ) do
-            {:ok, [_matched]} -> {:ok, true}
-            {:ok, []} -> {:ok, false}
-            {:error, _} = err -> err
-          end
+          {:ok, _false_or_nil} ->
+            {:ok, false}
 
-        {:error, _} = err ->
-          err
+          :unknown ->
+            # Relational / cross-store expressions (e.g. `exists(organization.profiles, ...)`)
+            # return `:unknown` from pure `Ash.Expr.eval/2`. NEVER map `:unknown` to `{:ok, nil}`!
+            case Ash.Filter.Runtime.filter_matches(
+                   changeset.domain,
+                   [eval_record],
+                   expr,
+                   actor: actor,
+                   tenant: changeset.tenant,
+                   authorize?: false,
+                   conflicting_upsert_values: conflicting_upsert_values
+                 ) do
+              {:ok, [_matched]} -> {:ok, true}
+              {:ok, []} -> {:ok, false}
+              {:error, _} = err -> err
+            end
+
+          {:error, _} = err ->
+            err
+        end
       end
     end
 
@@ -1639,45 +1658,47 @@ if Code.ensure_loaded?(Ash.DataLayer) do
          ) do
       record_struct = ensure_resource_struct(resource, record)
 
-      eval_opts = [
-        record: record_struct,
+      hydrate_ctx = %{
         resource: resource,
-        domain: changeset.domain,
-        actor: actor,
-        tenant: changeset.tenant,
-        context: changeset.context,
-        unknown_on_unknown_refs?: true
-      ]
+        public?: false,
+        conflicting_upsert_values: conflicting_upsert_values
+      }
 
-      case Ash.Expr.eval(expr, eval_opts) do
-        {:ok, value} ->
-          {:ok, value}
+      with {:ok, hydrated} <- Ash.Filter.hydrate_refs(expr, hydrate_ctx),
+           external_loads =
+             Query.external_loads_for_expression(hydrated, resource, [record_struct]),
+           {:ok, [eval_record]} <-
+             Query.load_external_deps(
+               [record_struct],
+               external_loads,
+               resource,
+               changeset.domain,
+               changeset.tenant,
+               actor,
+               changeset.context
+             ) do
+        eval_opts = [
+          record: eval_record,
+          resource: resource,
+          actor: actor,
+          tenant: changeset.tenant,
+          context: changeset.context,
+          unknown_on_unknown_refs?: true
+        ]
 
-        :unknown ->
-          hydrate_ctx = %{
-            resource: resource,
-            public?: false,
-            conflicting_upsert_values: conflicting_upsert_values
-          }
+        case Ash.Expr.eval_hydrated(hydrated, eval_opts) do
+          {:ok, val} ->
+            {:ok, val}
 
-          with {:ok, hydrated} <- Ash.Filter.hydrate_refs(expr, hydrate_ctx) do
-            case Ash.Expr.eval_hydrated(hydrated, eval_opts) do
-              {:ok, val} ->
-                {:ok, val}
+          :unknown ->
+            {:error,
+             InvalidChanges.exception(
+               message: "could not evaluate atomic expression #{inspect(expr)}"
+             )}
 
-              :unknown ->
-                {:error,
-                 InvalidChanges.exception(
-                   message: "could not evaluate atomic expression #{inspect(expr)}"
-                 )}
-
-              {:error, _} = err ->
-                err
-            end
-          end
-
-        {:error, _} = err ->
-          err
+          {:error, _} = err ->
+            err
+        end
       end
     end
 

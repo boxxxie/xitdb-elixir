@@ -1381,5 +1381,331 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         assert Enum.map(cents_window, & &1.cents) == [-1, 0, 250]
       end
     end
+
+    describe "Chained expression calculations with read preparations (Ash 3.37.5+ recursion regression)" do
+      defmodule PrepDomain do
+        use Ash.Domain, validate_config_inclusion?: false
+
+        resources do
+          allow_unregistered?(true)
+        end
+      end
+
+      defmodule PrepOrg do
+        use Ash.Resource,
+          domain: PrepDomain,
+          data_layer: Xitdb.Ash.DataLayer
+
+        xitdb do
+          store(PrimaryStore)
+          collection(:query_prep_orgs)
+        end
+
+        attributes do
+          integer_primary_key(:id)
+          attribute(:name, :string, allow_nil?: false, public?: true)
+        end
+
+        actions do
+          defaults([:read, :destroy, create: :*, update: :*])
+        end
+      end
+
+      defmodule PrepAlert do
+        use Ash.Resource,
+          domain: PrepDomain,
+          data_layer: Xitdb.Ash.DataLayer
+
+        xitdb do
+          store(SecondaryStore)
+          collection(:query_prep_alerts)
+        end
+
+        attributes do
+          integer_primary_key(:id)
+          attribute(:profile_id, :integer, allow_nil?: false, public?: true)
+          attribute(:severity, :atom, default: :info, public?: true)
+        end
+
+        actions do
+          defaults([:read, :destroy, create: :*, update: :*])
+        end
+      end
+
+      defmodule PrepProfile do
+        use Ash.Resource,
+          domain: PrepDomain,
+          data_layer: Xitdb.Ash.DataLayer
+
+        require Ash.Query
+
+        xitdb do
+          store(PrimaryStore)
+          collection(:query_prep_profiles)
+        end
+
+        preparations do
+          prepare(build(load: [:name, :display_name]))
+        end
+
+        attributes do
+          integer_primary_key(:id)
+          attribute(:first_name, :string, allow_nil?: false, public?: true)
+          attribute(:last_name, :string, default: "", allow_nil?: false, public?: true)
+          attribute(:preferred_name, :string, public?: true)
+          attribute(:score, :integer, default: 10, allow_nil?: false, public?: true)
+          attribute(:org_id, :integer, public?: true)
+        end
+
+        relationships do
+          belongs_to :org, PrepOrg do
+            attribute_type(:integer)
+            source_attribute(:org_id)
+            destination_attribute(:id)
+            allow_nil?(true)
+            public?(true)
+          end
+
+          has_many :alerts, PrepAlert do
+            destination_attribute(:profile_id)
+            public?(true)
+          end
+        end
+
+        calculations do
+          calculate(
+            :name,
+            :string,
+            expr(
+              if is_nil(last_name) or last_name == "" do
+                if is_nil(first_name), do: "", else: first_name
+              else
+                if is_nil(first_name) or first_name == "" do
+                  last_name
+                else
+                  first_name <> " " <> last_name
+                end
+              end
+            )
+          )
+
+          calculate(
+            :display_name,
+            :string,
+            expr(
+              if not is_nil(preferred_name) and preferred_name != "" do
+                preferred_name
+              else
+                name
+              end
+            )
+          )
+
+          calculate(
+            :org_label,
+            :string,
+            expr(display_name <> " @ " <> if(is_nil(org.name), do: "none", else: org.name))
+          )
+
+          calculate :scaled, :integer, expr(score * ^arg(:factor)) do
+            argument(:factor, :integer, allow_nil?: false)
+          end
+
+          calculate(
+            :combined_scaled,
+            :integer,
+            expr(scaled(factor: 2) + scaled(factor: 3))
+          )
+
+          calculate(:inner_has_alert, :boolean, expr(exists(alerts, true)))
+          calculate(:outer_has_alert, :boolean, expr(inner_has_alert))
+        end
+
+        actions do
+          defaults([:read, :destroy, create: :*, update: :*])
+        end
+      end
+
+      defmodule PrepUser do
+        use Ash.Resource,
+          domain: PrepDomain,
+          data_layer: Xitdb.Ash.DataLayer
+
+        xitdb do
+          store(PrimaryStore)
+          collection(:query_prep_users)
+        end
+
+        attributes do
+          integer_primary_key(:id)
+          attribute(:email, :string, allow_nil?: false, public?: true)
+          attribute(:profile_id, :integer, public?: true)
+        end
+
+        relationships do
+          belongs_to :profile, PrepProfile do
+            attribute_type(:integer)
+            source_attribute(:profile_id)
+            destination_attribute(:id)
+            allow_nil?(true)
+            public?(true)
+          end
+        end
+
+        actions do
+          defaults([:read, :destroy, create: :*, update: :*])
+        end
+      end
+
+      defmodule PrepRelationalProfile do
+        use Ash.Resource,
+          domain: PrepDomain,
+          data_layer: Xitdb.Ash.DataLayer
+
+        require Ash.Query
+
+        xitdb do
+          store(PrimaryStore)
+          collection(:query_prep_rel_profiles)
+        end
+
+        preparations do
+          prepare(build(load: [:org_label]))
+        end
+
+        attributes do
+          integer_primary_key(:id)
+          attribute(:label, :string, allow_nil?: false, public?: true)
+          attribute(:org_id, :integer, public?: true)
+        end
+
+        relationships do
+          belongs_to :org, PrepOrg do
+            attribute_type(:integer)
+            source_attribute(:org_id)
+            destination_attribute(:id)
+            allow_nil?(true)
+            public?(true)
+          end
+        end
+
+        calculations do
+          calculate(
+            :org_label,
+            :string,
+            expr(label <> ":" <> if(is_nil(org.name), do: "none", else: org.name))
+          )
+        end
+
+        actions do
+          defaults([:read, :destroy, create: :*, update: :*])
+        end
+      end
+
+      @tag timeout: 5_000
+      test "evaluates chained expression calculations under prepare build(load: ...) without recursion" do
+        org = Ash.create!(PrepOrg, %{name: "Acme Capital"}, domain: PrepDomain)
+
+        p1 =
+          Ash.create!(
+            PrepProfile,
+            %{first_name: "Alice", last_name: "Smith", score: 10, org_id: org.id},
+            domain: PrepDomain
+          )
+
+        p2 =
+          Ash.create!(
+            PrepProfile,
+            %{
+              first_name: "Robert",
+              last_name: "Jones",
+              preferred_name: "Bob",
+              score: 7,
+              org_id: nil
+            },
+            domain: PrepDomain
+          )
+
+        Ash.create!(PrepUser, %{email: "alice@example.com", profile_id: p1.id},
+          domain: PrepDomain
+        )
+
+        Ash.create!(PrepAlert, %{profile_id: p1.id, severity: :critical}, domain: PrepDomain)
+
+        # 1. Direct read triggering `prepare build(load: [:name, :display_name])`
+        profiles =
+          PrepProfile
+          |> Ash.Query.sort(display_name: :asc)
+          |> Ash.read!(domain: PrepDomain)
+
+        assert Enum.map(profiles, &{&1.name, &1.display_name}) == [
+                 {"Alice Smith", "Alice Smith"},
+                 {"Robert Jones", "Bob"}
+               ]
+
+        # 2. Filter on chained expression calculation
+        assert [%{id: id_p1, display_name: "Alice Smith"}] =
+                 PrepProfile
+                 |> Ash.Query.filter(display_name == "Alice Smith")
+                 |> Ash.read!(domain: PrepDomain)
+
+        assert id_p1 == p1.id
+
+        # 3. Loading via parent relationship
+        [user] =
+          PrepUser
+          |> Ash.Query.load(:profile)
+          |> Ash.read!(domain: PrepDomain)
+
+        assert user.profile.display_name == "Alice Smith"
+
+        # 4. Ash.load!/2 for chained + relational expression calcs (both populated and nil org)
+        [loaded_p1, loaded_p2] =
+          Ash.load!(profiles, [:display_name, :org_label], domain: PrepDomain)
+
+        assert loaded_p1.org_label == "Alice Smith @ Acme Capital"
+        assert loaded_p2.org_label == "Bob @ none"
+
+        # 5. Ash.calculate!/2 (DataLayer.calculate/3)
+        assert Ash.calculate!(p1, :display_name, domain: PrepDomain) == "Alice Smith"
+        assert Ash.calculate!(p2, :display_name, domain: PrepDomain) == "Bob"
+
+        # 6. Repeated parameterized calc (`scaled(factor: 2) + scaled(factor: 3)`) alongside
+        #    explicitly loaded `scaled(factor: 10)` in the same query (must not collide)
+        [calc_p1] =
+          PrepProfile
+          |> Ash.Query.filter(id == ^p1.id)
+          |> Ash.Query.load([{:scaled, %{factor: 10}}, :combined_scaled])
+          |> Ash.read!(domain: PrepDomain)
+
+        assert calc_p1.scaled == 100
+        assert calc_p1.combined_scaled == 50
+
+        # 7. Nested exists/2 inside a chained expression calculation
+        [alert_p1, alert_p2] =
+          PrepProfile
+          |> Ash.Query.sort(id: :asc)
+          |> Ash.Query.load(:outer_has_alert)
+          |> Ash.read!(domain: PrepDomain)
+
+        assert alert_p1.outer_has_alert == true
+        assert alert_p2.outer_has_alert == false
+      end
+
+      @tag timeout: 5_000
+      test "evaluates preparation-loaded relationship expression calculations without re-entering read preparations" do
+        org = Ash.create!(PrepOrg, %{name: "Northleaf"}, domain: PrepDomain)
+
+        Ash.create!(PrepRelationalProfile, %{label: "Lead", org_id: org.id}, domain: PrepDomain)
+        Ash.create!(PrepRelationalProfile, %{label: "Solo", org_id: nil}, domain: PrepDomain)
+
+        rows =
+          PrepRelationalProfile
+          |> Ash.Query.sort(id: :asc)
+          |> Ash.read!(domain: PrepDomain)
+
+        assert Enum.map(rows, & &1.org_label) == ["Lead:Northleaf", "Solo:none"]
+      end
+    end
   end
 end

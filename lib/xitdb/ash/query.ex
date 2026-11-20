@@ -2902,13 +2902,15 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     defp attach_calculations([], _query, _resource), do: {:ok, []}
 
     defp attach_calculations(records, %__MODULE__{calculations: calcs} = query, resource) do
-      domain = query.domain
+      domain = query.domain || Ash.Resource.Info.domain(resource)
       tenant = query.tenant
       actor = get_in_query_context(query, :actor)
+      base_records = records
 
       Enum.reduce_while(calcs, {:ok, records}, fn {calc, expr}, {:ok, acc_records} ->
         case eval_single_calculation(
                acc_records,
+               base_records,
                calc,
                expr,
                resource,
@@ -2924,7 +2926,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     end
 
     defp eval_single_calculation(
-           records,
+           acc_records,
+           base_records,
            %Calculation{} = calc,
            expr,
            resource,
@@ -2934,6 +2937,9 @@ if Code.ensure_loaded?(Ash.DataLayer) do
            query_context
          ) do
       has_calculate? = function_exported?(calc.module, :calculate, 3)
+
+      has_custom_calculate? =
+        calc.module != Ash.Resource.Calculation.Expression and has_calculate?
 
       effective_expr =
         cond do
@@ -2949,11 +2955,20 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
       cond do
         is_nil(effective_expr) and has_calculate? ->
-          eval_module_calculation(records, calc, resource, domain, tenant, actor, query_context)
+          eval_module_calculation(
+            acc_records,
+            calc,
+            resource,
+            domain,
+            tenant,
+            actor,
+            query_context
+          )
 
         not is_nil(effective_expr) ->
           case eval_expression_calculation(
-                 records,
+                 acc_records,
+                 base_records,
                  calc,
                  effective_expr,
                  resource,
@@ -2961,14 +2976,14 @@ if Code.ensure_loaded?(Ash.DataLayer) do
                  tenant,
                  actor,
                  query_context,
-                 has_calculate?
+                 has_custom_calculate?
                ) do
             {:ok, updated} ->
               {:ok, updated}
 
             :fallback_to_module ->
               eval_module_calculation(
-                records,
+                acc_records,
                 calc,
                 resource,
                 domain,
@@ -2983,7 +2998,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
         true ->
           eval_expression_calculation(
-            records,
+            acc_records,
+            base_records,
             calc,
             nil,
             resource,
@@ -3033,13 +3049,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
            actor,
            source_ctx
          ) do
-      args =
-        case ctx do
-          %Ash.Resource.Calculation.Context{arguments: a} when is_map(a) -> a
-          %{arguments: a} when is_map(a) -> a
-          _ -> %{}
-        end
-
+      args = calc_arguments(ctx)
       %Ash.Query{} = base_query = Ash.Query.new(resource)
 
       ash_query = %{
@@ -3057,17 +3067,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           []
         end
 
-      if deps == [] do
-        {:ok, records}
-      else
-        Ash.load(records, deps,
-          domain: domain,
-          tenant: tenant,
-          actor: actor,
-          context: source_ctx,
-          authorize?: false
-        )
-      end
+      load_external_deps(records, List.wrap(deps), resource, domain, tenant, actor, source_ctx)
     end
 
     defp invoke_calc_module(%Calculation{module: mod, opts: opts, context: ctx}, records) do
@@ -3079,7 +3079,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     end
 
     defp eval_expression_calculation(
-           records,
+           acc_records,
+           base_records,
            %Calculation{} = calc,
            expr,
            resource,
@@ -3092,81 +3093,472 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       calc_actor = get_in_calc_context(calc, :actor) || actor
       calc_tenant = get_in_calc_context(calc, :tenant) || tenant
       source_ctx = merge_calc_source_context(calc, query_context)
+      calc_args = calc_arguments(calc.context)
 
-      records
-      |> Enum.reduce_while({:ok, []}, fn record, {:ok, acc} ->
-        case Ash.Expr.eval(expr,
-               record: record,
+      filled_expr =
+        Ash.Expr.fill_template(expr,
+          actor: calc_actor,
+          tenant: calc_tenant,
+          args: calc_args,
+          context: source_ctx
+        )
+
+      with {:ok, hydrated} <-
+             Ash.Filter.hydrate_refs(filled_expr, %{
                resource: resource,
-               domain: domain,
-               actor: calc_actor,
-               tenant: calc_tenant,
-               context: source_ctx
+               public?: false,
+               source_context: source_ctx
+             }),
+           external_loads = external_loads_for_expression(hydrated, resource, base_records),
+           {:ok, eval_records} <-
+             load_external_deps(
+               base_records,
+               external_loads,
+               resource,
+               domain,
+               calc_tenant,
+               calc_actor,
+               source_ctx
              ) do
-          {:ok, raw} ->
-            {:ok, casted} = cast_calculation_output(calc, raw)
-            {:cont, {:ok, [put_calculation_result(record, calc, casted) | acc]}}
+        acc_records
+        |> Enum.zip(eval_records)
+        |> Enum.reduce_while({:ok, []}, fn {acc_record, eval_record}, {:ok, acc} ->
+          case Ash.Expr.eval_hydrated(hydrated,
+                 record: eval_record,
+                 resource: resource,
+                 actor: calc_actor,
+                 tenant: calc_tenant,
+                 context: source_ctx,
+                 unknown_on_unknown_refs?: has_calculate?
+               ) do
+            {:ok, raw} ->
+              {:ok, casted} = cast_calculation_output(calc, raw)
+              {:cont, {:ok, [put_calculation_result(acc_record, calc, casted) | acc]}}
 
-          {:error, _} = err ->
-            {:halt, err}
+            :unknown ->
+              if has_calculate? do
+                {:halt, :fallback_to_module}
+              else
+                {:cont, {:ok, [put_calculation_result(acc_record, calc, nil) | acc]}}
+              end
 
-          :unknown ->
-            case eval_hydrated_calculation(
-                   record,
-                   calc,
-                   expr,
-                   resource,
-                   domain,
-                   calc_tenant,
-                   calc_actor,
-                   source_ctx
-                 ) do
-              {:ok, val} ->
-                {:cont, {:ok, [put_calculation_result(record, calc, val) | acc]}}
+            {:error, _} = err ->
+              {:halt, err}
+          end
+        end)
+        |> case do
+          {:ok, rev} -> {:ok, Enum.reverse(rev)}
+          other -> other
+        end
+      end
+    end
 
-              :unknown ->
-                if has_calculate? do
-                  {:halt, :fallback_to_module}
-                else
-                  {:cont, {:ok, [put_calculation_result(record, calc, nil) | acc]}}
-                end
+    @doc false
+    def external_loads_for_expression(_hydrated, _resource, []), do: []
 
-              {:error, _} = err ->
-                {:halt, err}
+    def external_loads_for_expression(hydrated, resource, records) when is_list(records) do
+      deps = collect_expr_deps(hydrated, resource, [], [], MapSet.new())
+
+      ref_paths =
+        for {:ref, path} <- deps, path != [] do
+          path
+        end
+        |> Enum.uniq()
+
+      exists_paths =
+        for {:exists, path} <- deps, path != [] do
+          path
+        end
+        |> Enum.uniq()
+        |> Enum.reject(fn path ->
+          Enum.any?(ref_paths, &List.starts_with?(&1, path))
+        end)
+
+      (ref_paths ++ exists_paths)
+      |> Enum.uniq()
+      |> Enum.reject(&Ash.Resource.loaded?(records, &1))
+      |> Enum.map(&path_to_load/1)
+      |> Enum.reject(&(&1 == []))
+    end
+
+    @doc false
+    def load_external_deps(
+          records,
+          load_paths,
+          resource,
+          domain,
+          tenant,
+          actor,
+          source_ctx \\ %{}
+        )
+
+    def load_external_deps([], _load_paths, _resource, _domain, _tenant, _actor, _source_ctx),
+      do: {:ok, []}
+
+    def load_external_deps(records, [], _resource, _domain, _tenant, _actor, _source_ctx),
+      do: {:ok, records}
+
+    def load_external_deps(records, load_paths, resource, domain, tenant, actor, source_ctx)
+        when is_list(records) and is_list(load_paths) do
+      resolved_domain = domain || Ash.Resource.Info.domain(resource)
+
+      if is_nil(resolved_domain) do
+        {:ok, records}
+      else
+        load_query =
+          build_isolated_load_query(
+            resource,
+            resolved_domain,
+            tenant,
+            actor,
+            source_ctx,
+            load_paths
+          )
+
+        Ash.load(records, load_query,
+          domain: resolved_domain,
+          authorize?: false,
+          tenant: tenant,
+          actor: actor,
+          reuse_values?: true
+        )
+      end
+    end
+
+    defp build_isolated_load_query(resource, domain, tenant, actor, source_ctx, load_paths) do
+      read_action =
+        Ash.Resource.Info.primary_action(resource, :read) ||
+          Enum.find(Ash.Resource.Info.actions(resource), &(&1.type == :read))
+
+      base_query =
+        case read_action do
+          nil ->
+            Ash.Query.new(resource)
+
+          action ->
+            validated =
+              Ash.Query.for_read(resource, action.name, %{},
+                actor: actor,
+                tenant: tenant,
+                domain: domain,
+                authorize?: false
+              )
+
+            if validated.valid? do
+              Ash.Query.unset(validated, [
+                :load,
+                :calculations,
+                :aggregates,
+                :load_through,
+                :filter,
+                :sort,
+                :limit,
+                :offset,
+                :distinct,
+                :before_action,
+                :after_action,
+                :around_transaction,
+                :before_transaction,
+                :after_transaction,
+                :select
+              ])
+            else
+              Ash.Query.new(resource)
             end
         end
-      end)
-      |> case do
-        {:ok, rev} -> {:ok, Enum.reverse(rev)}
-        other -> other
+
+      private_ctx =
+        case get_in(source_ctx || %{}, [:private, :as_of]) do
+          nil -> %{internal?: true, authorize?: false}
+          as_of -> %{internal?: true, authorize?: false, as_of: as_of}
+        end
+
+      clean_source_ctx =
+        if is_map(source_ctx) do
+          Map.drop(source_ctx, [:private, :accessing_from, :loading_relationships?])
+        else
+          %{}
+        end
+
+      query_with_ctx =
+        base_query
+        |> then(fn q ->
+          if map_size(clean_source_ctx) > 0 do
+            Ash.Query.set_context(q, clean_source_ctx)
+          else
+            q
+          end
+        end)
+        |> Ash.Query.set_context(%{private: private_ctx})
+
+      Enum.reduce(load_paths, query_with_ctx, &Ash.Query.load(&2, &1))
+    end
+
+    defp collect_expr_deps(nil, _resource, _prefix, _parent_prefix, _visited), do: []
+
+    defp collect_expr_deps(
+           %Ash.Filter{expression: expr},
+           resource,
+           prefix,
+           parent_prefix,
+           visited
+         ) do
+      collect_expr_deps(expr, resource, prefix, parent_prefix, visited)
+    end
+
+    defp collect_expr_deps(
+           %Ref{combinations?: true},
+           _resource,
+           _prefix,
+           _parent_prefix,
+           _visited
+         ),
+         do: []
+
+    defp collect_expr_deps(
+           %Ref{
+             attribute:
+               %Calculation{
+                 name: calc_name,
+                 module: mod,
+                 opts: opts,
+                 context: ctx
+               } = ref_calc,
+             relationship_path: rel_path,
+             resource: ref_resource
+           },
+           resource,
+           prefix,
+           _parent_prefix,
+           visited
+         ) do
+      if inlineable_expr_calc?(rel_path, ref_resource, mod) do
+        target_resource = ref_resource || resource
+        visit_key = {target_resource, calc_name, mod, opts, calc_arguments(ctx)}
+
+        if MapSet.member?(visited, visit_key) do
+          []
+        else
+          next_visited = MapSet.put(visited, visit_key)
+          inner_raw = Ash.Resource.Calculation.expression(mod, opts, ctx)
+          inner_ctx = calc_source_context(ctx)
+
+          inner_filled =
+            Ash.Expr.fill_template(inner_raw,
+              actor: get_in_calc_context(ref_calc, :actor),
+              tenant: get_in_calc_context(ref_calc, :tenant),
+              args: calc_arguments(ctx),
+              context: inner_ctx
+            )
+
+          case Ash.Filter.hydrate_refs(inner_filled, %{
+                 resource: target_resource,
+                 public?: false,
+                 source_context: inner_ctx
+               }) do
+            {:ok, inner_hydrated} ->
+              collect_expr_deps(
+                inner_hydrated,
+                target_resource,
+                prefix ++ rel_path,
+                prefix,
+                next_visited
+              )
+
+            _ ->
+              [{:ref, prefix ++ rel_path ++ [runtime_calc_ref(ref_calc)]}]
+          end
+        end
+      else
+        [{:ref, prefix ++ rel_path ++ [runtime_calc_ref(ref_calc)]}]
       end
     end
 
-    defp eval_hydrated_calculation(
-           record,
-           calc,
-           expr,
-           resource,
-           domain,
-           tenant,
-           actor,
-           source_ctx
+    defp collect_expr_deps(
+           %Ref{attribute: attr, relationship_path: rel_path},
+           _resource,
+           prefix,
+           _parent_prefix,
+           _visited
          ) do
-      with {:ok, hydrated} <- Ash.Filter.hydrate_refs(expr, %{resource: resource, public?: false}) do
-        case Ash.Expr.eval_hydrated(hydrated,
-               record: record,
-               resource: resource,
-               domain: domain,
-               actor: actor,
-               tenant: tenant,
-               context: source_ctx
-             ) do
-          {:ok, raw} -> cast_calculation_output(calc, raw)
-          {:error, _} = err -> err
-          :unknown -> :unknown
-        end
+      [{:ref, prefix ++ rel_path ++ [attr]}]
+    end
+
+    defp collect_expr_deps(
+           %Ash.Query.Exists{related?: false},
+           _resource,
+           _prefix,
+           _parent_prefix,
+           _visited
+         ),
+         do: []
+
+    defp collect_expr_deps(
+           %Ash.Query.Exists{related?: true, at_path: at_path, path: path, expr: inner},
+           resource,
+           prefix,
+           _parent_prefix,
+           visited
+         ) do
+      full_path = prefix ++ at_path ++ path
+
+      [
+        {:exists, full_path}
+        | collect_expr_deps(inner, resource, full_path, prefix ++ at_path, visited)
+      ]
+    end
+
+    defp collect_expr_deps(
+           %Parent{expr: inner},
+           resource,
+           _prefix,
+           parent_prefix,
+           visited
+         ) do
+      collect_expr_deps(inner, resource, parent_prefix, parent_prefix, visited)
+    end
+
+    defp collect_expr_deps(
+           %Ash.Query.Call{args: args, relationship_path: rel_path},
+           resource,
+           prefix,
+           parent_prefix,
+           visited
+         ) do
+      collect_expr_deps(args, resource, prefix ++ rel_path, parent_prefix, visited)
+    end
+
+    defp collect_expr_deps(
+           %BooleanExpression{left: left, right: right},
+           resource,
+           prefix,
+           parent_prefix,
+           visited
+         ) do
+      collect_expr_deps(left, resource, prefix, parent_prefix, visited) ++
+        collect_expr_deps(right, resource, prefix, parent_prefix, visited)
+    end
+
+    defp collect_expr_deps(
+           %Not{expression: inner},
+           resource,
+           prefix,
+           parent_prefix,
+           visited
+         ) do
+      collect_expr_deps(inner, resource, prefix, parent_prefix, visited)
+    end
+
+    defp collect_expr_deps(
+           %Ash.CustomExpression{simple_expression: {:ok, simple}},
+           resource,
+           prefix,
+           parent_prefix,
+           visited
+         ) do
+      collect_expr_deps(simple, resource, prefix, parent_prefix, visited)
+    end
+
+    defp collect_expr_deps(
+           %Ash.CustomExpression{expression: inner},
+           resource,
+           prefix,
+           parent_prefix,
+           visited
+         ) do
+      collect_expr_deps(inner, resource, prefix, parent_prefix, visited)
+    end
+
+    defp collect_expr_deps(
+           %{__predicate__?: _, left: left, right: right},
+           resource,
+           prefix,
+           parent_prefix,
+           visited
+         ) do
+      collect_expr_deps(left, resource, prefix, parent_prefix, visited) ++
+        collect_expr_deps(right, resource, prefix, parent_prefix, visited)
+    end
+
+    defp collect_expr_deps(
+           %{__predicate__?: _, arguments: args},
+           resource,
+           prefix,
+           parent_prefix,
+           visited
+         ) do
+      collect_expr_deps(args, resource, prefix, parent_prefix, visited)
+    end
+
+    defp collect_expr_deps(list, resource, prefix, parent_prefix, visited) when is_list(list) do
+      Enum.flat_map(list, &collect_expr_deps(&1, resource, prefix, parent_prefix, visited))
+    end
+
+    defp collect_expr_deps(%MapSet{} = set, resource, prefix, parent_prefix, visited) do
+      set
+      |> MapSet.to_list()
+      |> collect_expr_deps(resource, prefix, parent_prefix, visited)
+    end
+
+    defp collect_expr_deps(map, resource, prefix, parent_prefix, visited)
+         when is_map(map) and not is_struct(map) do
+      Enum.flat_map(map, fn {k, v} ->
+        collect_expr_deps(k, resource, prefix, parent_prefix, visited) ++
+          collect_expr_deps(v, resource, prefix, parent_prefix, visited)
+      end)
+    end
+
+    defp collect_expr_deps(tuple, resource, prefix, parent_prefix, visited)
+         when is_tuple(tuple) do
+      tuple
+      |> Tuple.to_list()
+      |> collect_expr_deps(resource, prefix, parent_prefix, visited)
+    end
+
+    defp collect_expr_deps(_other, _resource, _prefix, _parent_prefix, _visited), do: []
+
+    defp inlineable_expr_calc?(rel_path, ref_resource, mod) do
+      is_atom(mod) and not is_nil(mod) and
+        Ash.Resource.Calculation.has_expression?(mod) and
+        (rel_path == [] or
+           (is_atom(ref_resource) and not is_nil(ref_resource) and
+              Ash.Resource.Info.data_layer(ref_resource) == Xitdb.Ash.DataLayer))
+    end
+
+    defp runtime_calc_ref(%Calculation{} = ref_calc) do
+      if Code.ensure_loaded?(Ash.Filter.Runtime) and
+           function_exported?(Ash.Filter.Runtime, :runtime_calculation_name, 1) do
+        %{ref_calc | name: Ash.Filter.Runtime.runtime_calculation_name(ref_calc), load: nil}
+      else
+        ref_calc
       end
     end
+
+    defp path_to_load([%struct{name: name}])
+         when struct in [
+                Ash.Resource.Attribute,
+                Ash.Resource.Aggregate,
+                Ash.Resource.Calculation
+              ] do
+      [name]
+    end
+
+    defp path_to_load([]), do: []
+    defp path_to_load([other]), do: [other]
+    defp path_to_load([first | rest]), do: [{first, path_to_load(rest)}]
+
+    defp calc_arguments(%Ash.Resource.Calculation.Context{arguments: args}) when is_map(args),
+      do: args
+
+    defp calc_arguments(%{arguments: args}) when is_map(args), do: args
+    defp calc_arguments(_), do: %{}
+
+    defp calc_source_context(%Ash.Resource.Calculation.Context{source_context: sc})
+         when is_map(sc),
+         do: sc
+
+    defp calc_source_context(%{source_context: sc}) when is_map(sc), do: sc
+    defp calc_source_context(_), do: %{}
 
     defp merge_calc_source_context(%Calculation{context: ctx}, query_context) do
       base = query_context || %{}
