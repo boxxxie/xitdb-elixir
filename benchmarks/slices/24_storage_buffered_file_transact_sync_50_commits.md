@@ -8,9 +8,9 @@
 
 | Metric | Elixir NIF Wrapper | Raw Odin Baseline | Comparison |
 | :--- | ---: | ---: | ---: |
-| **Median (`ns/op`)** | 63.54 µs (63542.0 ns) | 51.30 µs (51301.0 ns) | **`1.24x`** NIF Ratio |
-| **Mean ± σ (CV)** | 64.31 µs ± 3.27 µs (5.1%) | 51.30 µs ± 129.3 ns (0.3%) | Welch `z` = `8.88` |
-| **p95 / Max (`ns/op`)** | 68.55 µs / 69.37 µs | 51.43 µs / 51.44 µs | `5` vs `5` pooled samples |
+| **Median (`ns/op`)** | 80.20 µs (80200.0 ns) | 79.26 µs (79259.0 ns) | **`1.01x`** NIF Ratio |
+| **Mean ± σ (CV)** | 82.23 µs ± 5.95 µs (7.2%) | 78.85 µs ± 1.64 µs (2.1%) | Welch `z` = `1.22` |
+| **p95 / Max (`ns/op`)** | 90.38 µs / 92.67 µs | 80.59 µs / 80.75 µs | `5` vs `5` pooled samples |
 
 ## Benchmark Harnesses (Elixir vs. Raw Odin)
 
@@ -36,7 +36,7 @@
        end},
 ```
 
-### Raw Odin Harness ([`bench_client.odin#L1359-L1378`](../bench_client.odin#L1359-L1378))
+### Raw Odin Harness ([`bench_client.odin#L1366-L1385`](../bench_client.odin#L1366-L1385))
 
 ```odin
 	// #24: Storage: Buffered_File transact + sync (50 commits)
@@ -64,7 +64,7 @@
 ## Elixir Wrapper & NIF Bridge
 
 <details>
-<summary>Elixir <code>open</code> — <a href="../../lib/xitdb.ex#L170-L188">lib/xitdb.ex#L170-L188</a></summary>
+<summary>Elixir <code>open</code> — <a href="../../lib/xitdb.ex#L183-L201">lib/xitdb.ex#L183-L201</a></summary>
 
 ```elixir
   def open(opts \\ []) do
@@ -91,7 +91,7 @@
 </details>
 
 <details>
-<summary>Elixir <code>transact</code> — <a href="../../lib/xitdb.ex#L316-L339">lib/xitdb.ex#L316-L339</a></summary>
+<summary>Elixir <code>transact</code> — <a href="../../lib/xitdb.ex#L329-L352">lib/xitdb.ex#L329-L352</a></summary>
 
 ```elixir
   def transact(db, map_or_fun, opts \\ [])
@@ -123,7 +123,7 @@
 </details>
 
 <details>
-<summary>Elixir <code>sync</code> — <a href="../../lib/xitdb.ex#L202-L204">lib/xitdb.ex#L202-L204</a></summary>
+<summary>Elixir <code>sync</code> — <a href="../../lib/xitdb.ex#L215-L217">lib/xitdb.ex#L215-L217</a></summary>
 
 ```elixir
   def sync(%__MODULE__{db_ref: db_ref}) do
@@ -134,7 +134,7 @@
 </details>
 
 <details>
-<summary>Elixir <code>info!</code> — <a href="../../lib/xitdb.ex#L214-L214">lib/xitdb.ex#L214-L214</a></summary>
+<summary>Elixir <code>info!</code> — <a href="../../lib/xitdb.ex#L227-L227">lib/xitdb.ex#L227-L227</a></summary>
 
 ```elixir
   def info!(%__MODULE__{} = db), do: db |> info() |> Error.unwrap!()
@@ -143,7 +143,7 @@
 </details>
 
 <details>
-<summary>Elixir <code>close</code> — <a href="../../lib/xitdb.ex#L196-L198">lib/xitdb.ex#L196-L198</a></summary>
+<summary>Elixir <code>close</code> — <a href="../../lib/xitdb.ex#L209-L211">lib/xitdb.ex#L209-L211</a></summary>
 
 ```elixir
   def close(%__MODULE__{db_ref: db_ref}) do
@@ -154,7 +154,7 @@
 </details>
 
 <details>
-<summary>NIF <code>odin_nif_open</code> — <a href="../../native/xitdb_nif.odin#L715-L790">native/xitdb_nif.odin#L715-L790</a></summary>
+<summary>NIF <code>odin_nif_open</code> — <a href="../../native/xitdb_nif.odin#L754-L829">native/xitdb_nif.odin#L754-L829</a></summary>
 
 ```odin
 odin_nif_open :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {
@@ -238,7 +238,7 @@ odin_nif_open :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -
 </details>
 
 <details>
-<summary>NIF <code>odin_nif_transact</code> — <a href="../../native/xitdb_nif.odin#L4945-L5031">native/xitdb_nif.odin#L4945-L5031</a></summary>
+<summary>NIF <code>odin_nif_transact</code> — <a href="../../native/xitdb_nif.odin#L5239-L5326">native/xitdb_nif.odin#L5239-L5326</a></summary>
 
 ```odin
 odin_nif_transact :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {
@@ -295,8 +295,9 @@ odin_nif_transact :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TER
 
 	pre_header, pre_hdr_err := xitdb.database_read_root_header(&handle.db)
 	pre_len, pre_len_err := xitdb.core_length(handle.db.core)
-	pre_rh_bytes: [xitdb.ROOT_HEADER_LENGTH]u8 = ---
-	pre_rh_err := xitdb.core_read_exact_at(handle.db.core, xitdb.ROOT_HEADER_START, pre_rh_bytes[:])
+	file_size_start := xitdb.database_file_size_start(handle.db.header.version)
+	pre_fs_bytes: [8]u8 = ---
+	pre_fs_err := xitdb.core_read_exact_at(handle.db.core, file_size_start, pre_fs_bytes[:])
 
 	rep: xitdb.Tx_Report
 	c_err: xitdb.Error
@@ -305,7 +306,7 @@ odin_nif_transact :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TER
 		if c_err == nil {
 			break
 		}
-		if rb_err := rollback_failed_tx(&handle.db, pre_header, pre_hdr_err, pre_len, pre_len_err, pre_rh_bytes, pre_rh_err); rb_err != nil {
+		if rb_err := rollback_failed_tx(&handle.db, pre_header, pre_hdr_err, pre_len, pre_len_err, pre_fs_bytes, pre_fs_err); rb_err != nil {
 			return make_xitdb_err(env, rb_err)
 		}
 		if attempt == 0 && c_err == .Unexpected_Tag && len(validation_err) == 0 && adapt_tx_ops_for_base_moment(handle, &tx) {
@@ -333,7 +334,7 @@ odin_nif_transact :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TER
 </details>
 
 <details>
-<summary>NIF <code>odin_nif_sync</code> — <a href="../../native/xitdb_nif.odin#L816-L833">native/xitdb_nif.odin#L816-L833</a></summary>
+<summary>NIF <code>odin_nif_sync</code> — <a href="../../native/xitdb_nif.odin#L855-L872">native/xitdb_nif.odin#L855-L872</a></summary>
 
 ```odin
 odin_nif_sync :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {
@@ -359,7 +360,7 @@ odin_nif_sync :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -
 </details>
 
 <details>
-<summary>NIF <code>odin_nif_info</code> — <a href="../../native/xitdb_nif.odin#L836-L871">native/xitdb_nif.odin#L836-L871</a></summary>
+<summary>NIF <code>odin_nif_info</code> — <a href="../../native/xitdb_nif.odin#L875-L910">native/xitdb_nif.odin#L875-L910</a></summary>
 
 ```odin
 odin_nif_info :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {
@@ -403,7 +404,7 @@ odin_nif_info :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -
 </details>
 
 <details>
-<summary>NIF <code>odin_nif_close</code> — <a href="../../native/xitdb_nif.odin#L793-L813">native/xitdb_nif.odin#L793-L813</a></summary>
+<summary>NIF <code>odin_nif_close</code> — <a href="../../native/xitdb_nif.odin#L832-L852">native/xitdb_nif.odin#L832-L852</a></summary>
 
 ```odin
 odin_nif_close :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {
@@ -432,7 +433,7 @@ odin_nif_close :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) 
 </details>
 
 <details>
-<summary>NIF <code>parse_tx_ops</code> — <a href="../../native/xitdb_nif.odin#L4650-L4942">native/xitdb_nif.odin#L4650-L4942</a></summary>
+<summary>NIF <code>parse_tx_ops</code> — <a href="../../native/xitdb_nif.odin#L4942-L5236">native/xitdb_nif.odin#L4942-L5236</a></summary>
 
 ```odin
 parse_tx_ops :: proc(
@@ -544,7 +545,9 @@ parse_tx_ops :: proc(
 				return "invalid_insert_op", nil
 			}
 			if val, ok_v := decode_writeable_value(env, elems[3]); ok_v {
-				append(&tx.ops, xitdb.Tx_Op{kind = .Insert, steps = steps, offset = idx_val, val = val})
+				ic := new(Insert_Op_Ctx, tx.allocator)
+				ic^ = Insert_Op_Ctx{steps = steps, index = idx_val, val = val}
+				xitdb.tx_with_cursor(tx, insert_op_callback, ic)
 			} else if is_structured_write_candidate(env, elems[3]) {
 				sc := new(Structured_Op_Ctx, tx.allocator)
 				sc^ = Structured_Op_Ctx{
@@ -733,7 +736,7 @@ parse_tx_ops :: proc(
 </details>
 
 <details>
-<summary>NIF <code>validate_deferred_tx_ops</code> — <a href="../../native/xitdb_nif.odin#L4630-L4648">native/xitdb_nif.odin#L4630-L4648</a></summary>
+<summary>NIF <code>validate_deferred_tx_ops</code> — <a href="../../native/xitdb_nif.odin#L4922-L4940">native/xitdb_nif.odin#L4922-L4940</a></summary>
 
 ```odin
 validate_deferred_tx_ops :: proc(tx: ^xitdb.Tx) -> string {
@@ -760,7 +763,7 @@ validate_deferred_tx_ops :: proc(tx: ^xitdb.Tx) -> string {
 </details>
 
 <details>
-<summary>NIF <code>rollback_failed_tx</code> — <a href="../../native/xitdb_nif.odin#L4426-L4463">native/xitdb_nif.odin#L4426-L4463</a></summary>
+<summary>NIF <code>rollback_failed_tx</code> — <a href="../../native/xitdb_nif.odin#L4725-L4763">native/xitdb_nif.odin#L4725-L4763</a></summary>
 
 ```odin
 rollback_failed_tx :: proc(
@@ -769,8 +772,8 @@ rollback_failed_tx :: proc(
 	pre_hdr_err: xitdb.Error,
 	pre_len: i64,
 	pre_len_err: xitdb.Error,
-	pre_rh_bytes: [xitdb.ROOT_HEADER_LENGTH]u8,
-	pre_rh_err: xitdb.Error,
+	pre_fs_bytes: [8]u8,
+	pre_fs_err: xitdb.Error,
 ) -> xitdb.Error {
 	has_target_len := pre_hdr_err == nil || pre_len_err == nil
 	target_len := pre_header.file_size if pre_hdr_err == nil else pre_len
@@ -787,13 +790,14 @@ rollback_failed_tx :: proc(
 		}
 	}
 
-	cur_rh_bytes: [xitdb.ROOT_HEADER_LENGTH]u8 = ---
-	cur_rh_err := xitdb.core_read_exact_at(db.core, xitdb.ROOT_HEADER_START, cur_rh_bytes[:])
-	hdr_changed := pre_rh_err == nil && (cur_rh_err != nil || cur_rh_bytes != pre_rh_bytes)
+	file_size_start := xitdb.database_file_size_start(db.header.version)
+	cur_fs_bytes: [8]u8 = ---
+	cur_fs_err := xitdb.core_read_exact_at(db.core, file_size_start, cur_fs_bytes[:])
+	hdr_changed := pre_fs_err == nil && (cur_fs_err != nil || cur_fs_bytes != pre_fs_bytes)
 	if hdr_changed {
-		rh_bytes := xitdb.root_header_to_bytes(pre_header) if pre_hdr_err == nil else pre_rh_bytes
-		xitdb.core_seek_to(db.core, xitdb.ROOT_HEADER_START) or_return
-		xitdb.core_write_all(db.core, rh_bytes[:]) or_return
+		fs_bytes := pre_fs_bytes
+		xitdb.core_seek_to(db.core, file_size_start) or_return
+		xitdb.core_write_all(db.core, fs_bytes[:]) or_return
 		xitdb.core_flush(db.core) or_return
 		xitdb.core_sync(db.core) or_return
 	} else if len_changed {
@@ -820,7 +824,7 @@ core_buffered_file_open :: proc(path: string, buffer_size: i64 = DEFAULT_BUFFER_
 </details>
 
 <details>
-<summary><code>xitdb.core_destroy</code> — <a href="../../native/xitdb-odin/xitdb/core.odin#L347-L376">core.odin#L347-L376</a></summary>
+<summary><code>xitdb.core_destroy</code> — <a href="../../native/xitdb-odin/xitdb/core.odin#L351-L380">core.odin#L351-L380</a></summary>
 
 ```odin
 core_destroy :: proc(c: ^Core, close_file := false) -> Error {
@@ -858,7 +862,7 @@ core_destroy :: proc(c: ^Core, close_file := false) -> Error {
 </details>
 
 <details>
-<summary><code>xitdb.database_init</code> — <a href="../../native/xitdb-odin/xitdb/database.odin#L182-L234">database.odin#L182-L234</a></summary>
+<summary><code>xitdb.database_init</code> — <a href="../../native/xitdb-odin/xitdb/database.odin#L182-L247">database.odin#L182-L247</a></summary>
 
 ```odin
 database_init :: proc(core: ^Core, hasher := Hasher{}) -> (db: Database, err: Error) {
@@ -884,6 +888,22 @@ database_init :: proc(core: ^Core, hasher := Hasher{}) -> (db: Database, err: Er
 	core_seek_to(core, 0) or_return
 	length := core_length(core) or_return
 
+	// A database whose first commit never finished holds nothing. If it is no
+	// bigger than a new database, it was interrupted while being created, so
+	// it is created again. Otherwise it is a full copy that was interrupted
+	// (see `database_apply_replicated`), which is left for the next sync to replace.
+	has_commit := false
+	if length > 0 {
+		db.header = database_read_and_validate_header(&db) or_return
+		fsize := database_read_file_size(&db) or_return
+		has_commit = fsize > 0
+		new_size := database_file_size_start(db.header.version) + 8 + ROOT_TRAILER_LENGTH
+		if !has_commit && length <= new_size {
+			core_set_length(core, 0) or_return
+			length = 0
+		}
+	}
+
 	if length == 0 {
 		file_id := h.file_id
 		if file_id == 0 {
@@ -901,13 +921,10 @@ database_init :: proc(core: ^Core, hasher := Hasher{}) -> (db: Database, err: Er
 			padding      = 0,
 			magic_number = MAGIC_NUMBER,
 		}
-		header_write(db.header, core) or_return
-		rh_bytes := root_header_to_bytes(Root_Header{file_size = 0, root = Slot{}})
-		core_write_all(core, rh_bytes[:]) or_return
+		database_write_headers(&db) or_return
 		database_commit_root(&db, Slot{}, 0) or_return
 		core_sync(core) or_return
-	} else {
-		db.header = database_read_and_validate_header(&db) or_return
+	} else if has_commit {
 		_ = database_committed_size(&db) or_return
 	}
 
@@ -919,7 +936,7 @@ database_init :: proc(core: ^Core, hasher := Hasher{}) -> (db: Database, err: Er
 </details>
 
 <details>
-<summary><code>xitdb.sha1_hasher</code> — <a href="../../native/xitdb-odin/xitdb/types.odin#L826-L835">types.odin#L826-L835</a></summary>
+<summary><code>xitdb.sha1_hasher</code> — <a href="../../native/xitdb-odin/xitdb/types.odin#L828-L837">types.odin#L828-L837</a></summary>
 
 ```odin
 sha1_hasher :: proc(id: u32 = 0, file_id: u64 = 0) -> Hasher {
@@ -937,7 +954,7 @@ sha1_hasher :: proc(id: u32 = 0, file_id: u64 = 0) -> Hasher {
 </details>
 
 <details>
-<summary><code>xitdb.tx_init</code> — <a href="../../native/xitdb-odin/xitdb/dsl.odin#L627-L637">dsl.odin#L627-L637</a></summary>
+<summary><code>xitdb.tx_init</code> — <a href="../../native/xitdb-odin/xitdb/dsl.odin#L905-L916">dsl.odin#L905-L916</a></summary>
 
 ```odin
 tx_init :: proc(db: ^Database, base_moment: Maybe(i64) = -1, track_changes := false, allocator := context.temp_allocator) -> Tx {
@@ -948,6 +965,7 @@ tx_init :: proc(db: ^Database, base_moment: Maybe(i64) = -1, track_changes := fa
 		meta          = make([dynamic]Tx_Meta_Entry, 0, 4, allocator),
 		ops           = make([dynamic]Tx_Op, 0, 8, allocator),
 		index_rules   = make([dynamic]Secondary_Index_Rule, 0, 2, allocator),
+		owned_strs    = make([dynamic]string, 0, 0, allocator),
 		allocator     = allocator,
 	}
 }
@@ -956,11 +974,11 @@ tx_init :: proc(db: ^Database, base_moment: Maybe(i64) = -1, track_changes := fa
 </details>
 
 <details>
-<summary><code>xitdb.tx_put</code> — <a href="../../native/xitdb-odin/xitdb/dsl.odin#L698-L702">dsl.odin#L698-L702</a></summary>
+<summary><code>xitdb.tx_put</code> — <a href="../../native/xitdb-odin/xitdb/dsl.odin#L993-L997">dsl.odin#L993-L997</a></summary>
 
 ```odin
 tx_put :: proc(tx: ^Tx, path_str: string, val: Writeable_Data) -> Error {
-	steps := parse_steps(path_str, tx.allocator) or_return
+	steps := _tx_parse_steps(tx, path_str) or_return
 	append(&tx.ops, Tx_Op{kind = .Put, steps = steps, val = val})
 	return nil
 }
@@ -969,7 +987,7 @@ tx_put :: proc(tx: ^Tx, path_str: string, val: Writeable_Data) -> Error {
 </details>
 
 <details>
-<summary><code>xitdb.tx_commit</code> — <a href="../../native/xitdb-odin/xitdb/dsl.odin#L1035-L1092">dsl.odin#L1035-L1092</a></summary>
+<summary><code>xitdb.tx_commit</code> — <a href="../../native/xitdb-odin/xitdb/dsl.odin#L1334-L1396">dsl.odin#L1334-L1396</a></summary>
 
 ```odin
 tx_commit :: proc(tx: ^Tx) -> (report: Tx_Report, err: Error) {
@@ -979,10 +997,15 @@ tx_commit :: proc(tx: ^Tx) -> (report: Tx_Report, err: Error) {
 
 	ectx := _Tx_Exec_Ctx{
 		tx       = tx,
-		recorded = make([dynamic]Tx_Change, 0, len(tx.ops), tx.allocator),
+		recorded = make([dynamic]Tx_Change, 0, len(tx.ops) if tx.track_changes else 0, tx.allocator),
 	}
 	defer if err != nil {
-		diff_changes_destroy(ectx.recorded[:], tx.allocator)
+		for chg in ectx.recorded {
+			if len(chg.path_str) > 0 {
+				delete(chg.path_str, tx.allocator)
+			}
+		}
+		delete(ectx.recorded)
 	}
 
 	if bm, has_bm := tx.base_moment.?; has_bm && hist_count > 0 {
@@ -1035,7 +1058,7 @@ tx_commit :: proc(tx: ^Tx) -> (report: Tx_Report, err: Error) {
 </details>
 
 <details>
-<summary><code>xitdb.tx_report_destroy</code> — <a href="../../native/xitdb-odin/xitdb/dsl.odin#L667-L670">dsl.odin#L667-L670</a></summary>
+<summary><code>xitdb.tx_report_destroy</code> — <a href="../../native/xitdb-odin/xitdb/dsl.odin#L950-L953">dsl.odin#L950-L953</a></summary>
 
 ```odin
 tx_report_destroy :: proc(report: ^Tx_Report, allocator := context.allocator) {
@@ -1047,7 +1070,7 @@ tx_report_destroy :: proc(report: ^Tx_Report, allocator := context.allocator) {
 </details>
 
 <details>
-<summary><code>xitdb.tx_destroy</code> — <a href="../../native/xitdb-odin/xitdb/dsl.odin#L640-L652">dsl.odin#L640-L652</a></summary>
+<summary><code>xitdb.tx_destroy</code> — <a href="../../native/xitdb-odin/xitdb/dsl.odin#L919-L935">dsl.odin#L919-L935</a></summary>
 
 ```odin
 tx_destroy :: proc(tx: ^Tx) {
@@ -1059,6 +1082,10 @@ tx_destroy :: proc(tx: ^Tx) {
 			delete(op.from_steps, tx.allocator)
 		}
 	}
+	for s in tx.owned_strs {
+		delete(s, tx.allocator)
+	}
+	delete(tx.owned_strs)
 	delete(tx.meta)
 	delete(tx.ops)
 	delete(tx.index_rules)
@@ -1068,7 +1095,7 @@ tx_destroy :: proc(tx: ^Tx) {
 </details>
 
 <details>
-<summary><code>xitdb.core_sync</code> — <a href="../../native/xitdb-odin/xitdb/core.odin#L481-L500">core.odin#L481-L500</a></summary>
+<summary><code>xitdb.core_sync</code> — <a href="../../native/xitdb-odin/xitdb/core.odin#L485-L504">core.odin#L485-L504</a></summary>
 
 ```odin
 core_sync :: proc(c: ^Core) -> Error {
@@ -1096,7 +1123,7 @@ core_sync :: proc(c: ^Core) -> Error {
 </details>
 
 <details>
-<summary><code>xitdb.core_length</code> — <a href="../../native/xitdb-odin/xitdb/core.odin#L407-L429">core.odin#L407-L429</a></summary>
+<summary><code>xitdb.core_length</code> — <a href="../../native/xitdb-odin/xitdb/core.odin#L411-L433">core.odin#L411-L433</a></summary>
 
 ```odin
 core_length :: proc(c: ^Core) -> (length: i64, err: Error) {
@@ -1127,7 +1154,7 @@ core_length :: proc(c: ^Core) -> (length: i64, err: Error) {
 </details>
 
 <details>
-<summary><code>xitdb.sha256_hasher</code> — <a href="../../native/xitdb-odin/xitdb/types.odin#L838-L847">types.odin#L838-L847</a></summary>
+<summary><code>xitdb.sha256_hasher</code> — <a href="../../native/xitdb-odin/xitdb/types.odin#L840-L849">types.odin#L840-L849</a></summary>
 
 ```odin
 sha256_hasher :: proc(id: u32 = 0, file_id: u64 = 0) -> Hasher {

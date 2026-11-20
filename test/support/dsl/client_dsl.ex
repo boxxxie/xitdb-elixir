@@ -36,6 +36,14 @@ defmodule Xitdb.TestDSL.ClientDSL do
     ClientDriver.pin_snapshot(ctx, snapshot_name, moment_index)
   end
 
+  def trained_compression_dictionary(ctx, name, samples, opts \\ []) do
+    ClientDriver.train_dictionary(ctx, name, samples, opts)
+  end
+
+  def columnar_rows_committed(ctx, collection, rows, opts \\ []) do
+    ClientDriver.put_columnar_rows(ctx, collection, rows, opts)
+  end
+
   # ============================================================================
   # @upon steps
   # ============================================================================
@@ -64,6 +72,10 @@ defmodule Xitdb.TestDSL.ClientDSL do
     ClientDriver.attempt_failing_transact(ctx, fun)
   end
 
+  def attempting_failing_moment(ctx, map, opts \\ []) when is_map(map) do
+    ClientDriver.attempt_failing_transact(ctx, map, opts)
+  end
+
   def executing_dsl_transaction(ctx, fun) when is_function(fun, 1) do
     ClientDriver.execute_dsl_tx(ctx, fun)
   end
@@ -72,12 +84,24 @@ defmodule Xitdb.TestDSL.ClientDSL do
     ClientDriver.attempt_failing_dsl_tx(ctx, fun)
   end
 
-  def selecting_path(ctx, result_key, selector) do
-    ClientDriver.select_path(ctx, result_key, selector)
+  def selecting_path(ctx, result_key, selector, opts \\ []) do
+    ClientDriver.select_path(ctx, result_key, selector, opts)
   end
 
-  def pulling_projection(ctx, result_key, selector_or_path, pattern) do
-    ClientDriver.pull_projection(ctx, result_key, selector_or_path, pattern)
+  def seeking_sorted_map_range(ctx, result_key, path_keys, opts \\ []) do
+    ClientDriver.seek_sorted_map_range(ctx, result_key, path_keys, opts)
+  end
+
+  def pulling_projection(ctx, result_key, selector_or_path, pattern, opts \\ []) do
+    ClientDriver.pull_projection(ctx, result_key, selector_or_path, pattern, opts)
+  end
+
+  def materializing_path(ctx, result_key, path_keys, opts \\ []) do
+    ClientDriver.materialize_path(ctx, result_key, path_keys, opts)
+  end
+
+  def resetting_columnar_probe(ctx) do
+    ClientDriver.reset_columnar_probe(ctx)
   end
 
   def diffing_moments(ctx, result_key, moment_a, moment_b) do
@@ -115,6 +139,22 @@ defmodule Xitdb.TestDSL.ClientDSL do
         unquote(result_key),
         unquote(expected_value)
       )
+    end
+  end
+
+  defmacro resolved_tag_is(ctx_ast, result_key, expected_tag) do
+    quote line: __CALLER__.line do
+      ClientDriver.assert_resolved_tag(
+        unquote(ctx_ast),
+        unquote(result_key),
+        unquote(expected_tag)
+      )
+    end
+  end
+
+  defmacro columnar_page_reads_are(ctx_ast, expected_reads) do
+    quote line: __CALLER__.line do
+      ClientDriver.assert_columnar_page_reads(unquote(ctx_ast), unquote(expected_reads))
     end
   end
 

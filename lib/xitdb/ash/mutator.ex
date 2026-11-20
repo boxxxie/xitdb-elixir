@@ -7,8 +7,9 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     """
 
     alias Ash.Error.Changes.{InvalidAttribute, InvalidChanges, StaleRecord}
-    alias Xitdb.Ash.{Codec, Indexer, Info, Query, Store}
+    alias Xitdb.Ash.{Codec, Compress, Indexer, Info, Query, Store}
     alias Xitdb.Ash.Mutator.Sequences
+    alias Xitdb.Columnar
 
     @type snapshot :: {Xitdb.t(), non_neg_integer()}
 
@@ -267,6 +268,26 @@ if Code.ensure_loaded?(Ash.DataLayer) do
            fallback_tenant,
            options
          ) do
+      row_group_configs =
+        resource
+        |> Info.compression_configs()
+        |> Enum.filter(&(&1.mode == :row_group))
+
+      if row_group_configs == [] do
+        run_bulk_creates_standard({db, moment}, resource, stream, fallback_tenant, options)
+      else
+        run_bulk_creates_columnar(
+          {db, moment},
+          resource,
+          stream,
+          fallback_tenant,
+          row_group_configs,
+          options
+        )
+      end
+    end
+
+    defp run_bulk_creates_standard({db, moment}, resource, stream, fallback_tenant, options) do
       cursor_root = Xitdb.as_of(db, moment)
 
       staged =
@@ -342,6 +363,202 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
         {:error, _} = err ->
           err
+      end
+    end
+
+    defp run_bulk_creates_columnar(
+           {db, moment},
+           resource,
+           stream,
+           fallback_tenant,
+           row_group_configs,
+           options
+         ) do
+      cursor_root = Xitdb.as_of(db, moment)
+      [pk_name | _] = Ash.Resource.Info.primary_key(resource)
+      pk_attr = Ash.Resource.Info.attribute(resource, pk_name)
+
+      staged =
+        stream
+        |> Enum.with_index()
+        |> Enum.reduce_while(
+          {:ok, [], [], %{}, %{}, MapSet.new(), MapSet.new()},
+          fn {%Ash.Changeset{} = raw_cs, idx},
+             {:ok, rev_items, blob_ops_rev, seq_state, comp_batch_state, seen_pks,
+              seen_identities} ->
+            cs =
+              if is_nil(raw_cs.tenant) and fallback_tenant != nil do
+                %Ash.Changeset{raw_cs | tenant: fallback_tenant}
+              else
+                raw_cs
+              end
+
+            tenant = cs.tenant
+            scoped_col = Codec.scoped_collection(resource, tenant)
+
+            with {:ok, after_atomics} <- apply_create_record(resource, cs),
+                 {:ok, record_with_pk, seq_ops, next_seq_state} <-
+                   Sequences.plan_pk(cursor_root, resource, after_atomics, tenant, seq_state),
+                 :ok <-
+                   verify_pk_unused(
+                     cursor_root,
+                     resource,
+                     record_with_pk,
+                     tenant,
+                     seen_pks,
+                     allow_existing_cursor?(cs)
+                   ),
+                 record <- finalize_loaded_record(resource, record_with_pk, tenant),
+                 :ok <- verify_atomic_validations(record, record, resource, cs),
+                 :ok <- verify_create_filter(record, resource, cs),
+                 {:ok, next_seen_identities} <-
+                   track_batch_identities(resource, record, tenant, seen_identities),
+                 {:ok, raw_cursor_map} <-
+                   resource |> Codec.to_cursor_map(record) |> normalize_plan_error(),
+                 {:ok, val_cursor_map, item_blob_ops, next_comp_batch} <-
+                   Indexer.compress_cursor_map(
+                     cursor_root,
+                     resource,
+                     raw_cursor_map,
+                     comp_batch_state,
+                     :value
+                   ) do
+              doc_id = Codec.encode_pk_doc_id(pk_attr, Map.fetch!(record, pk_name))
+              next_seen_pks = MapSet.put(seen_pks, {scoped_col, doc_id})
+
+              item = %{
+                idx: idx,
+                cs: cs,
+                tenant: tenant,
+                scoped_col: scoped_col,
+                doc_id: doc_id,
+                seq_ops: seq_ops,
+                record: record,
+                cursor_map: val_cursor_map
+              }
+
+              {:cont,
+               {:ok, [item | rev_items], Enum.reverse(item_blob_ops, blob_ops_rev),
+                next_seq_state, next_comp_batch, next_seen_pks, next_seen_identities}}
+            else
+              {:error, _} = err ->
+                {:halt, err}
+            end
+          end
+        )
+
+      with {:ok, rev_items, blob_ops_rev, _seq_state, _comp_batch, _seen_pks, _seen_identities} <-
+             staged,
+           staged_items = Enum.reverse(rev_items),
+           {:ok, page_ops, updated_cursors_by_key} <-
+             encode_bulk_row_groups(staged_items, row_group_configs, db.db_ref, moment),
+           {:ok, indexed_ops_chunks, rev_records} <-
+             plan_bulk_columnar_items(
+               cursor_root,
+               resource,
+               staged_items,
+               updated_cursors_by_key
+             ) do
+        all_ops =
+          page_ops ++
+            Enum.reverse(blob_ops_rev) ++ (indexed_ops_chunks |> Enum.reverse() |> List.flatten())
+
+        sample_cs =
+          case staged_items do
+            [first | _] -> first.cs
+            [] -> nil
+          end
+
+        commit_opts = build_commit_opts(resource, :bulk_create, sample_cs, options)
+
+        with {:ok, next_snapshot} <- commit_ops({db, moment}, all_ops, commit_opts) do
+          {:ok, next_snapshot, Enum.reverse(rev_records)}
+        end
+      end
+    end
+
+    defp encode_bulk_row_groups(staged_items, row_group_configs, db_ref, moment) do
+      grouped = Enum.group_by(staged_items, & &1.scoped_col, &{&1.doc_id, &1.cursor_map})
+
+      Enum.reduce_while(grouped, {:ok, [], %{}}, fn {scoped_col, pairs},
+                                                    {:ok, ops_rev, map_acc} ->
+        col_res =
+          Enum.reduce_while(row_group_configs, {:ok, ops_rev, pairs}, fn %Compress{} = rg_cfg,
+                                                                         {:ok, p_ops_rev,
+                                                                          cur_pairs} ->
+            col_specs =
+              Enum.map(rg_cfg.fields, fn field ->
+                {field,
+                 [
+                   encoding: rg_cfg.encoding,
+                   codec: rg_cfg.codec,
+                   level: rg_cfg.level,
+                   dictionary: rg_cfg.dictionary
+                 ]}
+              end)
+
+            case Columnar.build_columnar_ops_for_groups(scoped_col, cur_pairs, col_specs,
+                   row_group_size: rg_cfg.row_group_size,
+                   db_ref: db_ref,
+                   moment: moment
+                 ) do
+              {:ok, cfg_page_ops, next_pairs} ->
+                {:cont, {:ok, Enum.reverse(cfg_page_ops, p_ops_rev), next_pairs}}
+
+              {:error, _} = err ->
+                {:halt, err}
+            end
+          end)
+
+        case col_res do
+          {:ok, next_ops_rev, updated_pairs} ->
+            next_map =
+              Enum.reduce(updated_pairs, map_acc, fn {doc_id, updated_cursor_map}, acc ->
+                Map.put(acc, {scoped_col, doc_id}, updated_cursor_map)
+              end)
+
+            {:cont, {:ok, next_ops_rev, next_map}}
+
+          {:error, _} = err ->
+            {:halt, err}
+        end
+      end)
+      |> case do
+        {:ok, ops_rev, map_acc} -> {:ok, Enum.reverse(ops_rev), map_acc}
+        {:error, _} = err -> err
+      end
+    end
+
+    defp plan_bulk_columnar_items(cursor_root, resource, staged_items, updated_cursors_by_key) do
+      Enum.reduce_while(staged_items, {:ok, [], [], %{}}, fn item,
+                                                             {:ok, ops_chunks, rev_records,
+                                                              idx_batch_state} ->
+        updated_cursor_map = Map.fetch!(updated_cursors_by_key, {item.scoped_col, item.doc_id})
+
+        case Indexer.plan_put_ops_batched(
+               cursor_root,
+               resource,
+               nil,
+               item.record,
+               item.tenant,
+               idx_batch_state,
+               prebuilt_cursor_map: updated_cursor_map
+             )
+             |> normalize_plan_error() do
+          {:ok, index_ops, next_idx_batch_state} ->
+            tagged = attach_bulk_metadata(item.record, item.cs, item.idx)
+
+            {:cont,
+             {:ok, [item.seq_ops ++ index_ops | ops_chunks], [tagged | rev_records],
+              next_idx_batch_state}}
+
+          {:error, _} = err ->
+            {:halt, err}
+        end
+      end)
+      |> case do
+        {:ok, ops_chunks, rev_records, _idx_batch_state} -> {:ok, ops_chunks, rev_records}
+        {:error, _} = err -> err
       end
     end
 
@@ -1178,6 +1395,22 @@ if Code.ensure_loaded?(Ash.DataLayer) do
        InvalidAttribute.exception(
          field: field,
          message: "must fit within a signed 64-bit integer (-2^63..2^63-1)"
+       )}
+    end
+
+    defp normalize_plan_error({:error, {:integer_out_of_u64_range, field}}) do
+      {:error,
+       InvalidAttribute.exception(
+         field: field,
+         message: "must fit within an unsigned 64-bit integer (0..2^64-1)"
+       )}
+    end
+
+    defp normalize_plan_error({:error, {:invalid_format_tag, field}}) do
+      {:error,
+       InvalidAttribute.exception(
+         field: field,
+         message: "tagged binary values must use a 2-byte tag and binary payload"
        )}
     end
 

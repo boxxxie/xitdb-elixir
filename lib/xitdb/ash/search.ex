@@ -184,8 +184,15 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     def tokenize(%Ash.CiString{} = ci), do: ci |> Ash.CiString.value() |> tokenize()
 
     def tokenize(text) when is_binary(text) do
-      text
-      |> :unicode.characters_to_nfc_binary()
+      valid_utf8 = if String.valid?(text), do: text, else: String.replace_invalid(text)
+
+      nfc =
+        case :unicode.characters_to_nfc_binary(valid_utf8) do
+          bin when is_binary(bin) -> bin
+          {_, prefix, _} when is_binary(prefix) -> prefix
+        end
+
+      nfc
       |> String.downcase()
       |> String.split(~r/[^\p{L}\p{N}]+/u, trim: true)
       |> Enum.map(&:binary.copy/1)

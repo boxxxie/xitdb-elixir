@@ -34,19 +34,23 @@ defmodule Xitdb.DSL.TxRuntime do
 
   def put(tx_ref, selector, value) when is_binary(selector) or is_list(selector) do
     %__MODULE__{} = state = Process.get(tx_ref)
+    encoded = TxCompiler.encode_value(value)
 
     cond do
-      is_nil(value) ->
+      is_nil(encoded) ->
         rm(tx_ref, selector)
         nil
 
-      not is_map(value) and not is_list(value) ->
-        op = {:put, selector, value}
+      not is_map(encoded) and not is_list(encoded) ->
+        op = {:put, selector, encoded}
 
         staged_log =
           case state.staged_log do
-            nil -> nil
-            log -> [{:put, parse_selector_steps(selector), value} | log]
+            nil ->
+              nil
+
+            log ->
+              [{:put, parse_selector_steps(selector), materialize_staged_value(encoded)} | log]
           end
 
         Process.put(tx_ref, %__MODULE__{state | ops: [op | state.ops], staged_log: staged_log})
@@ -56,7 +60,7 @@ defmodule Xitdb.DSL.TxRuntime do
         compiled_ops =
           selector
           |> Xitdb.Selector.format_path_steps()
-          |> TxCompiler.compile_node(value, true)
+          |> TxCompiler.compile_node(encoded, true)
 
         staged_log =
           case state.staged_log do
@@ -64,7 +68,7 @@ defmodule Xitdb.DSL.TxRuntime do
               nil
 
             log ->
-              [{:put, parse_selector_steps(selector), materialize_staged_value(value)} | log]
+              [{:put, parse_selector_steps(selector), materialize_staged_value(encoded)} | log]
           end
 
         new_state = %__MODULE__{
@@ -127,6 +131,7 @@ defmodule Xitdb.DSL.TxRuntime do
 
   def append(tx_ref, selector, value) when is_binary(selector) or is_list(selector) do
     %__MODULE__{} = state = Process.get(tx_ref)
+    encoded = TxCompiler.encode_value(value)
 
     staged_log =
       case state.staged_log do
@@ -134,12 +139,12 @@ defmodule Xitdb.DSL.TxRuntime do
           nil
 
         log ->
-          [{:append, parse_selector_steps(selector), materialize_staged_value(value)} | log]
+          [{:append, parse_selector_steps(selector), materialize_staged_value(encoded)} | log]
       end
 
     Process.put(tx_ref, %__MODULE__{
       state
-      | ops: [{:append, selector, value} | state.ops],
+      | ops: [{:append, selector, encoded} | state.ops],
         staged_log: staged_log
     })
 
@@ -149,6 +154,7 @@ defmodule Xitdb.DSL.TxRuntime do
   def insert(tx_ref, selector, index, value)
       when (is_binary(selector) or is_list(selector)) and is_integer(index) do
     %__MODULE__{} = state = Process.get(tx_ref)
+    encoded = TxCompiler.encode_value(value)
 
     staged_log =
       case state.staged_log do
@@ -157,14 +163,14 @@ defmodule Xitdb.DSL.TxRuntime do
 
         log ->
           [
-            {:insert, parse_selector_steps(selector), index, materialize_staged_value(value)}
+            {:insert, parse_selector_steps(selector), index, materialize_staged_value(encoded)}
             | log
           ]
       end
 
     Process.put(tx_ref, %__MODULE__{
       state
-      | ops: [{:insert, selector, index, value} | state.ops],
+      | ops: [{:insert, selector, index, encoded} | state.ops],
         staged_log: staged_log
     })
 
@@ -249,7 +255,8 @@ defmodule Xitdb.DSL.TxRuntime do
 
   def meta(tx_ref, key, val) do
     %__MODULE__{} = state = Process.get(tx_ref)
-    Process.put(tx_ref, %__MODULE__{state | ops: [{:meta, to_string(key), val} | state.ops]})
+    encoded = TxCompiler.encode_value(val)
+    Process.put(tx_ref, %__MODULE__{state | ops: [{:meta, to_string(key), encoded} | state.ops]})
     val
   end
 
@@ -302,6 +309,12 @@ defmodule Xitdb.DSL.TxRuntime do
     Enum.map(list, &materialize_staged_value/1)
   end
 
+  defp materialize_staged_value(struct) when is_struct(struct) do
+    struct |> TxCompiler.encode_value() |> materialize_staged_value()
+  end
+
+  defp materialize_staged_value({:compressed, bin}) when is_binary(bin), do: bin
+  defp materialize_staged_value({:compressed, bin, _opts}) when is_binary(bin), do: bin
   defp materialize_staged_value(scalar), do: scalar
 
   defp read_current_value(%__MODULE__{staged_log: staged_log, db: db, opts: opts}, selector) do

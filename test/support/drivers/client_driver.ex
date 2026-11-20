@@ -76,6 +76,24 @@ defmodule Xitdb.TestDrivers.ClientDriver do
     %{ctx | snapshots: Map.put(ctx.snapshots, snapshot_name, cursor)}
   end
 
+  def train_dictionary(ctx, name, samples, opts) do
+    {:ok, db, _dict_bytes} =
+      Xitdb.Compression.Dictionary.train_and_put(ctx.db, name, samples, opts)
+
+    %{ctx | db: db}
+  end
+
+  def put_columnar_rows(ctx, collection, rows, opts) do
+    {:ok, db} = Xitdb.Columnar.put_rows(ctx.db, collection, rows, opts)
+    %{ctx | db: db}
+  end
+
+  def reset_columnar_probe(ctx) do
+    Xitdb.Columnar.clear_cache(ctx.db)
+    Xitdb.Columnar.reset_stats()
+    ctx
+  end
+
   def navigate_access(ctx, result_key, path_keys) do
     root = Xitdb.db(ctx.db)
     val = Enum.reduce(path_keys, root, fn key, acc -> acc[key] end)
@@ -110,8 +128,8 @@ defmodule Xitdb.TestDrivers.ClientDriver do
     %{ctx | db: db}
   end
 
-  def attempt_failing_transact(ctx, fun) do
-    case Xitdb.transact(ctx.db, fun) do
+  def attempt_failing_transact(ctx, fun_or_map, opts \\ []) do
+    case Xitdb.transact(ctx.db, fun_or_map, opts) do
       {:error, err} ->
         %{ctx | last_error: err}
 
@@ -135,12 +153,23 @@ defmodule Xitdb.TestDrivers.ClientDriver do
     end
   end
 
-  def select_path(ctx, result_key, selector) do
-    val = Xitdb.select!(ctx.db, selector)
+  def select_path(ctx, result_key, selector, opts \\ []) do
+    val = Xitdb.select!(ctx.db, selector, opts)
     %{ctx | results: Map.put(ctx.results, result_key, val)}
   end
 
-  def pull_projection(ctx, result_key, selector_or_path, pattern) do
+  def seek_sorted_map_range(ctx, result_key, path_keys, opts) do
+    cursor = resolve_path(Xitdb.db(ctx.db), path_keys)
+
+    entries =
+      cursor
+      |> Xitdb.Key.stream_range(opts)
+      |> Enum.map(fn {k, v} -> {k, materialize_if_cursor(v)} end)
+
+    %{ctx | results: Map.put(ctx.results, result_key, entries)}
+  end
+
+  def pull_projection(ctx, result_key, selector_or_path, pattern, opts \\ []) do
     target =
       case selector_or_path do
         :root -> Xitdb.db(ctx.db)
@@ -148,7 +177,18 @@ defmodule Xitdb.TestDrivers.ClientDriver do
         sel when is_binary(sel) -> Xitdb.select!(ctx.db, sel)
       end
 
-    val = Xitdb.pull!(target, pattern)
+    val = Xitdb.pull!(target, pattern, opts)
+    %{ctx | results: Map.put(ctx.results, result_key, val)}
+  end
+
+  def materialize_path(ctx, result_key, path_keys, opts \\ []) do
+    target =
+      case path_keys do
+        [] -> ctx.db
+        _ -> resolve_path(Xitdb.db(ctx.db), path_keys)
+      end
+
+    val = Xitdb.materialize(target, opts)
     %{ctx | results: Map.put(ctx.results, result_key, val)}
   end
 
@@ -207,6 +247,19 @@ defmodule Xitdb.TestDrivers.ClientDriver do
       end
 
     assert actual_normalized == expected_value
+    ctx
+  end
+
+  def assert_resolved_tag(ctx, result_key, expected_tag) do
+    actual = Map.fetch!(ctx.results, result_key)
+    assert {:tagged, ^expected_tag, payload} = actual
+    assert is_binary(payload)
+    ctx
+  end
+
+  def assert_columnar_page_reads(ctx, expected_reads) do
+    stats = Xitdb.Columnar.stats()
+    assert stats.page_reads == expected_reads
     ctx
   end
 

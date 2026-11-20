@@ -394,4 +394,60 @@ defmodule Xitdb.DSL.PathCompilerTest do
       end
     end
   end
+
+  @tag :tmp_dir
+  test "select/2, history_of/2, info/1, and compact/2 handle 18-step overflow paths on :buffered_file",
+       %{tmp_dir: tmp_dir} do
+    db_path = Path.join(tmp_dir, "deep_history.xit")
+    compact_path = Path.join(tmp_dir, "deep_history_compacted.xit")
+
+    db = Xitdb.open!(backend: :buffered_file, path: db_path)
+    on_exit(fn -> Xitdb.close(db) end)
+
+    wrap_depth = fn leaf ->
+      Enum.reduce(18..1//-1, leaf, fn i, acc -> %{"k#{i}" => acc} end)
+    end
+
+    db =
+      db
+      |> Xitdb.transact!(wrap_depth.("v0"), doc: "m0", instant: 100)
+      |> Xitdb.transact!(wrap_depth.("v1"), doc: "m1", instant: 200)
+      |> Xitdb.transact!(wrap_depth.("v2"), doc: "m2", instant: 300)
+
+    selector_18 = ".k1.k2.k3.k4.k5.k6.k7.k8.k9.k10.k11.k12.k13.k14.k15.k16.k17.k18"
+    steps_18 = path_steps(k1.k2.k3.k4.k5.k6.k7.k8.k9.k10.k11.k12.k13.k14.k15.k16.k17.k18)
+
+    assert length(steps_18) == 18
+    assert {:ok, "v2"} = Xitdb.select(db, selector_18)
+    assert {:ok, "v2"} = Xitdb.select(db, steps_18)
+    assert {:ok, "v0"} = Xitdb.select(db, "@0" <> selector_18)
+
+    assert {:ok, hist_str} = Xitdb.history_of(db, selector_18)
+    assert {:ok, hist_steps} = Xitdb.history_of(db, steps_18)
+    assert hist_str == hist_steps
+
+    assert Enum.map(hist_str, &{&1.moment_index, &1.value, &1.doc, &1.instant}) == [
+             {0, "v0", "m0", 100},
+             {1, "v1", "m1", 200},
+             {2, "v2", "m2", 300}
+           ]
+
+    assert {:ok, %{moment_count: 3, file_size: size_before}} = Xitdb.info(db)
+    assert size_before > 0
+
+    {:ok, compacted} = Xitdb.compact(db, path: compact_path)
+    on_exit(fn -> Xitdb.close(compacted) end)
+
+    assert {:ok, %{moment_count: 1, file_size: size_after}} = Xitdb.info(compacted)
+    assert size_after > 0
+    assert size_after < size_before
+    assert {:ok, "v2"} = Xitdb.select(compacted, selector_18)
+    assert {:ok, [%{moment_index: 0, value: "v2"}]} = Xitdb.history_of(compacted, steps_18)
+
+    assert :ok = Xitdb.close(compacted)
+    reopened = Xitdb.open!(backend: :buffered_file, path: compact_path)
+    on_exit(fn -> Xitdb.close(reopened) end)
+    assert {:ok, %{moment_count: 1, file_size: ^size_after}} = Xitdb.info(reopened)
+    assert {:ok, "v2"} = Xitdb.select(reopened, steps_18)
+  end
 end

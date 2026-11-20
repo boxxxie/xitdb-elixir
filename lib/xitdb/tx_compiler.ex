@@ -41,9 +41,107 @@ defmodule Xitdb.TxCompiler do
       if map_size(map) == 0 do
         index_ops
       else
-        index_ops ++ [{:merge_map, map}]
+        encoded_map = encode_value(map)
+        index_ops ++ [{:merge_map, encoded_map}]
       end
     end
+  end
+
+  @doc false
+  @spec encode_value(term()) :: term()
+  def encode_value(term) do
+    if needs_struct_encoding?(term) do
+      do_encode_value(term)
+    else
+      term
+    end
+  end
+
+  defp needs_struct_encoding?(%Collection{kind: kind, data: data})
+       when kind in [:hash_map, :counted_hash_map, :sorted_map] do
+    cond do
+      is_map(data) and not is_struct(data) ->
+        map_values_need_encoding?(:maps.iterator(data))
+
+      is_list(data) ->
+        kv_list_needs_encoding?(data)
+
+      true ->
+        true
+    end
+  end
+
+  defp needs_struct_encoding?(%Collection{kind: kind, data: list})
+       when kind in [:array_list, :linked_array_list] do
+    if is_list(list), do: list_needs_encoding?(list), else: true
+  end
+
+  defp needs_struct_encoding?(%Collection{}), do: false
+  defp needs_struct_encoding?(%MapSet{}), do: false
+  defp needs_struct_encoding?(term) when is_struct(term), do: true
+
+  defp needs_struct_encoding?(map) when is_map(map) do
+    map_values_need_encoding?(:maps.iterator(map))
+  end
+
+  defp needs_struct_encoding?(list) when is_list(list), do: list_needs_encoding?(list)
+  defp needs_struct_encoding?(_scalar), do: false
+
+  defp map_values_need_encoding?(iter) do
+    case :maps.next(iter) do
+      :none ->
+        false
+
+      {_k, v, next_iter} ->
+        needs_struct_encoding?(v) or map_values_need_encoding?(next_iter)
+    end
+  end
+
+  defp list_needs_encoding?([]), do: false
+  defp list_needs_encoding?([h | t]), do: needs_struct_encoding?(h) or list_needs_encoding?(t)
+
+  defp kv_list_needs_encoding?([]), do: false
+
+  defp kv_list_needs_encoding?([{_k, v} | rest]) do
+    needs_struct_encoding?(v) or kv_list_needs_encoding?(rest)
+  end
+
+  defp kv_list_needs_encoding?([_other | rest]), do: kv_list_needs_encoding?(rest)
+
+  defp do_encode_value(%Collection{kind: kind, data: data} = col)
+       when kind in [:hash_map, :counted_hash_map, :sorted_map] do
+    %Collection{col | data: encode_kv_data(data)}
+  end
+
+  defp do_encode_value(%Collection{kind: kind, data: list} = col)
+       when kind in [:array_list, :linked_array_list] do
+    %Collection{col | data: Enum.map(list, &do_encode_value/1)}
+  end
+
+  defp do_encode_value(%Collection{} = col), do: col
+  defp do_encode_value(%MapSet{} = set), do: set
+
+  defp do_encode_value(struct) when is_struct(struct) do
+    struct |> Xitdb.Encoder.encode() |> do_encode_value()
+  end
+
+  defp do_encode_value(map) when is_map(map) do
+    Map.new(map, fn {k, v} -> {k, do_encode_value(v)} end)
+  end
+
+  defp do_encode_value([]), do: []
+  defp do_encode_value([h | t]), do: [do_encode_value(h) | do_encode_value(t)]
+  defp do_encode_value(other), do: other
+
+  defp encode_kv_data(data) when is_map(data) and not is_struct(data) do
+    Map.new(data, fn {k, v} -> {k, do_encode_value(v)} end)
+  end
+
+  defp encode_kv_data(enumerable) do
+    Enum.map(enumerable, fn
+      {k, v} -> {k, do_encode_value(v)}
+      other -> other
+    end)
   end
 
   def compile_node(prefix, node, reset?) do
@@ -108,6 +206,10 @@ defmodule Xitdb.TxCompiler do
 
   defp compile_node_acc(prefix, nil, true, acc) do
     [{:put, prefix, nil} | acc]
+  end
+
+  defp compile_node_acc(prefix, struct, reset?, acc) when is_struct(struct) do
+    compile_node_acc(prefix, Xitdb.Encoder.encode(struct), reset?, acc)
   end
 
   defp compile_node_acc(prefix, scalar, _reset?, acc) do

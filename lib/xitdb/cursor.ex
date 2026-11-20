@@ -163,6 +163,11 @@ defmodule Xitdb.Cursor do
     Map.new(map, fn {k, v} -> {k, unwrap_nif_value(db_ref, v, moment, path_steps)} end)
   end
 
+  def unwrap_nif_value(db_ref, {:tagged, tag, payload}, moment, _path_steps)
+      when tag in ["cz", "zs", "zd", "bp", "pg"] and is_binary(payload) do
+    Xitdb.Compression.resolve_tagged!(tag, payload, db_ref, moment)
+  end
+
   def unwrap_nif_value(_db_ref, scalar, _moment, _path_steps), do: scalar
 
   @doc false
@@ -329,6 +334,11 @@ defmodule Xitdb.Cursor do
 
   defp handle_fetch_result({:ok, {:cursor, _, _, _, _} = tuple}, cursor) do
     {:ok, from_nif_tuple(cursor.db_ref, tuple, cursor.moment)}
+  end
+
+  defp handle_fetch_result({:ok, {:tagged, tag, payload}}, cursor)
+       when tag in ["cz", "zs", "zd", "bp", "pg"] and is_binary(payload) do
+    {:ok, Xitdb.Compression.resolve_tagged!(tag, payload, cursor.db_ref, cursor.moment)}
   end
 
   defp handle_fetch_result({:ok, scalar}, _cursor), do: {:ok, scalar}
@@ -756,6 +766,11 @@ defmodule Xitdb.Cursor do
     virtual_staged_cursor(cursor, child_steps, :array_list)
   end
 
+  defp wrap_staged_val(_cursor, _child_steps, {:compressed, bin}) when is_binary(bin), do: bin
+
+  defp wrap_staged_val(_cursor, _child_steps, {:compressed, bin, _opts}) when is_binary(bin),
+    do: bin
+
   defp wrap_staged_val(_cursor, _child_steps, scalar), do: scalar
 
   defp virtual_staged_cursor(cursor, child_steps, tag, value \\ 0) do
@@ -888,64 +903,77 @@ defmodule Xitdb.Cursor do
               "cannot assign a %Xitdb.Cursor{} directly as a value inside put_in/update_in; use Xitdb.fork/3 to clone a subtree or Xitdb.materialize/1 to copy its data"
 
       {get_val, nil} when cursor.tag not in [:array_list, :linked_array_list] ->
-        {selector, ov_key} = steps_to_selector_and_override_key(child_steps)
-
-        updated_cursor = %__MODULE__{
-          cursor
-          | tx_mode: true,
-            staged_ops: [{:rm_if_exists, selector} | cursor.staged_ops],
-            staged_overrides: purge_prefix_from_map(cursor.staged_overrides, ov_key),
-            deleted_paths:
-              cursor.deleted_paths
-              |> purge_prefix_from_set(ov_key)
-              |> MapSet.put(ov_key),
-            staged_list_edits: purge_prefix_from_map(cursor.staged_list_edits, ov_key),
-            fork_aliases: purge_fork_aliases(cursor.fork_aliases, ov_key)
-        }
-
-        {get_val, updated_cursor}
+        stage_rm_override(cursor, child_steps, get_val)
 
       {get_val, new_val} ->
-        {selector, ov_key} = steps_to_selector_and_override_key(child_steps)
+        encoded_val = TxCompiler.encode_value(new_val)
 
-        new_ops =
-          cond do
-            is_nil(new_val) and cursor.tag in [:array_list, :linked_array_list] ->
-              [{:put, selector, nil}]
+        if is_nil(encoded_val) and cursor.tag not in [:array_list, :linked_array_list] do
+          stage_rm_override(cursor, child_steps, get_val)
+        else
+          {selector, ov_key} = steps_to_selector_and_override_key(child_steps)
 
-            is_binary(new_val) or is_number(new_val) or is_boolean(new_val) ->
-              [{:put, selector, new_val}]
+          new_ops =
+            cond do
+              is_nil(encoded_val) and cursor.tag in [:array_list, :linked_array_list] ->
+                [{:put, selector, nil}]
 
-            true ->
-              TxCompiler.compile_node(selector, new_val, true)
-          end
+              is_binary(encoded_val) or is_number(encoded_val) or is_boolean(encoded_val) or
+                match?({:tagged, <<_, _>>, bin} when is_binary(bin), encoded_val) or
+                match?({:compressed, bin} when is_binary(bin), encoded_val) or
+                  match?({:compressed, bin, o} when is_binary(bin) and is_list(o), encoded_val) ->
+                [{:put, selector, encoded_val}]
 
-        updated_overrides =
-          cursor.staged_overrides
-          |> purge_prefix_from_map(ov_key)
-          |> Map.put(ov_key, new_val)
+              true ->
+                TxCompiler.compile_node(selector, encoded_val, true)
+            end
 
-        updated_deleted =
-          if MapSet.size(cursor.deleted_paths) == 0 do
-            cursor.deleted_paths
-          else
-            cursor.deleted_paths
-            |> purge_prefix_from_set(ov_key)
-            |> MapSet.delete(ov_key)
-          end
+          updated_overrides =
+            cursor.staged_overrides
+            |> purge_prefix_from_map(ov_key)
+            |> Map.put(ov_key, encoded_val)
 
-        updated_cursor = %__MODULE__{
-          cursor
-          | tx_mode: true,
-            staged_ops: :lists.reverse(new_ops, cursor.staged_ops),
-            staged_overrides: updated_overrides,
-            deleted_paths: updated_deleted,
-            staged_list_edits: purge_prefix_from_map(cursor.staged_list_edits, ov_key),
-            fork_aliases: purge_fork_aliases(cursor.fork_aliases, ov_key)
-        }
+          updated_deleted =
+            if MapSet.size(cursor.deleted_paths) == 0 do
+              cursor.deleted_paths
+            else
+              cursor.deleted_paths
+              |> purge_prefix_from_set(ov_key)
+              |> MapSet.delete(ov_key)
+            end
 
-        {get_val, updated_cursor}
+          updated_cursor = %__MODULE__{
+            cursor
+            | tx_mode: true,
+              staged_ops: :lists.reverse(new_ops, cursor.staged_ops),
+              staged_overrides: updated_overrides,
+              deleted_paths: updated_deleted,
+              staged_list_edits: purge_prefix_from_map(cursor.staged_list_edits, ov_key),
+              fork_aliases: purge_fork_aliases(cursor.fork_aliases, ov_key)
+          }
+
+          {get_val, updated_cursor}
+        end
     end
+  end
+
+  defp stage_rm_override(%__MODULE__{} = cursor, child_steps, get_val) do
+    {selector, ov_key} = steps_to_selector_and_override_key(child_steps)
+
+    updated_cursor = %__MODULE__{
+      cursor
+      | tx_mode: true,
+        staged_ops: [{:rm_if_exists, selector} | cursor.staged_ops],
+        staged_overrides: purge_prefix_from_map(cursor.staged_overrides, ov_key),
+        deleted_paths:
+          cursor.deleted_paths
+          |> purge_prefix_from_set(ov_key)
+          |> MapSet.put(ov_key),
+        staged_list_edits: purge_prefix_from_map(cursor.staged_list_edits, ov_key),
+        fork_aliases: purge_fork_aliases(cursor.fork_aliases, ov_key)
+    }
+
+    {get_val, updated_cursor}
   end
 
   defp fetch_or_nil(cursor, resolved_key) do
@@ -2267,6 +2295,10 @@ defmodule Xitdb.Cursor do
   defp materialize_staged_val(list) when is_list(list) do
     Enum.map(list, &materialize_staged_val/1)
   end
+
+  defp materialize_staged_val({:compressed, bin}) when is_binary(bin), do: bin
+
+  defp materialize_staged_val({:compressed, bin, _opts}) when is_binary(bin), do: bin
 
   defp materialize_staged_val(other), do: other
 

@@ -7,11 +7,15 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
     alias Ash.Resource.Attribute
     alias Xitdb.Ash.Info
+    alias Xitdb.Key
 
     @null_tag 0x00
     @value_tag 0x01
     @global_tenant_tag 0x00
     @scoped_tenant_tag 0x01
+    @min_i64 -9_223_372_036_854_775_808
+    @max_i64 9_223_372_036_854_775_807
+    @max_u64 18_446_744_073_709_551_615
 
     # -- Collection Scoping & Entity Cursor Serialization --
 
@@ -62,24 +66,41 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
     @doc """
     Hydrates a Xitdb entity cursor back into a loaded `%Resource{}` struct.
+
+    When `only_attrs` is a `MapSet` (or list) of attribute names, attributes outside
+    `only_attrs` are left as `%Ash.NotLoaded{type: :attribute, field: name}` without
+    reading or decompressing their underlying cursor slots.
     """
-    @spec from_cursor(module(), term(), term()) :: {:ok, struct()} | {:error, term()}
-    def from_cursor(resource, cursor, tenant \\ nil) when is_atom(resource) do
+    @spec from_cursor(module(), term(), term(), :all | MapSet.t(atom()) | [atom()]) ::
+            {:ok, struct()} | {:error, term()}
+    def from_cursor(resource, cursor, tenant \\ nil, only_attrs \\ :all) when is_atom(resource) do
       counted_sets = counted_set_fields(resource)
+
+      allowed_attrs =
+        case only_attrs do
+          :all -> :all
+          %MapSet{} = set -> set
+          list when is_list(list) -> MapSet.new(list)
+        end
 
       attrs_result =
         resource
         |> Ash.Resource.Info.attributes()
         |> Enum.reduce_while({:ok, %{}}, fn %Attribute{} = attr, {:ok, acc} ->
-          raw = fetch_cursor_field(cursor, Atom.to_string(attr.name))
-          as_counted_set? = MapSet.member?(counted_sets, attr.name)
+          if allowed_attrs == :all or MapSet.member?(allowed_attrs, attr.name) do
+            raw = fetch_cursor_field(cursor, Atom.to_string(attr.name))
+            as_counted_set? = MapSet.member?(counted_sets, attr.name)
 
-          case load_attribute(attr, raw, as_counted_set?) do
-            {:ok, loaded} ->
-              {:cont, {:ok, Map.put(acc, attr.name, loaded)}}
+            case load_attribute(attr, raw, as_counted_set?) do
+              {:ok, loaded} ->
+                {:cont, {:ok, Map.put(acc, attr.name, loaded)}}
 
-            {:error, _reason} = err ->
-              {:halt, err}
+              {:error, _reason} = err ->
+                {:halt, err}
+            end
+          else
+            {:cont,
+             {:ok, Map.put(acc, attr.name, %Ash.NotLoaded{type: :attribute, field: attr.name})}}
           end
         end)
 
@@ -156,6 +177,12 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         {:integer, _} ->
           case Integer.parse(doc_id) do
             {int, ""} -> {:ok, int}
+            _ -> {:error, {:invalid_integer_pk, doc_id}}
+          end
+
+        {:unsigned_integer, _} ->
+          case Integer.parse(doc_id) do
+            {int, ""} when int >= 0 and int <= @max_u64 -> {:ok, int}
             _ -> {:error, {:invalid_integer_pk, doc_id}}
           end
 
@@ -255,52 +282,26 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       end
     end
 
-    # -- Low-Level Order-Preserving Primitive Codecs (Public for Property Testing) --
+    # -- Low-Level Order-Preserving Primitive Codecs (Delegated to Xitdb.Key) --
 
     @doc """
     Encodes a signed 64-bit integer into an 8-byte sign-flipped big-endian binary
     preserving `<, <=, ==, >=, >` under unsigned byte comparison.
     """
     @spec encode_i64_be(integer()) :: <<_::64>>
-    def encode_i64_be(val)
-        when is_integer(val) and val >= -9_223_372_036_854_775_808 and
-               val <= 9_223_372_036_854_775_807 do
-      <<msb::unsigned-8, rest::binary-size(7)>> = <<val::signed-big-64>>
-      <<Bitwise.bxor(msb, 0x80)::unsigned-8, rest::binary>>
-    end
+    defdelegate encode_i64_be(val), to: Key
 
     @doc """
     Decodes an 8-byte sign-flipped big-endian binary back into a signed 64-bit integer.
     """
     @spec decode_i64_be(<<_::64>>) :: integer()
-    def decode_i64_be(<<msb::unsigned-8, rest::binary-size(7)>>) do
-      <<val::signed-big-64>> = <<Bitwise.bxor(msb, 0x80)::unsigned-8, rest::binary>>
-      val
-    end
+    defdelegate decode_i64_be(bin), to: Key
 
     @doc """
     Encodes an IEEE-754 float into an 8-byte order-preserving binary (`-0.0` normalized to `+0.0`).
     """
     @spec encode_f64_be(float()) :: <<_::64>>
-    def encode_f64_be(val) when is_float(val) do
-      normalized = if val == 0.0, do: +0.0, else: val
-      <<b0::8, b1::8, b2::8, b3::8, b4::8, b5::8, b6::8, b7::8>> = <<normalized::float-big-64>>
-
-      if Bitwise.band(b0, 0x80) == 0 do
-        <<Bitwise.bxor(b0, 0x80)::8, b1::8, b2::8, b3::8, b4::8, b5::8, b6::8, b7::8>>
-      else
-        <<
-          Bitwise.bxor(b0, 0xFF)::8,
-          Bitwise.bxor(b1, 0xFF)::8,
-          Bitwise.bxor(b2, 0xFF)::8,
-          Bitwise.bxor(b3, 0xFF)::8,
-          Bitwise.bxor(b4, 0xFF)::8,
-          Bitwise.bxor(b5, 0xFF)::8,
-          Bitwise.bxor(b6, 0xFF)::8,
-          Bitwise.bxor(b7, 0xFF)::8
-        >>
-      end
-    end
+    defdelegate encode_f64_be(val), to: Key
 
     @doc """
     Encodes a `Decimal` into a canonical, scale-normalized (`60 == 60.0 == 60.000`)
@@ -308,33 +309,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     stripping trailing zeros so integer multiples of 10 retain their true magnitude.
     """
     @spec encode_decimal_key(Decimal.t()) :: binary()
-    def encode_decimal_key(%Decimal{coef: coef}) when coef in [:NaN, :inf] do
-      raise ArgumentError, "cannot index non-finite Decimal #{inspect(coef)} in Xitdb B+Tree"
-    end
-
-    def encode_decimal_key(%Decimal{coef: 0}), do: <<0x80>>
-
-    def encode_decimal_key(%Decimal{} = dec) do
-      if Decimal.eq?(dec, 0) do
-        <<0x80>>
-      else
-        raw_digits = Integer.digits(dec.coef)
-        exp10 = length(raw_digits) + dec.exp
-        digits = strip_trailing_zeros(raw_digits)
-
-        case dec.sign do
-          1 ->
-            exp_bin = encode_i64_be(exp10)
-            mantissa = for d <- digits, into: <<>>, do: <<d + 1::unsigned-8>>
-            <<0xC0, exp_bin::binary, mantissa::binary, 0x00>>
-
-          -1 ->
-            exp_bin = invert_bytes(encode_i64_be(exp10))
-            mantissa = for d <- digits, into: <<>>, do: <<10 - d::unsigned-8>>
-            <<0x40, exp_bin::binary, mantissa::binary, 0xFF>>
-        end
-      end
-    end
+    defdelegate encode_decimal_key(dec), to: Key
 
     @doc """
     Decodes a length-prefixed binary part `<<tag::8, ...>>`, returning `{value_or_nil, rest}`.
@@ -351,10 +326,14 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
     # -- Attribute Dump / Load Internals --
 
-    @min_i64 -9_223_372_036_854_775_808
-    @max_i64 9_223_372_036_854_775_807
     @nil_sentinel <<0, "__xitdb_nil__">>
     @nil_escape_prefix <<0, "__xitdb_esc__">>
+
+    @doc """
+    Serializes a single `Ash.Resource.Attribute` value into a Xitdb-compatible term.
+    """
+    @spec dump_attribute(Attribute.t(), term()) :: {:ok, term()} | {:error, term()}
+    def dump_attribute(%Attribute{} = attr, value), do: dump_attribute_or_set(attr, value, false)
 
     defp dump_attribute_or_set(_attr, nil, _as_counted_set?), do: {:ok, nil}
 
@@ -396,6 +375,21 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           else
             {:error, {:integer_out_of_i64_range, attr.name}}
           end
+
+        :unsigned_integer when is_integer(value) ->
+          cond do
+            value >= 0 and value <= @max_i64 ->
+              {:ok, value}
+
+            value > @max_i64 and value <= @max_u64 ->
+              {:ok, {:tagged, "u8", <<value::unsigned-big-64>>}}
+
+            true ->
+              {:error, {:integer_out_of_u64_range, attr.name}}
+          end
+
+        :unsigned_integer ->
+          {:error, {:integer_out_of_u64_range, attr.name}}
 
         :string when is_binary(value) ->
           {:ok, :binary.copy(value)}
@@ -488,9 +482,21 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
         _complex ->
           case Ash.Type.dump_to_embedded(attr.type, value, constraints) do
-            {:ok, dumped} -> {:ok, dumped}
-            {:error, _} = err -> err
-            :error -> {:error, {:dump_failed, attr.name}}
+            {:ok, {:tagged, tag, payload}} ->
+              if is_binary(tag) and byte_size(tag) == 2 and is_binary(payload) do
+                {:ok, {:tagged, :binary.copy(tag), :binary.copy(payload)}}
+              else
+                {:error, {:invalid_format_tag, attr.name}}
+              end
+
+            {:ok, dumped} ->
+              {:ok, dumped}
+
+            {:error, _} = err ->
+              err
+
+            :error ->
+              {:error, {:dump_failed, attr.name}}
           end
       end
     end
@@ -600,10 +606,14 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       end
     end
 
-    defp load_attribute(attr, raw, as_counted_set? \\ false)
-    defp load_attribute(_attr, nil, _as_counted_set?), do: {:ok, nil}
+    @doc """
+    Deserializes a raw serialized value or Xitdb cursor into an Elixir attribute value.
+    """
+    @spec load_attribute(Attribute.t(), term(), boolean()) :: {:ok, term()} | {:error, term()}
+    def load_attribute(attr, raw, as_counted_set? \\ false)
+    def load_attribute(_attr, nil, _as_counted_set?), do: {:ok, nil}
 
-    defp load_attribute(%Attribute{} = attr, raw, as_counted_set?) do
+    def load_attribute(%Attribute{} = attr, raw, as_counted_set?) do
       materialized = materialize_cursor_term(raw)
 
       decoded_raw =
@@ -624,6 +634,15 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       case kind do
         :integer when is_integer(raw) ->
           {:ok, raw}
+
+        :unsigned_integer when is_integer(raw) and raw >= 0 and raw <= @max_u64 ->
+          {:ok, raw}
+
+        :unsigned_integer ->
+          case raw do
+            {:tagged, "u8", <<u::unsigned-big-64>>} -> {:ok, u}
+            _ -> {:error, {:load_failed, attr.name}}
+          end
 
         :string when is_binary(raw) ->
           {:ok, :binary.copy(raw)}
@@ -712,7 +731,15 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       {kind, _constraints} = unwrap_type(elem_attr.type, elem_attr.constraints)
 
       case kind do
-        k when k in [:integer, :utc_datetime, :utc_datetime_usec, :datetime, :naive_datetime] ->
+        k
+        when k in [
+               :integer,
+               :unsigned_integer,
+               :utc_datetime,
+               :utc_datetime_usec,
+               :datetime,
+               :naive_datetime
+             ] ->
           case Integer.parse(item) do
             {int, ""} -> int
             _ -> item
@@ -795,9 +822,9 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     defp encode_composite_component(_attr, nil), do: <<@null_tag>>
 
     defp encode_composite_component(%Attribute{} = attr, value) do
-      {kind, scalar} = encode_attr_scalar(attr, value)
+      {fixed_width?, scalar} = encode_attr_scalar(attr, value)
 
-      if fixed_width_kind?(kind) do
+      if fixed_width? do
         <<@value_tag, scalar::binary>>
       else
         <<@value_tag, escape_null_terminated(scalar)::binary>>
@@ -806,9 +833,23 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
     defp encode_attr_scalar(%Attribute{} = attr, value) do
       {kind, constraints} = unwrap_type(attr.type, attr.constraints)
+      constraints = constraints || []
 
-      {effective_kind, effective_constraints, effective_value} =
-        if is_atom(kind) and not canonical_atom_kind?(kind) and Ash.Type.ash_type?(kind) do
+      cond do
+        is_atom(kind) and not canonical_atom_kind?(kind) and Code.ensure_loaded?(kind) and
+            function_exported?(kind, :xitdb_index_key, 2) ->
+          key_bin = kind.xitdb_index_key(value, constraints)
+
+          fixed? =
+            if function_exported?(kind, :xitdb_fixed_width?, 1) do
+              kind.xitdb_fixed_width?(constraints)
+            else
+              false
+            end
+
+          {fixed?, key_bin}
+
+        is_atom(kind) and not canonical_atom_kind?(kind) and Ash.Type.ash_type?(kind) ->
           storage_type = Ash.Type.storage_type(kind, constraints)
           {storage_kind, storage_constraints} = unwrap_type(storage_type, [])
 
@@ -818,17 +859,23 @@ if Code.ensure_loaded?(Ash.DataLayer) do
               _ -> value
             end
 
-          {storage_kind, storage_constraints, dumped}
-        else
-          {kind, constraints, value}
-        end
+          fixed? =
+            if Code.ensure_loaded?(kind) and function_exported?(kind, :xitdb_fixed_width?, 1) do
+              kind.xitdb_fixed_width?(constraints)
+            else
+              fixed_width_kind?(storage_kind)
+            end
 
-      {effective_kind,
-       encode_typed_scalar(effective_kind, effective_value, effective_constraints)}
+          {fixed?, encode_typed_scalar(storage_kind, dumped, storage_constraints)}
+
+        true ->
+          {fixed_width_kind?(kind), encode_typed_scalar(kind, value, constraints)}
+      end
     end
 
     @canonical_kinds [
       :integer,
+      :unsigned_integer,
       :string,
       :binary,
       :ci_string,
@@ -857,6 +904,16 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
     defp encode_typed_scalar(:integer, val, _constraints) when is_integer(val),
       do: encode_i64_be(val)
+
+    defp encode_typed_scalar(
+           :unsigned_integer,
+           {:tagged, "u8", <<val::unsigned-big-64>>},
+           _constraints
+         ),
+         do: Key.encode_u64_be(val)
+
+    defp encode_typed_scalar(:unsigned_integer, val, _constraints) when is_integer(val),
+      do: Key.encode_u64_be(val)
 
     defp encode_typed_scalar(:boolean, false, _constraints), do: <<0x00>>
     defp encode_typed_scalar(:boolean, true, _constraints), do: <<0x01>>
@@ -938,6 +995,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     defp fixed_width_kind?(kind) do
       kind in [
         :integer,
+        :unsigned_integer,
         :boolean,
         :float,
         :utc_datetime,
@@ -1002,6 +1060,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     end
 
     defp canonical_kind(Ash.Type.Integer), do: :integer
+    defp canonical_kind(Xitdb.Ash.Types.UnsignedInteger), do: :unsigned_integer
     defp canonical_kind(Ash.Type.String), do: :string
     defp canonical_kind(Ash.Type.Binary), do: :binary
     defp canonical_kind(Ash.Type.CiString), do: :ci_string
@@ -1030,6 +1089,10 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     defp materialize_cursor_term(val)
          when is_binary(val) or is_number(val) or is_boolean(val) or is_nil(val) do
       val
+    end
+
+    defp materialize_cursor_term({:tagged, <<_, _>> = tag, payload}) when is_binary(payload) do
+      {:tagged, :binary.copy(tag), :binary.copy(payload)}
     end
 
     defp materialize_cursor_term(val) when is_list(val) do
@@ -1092,19 +1155,6 @@ if Code.ensure_loaded?(Ash.DataLayer) do
             Enum.map(items, &materialize_cursor_term/1)
           end
       end
-    end
-
-    defp strip_trailing_zeros([0]), do: [0]
-
-    defp strip_trailing_zeros(digits) do
-      digits
-      |> Enum.reverse()
-      |> Enum.drop_while(&(&1 == 0))
-      |> Enum.reverse()
-    end
-
-    defp invert_bytes(bin) do
-      for <<b::unsigned-8 <- bin>>, into: <<>>, do: <<Bitwise.bxor(b, 0xFF)::unsigned-8>>
     end
   end
 end

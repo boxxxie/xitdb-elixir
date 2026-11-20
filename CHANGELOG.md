@@ -2,6 +2,33 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.1.0] - 2026-11-19
+
+### Added
+- **Transparent Value Compression & Content-Addressed Interning (`Xitdb.Compression`):**
+  - Added transparent `format_tag` codecs (`"cz"` zlib deflate, `"zs"` zstd, `"zd"` dictionary-assisted via `__dicts`, and `"bp"` content-addressed `__blobs` deduplication) with automatic shrink guards and `max_decompressed_bytes` enforcement across `materialize/2`, `select/3`, `pull/3`, `diff_moments/4`, `history_of/3`, and cooperative Datalog batch decoding (`nif_query_datalog/6`).
+  - Added `Xitdb.Compression.Dictionary` (`train_dictionary/2`, `put/4`, `get/2`, `train_and_put/4`) and supervised `Xitdb.CacheOwner` (`Xitdb.Application`) owning `:xitdb_page_cache` and `:xitdb_dict_cache` ETS tables.
+- **Parquet-Style Columnar Row-Group Pages (`Xitdb.Columnar`, `Xitdb.Columnar.Page`):**
+  - Added `"XCP1"` row-group column pages (`:plain_block`, `:dict_rle`, `:dict_block`), compact `"pg"` pointers, `O(1)` row slicing, zero-page-read metadata projections, and bounded LRU `:xitdb_page_cache` caching.
+  - Added Ash `compress` Spark DSL support (`Xitdb.Ash.Dsl`, `Xitdb.Ash.Compress`, `Xitdb.Ash.Mutator`, `Xitdb.Ash.Query`) with pre-compression BM25 tokenization and selective hydration.
+- **Online GC Compaction (`Xitdb.compact/2`, `Core_Overlay`):**
+  - Added zero-copy `Core_Overlay` GC compaction pruning unreachable `__blobs`, `__dicts`, and `__col_pages` entries on `Xitdb.compact/2` while keeping source handles intact.
+- **Typed Codecs & Ash Domain Types (`Xitdb.Key`, `Xitdb.Encoder`, `FixedDecimal64`, `RangedUnit`):**
+  - Added `Xitdb.Key` and `Xitdb.Encoder` protocols, unsigned `u64` support, `Xitdb.Ash.Types.FixedDecimal64`, and `Xitdb.Ash.Types.RangedUnit` with B+Tree interval decomposition.
+- **Coverage-Guided Fuzzing & Toolchain Support:**
+  - Integrated `ExFuzz` coverage-guided fuzz suites (`test/fuzz/*`) with persisted corpus fixtures (`test/fixtures/fuzz/`).
+  - Updated toolchain and CI matrix to Elixir `1.20.5` and Erlang/OTP `29.1.2`.
+
+### Changed
+- **Underlying `odin-xitdb` & NIF Traversal:** Synced `native/xitdb-odin` (`bd20160`), deduplicated pre-hashed `history_of` traversal, refreshed 1v1 client benchmarks, and updated `README.md`, HexDocs, and guide indexes.
+
+### Fixed
+- **Compression, Columnar & NIF Hardening:**
+  - Supervised `:xitdb_page_cache` and `:xitdb_dict_cache` under `Xitdb.CacheOwner` with atomic bounded eviction, copied decoded `Page` subbinaries via `:binary.copy/1`, rejected empty/oversized dictionary names, and dropped stale shared `:dictionary_bytes` on per-column overrides.
+  - Separated `prepare_list/6` from `prepare_kv_list/6` so `{:compressed, bin}` 2-tuples in lists, `array_list`, and `linked_list` rewrite cleanly; freed corrupt zlib buffers in `decode_cz_bytes`; replaced `transmute` with `u64` cast in `nif_dl_make_cache_key`; and propagated `:max_decompressed_bytes` plus `history_of(..., raw_tagged: true)`.
+- **Ash Query, Mutator & `RangedUnit` Hardening:**
+  - Normalized columnar bulk errors into `Ash.Error.Changes.InvalidAttribute`, hydrated `filter`/`sort`/`distinct` calculation dependencies cleanly, initialized synthetic query calculations via `Ash.Query.Calculation.from_resource_calculation/3` and `has_expression?/1`, validated exact `RangedUnit` bounds, and supported partial existing suffix prefixes in `RangedUnit.to_indexed_fields/2,3`.
+
 ## [2.0.1] - 2026-11-16
 
 ### Changed

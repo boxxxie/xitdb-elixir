@@ -121,3 +121,51 @@ use Xitdb.DSL
 db["orders"]["ord-1"]["total"]
 # => {:tagged, "dc", "199.95"}
 ```
+
+---
+
+## 5. Order-Preserving Binary Range Keys (`Xitdb.Key`)
+
+Because `:sorted_map` sorts keys lexicographically by raw unsigned bytes, store numeric range keys using `Xitdb.Key` encoders so `<, <=, ==, >=, >` order is preserved across negative, zero, positive, and `> max(i64)` values:
+
+- `Xitdb.Key.encode_i64_be/1` / `decode_i64_be/1` — 8-byte sign-flipped big-endian signed `i64`
+- `Xitdb.Key.encode_u64_be/1` / `decode_u64_be/1` — 8-byte big-endian unsigned `u64` (`0..18_446_744_073_709_551_615`)
+- `Xitdb.Key.encode_f64_be/1` — 8-byte order-preserving IEEE-754 `f64` (`-0.0` normalized to `+0.0`)
+- `Xitdb.Key.encode_decimal_key/1` — variable-length canonical scale-invariant `Decimal` key
+- `Xitdb.Key.encode_fixed_decimal64_be/2` / `decode_fixed_decimal64_be/2` — 8-byte fixed-scale `Decimal` key (`[scale: 10_000, signed?: true]`)
+- `Xitdb.Key.stream_range/2` — lazy `O(log N + K)` B+Tree range scanner over `:sorted_map` cursors via `nif_sorted_map_seek` (`:prefix`, `:min`, `:min_inclusive?`, `:max`, `:max_inclusive?`, `:page_size`)
+
+```elixir
+max_i64 = 9_223_372_036_854_775_807
+
+{:ok, db} =
+  Xitdb.transact(db, %{
+    "offsets" =>
+      Xitdb.sorted_map([
+        {Xitdb.Key.encode_u64_be(10), "small"},
+        {Xitdb.Key.encode_u64_be(max_i64 + 1), "large"}
+      ])
+  })
+
+Xitdb.db(db)["offsets"]
+|> Xitdb.Key.stream_range(min: Xitdb.Key.encode_u64_be(max_i64), min_inclusive?: false)
+|> Enum.map(fn {k, v} -> {Xitdb.Key.decode_u64_be(k), v} end)
+# => [{9_223_372_036_854_775_808, "large"}]
+```
+
+---
+
+## 6. Automatic Struct Serialization (`Xitdb.Encoder`)
+
+`Xitdb.Encoder` lets Elixir structs encode automatically across `Xitdb.transact/3`, `put_in/3` / `update_in/3`, `Xitdb.insert_at/4`, and `Xitdb.DSL.tx` blocks. Built-in implementations cover:
+
+| Struct | Encoded Term |
+| :--- | :--- |
+| `%Decimal{}` *(when `Decimal` is loaded)* | `{:tagged, "dc", Decimal.to_string(dec, :normal)}` |
+| `%Date{}` | `{:tagged, "dt", Date.to_iso8601(d)}` |
+| `%Time{}` | `{:tagged, "tm", Time.to_iso8601(t)}` |
+| `%DateTime{}` | `{:tagged, "ts", <<DateTime.to_unix(dt, :microsecond)::signed-big-64>>}` |
+| `%NaiveDateTime{}` | `{:tagged, "nt", NaiveDateTime.to_iso8601(ndt)}` |
+| `%Xitdb.Ash.Types.RangedUnit{}` | Compact `%{"b" => ..., "d" => ..., ...}` interval map |
+
+Implement `defimpl Xitdb.Encoder, for: MyStruct` to return any writeable map, list, scalar, `{:tagged, tag, binary}`, or nested encodable struct. Unimplemented structs continue to raise `Protocol.UndefinedError` (normalized to `{:error, %Xitdb.Error{reason: :transaction_exception}}` inside transactions).

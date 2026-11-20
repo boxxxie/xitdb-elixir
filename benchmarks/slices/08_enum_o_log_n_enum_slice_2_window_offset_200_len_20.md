@@ -8,9 +8,9 @@
 
 | Metric | Elixir NIF Wrapper | Raw Odin Baseline | Comparison |
 | :--- | ---: | ---: | ---: |
-| **Median (`ns/op`)** | 3.05 µs (3046.0 ns) | 1.61 µs (1614.0 ns) | **`1.89x`** NIF Ratio |
-| **Mean ± σ (CV)** | 3.07 µs ± 161.4 ns (5.3%) | 1.63 µs ± 32.6 ns (2.0%) | Welch `z` = `19.57` |
-| **p95 / Max (`ns/op`)** | 3.29 µs / 3.35 µs | 1.68 µs / 1.68 µs | `5` vs `5` pooled samples |
+| **Median (`ns/op`)** | 3.05 µs (3054.0 ns) | 1.77 µs (1772.0 ns) | **`1.72x`** NIF Ratio |
+| **Mean ± σ (CV)** | 3.04 µs ± 49.2 ns (1.6%) | 1.83 µs ± 99.4 ns (5.4%) | Welch `z` = `24.35` |
+| **p95 / Max (`ns/op`)** | 3.09 µs / 3.09 µs | 1.95 µs / 1.96 µs | `5` vs `5` pooled samples |
 
 ## Benchmark Harnesses (Elixir vs. Raw Odin)
 
@@ -27,7 +27,7 @@
        end},
 ```
 
-### Raw Odin Harness ([`bench_client.odin#L984-L1003`](../bench_client.odin#L984-L1003))
+### Raw Odin Harness ([`bench_client.odin#L991-L1010`](../bench_client.odin#L991-L1010))
 
 ```odin
 	// #8: O(log N) Enum.slice window
@@ -55,7 +55,7 @@
 ## Elixir Wrapper & NIF Bridge
 
 <details>
-<summary>Elixir <code>slice</code> — <a href="../../lib/xitdb/cursor.ex#L2690-L2752">lib/xitdb/cursor.ex#L2690-L2752</a></summary>
+<summary>Elixir <code>slice</code> — <a href="../../lib/xitdb/cursor.ex#L2778-L2840">lib/xitdb/cursor.ex#L2778-L2840</a></summary>
 
 ```elixir
   def slice(%Cursor{} = raw_cursor) do
@@ -126,7 +126,7 @@
 </details>
 
 <details>
-<summary>NIF <code>odin_nif_slot_slice</code> — <a href="../../native/xitdb_nif.odin#L1393-L1529">native/xitdb_nif.odin#L1393-L1529</a></summary>
+<summary>NIF <code>odin_nif_slot_slice</code> — <a href="../../native/xitdb_nif.odin#L1438-L1574">native/xitdb_nif.odin#L1438-L1574</a></summary>
 
 ```odin
 odin_nif_slot_slice :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {
@@ -271,7 +271,7 @@ odin_nif_slot_slice :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_T
 </details>
 
 <details>
-<summary>NIF <code>sorted_map_tx_rank</code> — <a href="../../native/xitdb_nif.odin#L1376-L1390">native/xitdb_nif.odin#L1376-L1390</a></summary>
+<summary>NIF <code>sorted_map_tx_rank</code> — <a href="../../native/xitdb_nif.odin#L1421-L1435">native/xitdb_nif.odin#L1421-L1435</a></summary>
 
 ```odin
 sorted_map_tx_rank :: proc(cur: xitdb.Read_Cursor) -> (has_tx: bool, rank: i64, err: xitdb.Error) {
@@ -294,7 +294,7 @@ sorted_map_tx_rank :: proc(cur: xitdb.Read_Cursor) -> (has_tx: bool, rank: i64, 
 </details>
 
 <details>
-<summary>NIF <code>slot_to_term</code> — <a href="../../native/xitdb_nif.odin#L354-L429">native/xitdb_nif.odin#L354-L429</a></summary>
+<summary>NIF <code>slot_to_term</code> — <a href="../../native/xitdb_nif.odin#L353-L434">native/xitdb_nif.odin#L353-L434</a></summary>
 
 ```odin
 slot_to_term :: proc(env: ErlNifEnv, db: ^xitdb.Database, slot: xitdb.Slot) -> (res: ERL_NIF_TERM, err: xitdb.Error) {
@@ -333,12 +333,18 @@ slot_to_term :: proc(env: ErlNifEnv, db: ^xitdb.Database, slot: xitdb.Slot) -> (
 			val_size = validate_bytes_slot_bounds(db, slot) or_return
 		}
 		if slot.full {
-			stack_buf: [128]u8 = ---
-			obj, buf_err := xitdb.cursor_read_bytes_buf(cur, stack_buf[:])
-			if buf_err != nil {
-				if buf_err != xitdb.Xitdb_Error.Stream_Too_Long {
+			obj: xitdb.Bytes
+			if slot.tag == .Short_Bytes || val_size <= 128 {
+				stack_buf: [128]u8 = ---
+				buf_obj, buf_err := xitdb.cursor_read_bytes_buf(cur, stack_buf[:])
+				if buf_err == nil {
+					obj = buf_obj
+				} else if buf_err != xitdb.Xitdb_Error.Stream_Too_Long {
 					return ATOM_NIL, buf_err
+				} else {
+					obj = xitdb.cursor_read_bytes_object(cur, 0, context.temp_allocator) or_return
 				}
+			} else {
 				obj = xitdb.cursor_read_bytes_object(cur, 0, context.temp_allocator) or_return
 			}
 			if len(obj.format_tag) == 2 && obj.format_tag[0] == 'b' && obj.format_tag[1] == 'l' {
@@ -378,7 +384,7 @@ slot_to_term :: proc(env: ErlNifEnv, db: ^xitdb.Database, slot: xitdb.Slot) -> (
 </details>
 
 <details>
-<summary>NIF <code>push_nif_term</code> — <a href="../../native/xitdb_nif.odin#L491-L510">native/xitdb_nif.odin#L491-L510</a></summary>
+<summary>NIF <code>push_nif_term</code> — <a href="../../native/xitdb_nif.odin#L496-L515">native/xitdb_nif.odin#L496-L515</a></summary>
 
 ```odin
 push_nif_term :: proc(
@@ -406,7 +412,7 @@ push_nif_term :: proc(
 </details>
 
 <details>
-<summary>NIF <code>read_key_cursor_string</code> — <a href="../../native/xitdb_nif.odin#L435-L463">native/xitdb_nif.odin#L435-L463</a></summary>
+<summary>NIF <code>read_key_cursor_string</code> — <a href="../../native/xitdb_nif.odin#L440-L468">native/xitdb_nif.odin#L440-L468</a></summary>
 
 ```odin
 read_key_cursor_string :: proc(cur: xitdb.Read_Cursor, sb_buf: []u8) -> (s: string, err: xitdb.Error) {
@@ -443,7 +449,7 @@ read_key_cursor_string :: proc(cur: xitdb.Read_Cursor, sb_buf: []u8) -> (s: stri
 </details>
 
 <details>
-<summary>NIF <code>make_list_from_term_buf</code> — <a href="../../native/xitdb_nif.odin#L512-L526">native/xitdb_nif.odin#L512-L526</a></summary>
+<summary>NIF <code>make_list_from_term_buf</code> — <a href="../../native/xitdb_nif.odin#L517-L531">native/xitdb_nif.odin#L517-L531</a></summary>
 
 ```odin
 make_list_from_term_buf :: proc(
@@ -466,7 +472,7 @@ make_list_from_term_buf :: proc(
 </details>
 
 <details>
-<summary>NIF <code>validate_bytes_slot_bounds</code> — <a href="../../native/xitdb_nif.odin#L335-L352">native/xitdb_nif.odin#L335-L352</a></summary>
+<summary>NIF <code>validate_bytes_slot_bounds</code> — <a href="../../native/xitdb_nif.odin#L334-L351">native/xitdb_nif.odin#L334-L351</a></summary>
 
 ```odin
 validate_bytes_slot_bounds :: proc(db: ^xitdb.Database, slot: xitdb.Slot) -> (val_size: i64, err: xitdb.Error) {
@@ -492,7 +498,7 @@ validate_bytes_slot_bounds :: proc(db: ^xitdb.Database, slot: xitdb.Slot) -> (va
 </details>
 
 <details>
-<summary>NIF <code>safe_cursor_read_string</code> — <a href="../../native/xitdb_nif.odin#L465-L471">native/xitdb_nif.odin#L465-L471</a></summary>
+<summary>NIF <code>safe_cursor_read_string</code> — <a href="../../native/xitdb_nif.odin#L470-L476">native/xitdb_nif.odin#L470-L476</a></summary>
 
 ```odin
 safe_cursor_read_string :: proc(cur: xitdb.Read_Cursor, allocator: mem.Allocator) -> (s: string, err: xitdb.Error) {
@@ -509,7 +515,7 @@ safe_cursor_read_string :: proc(cur: xitdb.Read_Cursor, allocator: mem.Allocator
 ## Reachable `xitdb` Core Procedures
 
 <details>
-<summary><code>xitdb.cursor_iterator_array_list_from_index</code> — <a href="../../native/xitdb-odin/xitdb/cursor.odin#L1102-L1136">cursor.odin#L1102-L1136</a></summary>
+<summary><code>xitdb.cursor_iterator_array_list_from_index</code> — <a href="../../native/xitdb-odin/xitdb/cursor.odin#L1157-L1194">cursor.odin#L1157-L1194</a></summary>
 
 ```odin
 cursor_iterator_array_list_from_index :: proc(unresolved_cursor: Read_Cursor, start_index: i64) -> (res: Cursor_Iterator, err: Error) {
@@ -533,6 +539,9 @@ cursor_iterator_array_list_from_index :: proc(unresolved_cursor: Read_Cursor, st
 	pos := header.ptr
 	sh := shift
 	for {
+		if res.stack_len >= ITERATOR_STACK_SIZE {
+			return {}, .Max_Shift_Exceeded
+		}
 		i := int((idx >> (u64(sh) * BIT_COUNT)) & i64(MASK))
 		level := &res.stack[res.stack_len]
 		_fill_slot_block_from(cursor, pos, i, SLOT_COUNT, level) or_return
@@ -552,7 +561,7 @@ cursor_iterator_array_list_from_index :: proc(unresolved_cursor: Read_Cursor, st
 </details>
 
 <details>
-<summary><code>xitdb.cursor_iterator_next</code> — <a href="../../native/xitdb-odin/xitdb/cursor.odin#L1535-L1556">cursor.odin#L1535-L1556</a></summary>
+<summary><code>xitdb.cursor_iterator_next</code> — <a href="../../native/xitdb-odin/xitdb/cursor.odin#L1614-L1635">cursor.odin#L1614-L1635</a></summary>
 
 ```odin
 cursor_iterator_next :: proc(it: ^Cursor_Iterator) -> (res: Maybe(Read_Cursor), err: Error) {
@@ -594,7 +603,7 @@ cursor_read_string :: proc(c: Read_Cursor, max_size: i64 = 0, allocator := conte
 </details>
 
 <details>
-<summary><code>xitdb.cursor_iterator_linked_array_list_from_index</code> — <a href="../../native/xitdb-odin/xitdb/cursor.odin#L1138-L1198">cursor.odin#L1138-L1198</a></summary>
+<summary><code>xitdb.cursor_iterator_linked_array_list_from_index</code> — <a href="../../native/xitdb-odin/xitdb/cursor.odin#L1196-L1259">cursor.odin#L1196-L1259</a></summary>
 
 ```odin
 cursor_iterator_linked_array_list_from_index :: proc(unresolved_cursor: Read_Cursor, start_index: i64) -> (res: Cursor_Iterator, err: Error) {
@@ -617,6 +626,9 @@ cursor_iterator_linked_array_list_from_index :: proc(unresolved_cursor: Read_Cur
 	node_ptr := header.root_ptr
 	rem := idx
 	for {
+		if res.stack_len >= ITERATOR_STACK_SIZE {
+			return {}, .Max_Shift_Exceeded
+		}
 		header_bytes: [BTREE_NODE_HEADER_SIZE]u8 = ---
 		core_read_exact_at(cursor.db.core, node_ptr, header_bytes[:]) or_return
 		kind_int := header_bytes[0]
@@ -624,7 +636,7 @@ cursor_iterator_linked_array_list_from_index :: proc(unresolved_cursor: Read_Cur
 			return {}, .Invalid_BTree_Node_Kind
 		}
 		num := int(header_bytes[1])
-		if num > BTREE_SLOT_COUNT {
+		if num > BTREE_SLOT_COUNT || (BTree_Node_Kind(kind_int) == .Branch && num == 0) {
 			return {}, .Invalid_BTree_Node
 		}
 		position := node_ptr + BTREE_NODE_HEADER_SIZE
@@ -663,7 +675,7 @@ cursor_iterator_linked_array_list_from_index :: proc(unresolved_cursor: Read_Cur
 </details>
 
 <details>
-<summary><code>xitdb.cursor_iterator_sorted_from_index</code> — <a href="../../native/xitdb-odin/xitdb/cursor.odin#L949-L1008">cursor.odin#L949-L1008</a></summary>
+<summary><code>xitdb.cursor_iterator_sorted_from_index</code> — <a href="../../native/xitdb-odin/xitdb/cursor.odin#L998-L1060">cursor.odin#L998-L1060</a></summary>
 
 ```odin
 cursor_iterator_sorted_from_index :: proc(unresolved_cursor: Read_Cursor, start_index: i64) -> (res: Cursor_Iterator, err: Error) {
@@ -685,6 +697,9 @@ cursor_iterator_sorted_from_index :: proc(unresolved_cursor: Read_Cursor, start_
 	node_ptr := header.root_ptr
 	rem := idx
 	for {
+		if res.stack_len >= ITERATOR_STACK_SIZE {
+			return {}, .Max_Shift_Exceeded
+		}
 		header_bytes: [BTREE_NODE_HEADER_SIZE]u8 = ---
 		core_read_exact_at(cursor.db.core, node_ptr, header_bytes[:]) or_return
 		kind_int := header_bytes[0]
@@ -692,7 +707,7 @@ cursor_iterator_sorted_from_index :: proc(unresolved_cursor: Read_Cursor, start_
 			return {}, .Invalid_BTree_Node_Kind
 		}
 		num := int(header_bytes[1])
-		if num > BTREE_SLOT_COUNT {
+		if num > BTREE_SLOT_COUNT || (BTree_Node_Kind(kind_int) == .Branch && num == 0) {
 			return {}, .Invalid_BTree_Node
 		}
 		position := node_ptr + BTREE_NODE_HEADER_SIZE
@@ -743,13 +758,13 @@ cursor_slot :: proc(c: Read_Cursor) -> (res: Slot, err: Error) {
 </details>
 
 <details>
-<summary><code>xitdb.cursor_read_kv_pair_slots</code> — <a href="../../native/xitdb-odin/xitdb/cursor.odin#L381-L402">cursor.odin#L381-L402</a></summary>
+<summary><code>xitdb.cursor_read_kv_pair_slots</code> — <a href="../../native/xitdb-odin/xitdb/cursor.odin#L404-L425">cursor.odin#L404-L425</a></summary>
 
 ```odin
 cursor_read_kv_pair_slots :: proc(c: Read_Cursor) -> (key_cursor: Read_Cursor, value_cursor: Read_Cursor, err: Error) {
 	slot_ptr := cursor_resolved(c) or_return
 	if is_key_only_entry(slot_ptr.slot) {
-		return Read_Cursor{slot_ptr = Slot_Pointer{position = nil, slot = slot_ptr.slot}, db = c.db, frozen_at = c.frozen_at},
+		return Read_Cursor{slot_ptr = Slot_Pointer{position = slot_ptr.position, slot = slot_ptr.slot}, db = c.db, frozen_at = c.frozen_at},
 			Read_Cursor{slot_ptr = Slot_Pointer{position = nil, slot = Slot{}}, db = c.db, frozen_at = c.frozen_at},
 			nil
 	}
@@ -773,7 +788,7 @@ cursor_read_kv_pair_slots :: proc(c: Read_Cursor) -> (key_cursor: Read_Cursor, v
 </details>
 
 <details>
-<summary><code>xitdb.cursor_iterator_sorted_from_key</code> — <a href="../../native/xitdb-odin/xitdb/cursor.odin#L1010-L1100">cursor.odin#L1010-L1100</a></summary>
+<summary><code>xitdb.cursor_iterator_sorted_from_key</code> — <a href="../../native/xitdb-odin/xitdb/cursor.odin#L1062-L1155">cursor.odin#L1062-L1155</a></summary>
 
 ```odin
 cursor_iterator_sorted_from_key :: proc(unresolved_cursor: Read_Cursor, start_key: []u8) -> (res: Cursor_Iterator, err: Error) {
@@ -791,6 +806,9 @@ cursor_iterator_sorted_from_key :: proc(unresolved_cursor: Read_Cursor, start_ke
 	node_ptr := header.root_ptr
 	before: i64 = 0
 	for {
+		if res.stack_len >= ITERATOR_STACK_SIZE {
+			return {}, .Max_Shift_Exceeded
+		}
 		header_bytes: [BTREE_NODE_HEADER_SIZE]u8 = ---
 		core_read_exact_at(cursor.db.core, node_ptr, header_bytes[:]) or_return
 		kind_int := header_bytes[0]
@@ -798,7 +816,7 @@ cursor_iterator_sorted_from_key :: proc(unresolved_cursor: Read_Cursor, start_ke
 			return {}, .Invalid_BTree_Node_Kind
 		}
 		num := int(header_bytes[1])
-		if num > BTREE_SLOT_COUNT {
+		if num > BTREE_SLOT_COUNT || (BTree_Node_Kind(kind_int) == .Branch && num == 0) {
 			return {}, .Invalid_BTree_Node
 		}
 		position := node_ptr + BTREE_NODE_HEADER_SIZE
@@ -920,7 +938,7 @@ cursor_read_float :: proc(c: Read_Cursor) -> (res: f64, err: Error) {
 </details>
 
 <details>
-<summary><code>xitdb.cursor_read_bytes_buf</code> — <a href="../../native/xitdb-odin/xitdb/cursor.odin#L294-L359">cursor.odin#L294-L359</a></summary>
+<summary><code>xitdb.cursor_read_bytes_buf</code> — <a href="../../native/xitdb-odin/xitdb/cursor.odin#L305-L381">cursor.odin#L305-L381</a></summary>
 
 ```odin
 cursor_read_bytes_buf :: proc(c: Read_Cursor, buffer: []u8) -> (res: Bytes, err: Error) {
@@ -933,12 +951,23 @@ cursor_read_bytes_buf :: proc(c: Read_Cursor, buffer: []u8) -> (res: Bytes, err:
 		return {}, .End_Of_Stream
 
 	case .Bytes:
+		if slot_ptr.slot.value < 0 {
+			return {}, .Expected_Unsigned_Long
+		}
 		value_size := core_read_long_at(c.db.core, slot_ptr.slot.value) or_return
+		if value_size < 0 {
+			return {}, .Expected_Unsigned_Long
+		}
 		if value_size > i64(len(buffer)) {
 			return {}, .Stream_Too_Long
 		}
+		extra: i64 = 10 if slot_ptr.slot.full else 8
+		core_len := core_length(c.db.core) or_return
+		if slot_ptr.slot.value > core_len || extra > core_len - slot_ptr.slot.value || value_size > core_len - slot_ptr.slot.value - extra {
+			return {}, Xitdb_Error.Unexpected_EOF
+		}
 		if slot_ptr.slot.full {
-			if value_size + 2 <= i64(len(buffer)) {
+			if value_size <= i64(len(buffer)) - 2 {
 				combined := buffer[:value_size + 2]
 				core_read_exact_at(c.db.core, slot_ptr.slot.value + 8, combined) or_return
 				return Bytes{

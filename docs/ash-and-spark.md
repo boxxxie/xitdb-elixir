@@ -265,8 +265,69 @@ Use `Xitdb.Ash.Info` to inspect resource configuration at runtime or compile tim
 - `Xitdb.Ash.Info.references/1`
 - `Xitdb.Ash.Info.counted_set_fields/1`
 - `Xitdb.Ash.Info.nested_in/1` / `nested?/1`
+- `Xitdb.Ash.Info.compression_configs/1` / `compression_for_field/2`
 
 At compile time, Spark runs:
 1. **`Xitdb.Ash.Transformers.BuildIndexPlan`** — validates `store`, `collection`, primary keys, `nested_in`, explicit/auto-`belongs_to` `index`es, `counted_set_fields`, and `search_field`s, generating `__xitdb_store__/0`, `__xitdb_collection__/0`, and `__xitdb_indexes__/0`.
 2. **`Xitdb.Ash.Verifiers.VerifyNoSqlFragments`** — rejects SQL `fragment(...)` calls across calculations, policies, validations, and identities.
 3. **`Xitdb.Ash.Verifiers.VerifyCrossStoreReferences`** — rejects cross-store `on_delete` cascades (`:delete`, `:nilify`, `:restrict`) and cross-store `nested_in` targets.
+
+---
+
+## 8. Domain Datatypes & Custom Range Indexes
+
+`Xitdb.Ash` provides built-in `Ash.Type`s and codec extension hooks for fixed-point finance metrics, full unsigned 64-bit integers (`> max(i64)`), interval ranges, and tagged binaries:
+
+- **`Xitdb.Ash.Types.UnsignedInteger`** (`storage_type: :unsigned_integer`): supports `0..18_446_744_073_709_551_615`, storing `0..9_223_372_036_854_775_807` as native integer slots and values exceeding signed `max(i64)` as `{:tagged, "u8", <<val::unsigned-big-64>>}`, while indexing all values with 8-byte `Xitdb.Key.encode_u64_be/1` B+Tree keys.
+- **`Xitdb.Ash.Types.FixedDecimal64`**: `%Decimal{}` runtime values backed by fixed-scale 64-bit integer slots (`scale:` positive power of 10, default `10_000`; `signed?: true | false`; `representation: :integer | :tagged` using `{:tagged, "d6", <<...>>}`), indexed via 8-byte `Xitdb.Key.encode_fixed_decimal64_be/2` keys.
+- **`Xitdb.Ash.Types.RangedUnit`**: domain interval struct (`bound_kind`, `dimension`, `currency`, `min_val`, `max_val`) stored as a compact string-keyed map, exposing `to_indexed_fields/2,3` (`min_d64`, `max_d64`, `bound`, `unit`, with optional `:prefix` and `unbounded: :sentinel`) for B+Tree overlap queries and `overlaps?/2` for exact boundary comparisons.
+- **Custom `Ash.Type` Index Hooks**: implement `xitdb_index_key(value, constraints) :: binary()` (and optional `xitdb_fixed_width?(constraints) :: boolean()`) on any custom `Ash.Type` module to control how `Xitdb.Ash.Codec` encodes single and composite B+Tree keys, plus return `{:tagged, <<a, b>>, binary}` directly from `dump_to_native/2` / `dump_to_embedded/2`.
+
+> [!NOTE]
+> Native Odin Datalog comparisons (`<`, `>`, `<=`, `>=` in `Xitdb.DSL.query`) compare un-tagged `i64`/`f64`/`string` fields inside `native/xitdb-odin`, whereas `Ash.Query` + `Xitdb.Ash.Indexer.scan_secondary_range/5` handle both `u64 > max(i64)` and `:tagged`-backed `FixedDecimal64` attributes in Elixir using `Xitdb.Key`.
+
+---
+
+## 9. Declarative Payload Compression (`compress`)
+
+Declare `compress` inside `xitdb do ... end` (`Xitdb.Ash.Dsl`) to store large email bodies, headers, and attachments using `:value` codecs (`:zstd` / `:zlib`, optional `intern_above:` deduplication in `__blobs`) or Parquet-style `:row_group` columnar pages on `Ash.bulk_create!`:
+
+```elixir
+defmodule MyApp.CRM.EmailActivity do
+  use Ash.Resource,
+    domain: MyApp.CRM,
+    data_layer: Xitdb.Ash.DataLayer
+
+  xitdb do
+    store MyApp.AppStore
+    collection :email_activities
+
+    compress [:body, :html_edit_body],
+      mode: :row_group,
+      row_group_size: 128,
+      codec: :zstd,
+      encoding: :dict_block,
+      dictionary: :email_html
+
+    compress [:header_properties],
+      mode: :row_group,
+      row_group_size: 128,
+      encoding: :dict_rle
+
+    compress :attachment_blob,
+      mode: :value,
+      codec: :zstd,
+      intern_above: 4096
+
+    search_field :title, boost: 3.0
+    search_field :body, boost: 2.0
+  end
+  # ...
+end
+```
+
+Key operational guarantees:
+- **Shared dictionaries on a Store**: call `Xitdb.Compression.Dictionary.train_and_put(MyApp.AppStore, :email_html, sample_bodies)` inside store startup/backfill to seed `.__dicts.email_html`.
+- **BM25 Search Compatibility**: `idx.search` tokenizes plaintext attribute values **before** compression or page packing, so `Xitdb.Ash.Search.query/3` works without scanning or decompressing body blobs.
+- **Zero-Decompression `select`**: when a query specifies `Ash.Query.select([:id, :title])`, `Xitdb.Ash.Query` hydrates only needed attributes and leaves unselected compressed attributes as `%Ash.NotLoaded{}`—performing `0` page reads and `0` decompressions.
+- **Atomic `create`/`update` History**: single-record writes and updates compress individual attributes atomically while preserving earlier `Xitdb.Columnar` row-group pages across `Store.with_as_of/3` snapshots.

@@ -1,7 +1,7 @@
 defmodule Xitdb.MixProject do
   use Mix.Project
 
-  @version "2.0.1"
+  @version "2.1.0"
   @source_url "https://github.com/boxxxie/xitdb-elixir"
 
   def project do
@@ -22,19 +22,25 @@ defmodule Xitdb.MixProject do
       source_url: @source_url,
       homepage_url: @source_url,
       package: package(),
-      docs: docs()
+      docs: docs(),
+      ex_fuzz: [
+        corpus_dir: "test/fixtures/fuzz",
+        cache_dir: "_build/ex_fuzz/corpus",
+        crash_dump_dir: "_build/ex_fuzz"
+      ]
     ]
   end
 
   def application do
     [
-      extra_applications: [:logger]
+      extra_applications: [:logger],
+      mod: {Xitdb.Application, []}
     ]
   end
 
   def cli do
     [
-      preferred_envs: [precommit: :test]
+      preferred_envs: [precommit: :test, fuzz: :test]
     ]
   end
 
@@ -50,6 +56,7 @@ defmodule Xitdb.MixProject do
       {:ash_phoenix, "~> 2.1", only: :test},
       {:simple_sat, "~> 0.1", only: :test},
       {:stream_data, "~> 1.1", optional: true},
+      {:ex_fuzz, "~> 0.1.0", only: [:dev, :test]},
       {:ex_doc, "~> 0.35", only: :dev, runtime: false}
     ]
   end
@@ -107,7 +114,15 @@ defmodule Xitdb.MixProject do
           Xitdb,
           Xitdb.Cursor,
           Xitdb.Collection,
+          Xitdb.Key,
+          Xitdb.Encoder,
           Xitdb.Error
+        ],
+        "Compression & Columnar Storage": [
+          Xitdb.Compression,
+          Xitdb.Compression.Dictionary,
+          Xitdb.Columnar,
+          Xitdb.Columnar.Page
         ],
         "DSLs, Pull & Sigils": [
           Xitdb.DSL,
@@ -122,9 +137,13 @@ defmodule Xitdb.MixProject do
           Xitdb.Ash.TestSandbox,
           Xitdb.Ash.Info,
           Xitdb.Ash.Tx,
+          Xitdb.Ash.Types.UnsignedInteger,
+          Xitdb.Ash.Types.FixedDecimal64,
+          Xitdb.Ash.Types.RangedUnit,
           Xitdb.Ash.LeaseError
         ],
         "Ash DSL Entities & Internals": [
+          Xitdb.Ash.Compress,
           Xitdb.Ash.Index,
           Xitdb.Ash.SearchField,
           Xitdb.Ash.Reference,
@@ -215,7 +234,7 @@ defmodule Mix.Tasks.Compile.OdinNif do
             "-build-mode:shared",
             "-out:#{so_path}",
             "-collection:xitdb=#{xitdb_col_dir}",
-            "-extra-linker-flags:#{c_obj}",
+            "-extra-linker-flags:#{c_obj} -lz",
             "-o:speed"
           ],
           stderr_to_stdout: true

@@ -8,9 +8,9 @@
 
 | Metric | Elixir NIF Wrapper | Raw Odin Baseline | Comparison |
 | :--- | ---: | ---: | ---: |
-| **Median (`ns/op`)** | 5.70 µs (5704.0 ns) | 3.82 µs (3821.0 ns) | **`1.49x`** NIF Ratio |
-| **Mean ± σ (CV)** | 5.73 µs ± 92.8 ns (1.6%) | 3.67 µs ± 235.7 ns (6.4%) | Welch `z` = `18.26` |
-| **p95 / Max (`ns/op`)** | 5.86 µs / 5.89 µs | 3.84 µs / 3.85 µs | `5` vs `5` pooled samples |
+| **Median (`ns/op`)** | 4.65 µs (4648.0 ns) | 3.31 µs (3307.0 ns) | **`1.41x`** NIF Ratio |
+| **Mean ± σ (CV)** | 4.77 µs ± 253.7 ns (5.3%) | 3.10 µs ± 431.2 ns (13.9%) | Welch `z` = `7.48` |
+| **p95 / Max (`ns/op`)** | 5.12 µs / 5.21 µs | 3.51 µs / 3.54 µs | `5` vs `5` pooled samples |
 
 ## Benchmark Harnesses (Elixir vs. Raw Odin)
 
@@ -27,7 +27,7 @@
        end},
 ```
 
-### Raw Odin Harness ([`bench_client.odin#L1053-L1068`](../bench_client.odin#L1053-L1068))
+### Raw Odin Harness ([`bench_client.odin#L1060-L1075`](../bench_client.odin#L1060-L1075))
 
 ```odin
 	// #11: Subtree materialize (nested user profile)
@@ -51,7 +51,7 @@
 ## Elixir Wrapper & NIF Bridge
 
 <details>
-<summary>Elixir <code>materialize</code> — <a href="../../lib/xitdb.ex#L549-L589">lib/xitdb.ex#L549-L589</a></summary>
+<summary>Elixir <code>materialize</code> — <a href="../../lib/xitdb.ex#L562-L602">lib/xitdb.ex#L562-L602</a></summary>
 
 ```elixir
   def materialize(%__MODULE__{} = db) do
@@ -66,13 +66,13 @@
 
         cursor.root and cursor.tag_id != -1 and cursor.value == 0 ->
           case NIF.nif_slot_materialize(cursor.db_ref, cursor.tag_id, 0, 0) do
-            {:ok, raw} -> Cursor.unwrap_nif_value(cursor.db_ref, raw, cursor.moment, [])
+            {:ok, raw} -> raw
             {:error, reason} -> raise Error, reason: reason
           end
 
         cursor.root ->
           case NIF.nif_slot_materialize(cursor.db_ref, -1, cursor.moment, 0) do
-            {:ok, raw} -> Cursor.unwrap_nif_value(cursor.db_ref, raw, cursor.moment, [])
+            {:ok, raw} -> raw
             {:error, reason} -> raise Error, reason: reason
           end
 
@@ -80,13 +80,13 @@
           Cursor.resolve_fork_disk_base(cursor) || empty_cursor_default(cursor.tag)
 
         true ->
-          %Cursor{db_ref: db_ref, tag_id: tag_id, value: val, full: full, moment: moment} =
+          %Cursor{db_ref: db_ref, tag_id: tag_id, value: val, full: full} =
             Cursor.ensure_resolved(cursor)
 
           full_int = if full, do: 1, else: 0
 
           case NIF.nif_slot_materialize(db_ref, tag_id, val, full_int) do
-            {:ok, raw} -> Cursor.unwrap_nif_value(db_ref, raw, moment, [])
+            {:ok, raw} -> raw
             {:error, reason} -> raise Error, reason: reason
           end
       end
@@ -100,7 +100,7 @@
 </details>
 
 <details>
-<summary>NIF <code>odin_nif_slot_materialize</code> — <a href="../../native/xitdb_nif.odin#L1586-L1634">native/xitdb_nif.odin#L1586-L1634</a></summary>
+<summary>NIF <code>odin_nif_slot_materialize</code> — <a href="../../native/xitdb_nif.odin#L1631-L1679">native/xitdb_nif.odin#L1631-L1679</a></summary>
 
 ```odin
 odin_nif_slot_materialize :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {
@@ -135,7 +135,7 @@ odin_nif_slot_materialize :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL
 		case .Array_List, .Linked_Array_List:
 			return make_ok(env, nif_make_list_from_array(env, nil, 0))
 		case .Hash_Set, .Counted_Hash_Set, .Sorted_Set:
-			return make_ok(env, nif_make_tuple2(env, ATOM_XITDB_SET, nif_make_list_from_array(env, nil, 0)))
+			return make_ok(env, make_mapset_term(env, nil))
 		case .Hash_Map, .Counted_Hash_Map, .Sorted_Map:
 			return make_ok(env, nif_make_new_map(env))
 		case:
@@ -157,7 +157,41 @@ odin_nif_slot_materialize :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL
 </details>
 
 <details>
-<summary>NIF <code>materialize_slot</code> — <a href="../../native/xitdb_nif.odin#L528-L603">native/xitdb_nif.odin#L528-L603</a></summary>
+<summary>NIF <code>make_mapset_term</code> — <a href="../../native/xitdb_nif.odin#L533-L558">native/xitdb_nif.odin#L533-L558</a></summary>
+
+```odin
+make_mapset_term :: proc(env: ErlNifEnv, elems: []ERL_NIF_TERM) -> ERL_NIF_TERM {
+	inner_map: ERL_NIF_TERM
+	if len(elems) == 0 {
+		inner_map = nif_make_new_map(env)
+	} else {
+		empty_list := nif_make_list_from_array(env, nil, 0)
+		val_buf: [16]ERL_NIF_TERM = ---
+		vals: []ERL_NIF_TERM
+		if len(elems) <= len(val_buf) {
+			for i in 0 ..< len(elems) {
+				val_buf[i] = empty_list
+			}
+			vals = val_buf[:len(elems)]
+		} else {
+			dyn_vals := make([]ERL_NIF_TERM, len(elems), context.temp_allocator)
+			for i in 0 ..< len(elems) {
+				dyn_vals[i] = empty_list
+			}
+			vals = dyn_vals
+		}
+		inner_map = make_map_safe(env, elems, vals)
+	}
+	ms_keys := [2]ERL_NIF_TERM{ATOM_STRUCT, ATOM_MAP}
+	ms_vals := [2]ERL_NIF_TERM{ATOM_MAPSET_MOD, inner_map}
+	return make_map_safe(env, ms_keys[:], ms_vals[:])
+}
+```
+
+</details>
+
+<details>
+<summary>NIF <code>materialize_slot</code> — <a href="../../native/xitdb_nif.odin#L560-L642">native/xitdb_nif.odin#L560-L642</a></summary>
 
 ```odin
 materialize_slot :: proc(env: ErlNifEnv, db: ^xitdb.Database, slot: xitdb.Slot, is_root: bool = false) -> (res: ERL_NIF_TERM, err: xitdb.Error) {
@@ -173,7 +207,10 @@ materialize_slot :: proc(env: ErlNifEnv, db: ^xitdb.Database, slot: xitdb.Slot, 
 	#partial switch slot.tag {
 	case .Array_List, .Linked_Array_List:
 		it := xitdb.cursor_iterator(cur) or_return
-		items := make([dynamic]ERL_NIF_TERM, 0, 16, context.temp_allocator)
+		item_buf: [16]ERL_NIF_TERM = ---
+		item_len := 0
+		item_dyn: [dynamic]ERL_NIF_TERM
+		using_dyn := false
 		for {
 			next_maybe := xitdb.cursor_iterator_next(&it) or_return
 			elem_cur, ok := next_maybe.?
@@ -182,16 +219,20 @@ materialize_slot :: proc(env: ErlNifEnv, db: ^xitdb.Database, slot: xitdb.Slot, 
 			}
 			elem_slot := xitdb.cursor_slot(elem_cur) or_return
 			term := materialize_slot(env, db, elem_slot, false) or_return
-			append(&items, term)
+			push_nif_term(item_buf[:], &item_len, &item_dyn, &using_dyn, term, context.temp_allocator)
 		}
+		items := item_dyn[:] if using_dyn else item_buf[:item_len]
 		if len(items) == 0 {
 			return nif_make_list_from_array(env, nil, 0), nil
 		}
-		return nif_make_list_from_array(env, raw_data(items[:]), c.uint(len(items))), nil
+		return nif_make_list_from_array(env, raw_data(items), c.uint(len(items))), nil
 
 	case .Hash_Set, .Counted_Hash_Set, .Sorted_Set:
 		it := xitdb.cursor_iterator(cur) or_return
-		items := make([dynamic]ERL_NIF_TERM, 0, 16, context.temp_allocator)
+		item_buf: [16]ERL_NIF_TERM = ---
+		item_len := 0
+		item_dyn: [dynamic]ERL_NIF_TERM
+		using_dyn := false
 		for {
 			next_maybe := xitdb.cursor_iterator_next(&it) or_return
 			elem_cur, ok := next_maybe.?
@@ -200,20 +241,18 @@ materialize_slot :: proc(env: ErlNifEnv, db: ^xitdb.Database, slot: xitdb.Slot, 
 			}
 			key_cur, _ := xitdb.cursor_read_kv_pair_slots(elem_cur) or_return
 			term := slot_to_term(env, db, key_cur.slot_ptr.slot) or_return
-			append(&items, term)
+			push_nif_term(item_buf[:], &item_len, &item_dyn, &using_dyn, term, context.temp_allocator)
 		}
-		list_term: ERL_NIF_TERM
-		if len(items) == 0 {
-			list_term = nif_make_list_from_array(env, nil, 0)
-		} else {
-			list_term = nif_make_list_from_array(env, raw_data(items[:]), c.uint(len(items)))
-		}
-		return nif_make_tuple2(env, ATOM_XITDB_SET, list_term), nil
+		items := item_dyn[:] if using_dyn else item_buf[:item_len]
+		return make_mapset_term(env, items), nil
 
 	case .Hash_Map, .Counted_Hash_Map, .Sorted_Map:
 		it := xitdb.cursor_iterator(cur) or_return
-		keys := make([dynamic]ERL_NIF_TERM, 0, 16, context.temp_allocator)
-		vals := make([dynamic]ERL_NIF_TERM, 0, 16, context.temp_allocator)
+		key_buf: [16]ERL_NIF_TERM = ---
+		val_buf: [16]ERL_NIF_TERM = ---
+		key_len, val_len := 0, 0
+		key_dyn, val_dyn: [dynamic]ERL_NIF_TERM
+		using_key_dyn, using_val_dyn := false, false
 		sb_buf: [128]u8 = ---
 		for {
 			next_maybe := xitdb.cursor_iterator_next(&it) or_return
@@ -228,10 +267,12 @@ materialize_slot :: proc(env: ErlNifEnv, db: ^xitdb.Database, slot: xitdb.Slot, 
 			}
 			k_term := make_binary(env, key_str)
 			v_term := materialize_slot(env, db, val_cur.slot_ptr.slot, false) or_return
-			append(&keys, k_term)
-			append(&vals, v_term)
+			push_nif_term(key_buf[:], &key_len, &key_dyn, &using_key_dyn, k_term, context.temp_allocator)
+			push_nif_term(val_buf[:], &val_len, &val_dyn, &using_val_dyn, v_term, context.temp_allocator)
 		}
-		return make_map_safe(env, keys[:], vals[:]), nil
+		keys := key_dyn[:] if using_key_dyn else key_buf[:key_len]
+		vals := val_dyn[:] if using_val_dyn else val_buf[:val_len]
+		return make_map_safe(env, keys, vals), nil
 	}
 
 	return ATOM_NIL, nil
@@ -241,7 +282,7 @@ materialize_slot :: proc(env: ErlNifEnv, db: ^xitdb.Database, slot: xitdb.Slot, 
 </details>
 
 <details>
-<summary>NIF <code>slot_to_term</code> — <a href="../../native/xitdb_nif.odin#L354-L429">native/xitdb_nif.odin#L354-L429</a></summary>
+<summary>NIF <code>slot_to_term</code> — <a href="../../native/xitdb_nif.odin#L353-L434">native/xitdb_nif.odin#L353-L434</a></summary>
 
 ```odin
 slot_to_term :: proc(env: ErlNifEnv, db: ^xitdb.Database, slot: xitdb.Slot) -> (res: ERL_NIF_TERM, err: xitdb.Error) {
@@ -280,12 +321,18 @@ slot_to_term :: proc(env: ErlNifEnv, db: ^xitdb.Database, slot: xitdb.Slot) -> (
 			val_size = validate_bytes_slot_bounds(db, slot) or_return
 		}
 		if slot.full {
-			stack_buf: [128]u8 = ---
-			obj, buf_err := xitdb.cursor_read_bytes_buf(cur, stack_buf[:])
-			if buf_err != nil {
-				if buf_err != xitdb.Xitdb_Error.Stream_Too_Long {
+			obj: xitdb.Bytes
+			if slot.tag == .Short_Bytes || val_size <= 128 {
+				stack_buf: [128]u8 = ---
+				buf_obj, buf_err := xitdb.cursor_read_bytes_buf(cur, stack_buf[:])
+				if buf_err == nil {
+					obj = buf_obj
+				} else if buf_err != xitdb.Xitdb_Error.Stream_Too_Long {
 					return ATOM_NIL, buf_err
+				} else {
+					obj = xitdb.cursor_read_bytes_object(cur, 0, context.temp_allocator) or_return
 				}
+			} else {
 				obj = xitdb.cursor_read_bytes_object(cur, 0, context.temp_allocator) or_return
 			}
 			if len(obj.format_tag) == 2 && obj.format_tag[0] == 'b' && obj.format_tag[1] == 'l' {
@@ -325,7 +372,35 @@ slot_to_term :: proc(env: ErlNifEnv, db: ^xitdb.Database, slot: xitdb.Slot) -> (
 </details>
 
 <details>
-<summary>NIF <code>read_key_cursor_string</code> — <a href="../../native/xitdb_nif.odin#L435-L463">native/xitdb_nif.odin#L435-L463</a></summary>
+<summary>NIF <code>push_nif_term</code> — <a href="../../native/xitdb_nif.odin#L496-L515">native/xitdb_nif.odin#L496-L515</a></summary>
+
+```odin
+push_nif_term :: proc(
+	buf: []ERL_NIF_TERM,
+	buf_len: ^int,
+	dyn: ^[dynamic]ERL_NIF_TERM,
+	using_dyn: ^bool,
+	term: ERL_NIF_TERM,
+	allocator: runtime.Allocator,
+) {
+	if !using_dyn^ {
+		if buf_len^ < len(buf) {
+			buf[buf_len^] = term
+			buf_len^ += 1
+			return
+		}
+		dyn^ = make([dynamic]ERL_NIF_TERM, buf_len^, max(buf_len^ * 2, 64), allocator)
+		copy(dyn^[:], buf[:buf_len^])
+		using_dyn^ = true
+	}
+	append(dyn, term)
+}
+```
+
+</details>
+
+<details>
+<summary>NIF <code>read_key_cursor_string</code> — <a href="../../native/xitdb_nif.odin#L440-L468">native/xitdb_nif.odin#L440-L468</a></summary>
 
 ```odin
 read_key_cursor_string :: proc(cur: xitdb.Read_Cursor, sb_buf: []u8) -> (s: string, err: xitdb.Error) {
@@ -362,7 +437,7 @@ read_key_cursor_string :: proc(cur: xitdb.Read_Cursor, sb_buf: []u8) -> (s: stri
 </details>
 
 <details>
-<summary>NIF <code>validate_bytes_slot_bounds</code> — <a href="../../native/xitdb_nif.odin#L335-L352">native/xitdb_nif.odin#L335-L352</a></summary>
+<summary>NIF <code>validate_bytes_slot_bounds</code> — <a href="../../native/xitdb_nif.odin#L334-L351">native/xitdb_nif.odin#L334-L351</a></summary>
 
 ```odin
 validate_bytes_slot_bounds :: proc(db: ^xitdb.Database, slot: xitdb.Slot) -> (val_size: i64, err: xitdb.Error) {
@@ -388,7 +463,7 @@ validate_bytes_slot_bounds :: proc(db: ^xitdb.Database, slot: xitdb.Slot) -> (va
 </details>
 
 <details>
-<summary>NIF <code>safe_cursor_read_string</code> — <a href="../../native/xitdb_nif.odin#L465-L471">native/xitdb_nif.odin#L465-L471</a></summary>
+<summary>NIF <code>safe_cursor_read_string</code> — <a href="../../native/xitdb_nif.odin#L470-L476">native/xitdb_nif.odin#L470-L476</a></summary>
 
 ```odin
 safe_cursor_read_string :: proc(cur: xitdb.Read_Cursor, allocator: mem.Allocator) -> (s: string, err: xitdb.Error) {
@@ -418,7 +493,7 @@ hash_map_get_cursor :: proc(m: Read_Hash_Map, key: string) -> (Maybe(Read_Cursor
 </details>
 
 <details>
-<summary><code>xitdb.pull</code> — <a href="../../native/xitdb-odin/xitdb/dsl.odin#L1714-L1724">dsl.odin#L1714-L1724</a></summary>
+<summary><code>xitdb.pull</code> — <a href="../../native/xitdb-odin/xitdb/dsl.odin#L2020-L2030">dsl.odin#L2020-L2030</a></summary>
 
 ```odin
 pull :: proc(cursor: Read_Cursor, pattern: string, allocator := context.temp_allocator) -> (res: Pull_Value, err: Error) {
@@ -437,7 +512,7 @@ pull :: proc(cursor: Read_Cursor, pattern: string, allocator := context.temp_all
 </details>
 
 <details>
-<summary><code>xitdb.cursor_iterator</code> — <a href="../../native/xitdb-odin/xitdb/cursor.odin#L842-L886">cursor.odin#L842-L886</a></summary>
+<summary><code>xitdb.cursor_iterator</code> — <a href="../../native/xitdb-odin/xitdb/cursor.odin#L891-L935">cursor.odin#L891-L935</a></summary>
 
 ```odin
 cursor_iterator :: proc(unresolved_cursor: Read_Cursor) -> (res: Cursor_Iterator, err: Error) {
@@ -490,7 +565,7 @@ cursor_iterator :: proc(unresolved_cursor: Read_Cursor) -> (res: Cursor_Iterator
 </details>
 
 <details>
-<summary><code>xitdb.cursor_iterator_next</code> — <a href="../../native/xitdb-odin/xitdb/cursor.odin#L1535-L1556">cursor.odin#L1535-L1556</a></summary>
+<summary><code>xitdb.cursor_iterator_next</code> — <a href="../../native/xitdb-odin/xitdb/cursor.odin#L1614-L1635">cursor.odin#L1614-L1635</a></summary>
 
 ```odin
 cursor_iterator_next :: proc(it: ^Cursor_Iterator) -> (res: Maybe(Read_Cursor), err: Error) {
@@ -532,13 +607,13 @@ cursor_slot :: proc(c: Read_Cursor) -> (res: Slot, err: Error) {
 </details>
 
 <details>
-<summary><code>xitdb.cursor_read_kv_pair_slots</code> — <a href="../../native/xitdb-odin/xitdb/cursor.odin#L381-L402">cursor.odin#L381-L402</a></summary>
+<summary><code>xitdb.cursor_read_kv_pair_slots</code> — <a href="../../native/xitdb-odin/xitdb/cursor.odin#L404-L425">cursor.odin#L404-L425</a></summary>
 
 ```odin
 cursor_read_kv_pair_slots :: proc(c: Read_Cursor) -> (key_cursor: Read_Cursor, value_cursor: Read_Cursor, err: Error) {
 	slot_ptr := cursor_resolved(c) or_return
 	if is_key_only_entry(slot_ptr.slot) {
-		return Read_Cursor{slot_ptr = Slot_Pointer{position = nil, slot = slot_ptr.slot}, db = c.db, frozen_at = c.frozen_at},
+		return Read_Cursor{slot_ptr = Slot_Pointer{position = slot_ptr.position, slot = slot_ptr.slot}, db = c.db, frozen_at = c.frozen_at},
 			Read_Cursor{slot_ptr = Slot_Pointer{position = nil, slot = Slot{}}, db = c.db, frozen_at = c.frozen_at},
 			nil
 	}
@@ -610,7 +685,7 @@ cursor_read_float :: proc(c: Read_Cursor) -> (res: f64, err: Error) {
 </details>
 
 <details>
-<summary><code>xitdb.cursor_read_bytes_buf</code> — <a href="../../native/xitdb-odin/xitdb/cursor.odin#L294-L359">cursor.odin#L294-L359</a></summary>
+<summary><code>xitdb.cursor_read_bytes_buf</code> — <a href="../../native/xitdb-odin/xitdb/cursor.odin#L305-L381">cursor.odin#L305-L381</a></summary>
 
 ```odin
 cursor_read_bytes_buf :: proc(c: Read_Cursor, buffer: []u8) -> (res: Bytes, err: Error) {
@@ -623,12 +698,23 @@ cursor_read_bytes_buf :: proc(c: Read_Cursor, buffer: []u8) -> (res: Bytes, err:
 		return {}, .End_Of_Stream
 
 	case .Bytes:
+		if slot_ptr.slot.value < 0 {
+			return {}, .Expected_Unsigned_Long
+		}
 		value_size := core_read_long_at(c.db.core, slot_ptr.slot.value) or_return
+		if value_size < 0 {
+			return {}, .Expected_Unsigned_Long
+		}
 		if value_size > i64(len(buffer)) {
 			return {}, .Stream_Too_Long
 		}
+		extra: i64 = 10 if slot_ptr.slot.full else 8
+		core_len := core_length(c.db.core) or_return
+		if slot_ptr.slot.value > core_len || extra > core_len - slot_ptr.slot.value || value_size > core_len - slot_ptr.slot.value - extra {
+			return {}, Xitdb_Error.Unexpected_EOF
+		}
 		if slot_ptr.slot.full {
-			if value_size + 2 <= i64(len(buffer)) {
+			if value_size <= i64(len(buffer)) - 2 {
 				combined := buffer[:value_size + 2]
 				core_read_exact_at(c.db.core, slot_ptr.slot.value + 8, combined) or_return
 				return Bytes{
@@ -684,7 +770,7 @@ cursor_read_bytes_buf :: proc(c: Read_Cursor, buffer: []u8) -> (res: Bytes, err:
 </details>
 
 <details>
-<summary><code>xitdb.cursor_read_bytes_object</code> — <a href="../../native/xitdb-odin/xitdb/cursor.odin#L238-L292">cursor.odin#L238-L292</a></summary>
+<summary><code>xitdb.cursor_read_bytes_object</code> — <a href="../../native/xitdb-odin/xitdb/cursor.odin#L238-L303">cursor.odin#L238-L303</a></summary>
 
 ```odin
 cursor_read_bytes_object :: proc(c: Read_Cursor, max_size: i64 = 0, allocator := context.allocator) -> (res: Bytes, err: Error) {
@@ -694,12 +780,23 @@ cursor_read_bytes_object :: proc(c: Read_Cursor, max_size: i64 = 0, allocator :=
 		return Bytes{value = make([]u8, 0, allocator)}, nil
 
 	case .Bytes:
+		if slot_ptr.slot.value < 0 {
+			return {}, .Expected_Unsigned_Long
+		}
 		value_size := core_read_long_at(c.db.core, slot_ptr.slot.value) or_return
+		if value_size < 0 {
+			return {}, .Expected_Unsigned_Long
+		}
 		if max_size > 0 && value_size > max_size {
 			return {}, .Stream_Too_Long
 		}
+		extra: i64 = 10 if slot_ptr.slot.full else 8
+		core_len := core_length(c.db.core) or_return
+		if slot_ptr.slot.value > core_len || extra > core_len - slot_ptr.slot.value || value_size > core_len - slot_ptr.slot.value - extra {
+			return {}, Xitdb_Error.Unexpected_EOF
+		}
 		value := make([]u8, int(value_size), allocator)
-		err := core_read_exact_at(c.db.core, slot_ptr.slot.value + 8, value)
+		err = core_read_exact_at(c.db.core, slot_ptr.slot.value + 8, value)
 		if err != nil {
 			delete(value, allocator)
 			return {}, err
@@ -747,7 +844,7 @@ cursor_read_bytes_object :: proc(c: Read_Cursor, max_size: i64 = 0, allocator :=
 </details>
 
 <details>
-<summary><code>xitdb.core_read_exact_at</code> — <a href="../../native/xitdb-odin/xitdb/core.odin#L705-L746">core.odin#L705-L746</a></summary>
+<summary><code>xitdb.core_read_exact_at</code> — <a href="../../native/xitdb-odin/xitdb/core.odin#L710-L755">core.odin#L710-L755</a></summary>
 
 ```odin
 core_read_exact_at :: proc(c: ^Core, pos: i64, p: []u8) -> Error {
@@ -759,15 +856,16 @@ core_read_exact_at :: proc(c: ^Core, pos: i64, p: []u8) -> Error {
 	}
 	#partial switch &v in c {
 	case Core_Memory:
-		end_pos := pos + i64(len(p))
-		if end_pos > i64(len(v.buf)) {
+		buf_len := i64(len(v.buf))
+		if pos > buf_len || i64(len(p)) > buf_len - pos {
 			return Xitdb_Error.Unexpected_EOF
 		}
+		end_pos := pos + i64(len(p))
 		copy(p, v.buf[int(pos):int(end_pos)])
 		return nil
 	case Core_Buffered_File:
 		buf_len := i64(len(v.memory.buf))
-		if buf_len > 0 && pos >= v.memory_pos && pos + i64(len(p)) <= v.memory_pos + buf_len {
+		if buf_len > 0 && pos >= v.memory_pos && pos <= v.memory_pos + buf_len && i64(len(p)) <= (v.memory_pos + buf_len) - pos {
 			mem_off := int(pos - v.memory_pos)
 			copy(p, v.memory.buf[mem_off : mem_off + len(p)])
 			return nil
@@ -775,6 +873,9 @@ core_read_exact_at :: proc(c: ^Core, pos: i64, p: []u8) -> Error {
 	}
 	total := 0
 	for total < len(p) {
+		if pos > max(i64) - i64(total) {
+			return Xitdb_Error.Unexpected_EOF
+		}
 		n, err := core_read_at(c, pos + i64(total), p[total:])
 		total += n
 		if err != nil {

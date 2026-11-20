@@ -8,9 +8,9 @@
 
 | Metric | Elixir NIF Wrapper | Raw Odin Baseline | Comparison |
 | :--- | ---: | ---: | ---: |
-| **Median (`ns/op`)** | 742.0 ns (742.0 ns) | 260.0 ns (260.0 ns) | **`2.85x`** NIF Ratio |
-| **Mean ± σ (CV)** | 744.8 ns ± 13.4 ns (1.8%) | 263.0 ns ± 4.8 ns (1.8%) | Welch `z` = `75.48` |
-| **p95 / Max (`ns/op`)** | 760.6 ns / 762.0 ns | 269.2 ns / 270.0 ns | `5` vs `5` pooled samples |
+| **Median (`ns/op`)** | 810.0 ns (810.0 ns) | 264.0 ns (264.0 ns) | **`3.07x`** NIF Ratio |
+| **Mean ± σ (CV)** | 859.0 ns ± 139.5 ns (16.2%) | 278.2 ns ± 31.5 ns (11.3%) | Welch `z` = `9.08` |
+| **p95 / Max (`ns/op`)** | 1.05 µs / 1.10 µs | 321.6 ns / 334.0 ns | `5` vs `5` pooled samples |
 
 ## Benchmark Harnesses (Elixir vs. Raw Odin)
 
@@ -27,7 +27,7 @@
        end},
 ```
 
-### Raw Odin Harness ([`bench_client.odin#L968-L982`](../bench_client.odin#L968-L982))
+### Raw Odin Harness ([`bench_client.odin#L975-L989`](../bench_client.odin#L975-L989))
 
 ```odin
 	// #7: O(1) Counted_Hash_Set membership check
@@ -50,7 +50,7 @@
 ## Elixir Wrapper & NIF Bridge
 
 <details>
-<summary>Elixir <code>member?</code> — <a href="../../lib/xitdb/cursor.ex#L2598-L2687">lib/xitdb/cursor.ex#L2598-L2687</a></summary>
+<summary>Elixir <code>member?</code> — <a href="../../lib/xitdb/cursor.ex#L2686-L2775">lib/xitdb/cursor.ex#L2686-L2775</a></summary>
 
 ```elixir
   def member?(
@@ -148,7 +148,7 @@
 </details>
 
 <details>
-<summary>NIF <code>odin_nif_slot_contains</code> — <a href="../../native/xitdb_nif.odin#L1282-L1374">native/xitdb_nif.odin#L1282-L1374</a></summary>
+<summary>NIF <code>odin_nif_slot_contains</code> — <a href="../../native/xitdb_nif.odin#L1321-L1419">native/xitdb_nif.odin#L1321-L1419</a></summary>
 
 ```odin
 odin_nif_slot_contains :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {
@@ -193,56 +193,62 @@ odin_nif_slot_contains :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NI
 		db       = &handle.db,
 	}
 
+	found := false
+	err: xitdb.Error = nil
+	slot_maybe: Maybe(xitdb.Slot) = nil
+
 	#partial switch slot.tag {
-	case .Hash_Set, .Counted_Hash_Set:
-		hs := xitdb.Read_Hash_Set{cursor = cur}
-		slot_maybe, err := xitdb.hash_set_get_slot(hs, key_str)
-		if err == .Key_Not_Found {
-			return make_ok(env, ATOM_FALSE)
+	case .Hash_Set:
+		hs: xitdb.Read_Hash_Set
+		hs, err = xitdb.read_hash_set_init(cur)
+		if err == nil {
+			slot_maybe, err = xitdb.hash_set_get_slot(hs, key_str)
 		}
-		if err != nil {
-			return make_xitdb_err(env, err)
+	case .Counted_Hash_Set:
+		chs: xitdb.Read_Counted_Hash_Set
+		chs, err = xitdb.read_counted_hash_set_init(cur)
+		if err == nil {
+			slot_maybe, err = xitdb.hash_set_get_slot(chs.read_hash_set, key_str)
 		}
-		_, found := slot_maybe.?
-		return make_ok(env, ATOM_TRUE if found else ATOM_FALSE)
-
 	case .Sorted_Set:
-		ss := xitdb.Read_Sorted_Set{cursor = cur}
-		found, err := xitdb.sorted_set_contains(ss, key_str)
-		if err == .Key_Not_Found {
-			return make_ok(env, ATOM_FALSE)
+		ss: xitdb.Read_Sorted_Set
+		ss, err = xitdb.read_sorted_set_init(cur)
+		if err == nil {
+			found, err = xitdb.sorted_set_contains(ss, key_str)
 		}
-		if err != nil {
-			return make_xitdb_err(env, err)
+	case .Hash_Map:
+		hm: xitdb.Read_Hash_Map
+		hm, err = xitdb.read_hash_map_init(cur)
+		if err == nil {
+			slot_maybe, err = xitdb.hash_map_get_slot(hm, key_str)
 		}
-		return make_ok(env, ATOM_TRUE if found else ATOM_FALSE)
-
-	case .Hash_Map, .Counted_Hash_Map:
-		hm := xitdb.Read_Hash_Map{cursor = cur}
-		slot_maybe, err := xitdb.hash_map_get_slot(hm, key_str)
-		if err == .Key_Not_Found {
-			return make_ok(env, ATOM_FALSE)
+	case .Counted_Hash_Map:
+		chm: xitdb.Read_Counted_Hash_Map
+		chm, err = xitdb.read_counted_hash_map_init(cur)
+		if err == nil {
+			slot_maybe, err = xitdb.hash_map_get_slot(chm.read_hash_map, key_str)
 		}
-		if err != nil {
-			return make_xitdb_err(env, err)
-		}
-		s, found := slot_maybe.?
-		return make_ok(env, ATOM_TRUE if (found && (s.tag != .None || s.full)) else ATOM_FALSE)
-
 	case .Sorted_Map:
-		sm := xitdb.Read_Sorted_Map{cursor = cur}
-		slot_maybe, err := xitdb.sorted_map_get_slot(sm, key_str)
-		if err == .Key_Not_Found {
-			return make_ok(env, ATOM_FALSE)
+		sm: xitdb.Read_Sorted_Map
+		sm, err = xitdb.read_sorted_map_init(cur)
+		if err == nil {
+			slot_maybe, err = xitdb.sorted_map_get_slot(sm, key_str)
 		}
-		if err != nil {
-			return make_xitdb_err(env, err)
-		}
-		s, found := slot_maybe.?
-		return make_ok(env, ATOM_TRUE if (found && (s.tag != .None || s.full)) else ATOM_FALSE)
+	case:
+		return make_err(env, "unsupported")
 	}
 
-	return make_err(env, "unsupported")
+	if err == .Key_Not_Found {
+		return make_ok(env, ATOM_FALSE)
+	}
+	if err != nil {
+		return make_xitdb_err(env, err)
+	}
+	if slot.tag == .Sorted_Set {
+		return make_ok(env, ATOM_TRUE if found else ATOM_FALSE)
+	}
+	s, has_slot := slot_maybe.?
+	return make_ok(env, ATOM_TRUE if (has_slot && (s.tag != .None || s.full)) else ATOM_FALSE)
 }
 ```
 
@@ -264,11 +270,79 @@ hash_set_get_slot :: proc(s: Read_Hash_Set, key: string) -> (Maybe(Slot), Error)
 </details>
 
 <details>
+<summary><code>xitdb.read_hash_set_init</code> — <a href="../../native/xitdb-odin/xitdb/collections.odin#L520-L528">collections.odin#L520-L528</a></summary>
+
+```odin
+read_hash_set_init :: proc(cursor: Read_Cursor) -> (res: Read_Hash_Set, err: Error) {
+	slot_ptr := cursor_resolved(cursor) or_return
+	#partial switch slot_ptr.slot.tag {
+	case .None, .Hash_Map, .Hash_Set:
+		return Read_Hash_Set{cursor = cursor}, nil
+	case:
+		return {}, .Unexpected_Tag
+	}
+}
+```
+
+</details>
+
+<details>
+<summary><code>xitdb.read_counted_hash_set_init</code> — <a href="../../native/xitdb-odin/xitdb/collections.odin#L537-L545">collections.odin#L537-L545</a></summary>
+
+```odin
+read_counted_hash_set_init :: proc(cursor: Read_Cursor) -> (res: Read_Counted_Hash_Set, err: Error) {
+	slot_ptr := cursor_resolved(cursor) or_return
+	#partial switch slot_ptr.slot.tag {
+	case .None, .Counted_Hash_Map, .Counted_Hash_Set:
+		return Read_Counted_Hash_Set{read_hash_set = Read_Hash_Set{cursor = cursor}}, nil
+	case:
+		return {}, .Unexpected_Tag
+	}
+}
+```
+
+</details>
+
+<details>
+<summary><code>xitdb.read_sorted_set_init</code> — <a href="../../native/xitdb-odin/xitdb/collections.odin#L842-L850">collections.odin#L842-L850</a></summary>
+
+```odin
+read_sorted_set_init :: proc(cursor: Read_Cursor) -> (res: Read_Sorted_Set, err: Error) {
+	slot_ptr := cursor_resolved(cursor) or_return
+	#partial switch slot_ptr.slot.tag {
+	case .None, .Sorted_Map, .Sorted_Set:
+		return Read_Sorted_Set{cursor = cursor}, nil
+	case:
+		return {}, .Unexpected_Tag
+	}
+}
+```
+
+</details>
+
+<details>
 <summary><code>xitdb.sorted_set_contains</code> — <a href="../../native/xitdb-odin/xitdb/collections.odin#L915-L917">collections.odin#L915-L917</a></summary>
 
 ```odin
 sorted_set_contains :: proc(s: Read_Sorted_Set, key: string) -> (res: bool, err: Error) {
 	return sorted_set_contains_by_bytes(s, transmute([]u8)key)
+}
+```
+
+</details>
+
+<details>
+<summary><code>xitdb.read_hash_map_init</code> — <a href="../../native/xitdb-odin/xitdb/collections.odin#L246-L254">collections.odin#L246-L254</a></summary>
+
+```odin
+read_hash_map_init :: proc(cursor: Read_Cursor) -> (res: Read_Hash_Map, err: Error) {
+	slot_ptr := cursor_resolved(cursor) or_return
+	#partial switch slot_ptr.slot.tag {
+	case .None, .Hash_Map, .Hash_Set:
+		return Read_Hash_Map{cursor = cursor}, nil
+	case:
+		return {}, .Unexpected_Tag
+	}
 }
 ```
 
@@ -288,6 +362,40 @@ hash_map_get_slot :: proc(m: Read_Hash_Map, key: string) -> (Maybe(Slot), Error)
 </details>
 
 <details>
+<summary><code>xitdb.read_counted_hash_map_init</code> — <a href="../../native/xitdb-odin/xitdb/collections.odin#L263-L271">collections.odin#L263-L271</a></summary>
+
+```odin
+read_counted_hash_map_init :: proc(cursor: Read_Cursor) -> (res: Read_Counted_Hash_Map, err: Error) {
+	slot_ptr := cursor_resolved(cursor) or_return
+	#partial switch slot_ptr.slot.tag {
+	case .None, .Counted_Hash_Map, .Counted_Hash_Set:
+		return Read_Counted_Hash_Map{read_hash_map = Read_Hash_Map{cursor = cursor}}, nil
+	case:
+		return {}, .Unexpected_Tag
+	}
+}
+```
+
+</details>
+
+<details>
+<summary><code>xitdb.read_sorted_map_init</code> — <a href="../../native/xitdb-odin/xitdb/collections.odin#L693-L701">collections.odin#L693-L701</a></summary>
+
+```odin
+read_sorted_map_init :: proc(cursor: Read_Cursor) -> (res: Read_Sorted_Map, err: Error) {
+	slot_ptr := cursor_resolved(cursor) or_return
+	#partial switch slot_ptr.slot.tag {
+	case .None, .Sorted_Map, .Sorted_Set:
+		return Read_Sorted_Map{cursor = cursor}, nil
+	case:
+		return {}, .Unexpected_Tag
+	}
+}
+```
+
+</details>
+
+<details>
 <summary><code>xitdb.sorted_map_get_slot</code> — <a href="../../native/xitdb-odin/xitdb/collections.odin#L793-L795">collections.odin#L793-L795</a></summary>
 
 ```odin
@@ -299,7 +407,7 @@ sorted_map_get_slot :: proc(m: Read_Sorted_Map, key: string) -> (Maybe(Slot), Er
 </details>
 
 <details>
-<summary><code>xitdb.database_digest_string_buf</code> — <a href="../../native/xitdb-odin/xitdb/database.odin#L267-L269">database.odin#L267-L269</a></summary>
+<summary><code>xitdb.database_digest_string_buf</code> — <a href="../../native/xitdb-odin/xitdb/database.odin#L280-L282">database.odin#L280-L282</a></summary>
 
 ```odin
 database_digest_string_buf :: proc(db: ^Database, s: string, buf: []u8) -> []u8 {
@@ -315,100 +423,6 @@ database_digest_string_buf :: proc(db: ^Database, s: string, buf: []u8) -> []u8 
 ```odin
 hash_set_get_slot_by_hash :: proc(s: Read_Hash_Set, hash: []u8) -> (Maybe(Slot), Error) {
 	return cursor_read_path_slot(s.cursor, []Path_Part{Hash_Map_Get{target = Hash_Map_Get_Key{hash = hash}}})
-}
-```
-
-</details>
-
-<details>
-<summary><code>xitdb.sorted_set_contains_by_bytes</code> — <a href="../../native/xitdb-odin/xitdb/collections.odin#L909-L913">collections.odin#L909-L913</a></summary>
-
-```odin
-sorted_set_contains_by_bytes :: proc(s: Read_Sorted_Set, key: []u8) -> (res: bool, err: Error) {
-	mc := cursor_read_path(s.cursor, []Path_Part{Sorted_Map_Get{target = Sorted_Map_Get_Key{key = key}}}) or_return
-	_, ok := mc.?
-	return ok, nil
-}
-```
-
-</details>
-
-<details>
-<summary><code>xitdb.hash_map_get_slot_by_hash</code> — <a href="../../native/xitdb-odin/xitdb/collections.odin#L308-L310">collections.odin#L308-L310</a></summary>
-
-```odin
-hash_map_get_slot_by_hash :: proc(m: Read_Hash_Map, hash: []u8) -> (Maybe(Slot), Error) {
-	return cursor_read_path_slot(m.cursor, []Path_Part{Hash_Map_Get{target = Hash_Map_Get_Value{hash = hash}}})
-}
-```
-
-</details>
-
-<details>
-<summary><code>xitdb.sorted_map_get_slot_by_bytes</code> — <a href="../../native/xitdb-odin/xitdb/collections.odin#L754-L756">collections.odin#L754-L756</a></summary>
-
-```odin
-sorted_map_get_slot_by_bytes :: proc(m: Read_Sorted_Map, key: []u8) -> (Maybe(Slot), Error) {
-	return cursor_read_path_slot(m.cursor, []Path_Part{Sorted_Map_Get{target = Sorted_Map_Get_Value{key = key}}})
-}
-```
-
-</details>
-
-<details>
-<summary><code>xitdb.database_digest_buf</code> — <a href="../../native/xitdb-odin/xitdb/database.odin#L258-L265">database.odin#L258-L265</a></summary>
-
-```odin
-database_digest_buf :: proc(db: ^Database, data: []u8, buf: []u8) -> []u8 {
-	hsize := int(db.header.hash_size)
-	out := buf[:hsize] if hsize <= len(buf) else make([]u8, hsize, context.temp_allocator)
-	if db.hasher.hash_proc != nil {
-		db.hasher.hash_proc(data, out, db.hasher.user_data)
-	}
-	return out
-}
-```
-
-</details>
-
-<details>
-<summary><code>xitdb.cursor_read_path_slot</code> — <a href="../../native/xitdb-odin/xitdb/cursor.odin#L80-L94">cursor.odin#L80-L94</a></summary>
-
-```odin
-cursor_read_path_slot :: proc(c: Read_Cursor, path: []Path_Part) -> (res: Maybe(Slot), err: Error) {
-	start := cursor_resolved(c) or_return
-	slot_ptr: Slot_Pointer
-	slot_ptr, err = read_slot_pointer(c.db, .Read_Only, path, 0, start, 0)
-	if err != nil {
-		if err == .Key_Not_Found {
-			return nil, nil
-		}
-		return nil, err
-	}
-	if !slot_empty(slot_ptr.slot) {
-		return slot_ptr.slot, nil
-	}
-	return nil, nil
-}
-```
-
-</details>
-
-<details>
-<summary><code>xitdb.cursor_read_path</code> — <a href="../../native/xitdb-odin/xitdb/cursor.odin#L67-L78">cursor.odin#L67-L78</a></summary>
-
-```odin
-cursor_read_path :: proc(c: Read_Cursor, path: []Path_Part) -> (res: Maybe(Read_Cursor), err: Error) {
-	start := cursor_resolved(c) or_return
-	slot_ptr: Slot_Pointer
-	slot_ptr, err = read_slot_pointer(c.db, .Read_Only, path, 0, start, 0)
-	if err != nil {
-		if err == .Key_Not_Found {
-			return nil, nil
-		}
-		return nil, err
-	}
-	return Read_Cursor{slot_ptr = slot_ptr, db = c.db}, nil
 }
 ```
 

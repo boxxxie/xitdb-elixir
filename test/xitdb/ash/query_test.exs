@@ -1268,5 +1268,118 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         end
       end
     end
+
+    describe "UnsignedInteger and custom xitdb_index_key/2 Ash.Type B+Tree range queries" do
+      defmodule CustomCentsType do
+        use Ash.Type
+
+        @impl true
+        def storage_type(_), do: :binary
+
+        @impl true
+        def matches_type?(v, _), do: is_integer(v)
+
+        @impl true
+        def cast_input(nil, _), do: {:ok, nil}
+        def cast_input(v, _) when is_integer(v), do: {:ok, v}
+        def cast_input(_, _), do: :error
+
+        @impl true
+        def cast_stored(nil, _), do: {:ok, nil}
+        def cast_stored({:tagged, "ct", <<v::signed-big-64>>}, _), do: {:ok, v}
+        def cast_stored(v, _) when is_integer(v), do: {:ok, v}
+        def cast_stored(_, _), do: :error
+
+        @impl true
+        def dump_to_native(nil, _), do: {:ok, nil}
+
+        def dump_to_native(v, _) when is_integer(v),
+          do: {:ok, {:tagged, "ct", <<v::signed-big-64>>}}
+
+        def dump_to_native(_, _), do: :error
+
+        def xitdb_index_key(v, _constraints) when is_integer(v),
+          do: Xitdb.Key.encode_i64_be(v)
+
+        def xitdb_fixed_width?(_constraints), do: true
+      end
+
+      defmodule UnsignedDomain do
+        use Ash.Domain, validate_config_inclusion?: false
+
+        resources do
+          allow_unregistered?(true)
+        end
+      end
+
+      defmodule RangeHookItem do
+        use Ash.Resource,
+          domain: UnsignedDomain,
+          data_layer: Xitdb.Ash.DataLayer
+
+        xitdb do
+          store(PrimaryStore)
+          collection(:query_range_hook_items)
+          index([:big_uint])
+          index([:cents])
+        end
+
+        attributes do
+          integer_primary_key(:id)
+          attribute(:big_uint, Xitdb.Ash.Types.UnsignedInteger, public?: true)
+          attribute(:cents, CustomCentsType, public?: true)
+        end
+
+        actions do
+          defaults([:read, :destroy, create: :*, update: :*])
+        end
+      end
+
+      @max_i64 9_223_372_036_854_775_807
+      @max_u64 18_446_744_073_709_551_615
+
+      test "supports <, <=, ==, >=, > range scans on UnsignedInteger (> max(i64)) and custom xitdb_index_key/2 types" do
+        values = [
+          {10, -500},
+          {@max_i64, -1},
+          {@max_i64 + 1, 0},
+          {@max_u64 - 10, 250},
+          {@max_u64, 1000}
+        ]
+
+        for {u, c} <- values do
+          Ash.create!(RangeHookItem, %{big_uint: u, cents: c}, domain: UnsignedDomain)
+        end
+
+        above_i64 =
+          RangeHookItem
+          |> Ash.Query.filter(big_uint > ^@max_i64)
+          |> Ash.Query.sort(big_uint: :asc)
+          |> Ash.read!(domain: UnsignedDomain)
+
+        assert Enum.map(above_i64, & &1.big_uint) == [@max_i64 + 1, @max_u64 - 10, @max_u64]
+
+        window_u64 =
+          RangeHookItem
+          |> Ash.Query.filter(big_uint >= ^@max_i64 and big_uint < ^@max_u64)
+          |> Ash.Query.sort(big_uint: :asc)
+          |> Ash.read!(domain: UnsignedDomain)
+
+        assert Enum.map(window_u64, & &1.big_uint) == [@max_i64, @max_i64 + 1, @max_u64 - 10]
+
+        assert [%{big_uint: @max_u64}] =
+                 RangeHookItem
+                 |> Ash.Query.filter(big_uint == ^@max_u64)
+                 |> Ash.read!(domain: UnsignedDomain)
+
+        cents_window =
+          RangeHookItem
+          |> Ash.Query.filter(cents > -500 and cents <= 250)
+          |> Ash.Query.sort(cents: :asc)
+          |> Ash.read!(domain: UnsignedDomain)
+
+        assert Enum.map(cents_window, & &1.cents) == [-1, 0, 250]
+      end
+    end
   end
 end

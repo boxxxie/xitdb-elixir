@@ -4,7 +4,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     Spark DSL extension for `Xitdb.Ash.DataLayer` (`xitdb do ... end`).
     """
 
-    alias Xitdb.Ash.{Index, NestedIn, Reference, SearchField}
+    alias Xitdb.Ash.{Compress, Index, NestedIn, Reference, SearchField}
 
     @index %Spark.Dsl.Entity{
       name: :index,
@@ -91,6 +91,73 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       ]
     }
 
+    @compress %Spark.Dsl.Entity{
+      name: :compress,
+      describe:
+        "Configures transparent value-level or Parquet-style row-group compression for attribute(s).",
+      examples: [
+        "compress [:body, :html_edit_body], mode: :row_group, row_group_size: 128, dictionary: :email_html",
+        "compress :attachment_blob, codec: :zstd, intern_above: 4096"
+      ],
+      target: Compress,
+      args: [:fields],
+      identifier: {:auto, :unique_integer},
+      schema: [
+        fields: [
+          type: {:wrap_list, :atom},
+          required: true,
+          doc: "Attribute name(s) whose stored binary payloads are compressed."
+        ],
+        mode: [
+          type: {:in, [:value, :row_group]},
+          default: :value,
+          doc:
+            "Compression granularity (`:value` per attribute or `:row_group` columnar pages on bulk writes)."
+        ],
+        codec: [
+          type: {:in, [:zstd, :zlib, :none]},
+          default: :zstd,
+          doc: "Compression codec (`:zstd` falls back to `:zlib` if runtime lacks `:zstd`)."
+        ],
+        level: [
+          type: {:or, [:integer, {:in, [nil]}]},
+          default: nil,
+          doc: "Optional codec compression level."
+        ],
+        min_bytes: [
+          type: :non_neg_integer,
+          default: 128,
+          doc: "Minimum byte length required before compressing in `:value` mode."
+        ],
+        min_savings: [
+          type: :non_neg_integer,
+          default: 16,
+          doc: "Minimum byte reduction required to keep a compressed tag instead of raw bytes."
+        ],
+        dictionary: [
+          type: {:or, [:atom, :string, {:in, [nil]}]},
+          default: nil,
+          doc: "Optional shared dictionary name stored under `__dicts`."
+        ],
+        intern_above: [
+          type: {:or, [:pos_integer, {:in, [nil]}]},
+          default: nil,
+          doc: "Optional byte threshold above which payloads are content-addressed in `__blobs`."
+        ],
+        row_group_size: [
+          type: :pos_integer,
+          default: 128,
+          doc: "Rows per immutable `\"XCP1\"` column page when `mode: :row_group`."
+        ],
+        encoding: [
+          type: {:in, [:auto, :plain_block, :dict_rle, :dict_block]},
+          default: :auto,
+          doc:
+            "Column page intra-page encoding (`:auto`, `:plain_block`, `:dict_rle`, or `:dict_block`)."
+        ]
+      ]
+    }
+
     @reference %Spark.Dsl.Entity{
       name: :reference,
       describe:
@@ -126,7 +193,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       name: :xitdb,
       describe:
         "Configures Xitdb storage, subtree nesting, B+Tree indexes, BM25 search, and FK rules.",
-      entities: [@nested_in, @index, @search_field],
+      entities: [@nested_in, @index, @search_field, @compress],
       sections: [@references],
       schema: [
         store: [

@@ -8,9 +8,9 @@
 
 | Metric | Elixir NIF Wrapper | Raw Odin Baseline | Comparison |
 | :--- | ---: | ---: | ---: |
-| **Median (`ns/op`)** | 156.0 ns (156.0 ns) | 7.0 ns (7.0 ns) | **`22.29x`** NIF Ratio |
-| **Mean ± σ (CV)** | 160.6 ns ± 9.9 ns (6.1%) | 9.4 ns ± 3.3 ns (35.0%) | Welch `z` = `32.52` |
-| **p95 / Max (`ns/op`)** | 174.2 ns / 178.0 ns | 13.0 ns / 13.0 ns | `5` vs `5` pooled samples |
+| **Median (`ns/op`)** | 163.0 ns (163.0 ns) | 7.0 ns (7.0 ns) | **`23.29x`** NIF Ratio |
+| **Mean ± σ (CV)** | 168.2 ns ± 10.0 ns (6.0%) | 7.0 ns ± 0.0 ns (0.0%) | Welch `z` = `35.92` |
+| **p95 / Max (`ns/op`)** | 180.2 ns / 181.0 ns | 7.0 ns / 7.0 ns | `5` vs `5` pooled samples |
 
 ## Benchmark Harnesses (Elixir vs. Raw Odin)
 
@@ -27,7 +27,7 @@
        end},
 ```
 
-### Raw Odin Harness ([`bench_client.odin#L954-L966`](../bench_client.odin#L954-L966))
+### Raw Odin Harness ([`bench_client.odin#L961-L973`](../bench_client.odin#L961-L973))
 
 ```odin
 	// #6: O(1) Counted_Hash_Map count
@@ -48,7 +48,7 @@
 ## Elixir Wrapper & NIF Bridge
 
 <details>
-<summary>Elixir <code>count</code> — <a href="../../lib/xitdb/cursor.ex#L2564-L2595">lib/xitdb/cursor.ex#L2564-L2595</a></summary>
+<summary>Elixir <code>count</code> — <a href="../../lib/xitdb/cursor.ex#L2652-L2683">lib/xitdb/cursor.ex#L2652-L2683</a></summary>
 
 ```elixir
   def count(%Cursor{tx_mode: false, root: false, tag_id: tag_id, db_ref: db_ref, value: val})
@@ -88,7 +88,7 @@
 </details>
 
 <details>
-<summary>NIF <code>odin_nif_slot_count</code> — <a href="../../native/xitdb_nif.odin#L1208-L1279">native/xitdb_nif.odin#L1208-L1279</a></summary>
+<summary>NIF <code>odin_nif_slot_count</code> — <a href="../../native/xitdb_nif.odin#L1247-L1318">native/xitdb_nif.odin#L1247-L1318</a></summary>
 
 ```odin
 odin_nif_slot_count :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {
@@ -181,7 +181,7 @@ counted_hash_map_count :: proc(m: Read_Counted_Hash_Map) -> (res: i64, err: Erro
 </details>
 
 <details>
-<summary><code>xitdb.cursor_count</code> — <a href="../../native/xitdb-odin/xitdb/cursor.odin#L413-L447">cursor.odin#L413-L447</a></summary>
+<summary><code>xitdb.cursor_count</code> — <a href="../../native/xitdb-odin/xitdb/cursor.odin#L436-L472">cursor.odin#L436-L472</a></summary>
 
 ```odin
 cursor_count :: proc(c: Read_Cursor) -> (res: i64, err: Error) {
@@ -200,7 +200,8 @@ cursor_count :: proc(c: Read_Cursor) -> (res: i64, err: Error) {
 		header := btree_header_from_bytes(hb) or_return
 		return header.size, nil
 	case .Bytes:
-		return core_read_long_at(c.db.core, slot_ptr.slot.value)
+		val := core_read_long_at(c.db.core, slot_ptr.slot.value) or_return
+		return check_long(val)
 	case .Short_Bytes:
 		buf: [8]u8
 		endian.unchecked_put_u64be(buf[:], u64(slot_ptr.slot.value))
@@ -214,7 +215,8 @@ cursor_count :: proc(c: Read_Cursor) -> (res: i64, err: Error) {
 		}
 		return i64(size), nil
 	case .Counted_Hash_Map, .Counted_Hash_Set:
-		return core_read_long_at(c.db.core, slot_ptr.slot.value)
+		val := core_read_long_at(c.db.core, slot_ptr.slot.value) or_return
+		return check_long(val)
 	case:
 		return 0, .Unexpected_Tag
 	}
@@ -298,7 +300,7 @@ cursor_resolved :: proc(c: Read_Cursor) -> (res: Slot_Pointer, err: Error) {
 </details>
 
 <details>
-<summary><code>xitdb.core_read_exact_at</code> — <a href="../../native/xitdb-odin/xitdb/core.odin#L705-L746">core.odin#L705-L746</a></summary>
+<summary><code>xitdb.core_read_exact_at</code> — <a href="../../native/xitdb-odin/xitdb/core.odin#L710-L755">core.odin#L710-L755</a></summary>
 
 ```odin
 core_read_exact_at :: proc(c: ^Core, pos: i64, p: []u8) -> Error {
@@ -310,15 +312,16 @@ core_read_exact_at :: proc(c: ^Core, pos: i64, p: []u8) -> Error {
 	}
 	#partial switch &v in c {
 	case Core_Memory:
-		end_pos := pos + i64(len(p))
-		if end_pos > i64(len(v.buf)) {
+		buf_len := i64(len(v.buf))
+		if pos > buf_len || i64(len(p)) > buf_len - pos {
 			return Xitdb_Error.Unexpected_EOF
 		}
+		end_pos := pos + i64(len(p))
 		copy(p, v.buf[int(pos):int(end_pos)])
 		return nil
 	case Core_Buffered_File:
 		buf_len := i64(len(v.memory.buf))
-		if buf_len > 0 && pos >= v.memory_pos && pos + i64(len(p)) <= v.memory_pos + buf_len {
+		if buf_len > 0 && pos >= v.memory_pos && pos <= v.memory_pos + buf_len && i64(len(p)) <= (v.memory_pos + buf_len) - pos {
 			mem_off := int(pos - v.memory_pos)
 			copy(p, v.memory.buf[mem_off : mem_off + len(p)])
 			return nil
@@ -326,6 +329,9 @@ core_read_exact_at :: proc(c: ^Core, pos: i64, p: []u8) -> Error {
 	}
 	total := 0
 	for total < len(p) {
+		if pos > max(i64) - i64(total) {
+			return Xitdb_Error.Unexpected_EOF
+		}
 		n, err := core_read_at(c, pos + i64(total), p[total:])
 		total += n
 		if err != nil {
@@ -348,7 +354,21 @@ core_read_exact_at :: proc(c: ^Core, pos: i64, p: []u8) -> Error {
 </details>
 
 <details>
-<summary><code>xitdb.database_digest_string_buf</code> — <a href="../../native/xitdb-odin/xitdb/database.odin#L267-L269">database.odin#L267-L269</a></summary>
+<summary><code>xitdb.check_long</code> — <a href="../../native/xitdb-odin/xitdb/types.odin#L1482-L1487">types.odin#L1482-L1487</a></summary>
+
+```odin
+check_long :: proc(n: i64) -> (res: i64, err: Error) {
+	if n < 0 {
+		return 0, .Expected_Unsigned_Long
+	}
+	return n, nil
+}
+```
+
+</details>
+
+<details>
+<summary><code>xitdb.database_digest_string_buf</code> — <a href="../../native/xitdb-odin/xitdb/database.odin#L280-L282">database.odin#L280-L282</a></summary>
 
 ```odin
 database_digest_string_buf :: proc(db: ^Database, s: string, buf: []u8) -> []u8 {
@@ -375,20 +395,6 @@ hash_map_get_slot_by_hash :: proc(m: Read_Hash_Map, hash: []u8) -> (Maybe(Slot),
 ```odin
 sorted_map_get_slot_by_bytes :: proc(m: Read_Sorted_Map, key: []u8) -> (Maybe(Slot), Error) {
 	return cursor_read_path_slot(m.cursor, []Path_Part{Sorted_Map_Get{target = Sorted_Map_Get_Value{key = key}}})
-}
-```
-
-</details>
-
-<details>
-<summary><code>xitdb.is_root</code> — <a href="../../native/xitdb-odin/xitdb/database.odin#L411-L416">database.odin#L411-L416</a></summary>
-
-```odin
-is_root :: proc(slot_ptr: Slot_Pointer) -> bool {
-	if pos, ok := slot_ptr.position.?; ok {
-		return pos == ROOT_HEADER_START
-	}
-	return false
 }
 ```
 

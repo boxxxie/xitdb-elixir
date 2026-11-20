@@ -854,6 +854,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
     @min_i64 -9_223_372_036_854_775_808
     @max_i64 9_223_372_036_854_775_807
+    @max_u64 18_446_744_073_709_551_615
 
     defp indexable_literal?(%Attribute{type: type, constraints: constraints} = attr, val) do
       {kind, _} = Codec.unwrap_type(type, constraints)
@@ -862,6 +863,9 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         case kind do
           :integer ->
             is_integer(val) and val >= @min_i64 and val <= @max_i64
+
+          :unsigned_integer ->
+            is_integer(val) and val >= 0 and val <= @max_u64
 
           :float ->
             is_float(val) or is_integer(val) or is_struct(val, Decimal)
@@ -977,14 +981,15 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     # Stage 2: Cursor Hydration & Attribute Multitenancy Enforcement
     # ==========================================================================
 
-    defp stage2_hydrate(raw_cursors, %__MODULE__{tenant: tenant}, resource) do
+    defp stage2_hydrate(raw_cursors, %__MODULE__{tenant: tenant} = query, resource) do
       strategy = Ash.Resource.Info.multitenancy_strategy(resource)
       global? = Ash.Resource.Info.multitenancy_global?(resource)
       tenant_attr = Ash.Resource.Info.multitenancy_attribute(resource)
+      only_attrs = needed_attributes_for_hydration(query, resource, tenant_attr)
 
       raw_cursors
       |> Enum.reduce_while({:ok, []}, fn {_doc_id, cursor}, {:ok, acc} ->
-        case Codec.from_cursor(resource, cursor, tenant) do
+        case Codec.from_cursor(resource, cursor, tenant, only_attrs) do
           {:ok, record} ->
             if Codec.matches_attribute_tenant?(record, strategy, tenant_attr, global?, tenant) do
               {:cont, {:ok, [record | acc]}}
@@ -997,6 +1002,344 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         end
       end)
       |> reverse_ok()
+    end
+
+    defp needed_attributes_for_hydration(%__MODULE__{select: nil}, _resource, _tenant_attr),
+      do: :all
+
+    defp needed_attributes_for_hydration(
+           %__MODULE__{aggregates: [_ | _]},
+           _resource,
+           _tenant_attr
+         ),
+         do: :all
+
+    defp needed_attributes_for_hydration(
+           %__MODULE__{select: select} = query,
+           resource,
+           tenant_attr
+         )
+         when is_list(select) do
+      if Info.compression_configs(resource) == [] do
+        :all
+      else
+        resolve_hydration_attributes(query, select, resource, tenant_attr)
+      end
+    end
+
+    defp resolve_hydration_attributes(query, select, resource, tenant_attr) do
+      pk_fields = Ash.Resource.Info.primary_key(resource)
+
+      always_selected =
+        resource
+        |> Ash.Resource.Info.attributes()
+        |> Enum.filter(&Map.get(&1, :always_select?, false))
+        |> Enum.map(& &1.name)
+
+      rel_source_attrs =
+        resource
+        |> Ash.Resource.Info.relationships()
+        |> Enum.map(& &1.source_attribute)
+        |> Enum.reject(&is_nil/1)
+
+      tenant_attrs = if is_nil(tenant_attr), do: [], else: [tenant_attr]
+
+      base_set =
+        MapSet.new(select ++ pk_fields ++ always_selected ++ rel_source_attrs ++ tenant_attrs)
+        |> collect_expr_ref_names(query.filter)
+        |> collect_sort_or_distinct_names(query.sort)
+        |> collect_sort_or_distinct_names(query.distinct)
+        |> collect_sort_or_distinct_names(query.distinct_sort)
+
+      {extra_calcs, has_extra_agg?} =
+        collect_extra_calcs_and_aggs(query.filter, [
+          query.sort,
+          query.distinct,
+          query.distinct_sort
+        ])
+
+      if has_extra_agg? do
+        :all
+      else
+        expand_hydration_deps(
+          query.calculations ++ extra_calcs,
+          base_set,
+          MapSet.new(),
+          MapSet.new(),
+          query,
+          resource
+        )
+      end
+    end
+
+    defp expand_hydration_deps([], acc_set, visited_calcs, checked_atoms, query, resource) do
+      unchecked_atoms =
+        acc_set
+        |> Enum.filter(fn item -> is_atom(item) and not MapSet.member?(checked_atoms, item) end)
+
+      if unchecked_atoms == [] do
+        acc_set
+      else
+        next_checked = Enum.reduce(unchecked_atoms, checked_atoms, &MapSet.put(&2, &1))
+
+        has_agg? =
+          Enum.any?(unchecked_atoms, &(Ash.Resource.Info.aggregate(resource, &1) != nil))
+
+        if has_agg? do
+          :all
+        else
+          atom_calcs_res =
+            Enum.reduce_while(unchecked_atoms, {:ok, []}, fn atom, {:ok, acc} ->
+              case Ash.Resource.Info.calculation(resource, atom) do
+                nil ->
+                  {:cont, {:ok, acc}}
+
+                res_calc ->
+                  case synthetic_query_calc(res_calc, query, resource) do
+                    {:ok, entry} -> {:cont, {:ok, [entry | acc]}}
+                    :error -> {:halt, :error}
+                  end
+              end
+            end)
+
+          case atom_calcs_res do
+            :error ->
+              :all
+
+            {:ok, []} ->
+              acc_set
+
+            {:ok, rev_calcs} ->
+              expand_hydration_deps(
+                Enum.reverse(rev_calcs),
+                acc_set,
+                visited_calcs,
+                next_checked,
+                query,
+                resource
+              )
+          end
+        end
+      end
+    end
+
+    defp expand_hydration_deps(
+           [entry | rest],
+           acc_set,
+           visited_calcs,
+           checked_atoms,
+           query,
+           resource
+         ) do
+      {calc, expr} =
+        case entry do
+          {%Calculation{} = c, e} -> {c, e}
+          %Calculation{} = c -> {c, nil}
+        end
+
+      dedup_key = {calc.name, calc.load, calc.module, calc.opts, calc.context, not is_nil(expr)}
+
+      if MapSet.member?(visited_calcs, dedup_key) do
+        expand_hydration_deps(rest, acc_set, visited_calcs, checked_atoms, query, resource)
+      else
+        next_visited = MapSet.put(visited_calcs, dedup_key)
+
+        next_acc =
+          acc_set
+          |> add_calc_key(calc.name)
+          |> add_calc_keys(List.wrap(calc.load))
+          |> add_calc_keys(List.wrap(calc.required_loads))
+          |> add_calc_keys(List.wrap(calc.select))
+          |> add_calc_keys(calc_module_load_and_select(calc, query, resource))
+          |> collect_calc_opts_expr_refs(calc.opts)
+
+        eff_expr = resolve_calc_expr(calc, expr)
+
+        cond do
+          is_nil(eff_expr) and calc.module != Ash.Resource.Calculation.Expression ->
+            :all
+
+          is_nil(eff_expr) ->
+            {opt_calcs, opt_agg?} =
+              extract_expr_calcs_and_aggs(
+                if(is_list(calc.opts), do: Keyword.get(calc.opts, :expr), else: nil)
+              )
+
+            if opt_agg? do
+              :all
+            else
+              expand_hydration_deps(
+                opt_calcs ++ rest,
+                next_acc,
+                next_visited,
+                checked_atoms,
+                query,
+                resource
+              )
+            end
+
+          true ->
+            {nested_calcs, nested_agg?} = extract_expr_calcs_and_aggs(eff_expr)
+
+            if nested_agg? do
+              :all
+            else
+              next_acc = collect_expr_ref_names(next_acc, eff_expr)
+
+              expand_hydration_deps(
+                nested_calcs ++ rest,
+                next_acc,
+                next_visited,
+                checked_atoms,
+                query,
+                resource
+              )
+            end
+        end
+      end
+    end
+
+    defp resolve_calc_expr(%Calculation{} = calc, expr) do
+      cond do
+        expr != nil ->
+          expr
+
+        calc.module == Ash.Resource.Calculation.Expression ->
+          if is_list(calc.opts), do: Keyword.get(calc.opts, :expr), else: nil
+
+        has_calc_expression?(calc.module) ->
+          Ash.Resource.Calculation.expression(calc.module, calc.opts, calc.context)
+
+        true ->
+          nil
+      end
+    end
+
+    defp has_calc_expression?(mod) when is_atom(mod) and not is_nil(mod) do
+      if function_exported?(mod, :has_expression?, 0) do
+        Ash.Resource.Calculation.has_expression?(mod)
+      else
+        function_exported?(mod, :expression, 2)
+      end
+    end
+
+    defp has_calc_expression?(_mod), do: false
+
+    defp calc_module_load_and_select(%Calculation{module: mod} = calc, query, resource)
+         when is_atom(mod) and not is_nil(mod) do
+      if function_exported?(mod, :load, 3) or function_exported?(mod, :select, 3) do
+        ash_query = Ash.Query.new(resource) |> Ash.Query.set_tenant(query.tenant)
+
+        loads =
+          if function_exported?(mod, :load, 3) do
+            try do
+              mod
+              |> Ash.Resource.Calculation.load(ash_query, calc.opts, calc.context)
+              |> List.wrap()
+            rescue
+              _ -> []
+            end
+          else
+            []
+          end
+
+        selects =
+          if function_exported?(mod, :select, 3) do
+            try do
+              mod.select(ash_query, calc.opts, calc.context) |> List.wrap()
+            rescue
+              _ -> []
+            end
+          else
+            []
+          end
+
+        loads ++ selects
+      else
+        []
+      end
+    end
+
+    defp calc_module_load_and_select(_calc, _query, _resource), do: []
+
+    defp synthetic_query_calc(%Ash.Resource.Calculation{} = res_calc, query, resource) do
+      case Calculation.from_resource_calculation(
+             resource,
+             res_calc,
+             source_context: query.context || %{}
+           ) do
+        {:ok, %Calculation{} = calc} ->
+          updated_ctx = %{
+            calc.context
+            | resource: resource,
+              domain: query.domain,
+              tenant: query.tenant || calc.context.tenant
+          }
+
+          updated_calc = %Calculation{
+            calc
+            | load: res_calc.load,
+              context: updated_ctx
+          }
+
+          {:ok, {updated_calc, nil}}
+
+        {:error, _} ->
+          :error
+      end
+    end
+
+    defp collect_extra_calcs_and_aggs(filter, sort_lists) do
+      {filter_calcs, filter_agg?} = extract_expr_calcs_and_aggs(filter)
+
+      Enum.reduce(sort_lists, {filter_calcs, filter_agg?}, fn
+        items, {calcs_acc, agg_acc?} when is_list(items) ->
+          Enum.reduce(items, {calcs_acc, agg_acc?}, fn item, {c_acc, a_acc?} ->
+            key =
+              case item do
+                {k, _dir} -> k
+                k -> k
+              end
+
+            case key do
+              %Calculation{} = calc -> {[{calc, nil} | c_acc], a_acc?}
+              %Aggregate{} -> {c_acc, true}
+              _ -> {c_acc, a_acc?}
+            end
+          end)
+
+        _other, acc ->
+          acc
+      end)
+    end
+
+    defp extract_expr_calcs_and_aggs(nil), do: {[], false}
+
+    defp extract_expr_calcs_and_aggs(%Ash.Filter{expression: expr}),
+      do: extract_expr_calcs_and_aggs(expr)
+
+    defp extract_expr_calcs_and_aggs(expr) do
+      expr
+      |> Ash.Filter.list_refs()
+      |> Enum.reduce({[], false}, fn
+        %Ref{attribute: %Calculation{} = calc}, {calcs, agg?} ->
+          {opt_calcs, opt_agg?} =
+            extract_expr_calcs_and_aggs(
+              if(is_list(calc.opts), do: Keyword.get(calc.opts, :expr), else: nil)
+            )
+
+          {[{calc, nil} | opt_calcs ++ calcs], agg? or opt_agg?}
+
+        %Ref{attribute: %Aggregate{}}, {calcs, _agg?} ->
+          {calcs, true}
+
+        _, acc ->
+          acc
+      end)
+    end
+
+    defp add_calc_keys(set, keys) do
+      Enum.reduce(keys, set, &add_calc_key(&2, &1))
     end
 
     # ==========================================================================

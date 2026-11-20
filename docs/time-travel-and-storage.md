@@ -166,3 +166,66 @@ Because commits are append-only, write-heavy databases accumulate older moments 
 Xitdb.moment_count(compacted_db)
 # => 1 (latest state preserved, historical data reclaimed)
 ```
+
+`Xitdb.compact/2` copies compressed `format_tag` payloads verbatim without re-inflating them and garbage-collects unreachable entries under `__blobs`, `__dicts`, and `__col_pages` that are no longer referenced by the latest moment.
+
+---
+
+## 7. Value Compression, Shared Dictionaries & Columnar Chunks
+
+For repetitive large binaries (such as HTML email bodies, headers, and template dispatches), Xitdb supports transparent compression layered onto `format_tag` slots:
+
+### Transparent Value Codecs (`Xitdb.Compression`)
+
+| Tag | Mechanism | Storage / Behavior |
+| :--- | :--- | :--- |
+| `"cz"` | `:zlib` deflate | Inline compressed payload with `min_bytes` (`128`) / `min_savings` (`16`) shrink guard |
+| `"zs"` | `:zstd` (OTP 28+) | Inline zstd frame with strict `max_decompressed_bytes` (`64 MB`) safety cap |
+| `"zd"` | Shared dictionary | Dictionary-assisted compression referencing `.__dicts.<name>` (`Xitdb.Compression.Dictionary`) |
+| `"bp"` | Interned blob | Content-addressed 32-byte SHA-256 pointer into `.__blobs.<sha256>` (deduplicated across commits) |
+| `"pg"` | Columnar pointer | `O(1)` random-access pointer into an immutable `"XCP1"` page in `.__col_pages` |
+
+```elixir
+# Train and persist an immutable shared dictionary from representative HTML samples
+{:ok, db, _dict_bytes} = Xitdb.Compression.Dictionary.train_and_put(db, :email_html, sample_bodies)
+
+# Write transparently compressed / dictionary-assisted / interned values
+db =
+  Xitdb.transact!(db, %{
+    "emails" => %{
+      "e1" => {:compressed, html_body, dictionary: :email_html},
+      "e2" => {:compressed, legal_pdf, intern: true, codec: :zstd},
+      "e3" => {:compressed, draft_body, codec: :zlib}
+    }
+  })
+
+# Or auto-compress all eligible binaries >= min_bytes in a transaction
+db = Xitdb.transact!(db, bulk_map, compress: [codec: :zstd, min_bytes: 128])
+
+# Reads, select, pull, materialize, diff_moments, history_of, and Datalog decode transparently:
+db["emails"]["e1"]                                      # => plaintext HTML binary
+Xitdb.select!(db, ".emails.e1")                         # => plaintext HTML binary
+Xitdb.select!(db, ".emails.e1", raw_tagged: true)       # => {:tagged, "zd", <<...>>}
+{:ok, changes} = Xitdb.diff_moments(db, 0, 1)           # => hides __blobs/__dicts/__col_pages unless include_internal: true
+```
+
+### Parquet-Style Row-Group Columnar Pages (`Xitdb.Columnar`)
+
+Use `Xitdb.Columnar.put_rows/4` when ingesting high-volume row collections so repetitive columns are batched across row groups (`row_group_size: 128`) into immutable `"XCP1"` pages (`:plain_block`, `:dict_rle`, or `:dict_block`):
+
+```elixir
+db =
+  Xitdb.Columnar.put_rows!(db, "activities", rows,
+    columns: [
+      {:body, encoding: :dict_block, dictionary: :email_html, codec: :zstd},
+      {:header_properties, encoding: :dict_rle, codec: :zstd}
+    ],
+    row_group_size: 128
+  )
+
+# Projections omitting columnar fields perform 0 page reads and 0 decompressions:
+meta = Xitdb.pull!(db["activities"]["10"], "{id, title}")
+
+# Single-row reads decompress at most one row-group page and cache it in bounded ETS (`:xitdb_page_cache`):
+body = db["activities"]["10"]["body"]
+```

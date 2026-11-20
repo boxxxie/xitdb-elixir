@@ -6,7 +6,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     """
 
     alias Spark.Dsl.Extension
-    alias Xitdb.Ash.{Index, NestedIn, Reference, SearchField}
+    alias Xitdb.Ash.{Compress, Index, NestedIn, Reference, SearchField}
 
     @type resource_or_dsl :: Ash.Resource.t() | Spark.Dsl.t()
 
@@ -195,6 +195,58 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         persisted ->
           persisted
       end
+    end
+
+    @doc """
+    Returns all declared `%Xitdb.Ash.Compress{}` compression rules for `resource_or_dsl`.
+    """
+    @spec compression_configs(resource_or_dsl()) :: [Compress.t()]
+    def compression_configs(resource) when is_atom(resource) do
+      fetch_persisted_or_compute(
+        resource,
+        :__xitdb_compress_configs__,
+        :xitdb_compress_configs,
+        &compression_configs_from_dsl/1
+      )
+    end
+
+    def compression_configs(dsl_state), do: compression_configs_from_dsl(dsl_state)
+
+    defp compression_configs_from_dsl(resource_or_dsl) do
+      for %Compress{} = cfg <- Extension.get_entities(resource_or_dsl, [:xitdb]) do
+        %Compress{cfg | __identifier__: nil, __spark_metadata__: nil}
+      end
+    end
+
+    @doc """
+    Returns a map of `%{attribute_name => %Xitdb.Ash.Compress{}}` for `resource_or_dsl`.
+    """
+    @spec compression_by_field(resource_or_dsl()) :: %{atom() => Compress.t()}
+    def compression_by_field(resource) when is_atom(resource) do
+      fetch_persisted_or_compute(
+        resource,
+        :__xitdb_compress_by_field__,
+        :xitdb_compress_by_field,
+        &compression_by_field_from_dsl/1
+      )
+    end
+
+    def compression_by_field(dsl_state), do: compression_by_field_from_dsl(dsl_state)
+
+    defp compression_by_field_from_dsl(resource_or_dsl) do
+      for %Compress{fields: fields} = cfg <- compression_configs_from_dsl(resource_or_dsl),
+          field <- fields,
+          into: %{} do
+        {field, cfg}
+      end
+    end
+
+    @doc """
+    Returns the `%Xitdb.Ash.Compress{}` configuration governing `field`, or `nil` if uncompressed.
+    """
+    @spec compression_for_field(resource_or_dsl(), atom()) :: Compress.t() | nil
+    def compression_for_field(resource_or_dsl, field) when is_atom(field) do
+      Map.get(compression_by_field(resource_or_dsl), field)
     end
 
     @doc """
