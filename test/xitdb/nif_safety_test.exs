@@ -1074,4 +1074,61 @@ defmodule Xitdb.NifSafetyTest do
 
     :ok = Xitdb.close(db)
   end
+
+  test "concurrent deeply nested diff_moments, materialize, pull, sync, and compact stay safe on default dirty scheduler stacks" do
+    depth = 16
+
+    compressed_leaf =
+      Xitdb.Compression.compress(String.duplicate("stack safety ", 32),
+        codec: :zlib,
+        min_bytes: 0
+      )
+
+    nested_a =
+      Enum.reduce(depth..1//-1, %{"leaf" => "v1", "blob" => compressed_leaf}, fn i, acc ->
+        %{"k#{i}" => acc}
+      end)
+
+    nested_b =
+      Enum.reduce(depth..1//-1, %{"leaf" => "v2", "blob" => compressed_leaf}, fn i, acc ->
+        %{"k#{i}" => acc}
+      end)
+
+    db = Xitdb.open!(backend: :memory)
+    db = Xitdb.transact!(db, %{"root" => nested_a, "__blobs" => %{"dead" => "unused"}})
+    db = Xitdb.transact!(db, %{"root" => nested_b})
+
+    expected_path = ".root." <> Enum.map_join(1..depth, ".", &"k#{&1}") <> ".leaf"
+
+    tasks =
+      for _ <- 1..32 do
+        Task.async(fn ->
+          {:ok, changes} = Xitdb.diff_moments(db, 0, 1)
+          assert [%{op: :put, path: ^expected_path, old_value: "v1", new_value: "v2"}] = changes
+
+          mat = Xitdb.materialize(db)
+          leaf_mat = Enum.reduce(1..depth, mat["root"], fn i, acc -> acc["k#{i}"] end)
+          assert leaf_mat["leaf"] == "v2"
+
+          {:ok, pulled} = Xitdb.pull(db, "*")
+          leaf_pull = Enum.reduce(1..depth, pulled["root"], fn i, acc -> acc["k#{i}"] end)
+          assert leaf_pull["leaf"] == "v2"
+
+          :ok = Xitdb.sync(db)
+
+          {:ok, compacted} = Xitdb.compact(db, path: "")
+          on_compacted = Xitdb.materialize(compacted)
+          assert :ok = Xitdb.close(compacted)
+
+          assert Enum.reduce(1..depth, on_compacted["root"], fn i, acc -> acc["k#{i}"] end)[
+                   "leaf"
+                 ] == "v2"
+
+          :ok
+        end)
+      end
+
+    assert Enum.all?(Task.await_many(tasks, 15_000), &(&1 == :ok))
+    assert :ok = Xitdb.close(db)
+  end
 end

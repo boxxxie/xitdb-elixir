@@ -676,6 +676,47 @@ make_mapset_term :: proc(env: ErlNifEnv, elems: []ERL_NIF_TERM) -> ERL_NIF_TERM 
 	return make_map_safe(env, ms_keys[:], ms_vals[:])
 }
 
+Nif_Iter_Pool :: struct {
+	free_list: [dynamic]^xitdb.Cursor_Iterator,
+	alloc:     runtime.Allocator,
+}
+
+nif_iter_pool_init :: proc(alloc := context.temp_allocator) -> Nif_Iter_Pool {
+	return Nif_Iter_Pool{
+		free_list = make([dynamic]^xitdb.Cursor_Iterator, alloc),
+		alloc     = alloc,
+	}
+}
+
+@(require_results)
+nif_alloc_cursor_iterator :: proc(alloc := context.temp_allocator) -> (it: ^xitdb.Cursor_Iterator, err: xitdb.Error) {
+	ptr, alloc_err := new(xitdb.Cursor_Iterator, alloc)
+	if alloc_err != nil || ptr == nil {
+		return nil, .Write_Failed
+	}
+	return ptr, nil
+}
+
+@(require_results)
+nif_iter_pool_acquire :: proc(pool: ^Nif_Iter_Pool) -> (it: ^xitdb.Cursor_Iterator, err: xitdb.Error) {
+	if pool == nil || pool.alloc.procedure == nil {
+		return nif_alloc_cursor_iterator(context.temp_allocator)
+	}
+	if len(pool.free_list) > 0 {
+		return pop(&pool.free_list), nil
+	}
+	return nif_alloc_cursor_iterator(pool.alloc)
+}
+
+nif_iter_pool_release :: proc(pool: ^Nif_Iter_Pool, it: ^xitdb.Cursor_Iterator) {
+	if pool == nil || pool.alloc.procedure == nil || it == nil {
+		return
+	}
+	if _, alloc_err := append(&pool.free_list, it); alloc_err != nil {
+		free(it, pool.alloc)
+	}
+}
+
 materialize_slot :: proc(
 	env: ErlNifEnv,
 	db: ^xitdb.Database,
@@ -684,6 +725,7 @@ materialize_slot :: proc(
 	raw_tagged: bool = false,
 	codec_err: ^string = nil,
 	max_bytes: u64 = MAX_NIF_DECOMPRESSED_BYTES,
+	pool: ^Nif_Iter_Pool = nil,
 ) -> (res: ERL_NIF_TERM, err: xitdb.Error) {
 	if !is_container_tag(slot.tag) {
 		return slot_to_term(env, db, slot, raw_tagged, codec_err, max_bytes)
@@ -696,19 +738,21 @@ materialize_slot :: proc(
 
 	#partial switch slot.tag {
 	case .Array_List, .Linked_Array_List:
-		it := xitdb.cursor_iterator(cur) or_return
+		it := nif_iter_pool_acquire(pool) or_return
+		defer nif_iter_pool_release(pool, it)
+		xitdb.cursor_iterator_init(it, cur) or_return
 		item_buf: [16]ERL_NIF_TERM = ---
 		item_len := 0
 		item_dyn: [dynamic]ERL_NIF_TERM
 		using_dyn := false
 		for {
-			next_maybe := xitdb.cursor_iterator_next(&it) or_return
+			next_maybe := xitdb.cursor_iterator_next(it) or_return
 			elem_cur, ok := next_maybe.?
 			if !ok {
 				break
 			}
 			elem_slot := xitdb.cursor_slot(elem_cur) or_return
-			term := materialize_slot(env, db, elem_slot, false, raw_tagged, codec_err, max_bytes) or_return
+			term := materialize_slot(env, db, elem_slot, false, raw_tagged, codec_err, max_bytes, pool) or_return
 			push_nif_term(item_buf[:], &item_len, &item_dyn, &using_dyn, term, context.temp_allocator)
 		}
 		items := item_dyn[:] if using_dyn else item_buf[:item_len]
@@ -718,13 +762,15 @@ materialize_slot :: proc(
 		return nif_make_list_from_array(env, raw_data(items), c.uint(len(items))), nil
 
 	case .Hash_Set, .Counted_Hash_Set, .Sorted_Set:
-		it := xitdb.cursor_iterator(cur) or_return
+		it := nif_iter_pool_acquire(pool) or_return
+		defer nif_iter_pool_release(pool, it)
+		xitdb.cursor_iterator_init(it, cur) or_return
 		item_buf: [16]ERL_NIF_TERM = ---
 		item_len := 0
 		item_dyn: [dynamic]ERL_NIF_TERM
 		using_dyn := false
 		for {
-			next_maybe := xitdb.cursor_iterator_next(&it) or_return
+			next_maybe := xitdb.cursor_iterator_next(it) or_return
 			elem_cur, ok := next_maybe.?
 			if !ok {
 				break
@@ -737,7 +783,9 @@ materialize_slot :: proc(
 		return make_mapset_term(env, items), nil
 
 	case .Hash_Map, .Counted_Hash_Map, .Sorted_Map:
-		it := xitdb.cursor_iterator(cur) or_return
+		it := nif_iter_pool_acquire(pool) or_return
+		defer nif_iter_pool_release(pool, it)
+		xitdb.cursor_iterator_init(it, cur) or_return
 		key_buf: [16]ERL_NIF_TERM = ---
 		val_buf: [16]ERL_NIF_TERM = ---
 		key_len, val_len := 0, 0
@@ -745,7 +793,7 @@ materialize_slot :: proc(
 		using_key_dyn, using_val_dyn := false, false
 		sb_buf: [128]u8 = ---
 		for {
-			next_maybe := xitdb.cursor_iterator_next(&it) or_return
+			next_maybe := xitdb.cursor_iterator_next(it) or_return
 			elem_cur, ok := next_maybe.?
 			if !ok {
 				break
@@ -756,7 +804,7 @@ materialize_slot :: proc(
 				continue
 			}
 			k_term := make_binary(env, key_str)
-			v_term := materialize_slot(env, db, val_cur.slot_ptr.slot, false, raw_tagged, codec_err, max_bytes) or_return
+			v_term := materialize_slot(env, db, val_cur.slot_ptr.slot, false, raw_tagged, codec_err, max_bytes, pool) or_return
 			push_nif_term(key_buf[:], &key_len, &key_dyn, &using_key_dyn, k_term, context.temp_allocator)
 			push_nif_term(val_buf[:], &val_len, &val_dyn, &using_val_dyn, v_term, context.temp_allocator)
 		}
@@ -1621,11 +1669,15 @@ odin_nif_slot_contains :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NI
 	return make_ok(env, ATOM_TRUE if (has_slot && (s.tag != .None || s.full)) else ATOM_FALSE)
 }
 
-sorted_map_tx_rank :: proc(cur: xitdb.Read_Cursor) -> (has_tx: bool, rank: i64, err: xitdb.Error) {
+sorted_map_tx_rank :: proc(cur: xitdb.Read_Cursor, tx_it: ^xitdb.Cursor_Iterator = nil) -> (has_tx: bool, rank: i64, err: xitdb.Error) {
+	it := tx_it
+	if it == nil {
+		it = nif_alloc_cursor_iterator(context.temp_allocator) or_return
+	}
 	tx_key := "__tx"
-	tx_it := xitdb.cursor_iterator_sorted_from_key(cur, transmute([]u8)tx_key) or_return
-	tx_rank := tx_it.index
-	next_maybe := xitdb.cursor_iterator_next(&tx_it) or_return
+	xitdb.cursor_iterator_sorted_from_key_init(it, cur, transmute([]u8)tx_key) or_return
+	tx_rank := it.index
+	next_maybe := xitdb.cursor_iterator_next(it) or_return
 	if elem_cur, ok := next_maybe.?; ok {
 		key_cur, _ := xitdb.cursor_read_kv_pair_slots(elem_cur) or_return
 		sb_buf: [16]u8 = ---
@@ -1686,18 +1738,21 @@ odin_nif_slot_slice :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_T
 		db       = &handle.db,
 	}
 
-	it: xitdb.Cursor_Iterator
+	it, it_alloc_err := nif_alloc_cursor_iterator(context.temp_allocator)
+	if it_alloc_err != nil {
+		return make_xitdb_err(env, it_alloc_err)
+	}
 	err: xitdb.Error = nil
 
 	#partial switch slot.tag {
 	case .Array_List:
-		it, err = xitdb.cursor_iterator_array_list_from_index(cur, start_idx)
+		err = xitdb.cursor_iterator_array_list_from_index_init(it, cur, start_idx)
 	case .Linked_Array_List:
-		it, err = xitdb.cursor_iterator_linked_array_list_from_index(cur, start_idx)
+		err = xitdb.cursor_iterator_linked_array_list_from_index_init(it, cur, start_idx)
 	case .Sorted_Map, .Sorted_Set:
 		seek_idx := start_idx
 		if is_root && slot.tag == .Sorted_Map {
-			has_tx, tx_rank, tx_err := sorted_map_tx_rank(cur)
+			has_tx, tx_rank, tx_err := sorted_map_tx_rank(cur, it)
 			if tx_err != nil {
 				return make_xitdb_err(env, tx_err)
 			}
@@ -1705,7 +1760,7 @@ odin_nif_slot_slice :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_T
 				seek_idx = start_idx + 1
 			}
 		}
-		it, err = xitdb.cursor_iterator_sorted_from_index(cur, seek_idx)
+		err = xitdb.cursor_iterator_sorted_from_index_init(it, cur, seek_idx)
 	case:
 		return make_err(env, "unsupported")
 	}
@@ -1722,7 +1777,7 @@ odin_nif_slot_slice :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_T
 	emitted: i64 = 0
 	codec_err := ""
 	for emitted < length {
-		next_maybe, n_err := xitdb.cursor_iterator_next(&it)
+		next_maybe, n_err := xitdb.cursor_iterator_next(it)
 		if n_err != nil {
 			return make_xitdb_err(env, n_err)
 		}
@@ -1906,7 +1961,8 @@ odin_nif_slot_materialize :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL
 		slot.full = (full_int != 0)
 	}
 	codec_err := ""
-	term, err := materialize_slot(env, &handle.db, slot, is_root, raw_tagged, &codec_err, max_bytes)
+	iter_pool := nif_iter_pool_init(context.temp_allocator)
+	term, err := materialize_slot(env, &handle.db, slot, is_root, raw_tagged, &codec_err, max_bytes, &iter_pool)
 	if err != nil {
 		if len(codec_err) > 0 {
 			return make_err(env, codec_err)
@@ -3575,9 +3631,10 @@ evict_source_map_indexes :: proc(ms: ^Merge_State, src_key: string, src_cur: xit
 	if sp.slot.value == 0 || (sp.slot.tag != .Hash_Map && sp.slot.tag != .Counted_Hash_Map && sp.slot.tag != .Sorted_Map) {
 		return nil
 	}
-	it := xitdb.cursor_iterator(src_cur) or_return
+	it := nif_alloc_cursor_iterator(context.temp_allocator) or_return
+	xitdb.cursor_iterator_init(it, src_cur) or_return
 	for {
-		next_maybe := xitdb.cursor_iterator_next(&it) or_return
+		next_maybe := xitdb.cursor_iterator_next(it) or_return
 		elem_cur, has_next := next_maybe.?
 		if !has_next {
 			break
@@ -5826,6 +5883,7 @@ nif_pull_wildcard :: proc(
 	raw_tagged: bool = false,
 	codec_err: ^string = nil,
 	max_bytes: u64 = MAX_NIF_DECOMPRESSED_BYTES,
+	pool: ^Nif_Iter_Pool = nil,
 ) -> (res: ERL_NIF_TERM, err_reason: string, err: xitdb.Error) {
 	slot := xitdb.cursor_slot(cur) or_return
 	if !is_container_tag(slot.tag) {
@@ -5844,15 +5902,17 @@ nif_pull_wildcard :: proc(
 
 	#partial switch slot.tag {
 	case .Array_List, .Linked_Array_List:
-		it := xitdb.cursor_iterator(cur) or_return
+		it := nif_iter_pool_acquire(pool) or_return
+		defer nif_iter_pool_release(pool, it)
+		xitdb.cursor_iterator_init(it, cur) or_return
 		items := make([dynamic]ERL_NIF_TERM, 0, 16, context.temp_allocator)
 		for {
-			next_maybe := xitdb.cursor_iterator_next(&it) or_return
+			next_maybe := xitdb.cursor_iterator_next(it) or_return
 			elem_cur, ok := next_maybe.?
 			if !ok {
 				break
 			}
-			v, v_reason, v_err := nif_pull_wildcard(env, db, elem_cur, false, visited, raw_tagged, codec_err, max_bytes)
+			v, v_reason, v_err := nif_pull_wildcard(env, db, elem_cur, false, visited, raw_tagged, codec_err, max_bytes, pool)
 			if v_err != nil {
 				return 0, "", v_err
 			}
@@ -5867,10 +5927,12 @@ nif_pull_wildcard :: proc(
 		return nif_make_list_from_array(env, raw_data(items[:]), c.uint(len(items))), "", nil
 
 	case .Hash_Set, .Counted_Hash_Set, .Sorted_Set:
-		it := xitdb.cursor_iterator(cur) or_return
+		it := nif_iter_pool_acquire(pool) or_return
+		defer nif_iter_pool_release(pool, it)
+		xitdb.cursor_iterator_init(it, cur) or_return
 		items := make([dynamic]ERL_NIF_TERM, 0, 16, context.temp_allocator)
 		for {
-			next_maybe := xitdb.cursor_iterator_next(&it) or_return
+			next_maybe := xitdb.cursor_iterator_next(it) or_return
 			elem_cur, ok := next_maybe.?
 			if !ok {
 				break
@@ -5885,11 +5947,13 @@ nif_pull_wildcard :: proc(
 		return nif_make_list_from_array(env, raw_data(items[:]), c.uint(len(items))), "", nil
 
 	case .Hash_Map, .Counted_Hash_Map, .Sorted_Map:
-		it := xitdb.cursor_iterator(cur) or_return
+		it := nif_iter_pool_acquire(pool) or_return
+		defer nif_iter_pool_release(pool, it)
+		xitdb.cursor_iterator_init(it, cur) or_return
 		keys := make([dynamic]ERL_NIF_TERM, 0, 16, context.temp_allocator)
 		vals := make([dynamic]ERL_NIF_TERM, 0, 16, context.temp_allocator)
 		for {
-			next_maybe := xitdb.cursor_iterator_next(&it) or_return
+			next_maybe := xitdb.cursor_iterator_next(it) or_return
 			elem_cur, ok := next_maybe.?
 			if !ok {
 				break
@@ -5899,7 +5963,7 @@ nif_pull_wildcard :: proc(
 			if is_root && k_str == "__tx" {
 				continue
 			}
-			v, v_reason, v_err := nif_pull_wildcard(env, db, val_cur, false, visited, raw_tagged, codec_err, max_bytes)
+			v, v_reason, v_err := nif_pull_wildcard(env, db, val_cur, false, visited, raw_tagged, codec_err, max_bytes, pool)
 			if v_err != nil {
 				return 0, "", v_err
 			}
@@ -5943,19 +6007,21 @@ nif_pull_range :: proc(
 	raw_tagged: bool = false,
 	codec_err: ^string = nil,
 	max_bytes: u64 = MAX_NIF_DECOMPRESSED_BYTES,
+	pool: ^Nif_Iter_Pool = nil,
 ) -> (res: ERL_NIF_TERM, err_reason: string, err: xitdb.Error) {
 	if start_idx < 0 || end_idx < start_idx {
 		return 0, "", .Invalid_Range
 	}
 	slot := xitdb.cursor_slot(cur) or_return
-	it: xitdb.Cursor_Iterator
+	it := nif_iter_pool_acquire(pool) or_return
+	defer nif_iter_pool_release(pool, it)
 	#partial switch slot.tag {
 	case .Array_List:
 		al_col := xitdb.read_array_list_init(cur) or_return
-		it = xitdb.array_list_iterator_from(al_col, start_idx) or_return
+		xitdb.cursor_iterator_array_list_from_index_init(it, al_col.cursor, start_idx) or_return
 	case .Linked_Array_List:
 		ll_col := xitdb.read_linked_array_list_init(cur) or_return
-		it = xitdb.linked_array_list_iterator_from(ll_col, start_idx) or_return
+		xitdb.cursor_iterator_linked_array_list_from_index_init(it, ll_col.cursor, start_idx) or_return
 	case:
 		return 0, "", .Unexpected_Tag
 	}
@@ -5965,7 +6031,7 @@ nif_pull_range :: proc(
 	trimmed_sub := strings.trim_space(sub_pattern)
 	wildcard_sub := len(trimmed_sub) == 0 || trimmed_sub == "*"
 	for i: i64 = 0; i < limit; i += 1 {
-		c_maybe := xitdb.cursor_iterator_next(&it) or_return
+		c_maybe := xitdb.cursor_iterator_next(it) or_return
 		elem_cur, ok := c_maybe.?
 		if !ok {
 			break
@@ -5978,7 +6044,7 @@ nif_pull_range :: proc(
 				continue
 			}
 		}
-		v, v_reason, v_err := nif_pull_cursor(env, db, elem_cur, trimmed_sub, false, visited, raw_tagged, codec_err, max_bytes)
+		v, v_reason, v_err := nif_pull_cursor(env, db, elem_cur, trimmed_sub, false, visited, raw_tagged, codec_err, max_bytes, pool)
 		if v_err != nil {
 			return 0, "", v_err
 		}
@@ -6003,10 +6069,11 @@ nif_pull_cursor :: proc(
 	raw_tagged: bool = false,
 	codec_err: ^string = nil,
 	max_bytes: u64 = MAX_NIF_DECOMPRESSED_BYTES,
+	pool: ^Nif_Iter_Pool = nil,
 ) -> (res: ERL_NIF_TERM, err_reason: string, err: xitdb.Error) {
 	p := strings.trim_space(pattern)
 	if len(p) == 0 || p == "*" {
-		return nif_pull_wildcard(env, db, cur, is_root, visited, raw_tagged, codec_err, max_bytes)
+		return nif_pull_wildcard(env, db, cur, is_root, visited, raw_tagged, codec_err, max_bytes, pool)
 	}
 
 	if len(p) >= 2 && p[0] == '{' && p[len(p) - 1] == '}' {
@@ -6030,9 +6097,11 @@ nif_pull_cursor :: proc(
 		if has_star {
 			#partial switch cur_slot.tag {
 			case .Hash_Map, .Counted_Hash_Map, .Sorted_Map:
-				it := xitdb.cursor_iterator(cur) or_return
+				it := nif_iter_pool_acquire(pool) or_return
+				defer nif_iter_pool_release(pool, it)
+				xitdb.cursor_iterator_init(it, cur) or_return
 				for {
-					next_maybe := xitdb.cursor_iterator_next(&it) or_return
+					next_maybe := xitdb.cursor_iterator_next(it) or_return
 					elem_cur, ok := next_maybe.?
 					if !ok {
 						break
@@ -6042,7 +6111,7 @@ nif_pull_cursor :: proc(
 					if is_root && k_str == "__tx" {
 						continue
 					}
-					v, v_reason, v_err := nif_pull_wildcard(env, db, val_cur, false, visited, raw_tagged, codec_err, max_bytes)
+					v, v_reason, v_err := nif_pull_wildcard(env, db, val_cur, false, visited, raw_tagged, codec_err, max_bytes, pool)
 					if v_err != nil {
 						return 0, "", v_err
 					}
@@ -6157,7 +6226,7 @@ nif_pull_cursor :: proc(
 
 			pulled: ERL_NIF_TERM
 			if has_range {
-				pr, pr_reason, pr_err := nif_pull_range(env, db, target_cur, range_start, range_end, sub_pattern, visited, raw_tagged, codec_err, max_bytes)
+				pr, pr_reason, pr_err := nif_pull_range(env, db, target_cur, range_start, range_end, sub_pattern, visited, raw_tagged, codec_err, max_bytes, pool)
 				if pr_err != nil {
 					return 0, "", pr_err
 				}
@@ -6170,7 +6239,7 @@ nif_pull_cursor :: proc(
 				if !is_container_tag(t_slot.tag) {
 					pulled = slot_to_term(env, db, t_slot, raw_tagged, codec_err, max_bytes) or_return
 				} else {
-					pc, pc_reason, pc_err := nif_pull_cursor(env, db, target_cur, sub_pattern, false, visited, raw_tagged, codec_err, max_bytes)
+					pc, pc_reason, pc_err := nif_pull_cursor(env, db, target_cur, sub_pattern, false, visited, raw_tagged, codec_err, max_bytes, pool)
 					if pc_err != nil {
 						return 0, "", pc_err
 					}
@@ -6180,7 +6249,7 @@ nif_pull_cursor :: proc(
 					pulled = pc
 				}
 			} else {
-				pc, pc_reason, pc_err := nif_pull_cursor(env, db, target_cur, sub_pattern, false, visited, raw_tagged, codec_err, max_bytes)
+				pc, pc_reason, pc_err := nif_pull_cursor(env, db, target_cur, sub_pattern, false, visited, raw_tagged, codec_err, max_bytes, pool)
 				if pc_err != nil {
 					return 0, "", pc_err
 				}
@@ -6263,7 +6332,8 @@ odin_nif_pull :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -
 	visited: map[i64]bool
 	visited.allocator = context.temp_allocator
 	codec_err := ""
-	res_term, p_reason, p_err := nif_pull_cursor(env, &handle.db, cur, pattern_str, is_root, &visited, raw_tagged, &codec_err, max_bytes)
+	iter_pool := nif_iter_pool_init(context.temp_allocator)
+	res_term, p_reason, p_err := nif_pull_cursor(env, &handle.db, cur, pattern_str, is_root, &visited, raw_tagged, &codec_err, max_bytes, &iter_pool)
 	if p_err != nil {
 		if len(codec_err) > 0 {
 			return make_err(env, codec_err)
@@ -6324,6 +6394,7 @@ odin_nif_diff_moments :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF
 	}
 	items := make([dynamic]ERL_NIF_TERM, 0, len(changes), context.temp_allocator)
 	codec_err := ""
+	iter_pool := nif_iter_pool_init(context.temp_allocator)
 	for chg in changes {
 		op_atom: ERL_NIF_TERM
 		switch chg.op {
@@ -6343,14 +6414,14 @@ odin_nif_diff_moments :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF
 			op_atom = ATOM_PUT
 		}
 
-		old_val, o_err := materialize_slot(env, &handle.db, chg.old_slot, false, raw_tagged, &codec_err, max_bytes)
+		old_val, o_err := materialize_slot(env, &handle.db, chg.old_slot, false, raw_tagged, &codec_err, max_bytes, &iter_pool)
 		if o_err != nil {
 			if len(codec_err) > 0 {
 				return make_err(env, codec_err)
 			}
 			return make_xitdb_err(env, o_err)
 		}
-		new_val, n_err := materialize_slot(env, &handle.db, chg.new_slot, false, raw_tagged, &codec_err, max_bytes)
+		new_val, n_err := materialize_slot(env, &handle.db, chg.new_slot, false, raw_tagged, &codec_err, max_bytes, &iter_pool)
 		if n_err != nil {
 			if len(codec_err) > 0 {
 				return make_err(env, codec_err)
@@ -6426,10 +6497,14 @@ odin_nif_history_of :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_T
 	if h_err != nil {
 		return make_xitdb_err(env, h_err)
 	}
-	it, it_err := xitdb.cursor_iterator(history.cursor)
-	if it_err != nil {
+	it, it_alloc_err := nif_alloc_cursor_iterator(context.temp_allocator)
+	if it_alloc_err != nil {
+		return make_xitdb_err(env, it_alloc_err)
+	}
+	if it_err := xitdb.cursor_iterator_init(it, history.cursor); it_err != nil {
 		return make_xitdb_err(env, it_err)
 	}
+	mat_pool := nif_iter_pool_init(context.temp_allocator)
 
 	tx_hash_buf: [64]u8 = ---
 	doc_hash_buf: [64]u8 = ---
@@ -6463,7 +6538,7 @@ odin_nif_history_of :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_T
 	prev_slot := xitdb.Slot{}
 
 	for {
-		mc_maybe, next_err := xitdb.cursor_iterator_next(&it)
+		mc_maybe, next_err := xitdb.cursor_iterator_next(it)
 		if next_err != nil {
 			return make_xitdb_err(env, next_err)
 		}
@@ -6538,7 +6613,7 @@ odin_nif_history_of :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_T
 			}
 
 			codec_err := ""
-			val_term, m_err := materialize_slot(env, &handle.db, cur_slot, false, raw_tagged, &codec_err, max_bytes)
+			val_term, m_err := materialize_slot(env, &handle.db, cur_slot, false, raw_tagged, &codec_err, max_bytes, &mat_pool)
 			if m_err != nil {
 				if len(codec_err) > 0 {
 					return make_err(env, codec_err)
@@ -6622,6 +6697,7 @@ NIF_Datalog_Query :: struct {
 	clauses:        [dynamic]NIF_Datalog_Clause,
 	has_aggregates: bool,
 	dl_ctx:         ^NIF_DL_Decode_Ctx,
+	iter_pool:      Nif_Iter_Pool,
 	allocator:      runtime.Allocator,
 }
 
@@ -8168,18 +8244,19 @@ nif_dl_eval_pattern_steps :: proc(
 
 		// Unbound variable step: branch across collection entries
 		var_idx := step.var_idx
-		it := new(xitdb.Cursor_Iterator, allocator)
+		it := nif_iter_pool_acquire(&q.iter_pool) or_return
+		defer nif_iter_pool_release(&q.iter_pool, it)
 
 		#partial switch slot.tag {
 		case .Sorted_Map, .Sorted_Set:
 			prefix_hint, has_prefix := nif_dl_find_prefix_hint(q, var_idx)
 			lower_hint, has_lower := nif_dl_find_lower_bound_hint(q, var_idx)
 			if has_prefix {
-				it^ = xitdb.cursor_iterator_sorted_from_key(cur, transmute([]u8)prefix_hint) or_return
+				xitdb.cursor_iterator_sorted_from_key_init(it, cur, transmute([]u8)prefix_hint) or_return
 			} else if has_lower {
-				it^ = xitdb.cursor_iterator_sorted_from_key(cur, transmute([]u8)lower_hint) or_return
+				xitdb.cursor_iterator_sorted_from_key_init(it, cur, transmute([]u8)lower_hint) or_return
 			} else {
-				it^ = xitdb.cursor_iterator(cur) or_return
+				xitdb.cursor_iterator_init(it, cur) or_return
 			}
 			for {
 				c_maybe := xitdb.cursor_iterator_next(it) or_return
@@ -8215,7 +8292,7 @@ nif_dl_eval_pattern_steps :: proc(
 
 		case .Hash_Map, .Counted_Hash_Map, .Hash_Set, .Counted_Hash_Set:
 			is_set := slot.tag == .Hash_Set || slot.tag == .Counted_Hash_Set
-			it^ = xitdb.cursor_iterator(cur) or_return
+			xitdb.cursor_iterator_init(it, cur) or_return
 			for {
 				c_maybe := xitdb.cursor_iterator_next(it) or_return
 				c, has_c := c_maybe.?
@@ -8249,7 +8326,7 @@ nif_dl_eval_pattern_steps :: proc(
 			return matched_any, nil
 
 		case .Array_List, .Linked_Array_List:
-			it^ = xitdb.cursor_iterator(cur) or_return
+			xitdb.cursor_iterator_init(it, cur) or_return
 			idx: i64 = 0
 			for {
 				c_maybe := xitdb.cursor_iterator_next(it) or_return
@@ -8682,6 +8759,7 @@ odin_nif_query_datalog :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NI
 	q := new(NIF_Datalog_Query, context.temp_allocator)
 	q^ = q_val
 	q.dl_ctx = &dl_ctx
+	q.iter_pool = nif_iter_pool_init(context.temp_allocator)
 
 	handle, ok := acquire_rlock(env, argv[0])
 	if !ok {
@@ -8838,6 +8916,7 @@ gc_collect_slot :: proc(
 	db: ^xitdb.Database,
 	slot: xitdb.Slot,
 	state: ^GC_Ref_State,
+	pool: ^Nif_Iter_Pool,
 	allocator: runtime.Allocator,
 ) -> xitdb.Error {
 	if slot.tag == .Bytes || slot.tag == .Short_Bytes {
@@ -8873,39 +8952,45 @@ gc_collect_slot :: proc(
 
 	#partial switch slot.tag {
 	case .Array_List, .Linked_Array_List:
-		it := xitdb.cursor_iterator(cur) or_return
+		it := nif_iter_pool_acquire(pool) or_return
+		defer nif_iter_pool_release(pool, it)
+		xitdb.cursor_iterator_init(it, cur) or_return
 		for {
-			next_maybe := xitdb.cursor_iterator_next(&it) or_return
+			next_maybe := xitdb.cursor_iterator_next(it) or_return
 			elem_cur, ok := next_maybe.?
 			if !ok {
 				break
 			}
 			elem_slot := xitdb.cursor_slot(elem_cur) or_return
-			gc_collect_slot(db, elem_slot, state, allocator) or_return
+			gc_collect_slot(db, elem_slot, state, pool, allocator) or_return
 		}
 
 	case .Hash_Set, .Counted_Hash_Set, .Sorted_Set:
-		it := xitdb.cursor_iterator(cur) or_return
+		it := nif_iter_pool_acquire(pool) or_return
+		defer nif_iter_pool_release(pool, it)
+		xitdb.cursor_iterator_init(it, cur) or_return
 		for {
-			next_maybe := xitdb.cursor_iterator_next(&it) or_return
+			next_maybe := xitdb.cursor_iterator_next(it) or_return
 			elem_cur, ok := next_maybe.?
 			if !ok {
 				break
 			}
 			key_cur, _ := xitdb.cursor_read_kv_pair_slots(elem_cur) or_return
-			gc_collect_slot(db, key_cur.slot_ptr.slot, state, allocator) or_return
+			gc_collect_slot(db, key_cur.slot_ptr.slot, state, pool, allocator) or_return
 		}
 
 	case .Hash_Map, .Counted_Hash_Map, .Sorted_Map:
-		it := xitdb.cursor_iterator(cur) or_return
+		it := nif_iter_pool_acquire(pool) or_return
+		defer nif_iter_pool_release(pool, it)
+		xitdb.cursor_iterator_init(it, cur) or_return
 		for {
-			next_maybe := xitdb.cursor_iterator_next(&it) or_return
+			next_maybe := xitdb.cursor_iterator_next(it) or_return
 			elem_cur, ok := next_maybe.?
 			if !ok {
 				break
 			}
 			_, val_cur := xitdb.cursor_read_kv_pair_slots(elem_cur) or_return
-			gc_collect_slot(db, val_cur.slot_ptr.slot, state, allocator) or_return
+			gc_collect_slot(db, val_cur.slot_ptr.slot, state, pool, allocator) or_return
 		}
 	}
 
@@ -8957,12 +9042,14 @@ gc_collect_dead_compression_ops :: proc(
 	dicts_slot: Maybe(xitdb.Slot) = nil
 	pages_slot: Maybe(xitdb.Slot) = nil
 
+	pool := nif_iter_pool_init(allocator)
 	sb_buf: [128]u8 = ---
-	root_it := xitdb.cursor_iterator(root_cur) or_return
+	root_it := nif_iter_pool_acquire(&pool) or_return
+	xitdb.cursor_iterator_init(root_it, root_cur) or_return
 	user_slots := make([dynamic]xitdb.Slot, 0, 16, allocator)
 
 	for {
-		next_maybe := xitdb.cursor_iterator_next(&root_it) or_return
+		next_maybe := xitdb.cursor_iterator_next(root_it) or_return
 		elem_cur, ok := next_maybe.?
 		if !ok {
 			break
@@ -8985,6 +9072,7 @@ gc_collect_dead_compression_ops :: proc(
 			append(&user_slots, val_cur.slot_ptr.slot)
 		}
 	}
+	nif_iter_pool_release(&pool, root_it)
 
 	if !has_compression_roots {
 		return dead_ops, false, nil
@@ -8998,7 +9086,7 @@ gc_collect_dead_compression_ops :: proc(
 	}
 
 	for s in user_slots {
-		gc_collect_slot(&handle.db, s, &state, allocator) or_return
+		gc_collect_slot(&handle.db, s, &state, &pool, allocator) or_return
 	}
 
 	// Inspect __blobs for dead entries and transitive live_dicts from live "zd" blobs
@@ -9008,11 +9096,13 @@ gc_collect_dead_compression_ops :: proc(
 			slot_ptr = xitdb.Slot_Pointer{position = nil, slot = bs},
 			db       = &handle.db,
 		}
-		b_it := xitdb.cursor_iterator(b_cur) or_return
+		b_it := nif_iter_pool_acquire(&pool) or_return
+		defer nif_iter_pool_release(&pool, b_it)
+		xitdb.cursor_iterator_init(b_it, b_cur) or_return
 		dead_blob_keys := make([dynamic]string, 0, 8, allocator)
 		live_blob_count := 0
 		for {
-			next_maybe := xitdb.cursor_iterator_next(&b_it) or_return
+			next_maybe := xitdb.cursor_iterator_next(b_it) or_return
 			elem_cur, ok := next_maybe.?
 			if !ok {
 				break
@@ -9052,12 +9142,14 @@ gc_collect_dead_compression_ops :: proc(
 			slot_ptr = xitdb.Slot_Pointer{position = nil, slot = ps},
 			db       = &handle.db,
 		}
-		col_it := xitdb.cursor_iterator(p_cur) or_return
+		col_it := nif_iter_pool_acquire(&pool) or_return
+		defer nif_iter_pool_release(&pool, col_it)
+		xitdb.cursor_iterator_init(col_it, p_cur) or_return
 		dead_col_ops := make([dynamic]xitdb.Tx_Op, 0, 8, allocator)
 		live_total_pages := 0
 
 		for {
-			col_next := xitdb.cursor_iterator_next(&col_it) or_return
+			col_next := xitdb.cursor_iterator_next(col_it) or_return
 			col_elem, ok_c := col_next.?
 			if !ok_c {
 				break
@@ -9075,12 +9167,14 @@ gc_collect_dead_compression_ops :: proc(
 			}
 
 			col_kind := map_key_step_kind(col_val_slot.tag)
-			field_it := xitdb.cursor_iterator(col_val_cur) or_return
+			field_it := nif_iter_pool_acquire(&pool) or_return
+			defer nif_iter_pool_release(&pool, field_it)
+			xitdb.cursor_iterator_init(field_it, col_val_cur) or_return
 			dead_field_ops := make([dynamic]xitdb.Tx_Op, 0, 8, allocator)
 			live_in_col := 0
 
 			for {
-				field_next := xitdb.cursor_iterator_next(&field_it) or_return
+				field_next := xitdb.cursor_iterator_next(field_it) or_return
 				field_elem, ok_f := field_next.?
 				if !ok_f {
 					break
@@ -9098,12 +9192,14 @@ gc_collect_dead_compression_ops :: proc(
 				}
 
 				field_kind := map_key_step_kind(field_val_slot.tag)
-				page_it := xitdb.cursor_iterator(field_val_cur) or_return
+				page_it := nif_iter_pool_acquire(&pool) or_return
+				defer nif_iter_pool_release(&pool, page_it)
+				xitdb.cursor_iterator_init(page_it, field_val_cur) or_return
 				dead_page_ids := make([dynamic]string, 0, 8, allocator)
 				live_in_field := 0
 
 				for {
-					page_next := xitdb.cursor_iterator_next(&page_it) or_return
+					page_next := xitdb.cursor_iterator_next(page_it) or_return
 					page_elem, ok_p := page_next.?
 					if !ok_p {
 						break
@@ -9178,11 +9274,13 @@ gc_collect_dead_compression_ops :: proc(
 			slot_ptr = xitdb.Slot_Pointer{position = nil, slot = ds},
 			db       = &handle.db,
 		}
-		d_it := xitdb.cursor_iterator(d_cur) or_return
+		d_it := nif_iter_pool_acquire(&pool) or_return
+		defer nif_iter_pool_release(&pool, d_it)
+		xitdb.cursor_iterator_init(d_it, d_cur) or_return
 		dead_dict_keys := make([dynamic]string, 0, 8, allocator)
 		live_dict_count := 0
 		for {
-			next_maybe := xitdb.cursor_iterator_next(&d_it) or_return
+			next_maybe := xitdb.cursor_iterator_next(d_it) or_return
 			elem_cur, ok := next_maybe.?
 			if !ok {
 				break
@@ -9586,10 +9684,15 @@ collect_postings_into_map :: proc(
 	multiplier: f64,
 	dest: ^map[string]f64,
 	arena_alloc: mem.Allocator,
+	postings_it: ^xitdb.Cursor_Iterator = nil,
 ) -> xitdb.Error {
-	it := xitdb.cursor_iterator(postings_cur) or_return
+	it := postings_it
+	if it == nil {
+		it = nif_alloc_cursor_iterator(arena_alloc) or_return
+	}
+	xitdb.cursor_iterator_init(it, postings_cur) or_return
 	for {
-		next_maybe := xitdb.cursor_iterator_next(&it) or_return
+		next_maybe := xitdb.cursor_iterator_next(it) or_return
 		elem_cur, has_next := next_maybe.?
 		if !has_next {
 			break
@@ -9632,31 +9735,31 @@ decode_container_entries_term :: proc(
 		db       = db,
 	}
 
-	it: xitdb.Cursor_Iterator
+	it := nif_alloc_cursor_iterator(arena_alloc) or_return
 	direct_seek := false
 	if offset > 0 {
 		#partial switch slot.tag {
 		case .Array_List:
-			it = xitdb.cursor_iterator_array_list_from_index(cur, offset) or_return
+			xitdb.cursor_iterator_array_list_from_index_init(it, cur, offset) or_return
 			direct_seek = true
 		case .Linked_Array_List:
-			it = xitdb.cursor_iterator_linked_array_list_from_index(cur, offset) or_return
+			xitdb.cursor_iterator_linked_array_list_from_index_init(it, cur, offset) or_return
 			direct_seek = true
 		case .Sorted_Map, .Sorted_Set:
 			seek_offset := offset
 			if skip_tx && slot.tag == .Sorted_Map && offset > 0 {
-				has_tx, tx_rank := sorted_map_tx_rank(cur) or_return
+				has_tx, tx_rank := sorted_map_tx_rank(cur, it) or_return
 				if has_tx && offset >= tx_rank {
 					seek_offset = offset + 1
 				}
 			}
-			it = xitdb.cursor_iterator_sorted_from_index(cur, seek_offset) or_return
+			xitdb.cursor_iterator_sorted_from_index_init(it, cur, seek_offset) or_return
 			direct_seek = true
 		case:
-			it = xitdb.cursor_iterator(cur) or_return
+			xitdb.cursor_iterator_init(it, cur) or_return
 		}
 	} else {
-		it = xitdb.cursor_iterator(cur) or_return
+		xitdb.cursor_iterator_init(it, cur) or_return
 	}
 
 	is_map := slot.tag == .Hash_Map || slot.tag == .Counted_Hash_Map || slot.tag == .Sorted_Map
@@ -9677,7 +9780,7 @@ decode_container_entries_term :: proc(
 		if limit > 0 && emitted >= limit {
 			break
 		}
-		next_maybe := xitdb.cursor_iterator_next(&it) or_return
+		next_maybe := xitdb.cursor_iterator_next(it) or_return
 		elem_cur, has_e := next_maybe.?
 		if !has_e {
 			break
@@ -9741,6 +9844,7 @@ decode_child_container_entries_term :: proc(
 	max_entries: i64,
 	arena_alloc: mem.Allocator,
 	codec_err: ^string = nil,
+	reusable_it: ^xitdb.Cursor_Iterator = nil,
 ) -> (res: ERL_NIF_TERM, count: i64, exceeded: bool, err: xitdb.Error) {
 	if slot.tag == .None || slot.value == 0 {
 		return nif_make_list_from_array(env, nil, 0), 0, false, nil
@@ -9765,7 +9869,11 @@ decode_child_container_entries_term :: proc(
 		}
 	}
 
-	it := xitdb.cursor_iterator(cur) or_return
+	it := reusable_it
+	if it == nil {
+		it = nif_alloc_cursor_iterator(arena_alloc) or_return
+	}
+	xitdb.cursor_iterator_init(it, cur) or_return
 
 	is_map := slot.tag == .Hash_Map || slot.tag == .Counted_Hash_Map || slot.tag == .Sorted_Map
 	is_set := slot.tag == .Hash_Set || slot.tag == .Counted_Hash_Set || slot.tag == .Sorted_Set
@@ -9781,7 +9889,7 @@ decode_child_container_entries_term :: proc(
 	emitted: i64 = 0
 
 	for {
-		next_maybe := xitdb.cursor_iterator_next(&it) or_return
+		next_maybe := xitdb.cursor_iterator_next(it) or_return
 		elem_cur, has_e := next_maybe.?
 		if !has_e {
 			break
@@ -9902,9 +10010,20 @@ odin_nif_sorted_map_seek :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_
 		return make_xitdb_err(env, sm_err)
 	}
 
-	it, it_err := xitdb.sorted_map_iterator_from_string(sm_col, prefix)
-	if it_err != nil {
+	it, it_alloc_err := nif_alloc_cursor_iterator(arena_alloc)
+	if it_alloc_err != nil {
+		return make_xitdb_err(env, it_alloc_err)
+	}
+	if it_err := xitdb.cursor_iterator_sorted_from_key_init(it, sm_col.cursor, transmute([]u8)prefix); it_err != nil {
 		return make_xitdb_err(env, it_err)
+	}
+	child_it: ^xitdb.Cursor_Iterator = nil
+	if decode_children {
+		child_alloc_err: xitdb.Error
+		child_it, child_alloc_err = nif_alloc_cursor_iterator(arena_alloc)
+		if child_alloc_err != nil {
+			return make_xitdb_err(env, child_alloc_err)
+		}
 	}
 
 	item_buf: [64]ERL_NIF_TERM = ---
@@ -9921,7 +10040,7 @@ odin_nif_sorted_map_seek :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_
 	codec_err := ""
 
 	for {
-		next_maybe, n_err := xitdb.cursor_iterator_next(&it)
+		next_maybe, n_err := xitdb.cursor_iterator_next(it)
 		if n_err != nil {
 			return make_xitdb_err(env, n_err)
 		}
@@ -9960,6 +10079,7 @@ odin_nif_sorted_map_seek :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_
 					budget,
 					arena_alloc,
 					&codec_err,
+					child_it,
 				)
 				if c_err != nil {
 					if len(codec_err) > 0 {
@@ -10188,18 +10308,26 @@ odin_nif_bm25_search :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_
 	idfs := make([]f64, num_tokens, arena_alloc)
 	sb_buf: [128]u8 = ---
 
+	terms_it, terms_it_err := nif_alloc_cursor_iterator(arena_alloc)
+	if terms_it_err != nil {
+		return make_xitdb_err(env, terms_it_err)
+	}
+	postings_it, postings_it_err := nif_alloc_cursor_iterator(arena_alloc)
+	if postings_it_err != nil {
+		return make_xitdb_err(env, postings_it_err)
+	}
+
 	for q_tok, tok_idx in query_terms {
 		merged := make(map[string]f64, 32, arena_alloc)
 		use_prefix := opts.prefix_enabled && utf8.rune_count_in_string(q_tok) >= opts.min_prefix_length
 
 		if use_prefix {
-			it, it_err := xitdb.sorted_map_iterator_from_string(terms_sm, q_tok)
-			if it_err != nil {
+			if it_err := xitdb.cursor_iterator_sorted_from_key_init(terms_it, terms_sm.cursor, transmute([]u8)q_tok); it_err != nil {
 				return make_xitdb_err(env, it_err)
 			}
 			scanned := 0
 			for scanned < opts.max_prefix_expansions {
-				next_maybe, n_err := xitdb.cursor_iterator_next(&it)
+				next_maybe, n_err := xitdb.cursor_iterator_next(terms_it)
 				if n_err != nil {
 					return make_xitdb_err(env, n_err)
 				}
@@ -10222,7 +10350,7 @@ odin_nif_bm25_search :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_
 					continue
 				}
 				mult := opts.exact_boost if matched_term == q_tok else opts.prefix_weight
-				if cp_err := collect_postings_into_map(val_cur, mult, &merged, arena_alloc); cp_err != nil {
+				if cp_err := collect_postings_into_map(val_cur, mult, &merged, arena_alloc, postings_it); cp_err != nil {
 					return make_xitdb_err(env, cp_err)
 				}
 				scanned += 1
@@ -10233,7 +10361,7 @@ odin_nif_bm25_search :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_
 				return make_xitdb_err(env, p_err)
 			}
 			if p_cur, has_p := p_maybe.?; has_p {
-				if cp_err := collect_postings_into_map(p_cur, opts.exact_boost, &merged, arena_alloc); cp_err != nil {
+				if cp_err := collect_postings_into_map(p_cur, opts.exact_boost, &merged, arena_alloc, postings_it); cp_err != nil {
 					return make_xitdb_err(env, cp_err)
 				}
 			}
