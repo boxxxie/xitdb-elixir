@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.2.1] - 2026-11-21
+
+### Changed
+- **Underlying `odin-xitdb` `v2.1.0` (`9ad5d10`):** Updated `native/xitdb-odin` to `v2.1.0`, bringing in-place `cursor_iterator*_init` procedures, pooled `_Iter_Pool` recursive traversals in DSL `pull`/`diff_cursors`/`unmarshal_into`/Datalog, wire/B-Tree/HAMT hardening, and Odin `dev-2026-11a+` / ARM64 `-vet` compatibility (`xitdb/sha_ni_amd64.odin`, `xitdb/sha_ni_other.odin`).
+
+### Fixed
+- **BEAM Dirty-Scheduler Stack Overflows (`SIGSEGV`) in `native/xitdb_nif.odin`:**
+  - Replaced stack-allocated `~4.4 KB` `Cursor_Iterator` values in recursive and multi-branch NIF functions with pooled or heap/arena-allocated pointer-initialized iterators (`Nif_Iter_Pool` + `xitdb.cursor_iterator*_init`), cutting per-frame stack usage across `materialize_slot`, `nif_pull_wildcard`, `nif_pull_range`, `nif_pull_cursor`, `gc_collect_slot`, `gc_collect_dead_compression_ops` (`odin_nif_compact`), `nif_dl_eval_pattern_steps`, `decode_container_entries_term`, `decode_child_container_entries_term`, `odin_nif_slot_slice`, `odin_nif_sorted_map_seek`, `odin_nif_bm25_search`, `collect_postings_into_map`, `sorted_map_tx_rank`, `evict_source_map_indexes`, and `odin_nif_history_of`.
+  - Added concurrent 16-level deep-nesting regression tests in `test/xitdb/nif_safety_test.exs` covering `Xitdb.diff_moments/3`, `Xitdb.materialize/2`, `Xitdb.pull/2`, `Xitdb.sync/1`, and `Xitdb.compact/2` under default BEAM dirty-scheduler stack sizes.
+
 ## [2.2.0] - 2026-11-20
 
 ### Added
