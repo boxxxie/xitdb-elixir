@@ -608,6 +608,91 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         # Sorted by name asc: Alpha, Beta, Delta -> offset 1, limit 2 -> [Beta, Delta]
         assert Enum.map(distinct_orgs, & &1.name) == ["Beta Partners", "Delta Holdings"]
       end
+
+      test "narrows Stage 2 hydration on uncompressed select queries while preserving filter, sort, distinct, calc, and exists deps" do
+        [o1, o2, _o3, _o4] = seed_orgs!()
+        seed!(PrimaryStore, Member, id: 1, org_id: o1.id, name: "Alice", score: 90, role: :lead)
+        seed!(PrimaryStore, Member, id: 2, org_id: o2.id, name: "Bob", score: 40, role: :analyst)
+
+        # 1. Filter on unselected attribute (:tier) + select([:name])
+        gold_orgs =
+          Org
+          |> Ash.Query.filter(tier == :gold)
+          |> Ash.Query.sort(name: :asc)
+          |> Ash.Query.select([:name])
+          |> Ash.read!()
+
+        assert Enum.map(gold_orgs, & &1.name) == ["Beta Partners", "Gamma Fund"]
+
+        for org <- gold_orgs do
+          assert %Ash.NotLoaded{type: :attribute, field: :tier} = org.tier
+          assert %Ash.NotLoaded{type: :attribute, field: :score} = org.score
+          assert %Ash.NotLoaded{type: :attribute, field: :secret_note} = org.secret_note
+          assert is_binary(org.always_tag)
+        end
+
+        # 2. Distinct + distinct_sort on unselected attributes (:tier, :score) + select([:name])
+        distinct_only =
+          Org
+          |> Ash.Query.distinct([:tier])
+          |> Ash.Query.distinct_sort(score: :desc)
+          |> Ash.Query.select([:name])
+          |> Ash.read!()
+
+        assert Enum.map(distinct_only, & &1.name) |> Enum.sort() == [
+                 "Alpha Capital",
+                 "Beta Partners",
+                 "Delta Holdings"
+               ]
+
+        for org <- distinct_only do
+          assert %Ash.NotLoaded{type: :attribute, field: :tier} = org.tier
+          assert %Ash.NotLoaded{type: :attribute, field: :score} = org.score
+          assert %Ash.NotLoaded{type: :attribute, field: :secret_note} = org.secret_note
+        end
+
+        # Sort on :score + select([:name]) (Ash retains :score for keysets, masks :tier/:secret_note)
+        sorted_orgs =
+          Org
+          |> Ash.Query.sort(score: :desc)
+          |> Ash.Query.select([:name])
+          |> Ash.read!()
+
+        assert Enum.map(sorted_orgs, & &1.name) == [
+                 "Alpha Capital",
+                 "Beta Partners",
+                 "Gamma Fund",
+                 "Delta Holdings"
+               ]
+
+        for org <- sorted_orgs do
+          assert %Ash.NotLoaded{type: :attribute, field: :tier} = org.tier
+          assert %Ash.NotLoaded{type: :attribute, field: :secret_note} = org.secret_note
+        end
+
+        # 3. Expression calculation referencing unselected attribute (:score) + related (:org.tier)
+        [alice, bob] =
+          Member
+          |> Ash.Query.sort(id: :asc)
+          |> Ash.Query.select([:name])
+          |> Ash.Query.load(:tier_score)
+          |> Ash.read!()
+
+        assert alice.tier_score == 140
+        assert bob.tier_score == 60
+        assert %Ash.NotLoaded{type: :attribute, field: :score} = alice.score
+        assert %Ash.NotLoaded{type: :attribute, field: :role} = alice.role
+
+        # 4. exists/2 with parent(threshold) where :threshold is unselected
+        qualified_orgs =
+          Org
+          |> Ash.Query.filter(exists(members, score >= parent(threshold)))
+          |> Ash.Query.select([:name])
+          |> Ash.read!()
+
+        assert Enum.map(qualified_orgs, & &1.name) == ["Alpha Capital"]
+        assert %Ash.NotLoaded{type: :attribute, field: :threshold} = hd(qualified_orgs).threshold
+      end
     end
 
     # --------------------------------------------------------------------------

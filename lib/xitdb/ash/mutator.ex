@@ -345,7 +345,9 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
       search_fields = Info.search_fields(resource)
       has_compress? = map_size(Info.compression_by_field(resource)) > 0
+      needs_struct_encode? = Enum.any?(attr_plan, fn {_, _, _, _, kind} -> kind == :general end)
       need_existing_record? = identities != [] or indexes != []
+      read_plan = if need_existing_record?, do: Codec.compile_read_plan(resource, :all), else: nil
 
       pass1 =
         changesets
@@ -403,15 +405,33 @@ if Code.ensure_loaded?(Ash.DataLayer) do
             %{}
           end
 
+        prefetch =
+          prefetch_bulk_lookups(
+            cursor_root,
+            resource,
+            nested_spec,
+            pk_name,
+            pk_attr,
+            int_pk?,
+            gen_int_pk?,
+            identities,
+            seq_state,
+            items
+          )
+
         init_state = %{
           rev_records: [],
           seq_state: seq_state,
           seen_pks: MapSet.new(),
-          col_exists: %{},
-          col_cursors: %{},
-          parent_col_cache: %{},
+          col_exists: prefetch.col_exists,
+          col_cursors: prefetch.col_cursors,
+          prefetched_col_entries: prefetch.prefetched_col_entries,
+          prefetched_parent_locs: prefetch.prefetched_parent_locs,
+          parent_col_cache: prefetch.parent_col_cache,
+          prefetched_parents: prefetch.prefetched_parents,
+          prefetched_identities: prefetch.prefetched_identities,
           verified_parents: MapSet.new(),
-          idx_slots: %{},
+          idx_slots: prefetch.idx_slots,
           unique_seen: %{},
           unique_released: MapSet.new(),
           unique_removals: %{},
@@ -423,7 +443,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           unique_buckets: %{},
           set_buckets: %{},
           set_removals: %{},
-          search_acc: %{}
+          search_items_rev: []
         }
 
         staged =
@@ -433,7 +453,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
             allow_existing? = allow_existing_cursor?(cs)
             skip_search? = skip_search_index?(cs, options)
 
-            with {:ok, record_with_pk, next_seq_state} <-
+            with {record_with_pk, next_seq_state} =
                    allocate_bulk_pk(
                      after_atomics,
                      scoped_col,
@@ -463,6 +483,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
                    resolve_bulk_existing(
                      cursor_root,
                      resource,
+                     read_plan,
                      nested_spec,
                      scoped_col,
                      pk_attr,
@@ -492,6 +513,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
                      attr_plan,
                      record,
                      has_compress?,
+                     needs_struct_encode?,
                      st_after_id.comp_batch
                    )
                    |> normalize_plan_error(),
@@ -528,16 +550,17 @@ if Code.ensure_loaded?(Ash.DataLayer) do
                 )
 
               st_after_search =
-                accumulate_bulk_search(
-                  cursor_root,
-                  scoped_col,
-                  doc_id,
-                  record,
-                  search_fields,
-                  skip_search?,
-                  allow_existing?,
+                if search_fields != [] and not skip_search? do
+                  %{
+                    st_after_sec
+                    | search_items_rev: [
+                        {scoped_col, doc_id, record, allow_existing?}
+                        | st_after_sec.search_items_rev
+                      ]
+                  }
+                else
                   st_after_sec
-                )
+                end
 
               tagged = attach_bulk_metadata(record, cs, idx)
 
@@ -550,7 +573,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
         case staged do
           {:ok, final_st} ->
-            all_ops = compile_coalesced_bulk_ops(cursor_root, final_st)
+            all_ops = compile_coalesced_bulk_ops(cursor_root, search_fields, final_st)
             commit_opts = build_commit_opts(resource, :bulk_create, sample_cs, options)
 
             with {:ok, next_snapshot} <- commit_ops({db, moment}, all_ops, commit_opts) do
@@ -563,28 +586,417 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       end
     end
 
+    defp prefetch_bulk_lookups(
+           cursor_root,
+           resource,
+           nested_spec,
+           pk_name,
+           pk_attr,
+           int_pk?,
+           gen_int_pk?,
+           identities,
+           seq_state,
+           items
+         ) do
+      parent_slot = if nested_spec != nil, do: Indexer.parent_slot(), else: nil
+      unique_cols = items |> Enum.map(&elem(&1, 2)) |> Enum.uniq()
+
+      unique_tenants =
+        if nested_spec != nil or identities != [] do
+          items |> Enum.map(&elem(&1, 0).tenant) |> Enum.uniq()
+        else
+          []
+        end
+
+      {col_exists, col_cursors, prefetched_col_entries} =
+        if nested_spec == nil do
+          Enum.reduce(unique_cols, {%{}, %{}, %{}}, fn scoped_col, {ex_acc, cur_acc, pre_acc} ->
+            col_cur = cursor_root[scoped_col]
+            exists? = match?(%Xitdb.Cursor{}, col_cur)
+            next_pre = if exists?, do: pre_acc, else: Map.put(pre_acc, scoped_col, :empty)
+
+            {
+              Map.put(ex_acc, scoped_col, exists?),
+              Map.put(cur_acc, scoped_col, col_cur),
+              next_pre
+            }
+          end)
+        else
+          {%{}, %{}, %{}}
+        end
+
+      {col_exists, idx_slots, prefetched_parent_locs, parent_col_cache, prefetched_parents} =
+        case nested_spec do
+          %{cardinality: :many} ->
+            {ex_acc, idx_acc, loc_acc} =
+              Enum.reduce(unique_cols, {col_exists, %{}, %{}}, fn scoped_col,
+                                                                  {ex_m, idx_m, loc_m} ->
+                slot_cur =
+                  case IndexStorage.get_index_slot(cursor_root, scoped_col, parent_slot) do
+                    %Xitdb.Cursor{} = c -> c
+                    _ -> nil
+                  end
+
+                exists? = slot_cur != nil
+                next_loc = if exists?, do: loc_m, else: Map.put(loc_m, scoped_col, :empty)
+
+                {
+                  Map.put(ex_m, {:parent_slot, scoped_col}, exists?),
+                  Map.put(idx_m, {scoped_col, parent_slot}, slot_cur),
+                  next_loc
+                }
+              end)
+
+            unique_parent_cols =
+              unique_tenants
+              |> Enum.map(&Indexer.resolve_parent_collection(nested_spec, &1, resource))
+              |> Enum.uniq()
+
+            {pcur_acc, ppre_acc} =
+              Enum.reduce(unique_parent_cols, {%{}, %{}}, fn parent_col, {cur_m, pre_m} ->
+                pcol_cur = cursor_root[parent_col]
+
+                next_pre =
+                  if match?(%Xitdb.Cursor{}, pcol_cur) do
+                    pre_m
+                  else
+                    Map.put(pre_m, parent_col, :empty)
+                  end
+
+                {Map.put(cur_m, parent_col, pcol_cur), next_pre}
+              end)
+
+            {ex_acc, idx_acc, loc_acc, pcur_acc, ppre_acc}
+
+          nil ->
+            {col_exists, %{}, %{}, %{}, %{}}
+        end
+
+      {idx_slots, prefetched_identities} =
+        if identities == [] do
+          {idx_slots, %{}}
+        else
+          id_slot_keys =
+            for tenant <- unique_tenants,
+                identity <- identities,
+                do:
+                  {Indexer.identity_collection(resource, identity, tenant),
+                   Indexer.identity_slot_name(identity.name)}
+
+          id_slot_keys
+          |> Enum.uniq()
+          |> Enum.reduce({idx_slots, %{}}, fn {id_col, slot} = key, {idx_m, pre_m} ->
+            slot_cur =
+              case IndexStorage.get_index_slot(cursor_root, id_col, slot) do
+                %Xitdb.Cursor{} = c -> c
+                _ -> nil
+              end
+
+            next_pre = if slot_cur != nil, do: pre_m, else: Map.put(pre_m, key, :empty)
+            {Map.put(idx_m, key, slot_cur), next_pre}
+          end)
+        end
+
+      any_col_exists? = Enum.any?(col_exists, fn {_k, exists?} -> exists? end)
+
+      any_parent_exists? =
+        Enum.any?(parent_col_cache, fn {_k, cur} -> match?(%Xitdb.Cursor{}, cur) end)
+
+      any_id_exists? =
+        Enum.any?(idx_slots, fn {{_col, s}, cur} -> s != parent_slot and cur != nil end)
+
+      if not (any_col_exists? or any_parent_exists? or any_id_exists?) do
+        %{
+          col_exists: col_exists,
+          col_cursors: col_cursors,
+          prefetched_col_entries: prefetched_col_entries,
+          prefetched_parent_locs: prefetched_parent_locs,
+          parent_col_cache: parent_col_cache,
+          prefetched_parents: prefetched_parents,
+          idx_slots: idx_slots,
+          prefetched_identities: prefetched_identities
+        }
+      else
+        attr_tenant? = Ash.Resource.Info.multitenancy_strategy(resource) == :attribute
+
+        tenant_attr =
+          if attr_tenant?, do: Ash.Resource.Info.multitenancy_attribute(resource), else: nil
+
+        need_pk? = any_col_exists? or any_id_exists?
+
+        pre_acc = %{
+          seq_state: seq_state,
+          col_keys: %{},
+          parent_loc_keys: %{},
+          parent_check_keys: %{},
+          nested_existing_refs: [],
+          id_keys: %{}
+        }
+
+        collected =
+          Enum.reduce(items, pre_acc, fn {cs, _idx, scoped_col, after_atomics}, acc ->
+            tenant = cs.tenant
+            allow_existing? = allow_existing_cursor?(cs)
+
+            record =
+              if attr_tenant? and tenant != nil and is_nil(Map.get(after_atomics, tenant_attr)) do
+                Map.put(after_atomics, tenant_attr, tenant)
+              else
+                after_atomics
+              end
+
+            {rec_for_scan, next_seq} =
+              if need_pk? do
+                allocate_bulk_pk(
+                  record,
+                  scoped_col,
+                  pk_name,
+                  int_pk?,
+                  gen_int_pk?,
+                  acc.seq_state
+                )
+              else
+                {record, acc.seq_state}
+              end
+
+            acc1 =
+              if need_pk? do
+                pk_val = Map.get(rec_for_scan, pk_name)
+
+                if pk_val != nil do
+                  case nested_spec do
+                    nil ->
+                      if Map.get(col_exists, scoped_col, false) do
+                        doc_id = Codec.encode_pk_doc_id(pk_attr, pk_val)
+                        Map.update!(acc, :col_keys, &put_bucket_key(&1, scoped_col, doc_id))
+                      else
+                        acc
+                      end
+
+                    %{cardinality: :many} ->
+                      if Map.get(col_exists, {:parent_slot, scoped_col}, false) do
+                        pk_hex =
+                          pk_attr
+                          |> Codec.encode_scalar_key(pk_val)
+                          |> IndexStorage.encode_btree_key()
+
+                        acc_loc =
+                          Map.update!(
+                            acc,
+                            :parent_loc_keys,
+                            &put_bucket_key(&1, scoped_col, pk_hex)
+                          )
+
+                        if allow_existing? do
+                          parent_col =
+                            Indexer.resolve_parent_collection(nested_spec, tenant, resource)
+
+                          if match?(%Xitdb.Cursor{}, Map.get(parent_col_cache, parent_col)) do
+                            %{
+                              acc_loc
+                              | nested_existing_refs: [
+                                  {scoped_col, pk_hex, parent_col} | acc_loc.nested_existing_refs
+                                ]
+                            }
+                          else
+                            acc_loc
+                          end
+                        else
+                          acc_loc
+                        end
+                      else
+                        acc
+                      end
+                  end
+                else
+                  acc
+                end
+              else
+                acc
+              end
+
+            acc2 =
+              if any_parent_exists? do
+                case Map.get(rec_for_scan, nested_spec.foreign_key) do
+                  nil ->
+                    acc1
+
+                  parent_val ->
+                    parent_col =
+                      Indexer.resolve_parent_collection(nested_spec, tenant, resource)
+
+                    if match?(%Xitdb.Cursor{}, Map.get(parent_col_cache, parent_col)) do
+                      parent_doc_id =
+                        Indexer.encode_parent_doc_id(resource, nested_spec, parent_val)
+
+                      Map.update!(
+                        acc1,
+                        :parent_check_keys,
+                        &put_bucket_key(&1, parent_col, parent_doc_id)
+                      )
+                    else
+                      acc1
+                    end
+                end
+              else
+                acc1
+              end
+
+            acc3 =
+              if any_id_exists? do
+                Enum.reduce(identities, acc2, fn identity, id_acc ->
+                  id_col = Indexer.identity_collection(resource, identity, tenant)
+                  slot = Indexer.identity_slot_name(identity.name)
+                  id_key = {id_col, slot}
+
+                  if Map.get(idx_slots, id_key) != nil do
+                    case Indexer.active_identity_key(resource, identity, rec_for_scan, tenant) do
+                      nil ->
+                        id_acc
+
+                      new_key ->
+                        hex_key = IndexStorage.encode_btree_key(new_key)
+                        Map.update!(id_acc, :id_keys, &put_bucket_key(&1, id_key, hex_key))
+                    end
+                  else
+                    id_acc
+                  end
+                end)
+              else
+                acc2
+              end
+
+            %{acc3 | seq_state: next_seq}
+          end)
+
+        prefetched_col_entries =
+          Enum.reduce(collected.col_keys, prefetched_col_entries, fn {scoped_col, keys}, acc ->
+            col_cur = Map.fetch!(col_cursors, scoped_col)
+            Map.put(acc, scoped_col, batch_slot_get_keys_with_queried(col_cur, keys))
+          end)
+
+        prefetched_parent_locs =
+          Enum.reduce(collected.parent_loc_keys, prefetched_parent_locs, fn {scoped_col, keys},
+                                                                            acc ->
+            slot_cur = Map.fetch!(idx_slots, {scoped_col, parent_slot})
+            Map.put(acc, scoped_col, batch_slot_get_keys_with_queried(slot_cur, keys))
+          end)
+
+        parent_check_keys =
+          Enum.reduce(collected.nested_existing_refs, collected.parent_check_keys, fn {scoped_col,
+                                                                                       pk_hex,
+                                                                                       parent_col},
+                                                                                      acc ->
+            case Map.get(prefetched_parent_locs, scoped_col) do
+              {_qset, pmap} ->
+                case Map.get(pmap, pk_hex) do
+                  old_parent_doc_id when is_binary(old_parent_doc_id) ->
+                    put_bucket_key(acc, parent_col, old_parent_doc_id)
+
+                  _ ->
+                    acc
+                end
+
+              _ ->
+                acc
+            end
+          end)
+
+        prefetched_parents =
+          Enum.reduce(parent_check_keys, prefetched_parents, fn {parent_col, keys}, acc ->
+            pcol_cur = Map.fetch!(parent_col_cache, parent_col)
+            Map.put(acc, parent_col, batch_slot_get_keys_with_queried(pcol_cur, keys))
+          end)
+
+        prefetched_identities =
+          Enum.reduce(collected.id_keys, prefetched_identities, fn {key, keys}, acc ->
+            slot_cur = Map.fetch!(idx_slots, key)
+            Map.put(acc, key, batch_slot_get_keys_with_queried(slot_cur, keys))
+          end)
+
+        %{
+          col_exists: col_exists,
+          col_cursors: col_cursors,
+          prefetched_col_entries: prefetched_col_entries,
+          prefetched_parent_locs: prefetched_parent_locs,
+          parent_col_cache: parent_col_cache,
+          prefetched_parents: prefetched_parents,
+          idx_slots: idx_slots,
+          prefetched_identities: prefetched_identities
+        }
+      end
+    end
+
+    defp put_bucket_key(buckets, bucket, val) do
+      Map.update(buckets, bucket, [val], &[val | &1])
+    end
+
+    defp batch_slot_get_keys_with_queried(%Xitdb.Cursor{} = cur, raw_keys) do
+      uniq_keys = Enum.uniq(raw_keys)
+      {MapSet.new(uniq_keys), batch_slot_get_keys(cur, uniq_keys)}
+    end
+
+    defp batch_slot_get_keys(
+           %Xitdb.Cursor{db_ref: db_ref, tag_id: tag_id, value: value, moment: moment},
+           keys
+         ) do
+      keys
+      |> Enum.chunk_every(2048)
+      |> Enum.reduce(%{}, fn chunk, acc ->
+        case Xitdb.NIF.nif_slot_get_keys(db_ref, tag_id, value, chunk) do
+          {:ok, map} when is_map(map) ->
+            if map_size(map) == 0 do
+              acc
+            else
+              Enum.reduce(map, acc, fn {k, v}, m ->
+                Map.put(m, k, Xitdb.Cursor.unwrap_nif_value(db_ref, v, moment))
+              end)
+            end
+
+          {:error, reason} ->
+            raise Xitdb.Error, reason: reason
+        end
+      end)
+    end
+
+    defp lookup_prefetched(cache, bucket_key, entry_key, fallback_fun) do
+      case Map.fetch(cache, bucket_key) do
+        {:ok, :empty} ->
+          nil
+
+        {:ok, {queried_set, result_map}} ->
+          if MapSet.member?(queried_set, entry_key) do
+            Map.get(result_map, entry_key)
+          else
+            fallback_fun.()
+          end
+
+        :error ->
+          fallback_fun.()
+      end
+    end
+
     defp allocate_bulk_pk(record, scoped_col, pk_name, true, gen_int_pk?, seq_state) do
       current_val = Map.get(record, pk_name)
-      %{initial: initial, current: cur} = entry = Map.fetch!(seq_state, scoped_col)
+      %{current: cur} = entry = Map.fetch!(seq_state, scoped_col)
 
       cond do
         is_nil(current_val) and gen_int_pk? ->
           allocated = cur + 1
           next_seq = Map.put(seq_state, scoped_col, %{entry | current: allocated})
-          {:ok, Map.put(record, pk_name, allocated), next_seq}
+          {Map.put(record, pk_name, allocated), next_seq}
 
         is_integer(current_val) and current_val > cur ->
           next_seq = Map.put(seq_state, scoped_col, %{entry | current: current_val})
-          {:ok, record, next_seq}
+          {record, next_seq}
 
         true ->
-          {:ok, record,
-           %{initial: initial, current: cur} |> then(&Map.put(seq_state, scoped_col, &1))}
+          {record, seq_state}
       end
     end
 
     defp allocate_bulk_pk(record, _scoped_col, _pk_name, false, _gen_int_pk?, seq_state) do
-      {:ok, record, seq_state}
+      {record, seq_state}
     end
 
     defp verify_bulk_pk_unused(
@@ -633,10 +1045,37 @@ if Code.ensure_loaded?(Ash.DataLayer) do
               case nested_spec do
                 nil ->
                   col_cur = Map.fetch!(st1.col_cursors, scoped_col)
-                  col_cur[doc_id] != nil
+
+                  lookup_prefetched(
+                    st1.prefetched_col_entries,
+                    scoped_col,
+                    doc_id,
+                    fn -> col_cur[doc_id] end
+                  ) != nil
 
                 %{cardinality: :many} ->
-                  Indexer.fetch_cursor(cursor_root, resource, pk_val, tenant) != :none
+                  pk_hex =
+                    pk_attr
+                    |> Codec.encode_scalar_key(pk_val)
+                    |> IndexStorage.encode_btree_key()
+
+                  prefetched_nil? =
+                    case Map.fetch(st1.prefetched_parent_locs, scoped_col) do
+                      {:ok, :empty} ->
+                        true
+
+                      {:ok, {qset, pmap}} ->
+                        MapSet.member?(qset, pk_hex) and Map.get(pmap, pk_hex) == nil
+
+                      :error ->
+                        false
+                    end
+
+                  if prefetched_nil? do
+                    false
+                  else
+                    Indexer.fetch_cursor(cursor_root, resource, pk_val, tenant) != :none
+                  end
               end
 
             if existing? do
@@ -686,6 +1125,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     defp resolve_bulk_existing(
            _cursor_root,
            _resource,
+           _read_plan,
            _nested_spec,
            _scoped_col,
            _pk_attr,
@@ -701,7 +1141,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
     defp resolve_bulk_existing(
            cursor_root,
-           resource,
+           _resource,
+           read_plan,
            nil,
            scoped_col,
            _pk_attr,
@@ -718,7 +1159,12 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         if col_exists? do
           col_cur = Map.fetch!(st1.col_cursors, scoped_col)
 
-          case col_cur[doc_id] do
+          case lookup_prefetched(
+                 st1.prefetched_col_entries,
+                 scoped_col,
+                 doc_id,
+                 fn -> col_cur[doc_id] end
+               ) do
             %Xitdb.Cursor{} = c -> c
             _ -> nil
           end
@@ -728,7 +1174,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
       existing_record =
         if existing_cur != nil and need_existing_record? do
-          hydrate_existing_record(resource, existing_cur, tenant)
+          hydrate_existing_record(read_plan, existing_cur, tenant)
         else
           nil
         end
@@ -739,6 +1185,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     defp resolve_bulk_existing(
            cursor_root,
            resource,
+           read_plan,
            %{cardinality: :many} = nested,
            scoped_col,
            pk_attr,
@@ -756,17 +1203,53 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
       old_parent_doc_id =
         case parent_slot_cur do
-          %Xitdb.Cursor{} -> parent_slot_cur[pk_hex]
-          _ -> nil
+          %Xitdb.Cursor{} ->
+            lookup_prefetched(
+              st1.prefetched_parent_locs,
+              scoped_col,
+              pk_hex,
+              fn -> parent_slot_cur[pk_hex] end
+            )
+
+          _ ->
+            nil
         end
 
       if is_binary(old_parent_doc_id) do
         parent_col = Indexer.resolve_parent_collection(nested, tenant, resource)
-        {parent_col_cur, st2} = fetch_cached_parent_col(cursor_root, parent_col, st1)
+
+        {pcur, st2} =
+          case Map.fetch(st1.prefetched_parents, parent_col) do
+            {:ok, :empty} ->
+              {nil, st1}
+
+            {:ok, {qset, pmap}} ->
+              if MapSet.member?(qset, old_parent_doc_id) do
+                {Map.get(pmap, old_parent_doc_id), st1}
+              else
+                {parent_col_cur, next_st} = fetch_cached_parent_col(cursor_root, parent_col, st1)
+
+                cur =
+                  if match?(%Xitdb.Cursor{}, parent_col_cur),
+                    do: parent_col_cur[old_parent_doc_id],
+                    else: nil
+
+                {cur, next_st}
+              end
+
+            :error ->
+              {parent_col_cur, next_st} = fetch_cached_parent_col(cursor_root, parent_col, st1)
+
+              cur =
+                if match?(%Xitdb.Cursor{}, parent_col_cur),
+                  do: parent_col_cur[old_parent_doc_id],
+                  else: nil
+
+              {cur, next_st}
+          end
 
         existing_cur =
-          with %Xitdb.Cursor{} = pcol <- parent_col_cur,
-               %Xitdb.Cursor{} = pcur <- pcol[old_parent_doc_id],
+          with %Xitdb.Cursor{} <- pcur,
                %Xitdb.Cursor{} = sub <- pcur[nested.path],
                %Xitdb.Cursor{} = c <- sub[doc_id] do
             c
@@ -776,7 +1259,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
         existing_record =
           if existing_cur != nil and need_existing_record? do
-            hydrate_existing_record(resource, existing_cur, tenant)
+            hydrate_existing_record(read_plan, existing_cur, tenant)
           else
             nil
           end
@@ -787,8 +1270,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       end
     end
 
-    defp hydrate_existing_record(resource, existing_cur, tenant) do
-      case Codec.from_cursor(resource, existing_cur, tenant) do
+    defp hydrate_existing_record(read_plan, existing_cur, tenant) do
+      case Codec.from_cursor_fast(read_plan, existing_cur, tenant) do
         {:ok, rec} -> rec
         _ -> nil
       end
@@ -834,7 +1317,19 @@ if Code.ensure_loaded?(Ash.DataLayer) do
             if old_key != nil and old_key != new_key do
               old_hex = IndexStorage.encode_btree_key(old_key)
 
-              if match?(%Xitdb.Cursor{}, slot_cur) and slot_cur[old_hex] == owner_id do
+              old_owner =
+                if match?(%Xitdb.Cursor{}, slot_cur) do
+                  lookup_prefetched(
+                    acc_st1.prefetched_identities,
+                    {id_col, slot},
+                    old_hex,
+                    fn -> slot_cur[old_hex] end
+                  )
+                else
+                  nil
+                end
+
+              if old_owner == owner_id do
                 old_seen_key = {id_col, identity.name, old_key}
                 bucket_key = {id_col, slot}
 
@@ -875,7 +1370,15 @@ if Code.ensure_loaded?(Ash.DataLayer) do
                 db_collision? =
                   case slot_cur do
                     %Xitdb.Cursor{} ->
-                      case slot_cur[hex_key] do
+                      stored_owner =
+                        lookup_prefetched(
+                          acc_st2.prefetched_identities,
+                          {id_col, slot},
+                          hex_key,
+                          fn -> slot_cur[hex_key] end
+                        )
+
+                      case stored_owner do
                         nil -> false
                         ^owner_id -> false
                         _other -> not MapSet.member?(acc_st2.unique_released, seen_key)
@@ -933,10 +1436,16 @@ if Code.ensure_loaded?(Ash.DataLayer) do
            attr_plan,
            record,
            has_compress?,
+           needs_struct_encode?,
            comp_batch
          ) do
       with {:ok, raw_map} <- Codec.to_cursor_map_fast(attr_plan, record) do
-        encoded_map = Xitdb.TxCompiler.encode_value(raw_map)
+        encoded_map =
+          if needs_struct_encode? do
+            Xitdb.TxCompiler.encode_value(raw_map)
+          else
+            raw_map
+          end
 
         if has_compress? do
           Indexer.compress_cursor_map(cursor_root, resource, encoded_map, comp_batch, :all)
@@ -951,13 +1460,52 @@ if Code.ensure_loaded?(Ash.DataLayer) do
          do: []
 
     defp compute_removed_fields(attr_plan, %Xitdb.Cursor{} = existing_cur, cursor_map) do
-      Enum.reduce(attr_plan, [], fn {_attr, _name, key, _cs?, _fk}, acc ->
-        if not Map.has_key?(cursor_map, key) and not is_nil(existing_cur[key]) do
-          [key | acc]
-        else
-          acc
+      missing_keys =
+        Enum.reduce(attr_plan, [], fn {_attr, _name, key, _cs?, _fk}, acc ->
+          if Map.has_key?(cursor_map, key), do: acc, else: [key | acc]
+        end)
+
+      if missing_keys == [] do
+        []
+      else
+        case Xitdb.NIF.nif_slot_get_keys(
+               existing_cur.db_ref,
+               existing_cur.tag_id,
+               existing_cur.value,
+               missing_keys
+             ) do
+          {:ok, map} when is_map(map) ->
+            if map_size(map) == 0 do
+              []
+            else
+              Enum.reduce(missing_keys, [], fn key, acc ->
+                case Map.fetch(map, key) do
+                  {:ok, {:tagged, tag, _} = v} when tag in ["cz", "zs", "zd", "bp", "pg"] ->
+                    if is_nil(
+                         Xitdb.Cursor.unwrap_nif_value(
+                           existing_cur.db_ref,
+                           v,
+                           existing_cur.moment
+                         )
+                       ) do
+                      acc
+                    else
+                      [key | acc]
+                    end
+
+                  {:ok, v} when not is_nil(v) ->
+                    [key | acc]
+
+                  _ ->
+                    acc
+                end
+              end)
+            end
+
+          {:error, reason} ->
+            raise Xitdb.Error, reason: reason
         end
-      end)
+      end
     end
 
     defp accumulate_bulk_entity(
@@ -1074,15 +1622,48 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       if MapSet.member?(st.verified_parents, key) do
         {:ok, st}
       else
-        {parent_col_cur, st1} = fetch_cached_parent_col(cursor_root, parent_col, st)
+        case Map.fetch(st.prefetched_parents, parent_col) do
+          {:ok, :empty} ->
+            {:error, InvalidChanges.exception(fields: [fk_attr], message: "does not exist")}
 
-        exists? = match?(%Xitdb.Cursor{}, parent_col_cur) and parent_col_cur[parent_doc_id] != nil
+          {:ok, {qset, pmap}} ->
+            if MapSet.member?(qset, parent_doc_id) do
+              if Map.get(pmap, parent_doc_id) != nil do
+                {:ok, %{st | verified_parents: MapSet.put(st.verified_parents, key)}}
+              else
+                {:error, InvalidChanges.exception(fields: [fk_attr], message: "does not exist")}
+              end
+            else
+              verify_bulk_parent_exists_uncached(
+                cursor_root,
+                parent_col,
+                parent_doc_id,
+                fk_attr,
+                st
+              )
+            end
 
-        if exists? do
-          {:ok, %{st1 | verified_parents: MapSet.put(st1.verified_parents, key)}}
-        else
-          {:error, InvalidChanges.exception(fields: [fk_attr], message: "does not exist")}
+          :error ->
+            verify_bulk_parent_exists_uncached(
+              cursor_root,
+              parent_col,
+              parent_doc_id,
+              fk_attr,
+              st
+            )
         end
+      end
+    end
+
+    defp verify_bulk_parent_exists_uncached(cursor_root, parent_col, parent_doc_id, fk_attr, st) do
+      key = {parent_col, parent_doc_id}
+      {parent_col_cur, st1} = fetch_cached_parent_col(cursor_root, parent_col, st)
+      exists? = match?(%Xitdb.Cursor{}, parent_col_cur) and parent_col_cur[parent_doc_id] != nil
+
+      if exists? do
+        {:ok, %{st1 | verified_parents: MapSet.put(st1.verified_parents, key)}}
+      else
+        {:error, InvalidChanges.exception(fields: [fk_attr], message: "does not exist")}
       end
     end
 
@@ -1132,143 +1713,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       %{st | set_buckets: next_sets, set_removals: next_removals}
     end
 
-    defp accumulate_bulk_search(
-           _cursor_root,
-           _scoped_col,
-           _doc_id,
-           _record,
-           [],
-           _skip_search?,
-           _allow_existing?,
-           st
-         ),
-         do: st
-
-    defp accumulate_bulk_search(
-           _cursor_root,
-           _scoped_col,
-           _doc_id,
-           _record,
-           _search_fields,
-           true,
-           _allow_existing?,
-           st
-         ),
-         do: st
-
-    defp accumulate_bulk_search(
-           cursor_root,
-           scoped_col,
-           doc_id,
-           record,
-           search_fields,
-           false,
-           allow_existing?,
-           st
-         ) do
-      new_terms = Search.extract_weighted_terms_for_record(record, search_fields, cursor_root)
-      new_len = Enum.reduce(new_terms, 0, fn {_t, w}, sum -> sum + w end)
-
-      col_state =
-        Map.get_lazy(st.search_acc, scoped_col, fn ->
-          stats = Search.Storage.read_corpus_stats(cursor_root, scoped_col)
-          docs_cur = get_search_docs_cursor(cursor_root, scoped_col)
-
-          %{
-            doc_count: stats.doc_count,
-            total_len: stats.total_len,
-            docs_cur: docs_cur,
-            changed?: false,
-            doc_entries: [],
-            deleted_docs: [],
-            term_postings: %{},
-            deleted_terms: []
-          }
-        end)
-
-      old_doc =
-        if col_state.docs_cur != nil and allow_existing? do
-          Search.Storage.read_doc(cursor_root, scoped_col, doc_id)
-        else
-          %{len: 0, terms: %{}}
-        end
-
-      if old_doc.terms == new_terms do
-        %{st | search_acc: Map.put(st.search_acc, scoped_col, col_state)}
-      else
-        was_indexed? = old_doc.len > 0
-        now_indexed? = new_len > 0
-
-        doc_count_delta =
-          cond do
-            not was_indexed? and now_indexed? -> 1
-            was_indexed? and not now_indexed? -> -1
-            true -> 0
-          end
-
-        next_doc_entries =
-          if now_indexed? do
-            [{doc_id, %{"len" => new_len, "terms" => new_terms}, []} | col_state.doc_entries]
-          else
-            col_state.doc_entries
-          end
-
-        next_deleted_docs =
-          if not now_indexed? and was_indexed? do
-            [doc_id | col_state.deleted_docs]
-          else
-            col_state.deleted_docs
-          end
-
-        next_postings =
-          Enum.reduce(new_terms, col_state.term_postings, fn {term, new_w}, acc ->
-            if Map.get(old_doc.terms, term) == new_w do
-              acc
-            else
-              Map.update(acc, term, [{doc_id, new_w}], &[{doc_id, new_w} | &1])
-            end
-          end)
-
-        next_deleted_terms =
-          if was_indexed? do
-            Enum.reduce(old_doc.terms, col_state.deleted_terms, fn {old_term, _old_w}, acc ->
-              if Map.has_key?(new_terms, old_term) do
-                acc
-              else
-                [{old_term, doc_id} | acc]
-              end
-            end)
-          else
-            col_state.deleted_terms
-          end
-
-        updated_col = %{
-          col_state
-          | doc_count: max(0, col_state.doc_count + doc_count_delta),
-            total_len: max(0, col_state.total_len + (new_len - old_doc.len)),
-            changed?: true,
-            doc_entries: next_doc_entries,
-            deleted_docs: next_deleted_docs,
-            term_postings: next_postings,
-            deleted_terms: next_deleted_terms
-        }
-
-        %{st | search_acc: Map.put(st.search_acc, scoped_col, updated_col)}
-      end
-    end
-
-    defp get_search_docs_cursor(cursor_root, scoped_col) do
-      with %Xitdb.Cursor{} = idx <- cursor_root["idx"],
-           %Xitdb.Cursor{} = search <- idx["search"],
-           %Xitdb.Cursor{} = col <- search[scoped_col],
-           %Xitdb.Cursor{} = docs <- col["docs"] do
-        docs
-      else
-        _ -> nil
-      end
-    end
-
-    defp compile_coalesced_bulk_ops(cursor_root, st) do
+    defp compile_coalesced_bulk_ops(cursor_root, search_fields, st) do
       {seq_ops, _cached_meta?} =
         Enum.reduce(st.seq_state, {[], false}, fn
           {scoped_col, %{initial: initial, current: current}}, {ops_acc, cached?}
@@ -1376,63 +1821,16 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         end)
 
       search_ops =
-        Enum.flat_map(st.search_acc, fn
-          {_col, %{changed?: false}} ->
-            []
-
-          {col, col_st} ->
-            meta_op =
-              {:put, ["idx", "search", col, "meta"],
-               %{"doc_count" => col_st.doc_count, "total_len" => col_st.total_len}}
-
-            rm_doc_ops =
-              Enum.map(col_st.deleted_docs, fn doc_id ->
-                {:rm, ["idx", "search", col, "docs", doc_id]}
-              end)
-
-            doc_put_ops =
-              if col_st.doc_entries == [] do
-                []
-              else
-                [
-                  {:bulk_put_maps, ["idx", "search", col, "docs"],
-                   Enum.reverse(col_st.doc_entries)}
-                ]
-              end
-
-            term_put_ops =
-              if map_size(col_st.term_postings) == 0 do
-                []
-              else
-                sorted_terms = :lists.keysort(1, :maps.to_list(col_st.term_postings))
-
-                [
-                  {:bulk_index_puts, ["idx", "search", col, "terms"], :hash_map_merge,
-                   sorted_terms}
-                ]
-              end
-
-            term_rm_ops =
-              col_st.deleted_terms
-              |> Enum.group_by(&elem(&1, 0), &elem(&1, 1))
-              |> Enum.flat_map(fn {term, doc_ids} ->
-                removed_set = MapSet.new(doc_ids)
-
-                has_remaining? =
-                  Map.has_key?(col_st.term_postings, term) or
-                    Search.Storage.term_has_doc_outside?(cursor_root, col, term, removed_set)
-
-                if has_remaining? do
-                  Enum.map(removed_set, fn doc_id ->
-                    {:rm, ["idx", "search", col, "terms", {:sorted_map, term}, doc_id]}
-                  end)
-                else
-                  [{:rm, ["idx", "search", col, "terms", {:sorted_map, term}]}]
-                end
-              end)
-
-            [meta_op | rm_doc_ops] ++ doc_put_ops ++ term_put_ops ++ term_rm_ops
-        end)
+        if search_fields == [] or st.search_items_rev == [] do
+          []
+        else
+          Search.plan_bulk_index_ops(
+            cursor_root,
+            search_fields,
+            Enum.reverse(st.search_items_rev),
+            parallel: :auto
+          )
+        end
 
       seq_ops ++
         blob_ops ++

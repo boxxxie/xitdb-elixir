@@ -299,9 +299,149 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       end
     end
 
+    @doc """
+    Incrementally indexes or updates a batch of `records` in `idx.search.<collection>`
+    inside a single atomic transaction (`Xitdb.Ash.Store` module, `{db, moment}`, or `%Xitdb{}`).
+
+    Useful after deferred bulk writes (`context: %{xitdb: %{skip_search_index?: true}}` with
+    `return_records?: true`) when appending to an already-populated collection where re-scanning
+    all existing rows via `rebuild_index!/3` is unnecessary.
+
+    ## Options
+    - `:tenant` (`term()`) — optional multitenant scope (defaults to `nil`).
+    - `:parallel` (`boolean()`) — enable parallel worker term extraction when at least 128
+      records are indexed (defaults to `true`).
+    - `:assume_new?` (`boolean()`) — skip reading prior `idx.search.<collection>.docs` entries
+      when callers know the records are newly inserted (defaults to `false`).
+    - `:worker_wrapper` (`(-> result) | (Xitdb.Cursor.t(), (-> result) -> result)`) — optional
+      wrapper invoked once per worker slice (for example, initializing process-local lookup caches).
+    """
+    @spec index_records!(
+            module() | {Xitdb.t(), integer()} | Xitdb.t(),
+            module(),
+            Enumerable.t(),
+            keyword()
+          ) :: :ok | {Xitdb.t(), integer()} | Xitdb.t()
+    def index_records!(store_or_db, resource, records, opts \\ [])
+
+    def index_records!(store, resource, records, opts)
+        when is_atom(store) and is_atom(resource) and is_list(opts) do
+      search_fields = Info.search_fields(resource)
+      records_list = Enum.to_list(records)
+
+      if search_fields == [] or records_list == [] do
+        :ok
+      else
+        mutate_opts = Keyword.take(opts, [:timeout, :lease_timeout])
+
+        case Store.mutate(
+               store,
+               fn {db, moment} ->
+                 next_snapshot =
+                   do_index_records_snapshot(
+                     {db, moment},
+                     resource,
+                     search_fields,
+                     records_list,
+                     opts
+                   )
+
+                 {:ok, next_snapshot, :ok}
+               end,
+               mutate_opts
+             ) do
+          {:ok, :ok} -> :ok
+          {:error, %_{} = err} when is_exception(err) -> raise err
+          {:error, reason} -> raise Xitdb.Error, reason: reason
+        end
+      end
+    end
+
+    def index_records!({%Xitdb{} = db, moment}, resource, records, opts)
+        when is_integer(moment) and is_atom(resource) and is_list(opts) do
+      search_fields = Info.search_fields(resource)
+      records_list = Enum.to_list(records)
+
+      if search_fields == [] or records_list == [] do
+        {db, moment}
+      else
+        do_index_records_snapshot({db, moment}, resource, search_fields, records_list, opts)
+      end
+    end
+
+    def index_records!(%Xitdb{} = db, resource, records, opts)
+        when is_atom(resource) and is_list(opts) do
+      search_fields = Info.search_fields(resource)
+      records_list = Enum.to_list(records)
+
+      if search_fields == [] or records_list == [] do
+        db
+      else
+        moment = max(Xitdb.moment_count(db) - 1, -1)
+
+        {next_db, _next_moment} =
+          do_index_records_snapshot({db, moment}, resource, search_fields, records_list, opts)
+
+        next_db
+      end
+    end
+
     @doc false
     def extract_weighted_terms_for_record(record, search_fields, db) do
       extract_weighted_terms(record, search_fields, db)
+    end
+
+    @doc false
+    def compile_search_plan(search_fields) do
+      Enum.map(search_fields, fn %{field: field, boost: boost, resolver: resolver} ->
+        {field, max(1, round(boost * @weight_scale)), resolver}
+      end)
+    end
+
+    @doc false
+    def extract_weighted_terms_and_len(record, search_plan, db) do
+      do_extract_weighted_terms(search_plan, record, db, %{}, 0)
+    end
+
+    @doc false
+    def plan_bulk_index_ops(cursor_root, search_fields, items, opts \\ [])
+
+    def plan_bulk_index_ops(_cursor_root, [], _items, _opts), do: []
+    def plan_bulk_index_ops(_cursor_root, _search_fields, [], _opts), do: []
+
+    def plan_bulk_index_ops(cursor_root, search_fields, items, opts) do
+      search_plan = compile_search_plan(search_fields)
+
+      has_resolver? =
+        Enum.any?(search_plan, fn {_field, _weight, resolver} -> resolver != nil end)
+
+      parallel_opt = Keyword.get(opts, :parallel, :auto)
+      worker_wrapper = Keyword.get(opts, :worker_wrapper)
+
+      {col_order_rev, by_col_rev} =
+        Enum.reduce(items, {[], %{}}, fn {scoped_col, _doc_id, _record, _check_existing?} = item,
+                                         {order_acc, map_acc} ->
+          case Map.fetch(map_acc, scoped_col) do
+            {:ok, list} -> {order_acc, Map.put(map_acc, scoped_col, [item | list])}
+            :error -> {[scoped_col | order_acc], Map.put(map_acc, scoped_col, [item])}
+          end
+        end)
+
+      col_order_rev
+      |> Enum.reverse()
+      |> Enum.flat_map(fn scoped_col ->
+        col_items = by_col_rev |> Map.fetch!(scoped_col) |> Enum.reverse()
+
+        plan_bulk_index_col_ops(
+          cursor_root,
+          scoped_col,
+          search_plan,
+          has_resolver?,
+          col_items,
+          parallel_opt,
+          worker_wrapper
+        )
+      end)
     end
 
     @doc """
@@ -627,37 +767,399 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     # -- Internal Indexing & Diff Calculation --
 
     defp extract_weighted_terms(record, search_fields, db) do
-      Enum.reduce(search_fields, %{}, fn %{field: field, boost: boost, resolver: resolver}, acc ->
-        weight = max(1, round(boost * @weight_scale))
+      {terms, _len} =
+        extract_weighted_terms_and_len(record, compile_search_plan(search_fields), db)
 
-        raw_value =
-          case resolver do
-            fun when is_function(fun, 2) -> fun.(record, db)
-            nil -> Map.get(record, field)
-          end
+      terms
+    end
 
-        raw_value
-        |> extract_tokens()
-        |> Enum.reduce(acc, fn token, term_acc ->
-          Map.update(term_acc, token, weight, &(&1 + weight))
-        end)
+    defp do_extract_weighted_terms([], _record, _db, acc, total_len), do: {acc, total_len}
+
+    defp do_extract_weighted_terms([{field, weight, resolver} | rest], record, db, acc, total_len) do
+      raw_value =
+        case resolver do
+          fun when is_function(fun, 2) -> fun.(record, db)
+          nil -> Map.get(record, field)
+        end
+
+      {next_acc, next_len} = add_field_tokens(raw_value, weight, acc, total_len)
+      do_extract_weighted_terms(rest, record, db, next_acc, next_len)
+    end
+
+    defp add_field_tokens(value, weight, acc, len) when is_binary(value) do
+      add_token_list(tokenize(value), weight, acc, len)
+    end
+
+    defp add_field_tokens(%Ash.CiString{} = value, weight, acc, len) do
+      add_token_list(tokenize(value), weight, acc, len)
+    end
+
+    defp add_field_tokens(values, weight, acc, len) when is_list(values) do
+      Enum.reduce(values, {acc, len}, fn v, {a, l} ->
+        add_field_tokens(v, weight, a, l)
       end)
     end
 
-    defp extract_tokens(values) when is_list(values) do
-      Enum.flat_map(values, &extract_tokens/1)
-    end
-
-    defp extract_tokens(value) when is_binary(value) or is_struct(value, Ash.CiString) do
-      tokenize(value)
-    end
-
-    defp extract_tokens(value)
+    defp add_field_tokens(value, weight, acc, len)
          when is_atom(value) and not is_nil(value) and not is_boolean(value) do
-      value |> Atom.to_string() |> tokenize()
+      add_token_list(value |> Atom.to_string() |> tokenize(), weight, acc, len)
     end
 
-    defp extract_tokens(_other), do: []
+    defp add_field_tokens(_other, _weight, acc, len), do: {acc, len}
+
+    defp add_token_list([], _weight, acc, len), do: {acc, len}
+
+    defp add_token_list([token | rest], weight, acc, len) do
+      next_acc =
+        case acc do
+          %{^token => cur} -> Map.put(acc, token, cur + weight)
+          _ -> Map.put(acc, token, weight)
+        end
+
+      add_token_list(rest, weight, next_acc, len + weight)
+    end
+
+    defp do_index_records_snapshot(
+           {%Xitdb{} = db, moment},
+           resource,
+           search_fields,
+           records,
+           opts
+         ) do
+      tenant = opts[:tenant]
+      collection = Codec.scoped_collection(resource, tenant)
+      [pk_name | _] = Ash.Resource.Info.primary_key(resource)
+      pk_attr = Ash.Resource.Info.attribute(resource, pk_name)
+      check_existing? = not Keyword.get(opts, :assume_new?, false)
+      parallel? = Keyword.get(opts, :parallel, true)
+      worker_wrapper = Keyword.get(opts, :worker_wrapper)
+      cursor_root = Xitdb.as_of(db, moment)
+
+      # Deduplicate by doc_id keeping the last occurrence to remain idempotent
+      {deduped_items, _seen} =
+        records
+        |> Enum.reverse()
+        |> Enum.reduce({[], MapSet.new()}, fn record, {acc, seen} ->
+          doc_id = Codec.encode_pk_doc_id(pk_attr, Map.fetch!(record, pk_name))
+
+          if MapSet.member?(seen, doc_id) do
+            {acc, seen}
+          else
+            {[{collection, doc_id, record, check_existing?} | acc], MapSet.put(seen, doc_id)}
+          end
+        end)
+
+      ops =
+        plan_bulk_index_ops(
+          cursor_root,
+          search_fields,
+          deduped_items,
+          parallel: parallel?,
+          worker_wrapper: worker_wrapper
+        )
+
+      commit_bulk_search_ops({db, moment}, collection, ops)
+    end
+
+    defp plan_bulk_index_col_ops(
+           cursor_root,
+           scoped_col,
+           search_plan,
+           has_resolver?,
+           col_items,
+           parallel_opt,
+           worker_wrapper
+         ) do
+      stats = Storage.read_corpus_stats(cursor_root, scoped_col)
+      docs_cur = Storage.get_docs_cursor(cursor_root, scoped_col)
+
+      old_docs_map =
+        if docs_cur != nil do
+          existing_ids = for {_col, doc_id, _rec, true} <- col_items, do: doc_id
+
+          if existing_ids == [] do
+            %{}
+          else
+            Storage.read_docs_from_cursor(docs_cur, existing_ids)
+          end
+        else
+          %{}
+        end
+
+      total = length(col_items)
+
+      run_parallel? =
+        case parallel_opt do
+          true -> total >= 128
+          :auto -> not has_resolver? and total >= 500
+          false -> false
+        end
+
+      {dc_delta, len_delta, changed?, doc_entries, deleted_docs, term_postings, deleted_terms} =
+        if run_parallel? do
+          concurrency = min(System.schedulers_online(), 8)
+          slice_size = max(div(total + concurrency - 1, concurrency), 1)
+          has_old_docs? = map_size(old_docs_map) > 0
+
+          slice_pairs =
+            col_items
+            |> Enum.chunk_every(slice_size)
+            |> Enum.map(fn slice ->
+              slice_old =
+                if has_old_docs? do
+                  Enum.reduce(slice, %{}, fn {_c, doc_id, _rec, check?}, acc ->
+                    if check? do
+                      case Map.fetch(old_docs_map, doc_id) do
+                        {:ok, doc} -> Map.put(acc, doc_id, doc)
+                        :error -> acc
+                      end
+                    else
+                      acc
+                    end
+                  end)
+                else
+                  %{}
+                end
+
+              {slice, slice_old}
+            end)
+
+          slice_pairs
+          |> Task.async_stream(
+            fn {slice, slice_old} ->
+              run_with_worker_wrapper(worker_wrapper, cursor_root, fn ->
+                extract_bulk_index_slice(slice, cursor_root, search_plan, slice_old)
+              end)
+            end,
+            max_concurrency: concurrency,
+            ordered: false,
+            timeout: :infinity
+          )
+          |> Enum.reduce({0, 0, false, [], [], %{}, []}, fn
+            {:ok, {sdc, slen, sch?, sdocs, sdel_docs, sterms, sdel_terms}},
+            {adc, alen, ach?, adocs, adel_docs, aterms, adel_terms} ->
+              merged_terms =
+                if map_size(aterms) == 0 do
+                  sterms
+                else
+                  merge_term_postings(aterms, sterms)
+                end
+
+              {
+                adc + sdc,
+                alen + slen,
+                ach? or sch?,
+                sdocs ++ adocs,
+                sdel_docs ++ adel_docs,
+                merged_terms,
+                sdel_terms ++ adel_terms
+              }
+          end)
+        else
+          run_with_worker_wrapper(worker_wrapper, cursor_root, fn ->
+            extract_bulk_index_slice(col_items, cursor_root, search_plan, old_docs_map)
+          end)
+        end
+
+      if not changed? do
+        []
+      else
+        new_doc_count = max(0, stats.doc_count + dc_delta)
+        new_total_len = max(0, stats.total_len + len_delta)
+
+        meta_op =
+          {:put, ["idx", "search", scoped_col, "meta"],
+           %{"doc_count" => new_doc_count, "total_len" => new_total_len}}
+
+        rm_doc_ops =
+          Enum.map(deleted_docs, fn doc_id ->
+            {:rm, ["idx", "search", scoped_col, "docs", doc_id]}
+          end)
+
+        doc_put_ops =
+          if doc_entries == [] do
+            []
+          else
+            [{:bulk_put_maps, ["idx", "search", scoped_col, "docs"], doc_entries}]
+          end
+
+        term_put_ops =
+          if map_size(term_postings) == 0 do
+            []
+          else
+            sorted_terms = :lists.keysort(1, :maps.to_list(term_postings))
+
+            [
+              {:bulk_index_puts, ["idx", "search", scoped_col, "terms"], :hash_map_merge,
+               sorted_terms}
+            ]
+          end
+
+        term_rm_ops =
+          if deleted_terms == [] do
+            []
+          else
+            deleted_terms
+            |> Enum.group_by(&elem(&1, 0), &elem(&1, 1))
+            |> Enum.flat_map(fn {term, doc_ids} ->
+              removed_set = MapSet.new(doc_ids)
+
+              has_remaining? =
+                Map.has_key?(term_postings, term) or
+                  Storage.term_has_doc_outside?(cursor_root, scoped_col, term, removed_set)
+
+              if has_remaining? do
+                Enum.map(removed_set, fn doc_id ->
+                  {:rm, ["idx", "search", scoped_col, "terms", {:sorted_map, term}, doc_id]}
+                end)
+              else
+                [{:rm, ["idx", "search", scoped_col, "terms", {:sorted_map, term}]}]
+              end
+            end)
+          end
+
+        [meta_op | rm_doc_ops] ++ doc_put_ops ++ term_put_ops ++ term_rm_ops
+      end
+    end
+
+    defp extract_bulk_index_slice(slice, cursor_root, search_plan, old_docs_map) do
+      {dc, len, ch?, docs_rev, del_docs_rev, terms, del_terms} =
+        Enum.reduce(slice, {0, 0, false, [], [], %{}, []}, fn item, acc ->
+          diff_bulk_index_item(item, cursor_root, search_plan, old_docs_map, acc)
+        end)
+
+      {dc, len, ch?, Enum.reverse(docs_rev), Enum.reverse(del_docs_rev), terms, del_terms}
+    end
+
+    defp diff_bulk_index_item(
+           {_col, doc_id, record, check_existing?},
+           cursor_root,
+           search_plan,
+           old_docs_map,
+           {dc_acc, len_acc, ch?, docs_rev, del_docs_rev, terms_acc, del_terms_acc}
+         ) do
+      {new_terms, new_len} = extract_weighted_terms_and_len(record, search_plan, cursor_root)
+
+      old_doc =
+        if check_existing? and map_size(old_docs_map) > 0 do
+          Map.get(old_docs_map, doc_id, %{len: 0, terms: %{}})
+        else
+          %{len: 0, terms: %{}}
+        end
+
+      if old_doc.terms == new_terms do
+        {dc_acc, len_acc, ch?, docs_rev, del_docs_rev, terms_acc, del_terms_acc}
+      else
+        old_len = old_doc.len
+        was_indexed? = old_len > 0
+        now_indexed? = new_len > 0
+
+        dc_delta =
+          cond do
+            not was_indexed? and now_indexed? -> 1
+            was_indexed? and not now_indexed? -> -1
+            true -> 0
+          end
+
+        next_docs_rev =
+          if now_indexed? do
+            [{doc_id, %{"len" => new_len, "terms" => new_terms}, []} | docs_rev]
+          else
+            docs_rev
+          end
+
+        next_del_docs_rev =
+          if not now_indexed? and was_indexed? do
+            [doc_id | del_docs_rev]
+          else
+            del_docs_rev
+          end
+
+        next_terms =
+          if was_indexed? do
+            add_changed_term_postings(
+              :maps.next(:maps.iterator(new_terms)),
+              doc_id,
+              old_doc.terms,
+              terms_acc
+            )
+          else
+            add_term_postings(:maps.next(:maps.iterator(new_terms)), doc_id, terms_acc)
+          end
+
+        next_del_terms =
+          if was_indexed? do
+            collect_deleted_terms(
+              :maps.next(:maps.iterator(old_doc.terms)),
+              doc_id,
+              new_terms,
+              del_terms_acc
+            )
+          else
+            del_terms_acc
+          end
+
+        {
+          dc_acc + dc_delta,
+          len_acc + (new_len - old_len),
+          true,
+          next_docs_rev,
+          next_del_docs_rev,
+          next_terms,
+          next_del_terms
+        }
+      end
+    end
+
+    defp add_changed_term_postings(:none, _doc_id, _old_terms, acc), do: acc
+
+    defp add_changed_term_postings({term, new_w, iter}, doc_id, old_terms, acc) do
+      next_acc =
+        case old_terms do
+          %{^term => ^new_w} ->
+            acc
+
+          _ ->
+            case acc do
+              %{^term => existing} -> Map.put(acc, term, [{doc_id, new_w} | existing])
+              _ -> Map.put(acc, term, [{doc_id, new_w}])
+            end
+        end
+
+      add_changed_term_postings(:maps.next(iter), doc_id, old_terms, next_acc)
+    end
+
+    defp collect_deleted_terms(:none, _doc_id, _new_terms, acc), do: acc
+
+    defp collect_deleted_terms({old_term, _old_w, iter}, doc_id, new_terms, acc) do
+      next_acc =
+        if Map.has_key?(new_terms, old_term) do
+          acc
+        else
+          [{old_term, doc_id} | acc]
+        end
+
+      collect_deleted_terms(:maps.next(iter), doc_id, new_terms, next_acc)
+    end
+
+    defp commit_bulk_search_ops({db, moment}, _collection, []), do: {db, moment}
+
+    defp commit_bulk_search_ops({db, moment}, collection, ops) do
+      base_opts = Storage.search_reindex_tx_opts(collection)
+
+      tx_opts =
+        if moment >= 0 do
+          Keyword.put(base_opts, :base_moment, moment)
+        else
+          base_opts
+        end
+
+      case Xitdb.transact_ops_with_moment(db, ops, tx_opts) do
+        {:ok, next_db, next_moment} -> {next_db, next_moment}
+        {:error, %_{} = err} when is_exception(err) -> raise err
+        {:error, reason} -> raise Xitdb.Error, reason: reason
+      end
+    end
 
     defp apply_doc_diff(db, collection, doc_key, new_terms) do
       %{len: old_len, terms: old_terms} = Storage.read_doc(db, collection, doc_key)
@@ -835,6 +1337,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
            worker_wrapper
          ) do
       total = length(cursors)
+      read_plan = Codec.compile_read_plan(resource, only_attrs, tenant)
+      search_plan = compile_search_plan(search_fields)
 
       if parallel? and total >= 128 do
         concurrency = min(System.schedulers_online(), 8)
@@ -850,8 +1354,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
                 cursor_root,
                 resource,
                 tenant,
-                only_attrs,
-                search_fields
+                read_plan,
+                search_plan
               )
             end)
           end,
@@ -874,7 +1378,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         end)
       else
         run_with_worker_wrapper(worker_wrapper, cursor_root, fn ->
-          extract_corpus_slice(cursors, cursor_root, resource, tenant, only_attrs, search_fields)
+          extract_corpus_slice(cursors, cursor_root, resource, tenant, read_plan, search_plan)
         end)
       end
     end
@@ -887,27 +1391,18 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     defp run_with_worker_wrapper(wrapper, cursor_root, fun) when is_function(wrapper, 2),
       do: wrapper.(cursor_root, fun)
 
-    defp extract_corpus_slice(slice, cursor_root, resource, tenant, only_attrs, search_fields) do
+    defp extract_corpus_slice(slice, cursor_root, resource, tenant, read_plan, search_plan) do
       filter_tenant? = Ash.Resource.Info.multitenancy_strategy(resource) != :attribute
 
       Enum.reduce(slice, {0, 0, [], %{}}, fn {doc_id, cursor},
                                              {c_acc, l_acc, docs_acc, terms_acc} ->
-        with {:ok, record} <- Codec.from_cursor(resource, cursor, tenant, only_attrs),
+        with {:ok, record} <- Codec.from_cursor_fast(read_plan, cursor, tenant),
              true <- not filter_tenant? or Codec.matches_tenant?(resource, record, tenant) do
-          terms = extract_weighted_terms(record, search_fields, cursor_root)
-          len = Enum.reduce(terms, 0, fn {_t, w}, sum -> sum + w end)
+          {terms, len} = extract_weighted_terms_and_len(record, search_plan, cursor_root)
 
           if len > 0 do
             doc_entry = {doc_id, %{"len" => len, "terms" => terms}, []}
-
-            next_terms =
-              Enum.reduce(terms, terms_acc, fn {term, weight}, t_acc ->
-                case Map.fetch(t_acc, term) do
-                  {:ok, existing} -> Map.put(t_acc, term, [{doc_id, weight} | existing])
-                  :error -> Map.put(t_acc, term, [{doc_id, weight}])
-                end
-              end)
-
+            next_terms = add_term_postings(:maps.next(:maps.iterator(terms)), doc_id, terms_acc)
             {c_acc + 1, l_acc + len, [doc_entry | docs_acc], next_terms}
           else
             {c_acc, l_acc, docs_acc, terms_acc}
@@ -918,17 +1413,36 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       end)
     end
 
+    defp add_term_postings(:none, _doc_id, acc), do: acc
+
+    defp add_term_postings({term, weight, iter}, doc_id, acc) do
+      next_acc =
+        case acc do
+          %{^term => existing} -> Map.put(acc, term, [{doc_id, weight} | existing])
+          _ -> Map.put(acc, term, [{doc_id, weight}])
+        end
+
+      add_term_postings(:maps.next(iter), doc_id, next_acc)
+    end
+
     defp merge_term_postings(target, source) when map_size(target) < map_size(source) do
       merge_term_postings(source, target)
     end
 
     defp merge_term_postings(target, source) do
-      Enum.reduce(source, target, fn {term, postings}, acc ->
-        case Map.fetch(acc, term) do
-          {:ok, existing} -> Map.put(acc, term, postings ++ existing)
-          :error -> Map.put(acc, term, postings)
+      do_merge_term_postings(:maps.next(:maps.iterator(source)), target)
+    end
+
+    defp do_merge_term_postings(:none, acc), do: acc
+
+    defp do_merge_term_postings({term, postings, iter}, acc) do
+      next_acc =
+        case acc do
+          %{^term => existing} -> Map.put(acc, term, postings ++ existing)
+          _ -> Map.put(acc, term, postings)
         end
-      end)
+
+      do_merge_term_postings(:maps.next(iter), next_acc)
     end
 
     defp decode_doc_key(resource, key) do
@@ -986,29 +1500,125 @@ if Code.ensure_loaded?(Ash.DataLayer) do
                {:hash_map, "docs"},
                {:hash_map, doc_key}
              ]) do
-        terms =
-          case doc["terms"] do
-            nil ->
-              %{}
-
-            %Xitdb.Collection{data: data} ->
-              Map.new(data, fn {k, v} -> {to_string(k), v} end)
-
-            raw_terms when is_map(raw_terms) and not is_struct(raw_terms) ->
-              raw_terms
-
-            %Xitdb.Cursor{} = terms_cur ->
-              Map.new(terms_cur)
-
-            _ ->
-              %{}
-          end
-
-        %{len: doc["len"] || 0, terms: terms}
+        decode_search_doc_val(doc)
       else
         _ -> %{len: 0, terms: %{}}
       end
     end
+
+    @doc false
+    @spec get_docs_cursor(term(), String.t()) :: Xitdb.Cursor.t() | nil
+    def get_docs_cursor(db, collection) do
+      case get_in_search(db, collection, "docs") do
+        %Xitdb.Cursor{} = docs -> docs
+        _ -> nil
+      end
+    end
+
+    @doc false
+    @spec read_docs_from_cursor(term(), [String.t()]) :: %{
+            optional(String.t()) => %{
+              len: non_neg_integer(),
+              terms: %{optional(String.t()) => pos_integer()}
+            }
+          }
+    def read_docs_from_cursor(nil, _doc_ids), do: %{}
+    def read_docs_from_cursor(_docs_cur, []), do: %{}
+
+    def read_docs_from_cursor(%Xitdb.Cursor{tx_mode: false} = raw_cur, doc_ids)
+        when is_list(doc_ids) do
+      cur = if raw_cur.tag_id == -1, do: Xitdb.Cursor.ensure_resolved(raw_cur), else: raw_cur
+
+      if cur.tag in [:hash_map, :counted_hash_map, :sorted_map] do
+        doc_ids
+        |> Enum.uniq()
+        |> Enum.chunk_every(2048)
+        |> Enum.reduce(%{}, fn chunk, acc ->
+          case Xitdb.NIF.nif_slot_get_keys(cur.db_ref, cur.tag_id, cur.value, chunk) do
+            {:ok, hits} when is_map(hits) ->
+              Enum.reduce(hits, acc, fn {doc_id, raw_doc}, doc_acc ->
+                doc_val = Xitdb.Cursor.unwrap_nif_value(cur.db_ref, raw_doc, cur.moment)
+                Map.put(doc_acc, doc_id, decode_search_doc_val(doc_val))
+              end)
+
+            {:error, _reason} ->
+              fallback_read_docs_from_cursor(cur, chunk, acc)
+          end
+        end)
+      else
+        %{}
+      end
+    end
+
+    def read_docs_from_cursor(docs_cur, doc_ids) when is_list(doc_ids) do
+      fallback_read_docs_from_cursor(docs_cur, Enum.uniq(doc_ids), %{})
+    end
+
+    defp fallback_read_docs_from_cursor(docs_cur, doc_ids, acc) do
+      Enum.reduce(doc_ids, acc, fn doc_id, m ->
+        case docs_cur[doc_id] do
+          nil -> m
+          doc -> Map.put(m, doc_id, decode_search_doc_val(doc))
+        end
+      end)
+    end
+
+    defp decode_search_doc_val(%Xitdb.Cursor{tx_mode: false} = raw_doc_cur) do
+      doc_cur =
+        if raw_doc_cur.tag_id == -1,
+          do: Xitdb.Cursor.ensure_resolved(raw_doc_cur),
+          else: raw_doc_cur
+
+      if doc_cur.tag in [:hash_map, :counted_hash_map, :sorted_map] do
+        case Xitdb.NIF.nif_slot_get_keys(doc_cur.db_ref, doc_cur.tag_id, doc_cur.value, [
+               "len",
+               "terms"
+             ]) do
+          {:ok, fields} when is_map(fields) ->
+            len = Map.get(fields, "len") || 0
+
+            terms =
+              case Map.get(fields, "terms") do
+                nil ->
+                  %{}
+
+                raw_terms ->
+                  doc_cur.db_ref
+                  |> Xitdb.Cursor.unwrap_nif_value(raw_terms, doc_cur.moment)
+                  |> unwrap_search_doc_terms()
+              end
+
+            %{len: len, terms: terms}
+
+          {:error, _reason} ->
+            %{len: doc_cur["len"] || 0, terms: unwrap_search_doc_terms(doc_cur["terms"])}
+        end
+      else
+        %{len: 0, terms: %{}}
+      end
+    end
+
+    defp decode_search_doc_val(doc) when is_map(doc) and not is_struct(doc) do
+      %{len: doc["len"] || 0, terms: unwrap_search_doc_terms(doc["terms"])}
+    end
+
+    defp decode_search_doc_val(doc) do
+      %{len: doc["len"] || 0, terms: unwrap_search_doc_terms(doc["terms"])}
+    end
+
+    defp unwrap_search_doc_terms(nil), do: %{}
+
+    defp unwrap_search_doc_terms(%Xitdb.Collection{data: data}) do
+      Map.new(data, fn {k, v} -> {to_string(k), v} end)
+    end
+
+    defp unwrap_search_doc_terms(raw_terms)
+         when is_map(raw_terms) and not is_struct(raw_terms) do
+      raw_terms
+    end
+
+    defp unwrap_search_doc_terms(%Xitdb.Cursor{} = terms_cur), do: Map.new(terms_cur)
+    defp unwrap_search_doc_terms(_other), do: %{}
 
     @spec read_doc_len(term(), String.t(), String.t()) :: non_neg_integer()
     def read_doc_len(db, collection, doc_key) do

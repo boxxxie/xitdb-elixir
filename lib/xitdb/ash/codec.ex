@@ -131,6 +131,155 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       end)
     end
 
+    @doc false
+    @spec compile_read_plan(module(), :all | MapSet.t(atom()) | [atom()], term()) :: map()
+    def compile_read_plan(resource, only_attrs \\ :all, tenant \\ nil) when is_atom(resource) do
+      counted_sets = counted_set_fields(resource)
+
+      allowed_attrs =
+        case only_attrs do
+          :all -> :all
+          %MapSet{} = set -> set
+          list when is_list(list) -> MapSet.new(list)
+        end
+
+      {entries_rev, keys_rev, base_fields} =
+        resource
+        |> Ash.Resource.Info.attributes()
+        |> Enum.reduce({[], [], %{}}, fn %Attribute{} = attr, {e_acc, k_acc, f_acc} ->
+          if allowed_attrs == :all or MapSet.member?(allowed_attrs, attr.name) do
+            as_counted_set? = MapSet.member?(counted_sets, attr.name)
+            key_str = Atom.to_string(attr.name)
+
+            fast_kind =
+              if as_counted_set? do
+                :general
+              else
+                {kind, _constraints} = unwrap_type(attr.type, attr.constraints)
+
+                case kind do
+                  k when k in [:string, :binary, :uuid] -> :binary_copy
+                  :integer -> :integer
+                  :boolean -> :boolean
+                  :float -> :float
+                  :ci_string -> :ci_string
+                  _ -> :general
+                end
+              end
+
+            entry = {attr, attr.name, key_str, as_counted_set?, fast_kind}
+            {[entry | e_acc], [key_str | k_acc], Map.put(f_acc, attr.name, nil)}
+          else
+            not_loaded = %Ash.NotLoaded{type: :attribute, field: attr.name}
+            {e_acc, k_acc, Map.put(f_acc, attr.name, not_loaded)}
+          end
+        end)
+
+      base_struct = build_loaded_struct(resource, base_fields, tenant)
+
+      %{
+        resource: resource,
+        tenant: tenant,
+        base_struct: base_struct,
+        keys: Enum.reverse(keys_rev),
+        entries: Enum.reverse(entries_rev)
+      }
+    end
+
+    @doc false
+    @spec from_cursor_fast(map(), term(), term()) :: {:ok, struct()} | {:error, term()}
+    def from_cursor_fast(
+          %{entries: entries, keys: keys, base_struct: base_struct} = plan,
+          cursor,
+          tenant \\ nil
+        ) do
+      base =
+        if tenant != nil and tenant != plan.tenant do
+          Ash.Resource.put_metadata(base_struct, :tenant, tenant)
+        else
+          base_struct
+        end
+
+      source =
+        case cursor do
+          %Xitdb.Cursor{tx_mode: false} = raw_cur ->
+            cur =
+              if raw_cur.tag_id == -1, do: Xitdb.Cursor.ensure_resolved(raw_cur), else: raw_cur
+
+            if keys == [] do
+              {:map, %{}, nil}
+            else
+              case Xitdb.NIF.nif_slot_get_keys(cur.db_ref, cur.tag_id, cur.value, keys) do
+                {:ok, map} -> {:map, map, cur}
+                {:error, _} -> {:cursor, cur}
+              end
+            end
+
+          map when is_map(map) and not is_struct(map) ->
+            {:map, map, nil}
+
+          other ->
+            {:cursor, other}
+        end
+
+      hydrate_from_plan_source(entries, source, base)
+    end
+
+    defp hydrate_from_plan_source(entries, {:map, raw_map, cur}, base) do
+      Enum.reduce_while(entries, {:ok, base}, fn {attr, name, key_str, as_counted_set?, fast_kind},
+                                                 {:ok, acc} ->
+        case Map.get(raw_map, key_str) do
+          nil ->
+            {:cont, {:ok, acc}}
+
+          raw ->
+            val =
+              if cur != nil and (is_tuple(raw) or is_list(raw) or is_map(raw)) do
+                Xitdb.Cursor.unwrap_nif_value(cur.db_ref, raw, cur.moment)
+              else
+                raw
+              end
+
+            decode_plan_attr(attr, name, val, as_counted_set?, fast_kind, acc)
+        end
+      end)
+    end
+
+    defp hydrate_from_plan_source(entries, {:cursor, cursor}, base) do
+      Enum.reduce_while(entries, {:ok, base}, fn {attr, name, key_str, as_counted_set?, fast_kind},
+                                                 {:ok, acc} ->
+        case fetch_cursor_field(cursor, key_str) do
+          nil -> {:cont, {:ok, acc}}
+          val -> decode_plan_attr(attr, name, val, as_counted_set?, fast_kind, acc)
+        end
+      end)
+    end
+
+    defp decode_plan_attr(attr, name, val, as_counted_set?, fast_kind, acc) do
+      case fast_kind do
+        :binary_copy when is_binary(val) ->
+          {:cont, {:ok, Map.put(acc, name, :binary.copy(val))}}
+
+        :integer when is_integer(val) ->
+          {:cont, {:ok, Map.put(acc, name, val)}}
+
+        :boolean when is_boolean(val) ->
+          {:cont, {:ok, Map.put(acc, name, val)}}
+
+        :float when is_number(val) ->
+          {:cont, {:ok, Map.put(acc, name, val * 1.0)}}
+
+        :ci_string when is_binary(val) ->
+          {:cont, {:ok, Map.put(acc, name, Ash.CiString.new(:binary.copy(val)))}}
+
+        _ ->
+          case load_attribute(attr, val, as_counted_set?) do
+            {:ok, loaded} -> {:cont, {:ok, Map.put(acc, name, loaded)}}
+            {:error, _reason} = err -> {:halt, err}
+          end
+      end
+    end
+
     @doc """
     Hydrates a Xitdb entity cursor back into a loaded `%Resource{}` struct.
 

@@ -211,7 +211,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         with {:ok, raw_cursors, strategy} <-
                stage1_narrow_with_stats(db_or_cursor, query, resource),
              candidate_count = length(raw_cursors),
-             {:ok, hydrated} <- stage2_hydrate(raw_cursors, query, resource),
+             {:ok, hydrated, hydrated_attrs} <- stage2_hydrate(raw_cursors, query, resource),
              {:ok, prefiltered, residual_filter} <-
                stage3_prefilter(db_or_cursor, hydrated, query, resource),
              {stage4_query, post_slice_query} <-
@@ -227,7 +227,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
              ordered = stage5_order_and_slice(enriched_and_filtered, query, resource),
              {:ok, post_enriched} <-
                attach_derived(db_or_cursor, ordered, post_slice_query, resource) do
-          projected = stage6_project(post_enriched, query, resource)
+          projected = stage6_project(post_enriched, query, resource, hydrated_attrs)
 
           {:ok, projected,
            %{
@@ -986,22 +986,29 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       global? = Ash.Resource.Info.multitenancy_global?(resource)
       tenant_attr = Ash.Resource.Info.multitenancy_attribute(resource)
       only_attrs = needed_attributes_for_hydration(query, resource, tenant_attr)
+      read_plan = Codec.compile_read_plan(resource, only_attrs, tenant)
 
-      raw_cursors
-      |> Enum.reduce_while({:ok, []}, fn {_doc_id, cursor}, {:ok, acc} ->
-        case Codec.from_cursor(resource, cursor, tenant, only_attrs) do
-          {:ok, record} ->
-            if Codec.matches_attribute_tenant?(record, strategy, tenant_attr, global?, tenant) do
-              {:cont, {:ok, [record | acc]}}
-            else
-              {:cont, {:ok, acc}}
-            end
+      result =
+        raw_cursors
+        |> Enum.reduce_while({:ok, []}, fn {_doc_id, cursor}, {:ok, acc} ->
+          case Codec.from_cursor_fast(read_plan, cursor, tenant) do
+            {:ok, record} ->
+              if Codec.matches_attribute_tenant?(record, strategy, tenant_attr, global?, tenant) do
+                {:cont, {:ok, [record | acc]}}
+              else
+                {:cont, {:ok, acc}}
+              end
 
-          {:error, _} = err ->
-            {:halt, err}
-        end
-      end)
-      |> reverse_ok()
+            {:error, _} = err ->
+              {:halt, err}
+          end
+        end)
+        |> reverse_ok()
+
+      case result do
+        {:ok, hydrated} -> {:ok, hydrated, only_attrs}
+        {:error, _} = err -> err
+      end
     end
 
     defp needed_attributes_for_hydration(%__MODULE__{select: nil}, _resource, _tenant_attr),
@@ -1020,55 +1027,63 @@ if Code.ensure_loaded?(Ash.DataLayer) do
            tenant_attr
          )
          when is_list(select) do
-      if Info.compression_configs(resource) == [] do
-        :all
-      else
-        resolve_hydration_attributes(query, select, resource, tenant_attr)
-      end
+      resolve_hydration_attributes(query, select, resource, tenant_attr)
     end
 
     defp resolve_hydration_attributes(query, select, resource, tenant_attr) do
-      pk_fields = Ash.Resource.Info.primary_key(resource)
+      has_exists_or_parent? =
+        query.filter != nil and
+          Ash.Filter.find(query.filter, fn
+            %Ash.Query.Exists{} -> true
+            %Parent{} -> true
+            _ -> false
+          end) != nil
 
-      always_selected =
-        resource
-        |> Ash.Resource.Info.attributes()
-        |> Enum.filter(&Map.get(&1, :always_select?, false))
-        |> Enum.map(& &1.name)
-
-      rel_source_attrs =
-        resource
-        |> Ash.Resource.Info.relationships()
-        |> Enum.map(& &1.source_attribute)
-        |> Enum.reject(&is_nil/1)
-
-      tenant_attrs = if is_nil(tenant_attr), do: [], else: [tenant_attr]
-
-      base_set =
-        MapSet.new(select ++ pk_fields ++ always_selected ++ rel_source_attrs ++ tenant_attrs)
-        |> collect_expr_ref_names(query.filter)
-        |> collect_sort_or_distinct_names(query.sort)
-        |> collect_sort_or_distinct_names(query.distinct)
-        |> collect_sort_or_distinct_names(query.distinct_sort)
-
-      {extra_calcs, has_extra_agg?} =
-        collect_extra_calcs_and_aggs(query.filter, [
-          query.sort,
-          query.distinct,
-          query.distinct_sort
-        ])
-
-      if has_extra_agg? do
+      if has_exists_or_parent? do
         :all
       else
-        expand_hydration_deps(
-          query.calculations ++ extra_calcs,
-          base_set,
-          MapSet.new(),
-          MapSet.new(),
-          query,
+        pk_fields = Ash.Resource.Info.primary_key(resource)
+
+        always_selected =
           resource
-        )
+          |> Ash.Resource.Info.attributes()
+          |> Enum.filter(&Map.get(&1, :always_select?, false))
+          |> Enum.map(& &1.name)
+
+        rel_source_attrs =
+          resource
+          |> Ash.Resource.Info.relationships()
+          |> Enum.map(& &1.source_attribute)
+          |> Enum.reject(&is_nil/1)
+
+        tenant_attrs = if is_nil(tenant_attr), do: [], else: [tenant_attr]
+
+        base_set =
+          MapSet.new(select ++ pk_fields ++ always_selected ++ rel_source_attrs ++ tenant_attrs)
+          |> collect_expr_ref_names(query.filter)
+          |> collect_sort_or_distinct_names(query.sort)
+          |> collect_sort_or_distinct_names(query.distinct)
+          |> collect_sort_or_distinct_names(query.distinct_sort)
+
+        {extra_calcs, has_extra_agg?} =
+          collect_extra_calcs_and_aggs(query.filter, [
+            query.sort,
+            query.distinct,
+            query.distinct_sort
+          ])
+
+        if has_extra_agg? do
+          :all
+        else
+          expand_hydration_deps(
+            query.calculations ++ extra_calcs,
+            base_set,
+            MapSet.new(),
+            MapSet.new(),
+            query,
+            resource
+          )
+        end
       end
     end
 
@@ -1801,7 +1816,12 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         %Ref{attribute: %Aggregate{name: name, load: load}}, set ->
           set |> add_calc_key(name) |> add_calc_key(load)
 
-        %Ref{attribute: name}, set when is_atom(name) ->
+        %Ref{relationship_path: path, attribute: %Attribute{name: name}}, set
+        when path in [[], nil] ->
+          MapSet.put(set, name)
+
+        %Ref{relationship_path: path, attribute: name}, set
+        when path in [[], nil] and is_atom(name) ->
           MapSet.put(set, name)
 
         _, set ->
@@ -1819,6 +1839,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     end
 
     defp add_sort_key_names(set, name) when is_atom(name), do: add_calc_key(set, name)
+    defp add_sort_key_names(set, %Attribute{name: name}), do: MapSet.put(set, name)
 
     defp add_sort_key_names(set, %Calculation{name: name, load: load, opts: opts}) do
       set
@@ -2638,7 +2659,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
             end
         end
 
-      with {:ok, hydrated} <- stage2_hydrate(cursors, %__MODULE__{tenant: tenant}, dest_res) do
+      with {:ok, hydrated, _hydrated_attrs} <-
+             stage2_hydrate(cursors, %__MODULE__{tenant: tenant}, dest_res) do
         allowed = MapSet.new(values, &join_key_value(effective_pair_attr, &1))
 
         {:ok,
@@ -3719,9 +3741,13 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     # Stage 6: Field Projection Masking
     # ==========================================================================
 
-    defp stage6_project(records, %__MODULE__{select: nil}, _resource), do: records
+    defp stage6_project([], _query, _resource, _hydrated_attrs), do: []
 
-    defp stage6_project(records, %__MODULE__{select: select}, resource) when is_list(select) do
+    defp stage6_project(records, %__MODULE__{select: nil}, _resource, _hydrated_attrs),
+      do: records
+
+    defp stage6_project(records, %__MODULE__{select: select}, resource, hydrated_attrs)
+         when is_list(select) do
       pk_fields = Ash.Resource.Info.primary_key(resource)
 
       always_selected =
@@ -3736,13 +3762,20 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         resource
         |> Ash.Resource.Info.attributes()
         |> Enum.map(& &1.name)
-        |> Enum.reject(&MapSet.member?(keep_set, &1))
-
-      Enum.map(records, fn record ->
-        Enum.reduce(to_mask, record, fn field, acc ->
-          Map.put(acc, field, %Ash.NotLoaded{type: :attribute, field: field})
+        |> Enum.filter(fn name ->
+          not MapSet.member?(keep_set, name) and
+            (hydrated_attrs == :all or MapSet.member?(hydrated_attrs, name))
         end)
-      end)
+
+      if to_mask == [] do
+        records
+      else
+        Enum.map(records, fn record ->
+          Enum.reduce(to_mask, record, fn field, acc ->
+            Map.put(acc, field, %Ash.NotLoaded{type: :attribute, field: field})
+          end)
+        end)
+      end
     end
 
     # ==========================================================================

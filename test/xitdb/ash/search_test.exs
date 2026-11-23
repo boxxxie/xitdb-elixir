@@ -571,4 +571,225 @@ defmodule Xitdb.Ash.SearchTest do
       end
     end
   end
+
+  describe "index_records!/4" do
+    alias Xitdb.Ash.SearchTest.{
+      SearchRebuildAttrTenant,
+      SearchRebuildDomain,
+      SearchRebuildOrg,
+      SearchRebuildProfile,
+      SearchRebuildStore
+    }
+
+    setup do
+      {:ok, pid} =
+        Xitdb.Ash.Store.start_link(
+          name: SearchRebuildStore,
+          path: :memory,
+          domains: [SearchRebuildDomain]
+        )
+
+      on_exit(fn ->
+        if Process.alive?(pid) do
+          try do
+            GenServer.stop(pid, :normal, 1_000)
+          catch
+            :exit, _ -> :ok
+          end
+        end
+      end)
+
+      :ok
+    end
+
+    test "incrementally indexes deferred batches into a populated store and handles updates, clears, and duplicates" do
+      # Seed initial batch eagerly
+      Ash.bulk_create!(
+        [
+          %{id: 1, name: "Northleaf Capital", mandate: "Infrastructure Credit"},
+          %{id: 2, name: "HarbourVest Partners", mandate: "Private Equity"}
+        ],
+        SearchRebuildOrg,
+        :create,
+        domain: SearchRebuildDomain,
+        return_records?: false
+      )
+
+      # Append a deferred batch with skip_search_index?: true
+      %{records: appended} =
+        Ash.bulk_create!(
+          [
+            %{id: 3, name: "Polar Asset Management", mandate: "Macro Credit"},
+            %{id: 4, name: "Brookfield Credit", mandate: "Direct Lending"}
+          ],
+          SearchRebuildOrg,
+          :create,
+          domain: SearchRebuildDomain,
+          return_records?: true,
+          context: %{xitdb: %{skip_search_index?: true}}
+        )
+
+      assert Search.ids(SearchRebuildOrg, "polar") == []
+
+      :ok =
+        Search.index_records!(SearchRebuildStore, SearchRebuildOrg, appended, assume_new?: true)
+
+      assert Search.ids(SearchRebuildOrg, "polar") == [3]
+      assert Search.ids(SearchRebuildOrg, "credit", limit: 10) |> Enum.sort() == [1, 3, 4]
+
+      # Duplicate PKs keep the last occurrence, and clearing searchable text prunes emptied terms
+      updated_1 = %SearchRebuildOrg{id: 1, name: "Northleaf Renamed", mandate: "Venture"}
+      updated_1_final = %SearchRebuildOrg{id: 1, name: "Northleaf Final", mandate: nil}
+      cleared_2 = %SearchRebuildOrg{id: 2, name: "---", mandate: nil}
+
+      :ok =
+        Search.index_records!(
+          SearchRebuildStore,
+          SearchRebuildOrg,
+          [updated_1, updated_1_final, cleared_2],
+          parallel: false
+        )
+
+      assert Search.ids(SearchRebuildOrg, "infrastructure") == []
+      assert Search.ids(SearchRebuildOrg, "renamed") == []
+      assert Search.ids(SearchRebuildOrg, "harbourvest") == []
+      assert Search.ids(SearchRebuildOrg, "final") == [1]
+
+      db = Xitdb.Ash.Store.current_db(SearchRebuildStore)
+      meta = db["idx"]["search"]["sr_orgs"]["meta"]
+      assert meta["doc_count"] == 3
+      assert is_nil(db["idx"]["search"]["sr_orgs"]["docs"]["2"])
+      assert is_nil(db["idx"]["search"]["sr_orgs"]["terms"]["harbourvest"])
+
+      # Empty records list is a clean no-op
+      assert :ok = Search.index_records!(SearchRebuildStore, SearchRebuildOrg, [])
+    end
+
+    test "supports parallel: true with worker_wrapper, attribute multitenancy, {db, moment}, %Xitdb{}, and read-only errors" do
+      Ash.bulk_create!(
+        [
+          %{id: 1, name: "Northleaf Capital", mandate: "Infrastructure Credit"},
+          %{id: 2, name: "HarbourVest Partners", mandate: "Private Equity"}
+        ],
+        SearchRebuildOrg,
+        :create,
+        domain: SearchRebuildDomain,
+        context: %{xitdb: %{skip_search_index?: true}}
+      )
+
+      profile_inputs =
+        for i <- 1..150 do
+          %{
+            id: i,
+            full_name: if(i == 42, do: "Zara Quantum", else: "Member #{i}"),
+            title: if(i <= 2, do: "Managing Director", else: "Associate"),
+            org_id: if(rem(i, 2) == 0, do: 1, else: 2)
+          }
+        end
+
+      %{records: profiles} =
+        Ash.bulk_create!(profile_inputs, SearchRebuildProfile, :create,
+          domain: SearchRebuildDomain,
+          return_records?: true,
+          context: %{xitdb: %{skip_search_index?: true}}
+        )
+
+      parent = self()
+
+      wrapper = fn cursor_root, work ->
+        names =
+          for {id_str, org_cur} <- Enum.to_list(cursor_root["sr_orgs"]), into: %{} do
+            {String.to_integer(id_str), org_cur["name"]}
+          end
+
+        Process.put(:sr_org_cache, %{root: cursor_root, names: names})
+        send(parent, {:index_wrapped_shard, self()})
+
+        try do
+          work.()
+        after
+          Process.delete(:sr_org_cache)
+        end
+      end
+
+      :ok =
+        Search.index_records!(SearchRebuildStore, SearchRebuildProfile, profiles,
+          parallel: true,
+          worker_wrapper: wrapper
+        )
+
+      assert_received {:index_wrapped_shard, _pid}
+      assert Search.ids(SearchRebuildProfile, "quantum") == [42]
+      assert 42 in Search.ids(SearchRebuildProfile, "northleaf", limit: 200)
+      refute 41 in Search.ids(SearchRebuildProfile, "northleaf", limit: 200)
+
+      # Attribute multitenancy
+      %{records: t_a} =
+        Ash.bulk_create!([%{id: 1, name: "Shared Alpha"}], SearchRebuildAttrTenant, :create,
+          domain: SearchRebuildDomain,
+          tenant: "tenant_a",
+          return_records?: true,
+          context: %{xitdb: %{skip_search_index?: true}}
+        )
+
+      %{records: t_b} =
+        Ash.bulk_create!([%{id: 2, name: "Shared Beta"}], SearchRebuildAttrTenant, :create,
+          domain: SearchRebuildDomain,
+          tenant: "tenant_b",
+          return_records?: true,
+          context: %{xitdb: %{skip_search_index?: true}}
+        )
+
+      :ok =
+        Search.index_records!(SearchRebuildStore, SearchRebuildAttrTenant, t_a,
+          tenant: "tenant_a"
+        )
+
+      :ok =
+        Search.index_records!(SearchRebuildStore, SearchRebuildAttrTenant, t_b,
+          tenant: "tenant_b"
+        )
+
+      assert Search.ids(SearchRebuildAttrTenant, "shared", tenant: "tenant_a") == [1]
+      assert Search.ids(SearchRebuildAttrTenant, "shared", tenant: "tenant_b") == [2]
+
+      # %Xitdb{} and {db, moment} handles + read-only error unwrapping
+      tmp = Path.join(System.tmp_dir!(), "xitdb_ro_idx_#{System.unique_integer([:positive])}")
+      File.mkdir_p!(tmp)
+      db_path = Path.join(tmp, "ro.xit")
+      on_exit(fn -> File.rm_rf(tmp) end)
+
+      {:ok, raw_db} = Xitdb.open(backend: :file, path: db_path)
+
+      p1 = %SearchProfile{
+        id: "p1",
+        full_name: "Alice Smith",
+        headline: "Principal",
+        organization_id: nil
+      }
+
+      raw_db = Search.index_records!(raw_db, SearchProfile, [p1], parallel: false)
+      assert Search.ids(SearchProfile, "alice", db: raw_db) == ["p1"]
+
+      m = Xitdb.moment_count(raw_db) - 1
+      p1_new = %{p1 | headline: "Partner"}
+      {raw_db, m2} = Search.index_records!({raw_db, m}, SearchProfile, [p1_new], parallel: false)
+      assert Search.ids(SearchProfile, "partner", db: Xitdb.as_of(raw_db, m2)) == ["p1"]
+      assert Search.ids(SearchProfile, "principal", db: Xitdb.as_of(raw_db, m2)) == []
+      assert :ok = Xitdb.close(raw_db)
+
+      {:ok, ro_db} = Xitdb.open(backend: :file, path: db_path, read_only: true)
+
+      try do
+        err =
+          assert_raise Xitdb.Error, fn ->
+            Search.index_records!(ro_db, SearchProfile, [p1], parallel: false)
+          end
+
+        assert err.reason == :read_only
+      after
+        Xitdb.close(ro_db)
+      end
+    end
+  end
 end

@@ -2689,6 +2689,77 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         assert Search.ids(BulkNestedOne, "originalalpha") == []
         assert Search.ids(BulkNestedOne, "middlebeta") == []
       end
+
+      test "coalesced eager bulk_create with allow_existing_cursor?: true and >= 500 parallel: :auto rows matches rebuild_index!" do
+        Ash.bulk_create!(
+          [
+            %{id: 1, name: "Alpha Legacy", slug: "s1", sector: "tech"},
+            %{id: 2, name: "Beta Shared", slug: "s2", sector: "tech"}
+          ],
+          BulkParent,
+          :create,
+          domain: BulkDomain,
+          return_records?: false
+        )
+
+        # Overwrite id 1 (removing "legacy" and adding "rebranded") and id 2 (punctuation-only name clears doc)
+        Ash.bulk_create!(
+          [
+            %{id: 1, name: "Alpha Rebranded", slug: "s1", sector: "tech"},
+            %{id: 2, name: "---", slug: "s2", sector: "tech"}
+          ],
+          BulkParent,
+          :create,
+          domain: BulkDomain,
+          return_records?: false,
+          context: %{xitdb: %{allow_existing_cursor?: true}}
+        )
+
+        assert Search.ids(BulkParent, "legacy") == []
+        assert Search.ids(BulkParent, "shared") == []
+        assert Search.ids(BulkParent, "rebranded") == [1]
+
+        root_mid = Store.root(BulkStore)
+        assert root_mid["idx"]["search"]["bulk_parents"]["meta"]["doc_count"] == 1
+        assert is_nil(root_mid["idx"]["search"]["bulk_parents"]["docs"]["2"])
+        assert is_nil(root_mid["idx"]["search"]["bulk_parents"]["terms"]["legacy"])
+        assert is_nil(root_mid["idx"]["search"]["bulk_parents"]["terms"]["shared"])
+
+        # >= 500 rows exercises parallel: :auto inside Mutator coalesced bulk_create!
+        large_inputs =
+          for i <- 10..529 do
+            %{
+              id: i,
+              name: "Enterprise #{i} ParallelToken#{rem(i, 17)}",
+              slug: "ent-#{i}",
+              sector: "sector_#{rem(i, 4)}"
+            }
+          end
+
+        Ash.bulk_create!(large_inputs, BulkParent, :create,
+          domain: BulkDomain,
+          batch_size: 600,
+          return_records?: false
+        )
+
+        root_after = Store.root(BulkStore)
+        meta_eager = Xitdb.materialize(root_after["idx"]["search"]["bulk_parents"]["meta"])
+        terms_eager = Xitdb.materialize(root_after["idx"]["search"]["bulk_parents"]["terms"])
+        hits_eager = Search.query(BulkParent, "enterprise paralleltoken5", limit: 40)
+
+        assert meta_eager["doc_count"] == 521
+
+        :ok = Search.rebuild_index!(BulkStore, BulkParent, parallel: true)
+        root_rebuilt = Store.root(BulkStore)
+
+        assert Xitdb.materialize(root_rebuilt["idx"]["search"]["bulk_parents"]["meta"]) ==
+                 meta_eager
+
+        assert Xitdb.materialize(root_rebuilt["idx"]["search"]["bulk_parents"]["terms"]) ==
+                 terms_eager
+
+        assert Search.query(BulkParent, "enterprise paralleltoken5", limit: 40) == hits_eager
+      end
     end
   end
 end

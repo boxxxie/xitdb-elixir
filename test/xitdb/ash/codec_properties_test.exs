@@ -384,6 +384,231 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       end
     end
 
+    defmodule FastPlanPropRecord do
+      @moduledoc false
+      use Ash.Resource,
+        domain: nil,
+        validate_domain_inclusion?: false,
+        extensions: [Xitdb.Ash.Dsl]
+
+      xitdb do
+        store Xitdb.TestSupport.MdmStore
+        collection :fast_plan_prop_records
+        counted_set_fields [:tags]
+      end
+
+      attributes do
+        attribute(:id, :integer, primary_key?: true, allow_nil?: false, public?: true)
+        attribute(:name, :string, public?: true)
+        attribute(:raw_bin, :binary, public?: true)
+        attribute(:active, :boolean, default: true, public?: true)
+        attribute(:score, :float, public?: true)
+        attribute(:email, :ci_string, public?: true)
+        attribute(:amount, :decimal, public?: true)
+        attribute(:big_u64, Xitdb.Ash.Types.UnsignedInteger, public?: true)
+        attribute(:on_date, :date, public?: true)
+        attribute(:meta, :map, public?: true)
+        attribute(:tags, {:array, :string}, public?: true)
+      end
+    end
+
+    property "Codec.to_cursor_map_fast/2 matches Codec.to_cursor_map/2 across all types, nil values, and counted sets" do
+      plan = Codec.compile_attr_plan(FastPlanPropRecord)
+
+      opt = fn g -> one_of([constant(nil), g]) end
+
+      rec_gen =
+        gen all(
+              id <- member_of([@min_i64, -1, 0, 1, @max_i64]),
+              name <- opt.(string(:printable, max_length: 16)),
+              raw_bin <- opt.(binary(max_length: 12)),
+              active <- opt.(boolean()),
+              score <- opt.(one_of([integer(-100..100), float(min: -1000.0, max: 1000.0)])),
+              email <-
+                opt.(
+                  map(string(:alphanumeric, min_length: 1, max_length: 12), &Ash.CiString.new/1)
+                ),
+              amount <-
+                opt.(
+                  map(tuple({integer(-999..999), integer(0..99)}), fn {w, f} ->
+                    Decimal.new("#{w}.#{f}")
+                  end)
+                ),
+              big_u64 <-
+                opt.(
+                  one_of([
+                    constant(0),
+                    constant(@max_i64),
+                    constant(@max_i64 + 1),
+                    constant(@max_u64)
+                  ])
+                ),
+              on_date <- opt.(member_of([~D[2026-01-01], ~D[2026-11-23]])),
+              meta <-
+                opt.(
+                  map_of(
+                    string(:alphanumeric, min_length: 1, max_length: 6),
+                    one_of([
+                      constant(nil),
+                      integer(-10..10),
+                      string(:alphanumeric, max_length: 8)
+                    ]),
+                    max_length: 3
+                  )
+                ),
+              tags <-
+                opt.(list_of(string(:alphanumeric, min_length: 1, max_length: 8), max_length: 4))
+            ) do
+          %FastPlanPropRecord{
+            id: id,
+            name: name,
+            raw_bin: raw_bin,
+            active: active,
+            score: score,
+            email: email,
+            amount: amount,
+            big_u64: big_u64,
+            on_date: on_date,
+            meta: meta,
+            tags: tags
+          }
+        end
+
+      check all(rec <- rec_gen, max_runs: 100) do
+        assert Codec.to_cursor_map_fast(plan, rec) == Codec.to_cursor_map(FastPlanPropRecord, rec)
+      end
+    end
+
+    defmodule FastCompressedPropRecord do
+      @moduledoc false
+      use Ash.Resource,
+        domain: nil,
+        validate_domain_inclusion?: false,
+        extensions: [Xitdb.Ash.Dsl]
+
+      xitdb do
+        store Xitdb.TestSupport.MdmStore
+        collection :fast_compressed_prop_records
+        counted_set_fields [:tags]
+        compress([:bio], mode: :value, codec: :zstd, min_bytes: 16, intern_above: 64)
+      end
+
+      attributes do
+        attribute(:id, :integer, primary_key?: true, allow_nil?: false, public?: true)
+        attribute(:name, :string, public?: true)
+        attribute(:bio, :string, public?: true)
+        attribute(:active, :boolean, default: true, public?: true)
+        attribute(:score, :float, public?: true)
+        attribute(:email, :ci_string, public?: true)
+        attribute(:amount, :decimal, public?: true)
+        attribute(:big_u64, Xitdb.Ash.Types.UnsignedInteger, public?: true)
+        attribute(:meta, :map, public?: true)
+        attribute(:tags, {:array, :string}, public?: true)
+      end
+    end
+
+    property "Codec.from_cursor_fast/3 matches Codec.from_cursor/4 across :all, only_attrs subsets, nil defaults, counted sets, and compression" do
+      all_attr_names = [
+        :id,
+        :name,
+        :bio,
+        :active,
+        :score,
+        :email,
+        :amount,
+        :big_u64,
+        :meta,
+        :tags
+      ]
+
+      opt = fn g -> one_of([constant(nil), g]) end
+
+      rec_gen =
+        gen all(
+              id <- integer(1..500),
+              name <- opt.(string(:printable, max_length: 14)),
+              bio <-
+                opt.(
+                  one_of([
+                    string(:alphanumeric, max_length: 10),
+                    map(
+                      string(:alphanumeric, min_length: 4, max_length: 8),
+                      &String.duplicate(&1, 8)
+                    )
+                  ])
+                ),
+              active <- opt.(boolean()),
+              score <- opt.(one_of([integer(-50..50), float(min: -100.0, max: 100.0)])),
+              email <-
+                opt.(
+                  map(string(:alphanumeric, min_length: 1, max_length: 10), &Ash.CiString.new/1)
+                ),
+              amount <-
+                opt.(
+                  map(tuple({integer(-99..99), integer(0..99)}), fn {w, f} ->
+                    Decimal.new("#{w}.#{f}")
+                  end)
+                ),
+              big_u64 <-
+                opt.(
+                  one_of([
+                    constant(0),
+                    constant(@max_i64),
+                    constant(@max_i64 + 1),
+                    constant(@max_u64)
+                  ])
+                ),
+              meta <-
+                opt.(
+                  map_of(
+                    string(:alphanumeric, min_length: 1, max_length: 5),
+                    one_of([constant(nil), integer(-5..5), string(:alphanumeric, max_length: 6)]),
+                    max_length: 2
+                  )
+                ),
+              tags <-
+                opt.(list_of(string(:alphanumeric, min_length: 1, max_length: 6), max_length: 3)),
+              only_attrs <-
+                one_of([
+                  constant(:all),
+                  constant([]),
+                  constant([:id]),
+                  list_of(member_of(all_attr_names), max_length: 5)
+                ]),
+              tenant <- member_of([nil, "tenant_1"])
+            ) do
+          {%FastCompressedPropRecord{
+             id: id,
+             name: name,
+             bio: bio,
+             active: active,
+             score: score,
+             email: email,
+             amount: amount,
+             big_u64: big_u64,
+             meta: meta,
+             tags: tags
+           }, only_attrs, tenant}
+        end
+
+      {:ok, db} = Xitdb.open(backend: :memory)
+
+      try do
+        check all({rec, only_attrs, tenant} <- rec_gen, max_runs: 75) do
+          {:ok, db} = Xitdb.Ash.Indexer.put_record(db, FastCompressedPropRecord, nil, rec, tenant)
+          doc_id = Integer.to_string(rec.id)
+          col = Codec.scoped_collection(FastCompressedPropRecord, tenant)
+          cur = Xitdb.db(db)[col][doc_id]
+          plan = Codec.compile_read_plan(FastCompressedPropRecord, only_attrs, tenant)
+
+          assert Codec.from_cursor_fast(plan, cur, tenant) ==
+                   Codec.from_cursor(FastCompressedPropRecord, cur, tenant, only_attrs)
+        end
+      after
+        :ok = Xitdb.close(db)
+      end
+    end
+
     defp compare_terms(a, b) when a < b, do: :lt
     defp compare_terms(a, b) when a > b, do: :gt
     defp compare_terms(_a, _b), do: :eq
