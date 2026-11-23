@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.4.2] - 2026-11-23
+
+### Fixed
+- **Iterative, Header-Only Compression Reference GC During Compaction (`native/xitdb_nif.odin`, `Xitdb.compact/2`):**
+  - Replaced recursive `gc_collect_slot/5` traversal with iterative worklist-based `gc_collect_slots_iterative/5` (sharing a single pooled `Nif_Iter_Pool` iterator and pre-filtering/deduplicating containers via `gc_enqueue_or_mark_slot/5`) so compaction stays `O(1)` in C stack depth on arbitrarily deep trees.
+  - Replaced full-payload `cursor_read_bytes_object` reads in compression reference marking with header-only reads (`gc_mark_tagged_slot/4`, `gc_mark_col_page_dict/4`) and stack-buffered key probing (`gc_encode_sha256_hex_buf/2`, `gc_mark_page_ref/5`, `gc_lookup_page_live/4`), bounding `"pg"` pointer reads and avoiding transient `temp_allocator` memory spikes on large compressed databases.
+
 ## [2.4.1] - 2026-11-23
 
 ### Fixed

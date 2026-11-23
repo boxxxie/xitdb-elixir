@@ -1,7 +1,7 @@
 # Xitdb
 
 [![CI](https://github.com/boxxxie/xitdb-elixir/actions/workflows/ci.yml/badge.svg)](https://github.com/boxxxie/xitdb-elixir/actions/workflows/ci.yml)
-[![Hex.pm](https://img.shields.io/badge/hex-2.4.1-blue.svg?logo=elixir&logoColor=white)](https://hex.pm/packages/xitdb)
+[![Hex.pm](https://img.shields.io/badge/hex-2.4.2-blue.svg?logo=elixir&logoColor=white)](https://hex.pm/packages/xitdb)
 [![Elixir](https://img.shields.io/badge/Elixir-~%3E%201.19-4B275F.svg?logo=elixir&logoColor=white)](https://elixir-lang.org)
 [![Odin](https://img.shields.io/badge/Odin-dev--2026--09%2B-3882D2.svg)](https://odin-lang.org)
 [![Ash](https://img.shields.io/badge/Ash-3.37.2%2B-E04F5F.svg)](https://ash-hq.org)
