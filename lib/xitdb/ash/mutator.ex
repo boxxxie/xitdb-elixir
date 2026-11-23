@@ -541,6 +541,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
                    ) do
               st_after_sec =
                 accumulate_bulk_secondary(
+                  cursor_root,
                   indexes,
                   scoped_col,
                   doc_id,
@@ -1667,50 +1668,89 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       end
     end
 
-    defp accumulate_bulk_secondary([], _scoped_col, _doc_id, _existing_record, _record, st),
-      do: st
+    defp accumulate_bulk_secondary(
+           _cursor_root,
+           [],
+           _scoped_col,
+           _doc_id,
+           _existing_record,
+           _record,
+           st
+         ),
+         do: st
 
-    defp accumulate_bulk_secondary(indexes, scoped_col, doc_id, existing_record, record, st) do
-      {next_sets, next_removals} =
-        Enum.reduce(indexes, {st.set_buckets, st.set_removals}, fn %{
-                                                                     slot: slot,
-                                                                     fields: fields,
-                                                                     attrs: attrs
-                                                                   },
-                                                                   {add_acc, rm_acc} ->
-          old_raw = Indexer.encode_record_index_key(attrs, fields, existing_record)
-          new_raw = Indexer.encode_record_index_key(attrs, fields, record)
+    defp accumulate_bulk_secondary(
+           cursor_root,
+           indexes,
+           scoped_col,
+           doc_id,
+           existing_record,
+           record,
+           st
+         ) do
+      Enum.reduce(indexes, st, fn %{slot: slot, fields: fields, attrs: attrs}, acc_st ->
+        old_raw = Indexer.encode_record_index_key(attrs, fields, existing_record)
+        new_raw = Indexer.encode_record_index_key(attrs, fields, record)
+        bucket_key = {scoped_col, slot}
 
-          if old_raw == new_raw do
-            {add_acc, rm_acc}
-          else
-            bucket_key = {scoped_col, slot}
+        cond do
+          is_nil(old_raw) and is_nil(new_raw) ->
+            acc_st
 
-            next_rm_acc =
+          old_raw == new_raw ->
+            # `allow_existing_cursor?: true` can hydrate pre-existing raw cursors
+            # whose secondary index buckets have never been populated. Only skip
+            # writing when `doc_id` is already present in `idx.<col>.<slot>[new_hex]`.
+            new_hex = IndexStorage.encode_btree_key(new_raw)
+            {slot_cur, acc_st1} = fetch_cached_idx_slot(cursor_root, scoped_col, slot, acc_st)
+
+            already_indexed? =
+              case slot_cur do
+                %Xitdb.Cursor{} ->
+                  case slot_cur[new_hex] do
+                    nil -> false
+                    set_cur -> IndexStorage.set_container_member?(set_cur, doc_id)
+                  end
+
+                _ ->
+                  false
+              end
+
+            if already_indexed? do
+              acc_st1
+            else
+              put_set_bucket(acc_st1, bucket_key, new_hex, doc_id)
+            end
+
+          true ->
+            acc_st1 =
               if old_raw != nil do
                 old_hex = IndexStorage.encode_btree_key(old_raw)
-                inner_rm = Map.get(rm_acc, bucket_key, %{})
-                next_inner_rm = Map.update(inner_rm, old_hex, [doc_id], &[doc_id | &1])
-                Map.put(rm_acc, bucket_key, next_inner_rm)
+                put_set_removal(acc_st, bucket_key, old_hex, doc_id)
               else
-                rm_acc
+                acc_st
               end
 
-            next_add_acc =
-              if new_raw != nil do
-                new_hex = IndexStorage.encode_btree_key(new_raw)
-                inner_add = Map.get(add_acc, bucket_key, %{})
-                next_inner_add = Map.update(inner_add, new_hex, [doc_id], &[doc_id | &1])
-                Map.put(add_acc, bucket_key, next_inner_add)
-              else
-                add_acc
-              end
+            if new_raw != nil do
+              new_hex = IndexStorage.encode_btree_key(new_raw)
+              put_set_bucket(acc_st1, bucket_key, new_hex, doc_id)
+            else
+              acc_st1
+            end
+        end
+      end)
+    end
 
-            {next_add_acc, next_rm_acc}
-          end
-        end)
+    defp put_set_bucket(st, bucket_key, hex_key, doc_id) do
+      inner = Map.get(st.set_buckets, bucket_key, %{})
+      next_inner = Map.update(inner, hex_key, [doc_id], &[doc_id | &1])
+      %{st | set_buckets: Map.put(st.set_buckets, bucket_key, next_inner)}
+    end
 
-      %{st | set_buckets: next_sets, set_removals: next_removals}
+    defp put_set_removal(st, bucket_key, hex_key, doc_id) do
+      inner = Map.get(st.set_removals, bucket_key, %{})
+      next_inner = Map.update(inner, hex_key, [doc_id], &[doc_id | &1])
+      %{st | set_removals: Map.put(st.set_removals, bucket_key, next_inner)}
     end
 
     defp compile_coalesced_bulk_ops(cursor_root, search_fields, st) do

@@ -2590,6 +2590,72 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         assert modern_ids == [10, 11]
       end
 
+      test "coalesced bulk_create with allow_existing_cursor?: true populates missing secondary indexes on pre-existing raw cursors" do
+        {:ok, :ok} =
+          Store.mutate(BulkStore, fn {db, _m} ->
+            Xitdb.transact_ops_with_moment(db, [
+              {:put, ["bulk_parents", "99"],
+               %{"id" => 99, "name" => "Raw Org", "slug" => "raw-org", "sector" => "fintech"}}
+            ])
+            |> then(fn {:ok, next_db, next_m} -> {:ok, {next_db, next_m}, :ok} end)
+          end)
+
+        Ash.bulk_create!(
+          [%{id: 99, name: "Raw Org", slug: "raw-org", sector: "fintech"}],
+          BulkParent,
+          :create,
+          domain: BulkDomain,
+          context: %{xitdb: %{allow_existing_cursor?: true}}
+        )
+
+        require Ash.Query
+
+        assert [99] ==
+                 BulkParent
+                 |> Ash.Query.filter(sector == "fintech")
+                 |> Ash.read!(domain: BulkDomain)
+                 |> Enum.map(& &1.id)
+
+        assert [99] ==
+                 BulkParent
+                 |> Ash.Query.filter(slug == "raw-org")
+                 |> Ash.read!(domain: BulkDomain)
+                 |> Enum.map(& &1.id)
+
+        Ash.bulk_create!(
+          [%{id: 99, name: "Raw Org", slug: "raw-org", sector: "clean"}],
+          BulkParent,
+          :create,
+          domain: BulkDomain,
+          context: %{xitdb: %{allow_existing_cursor?: true}}
+        )
+
+        assert [] ==
+                 BulkParent
+                 |> Ash.Query.filter(sector == "fintech")
+                 |> Ash.read!(domain: BulkDomain)
+
+        assert [99] ==
+                 BulkParent
+                 |> Ash.Query.filter(sector == "clean")
+                 |> Ash.read!(domain: BulkDomain)
+                 |> Enum.map(& &1.id)
+
+        Ash.bulk_create!(
+          [%{id: 99, name: "Raw Org", slug: "raw-org", sector: "clean"}],
+          BulkParent,
+          :create,
+          domain: BulkDomain,
+          context: %{xitdb: %{allow_existing_cursor?: true}}
+        )
+
+        assert [99] ==
+                 BulkParent
+                 |> Ash.Query.filter(sector == "clean")
+                 |> Ash.read!(domain: BulkDomain)
+                 |> Enum.map(& &1.id)
+      end
+
       test "coalesced bulk_create with allow_existing_cursor?: true clears nil'd fields and reparents nested :many children cleanly" do
         Ash.bulk_create!(
           [
