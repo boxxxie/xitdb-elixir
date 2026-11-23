@@ -2,6 +2,26 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.3.0] - 2026-11-23
+
+### Added
+- **Bulk NIF Transaction Operations (`native/xitdb_nif.odin`):**
+  - Added coarse-grained `:bulk_put_maps`, `:bulk_put_nested_maps`, and `:bulk_index_puts` (`:unique`, `:counted_set_add`, `:hash_map_merge`) transaction callbacks with deferred cold validation, adaptive container initialization, and atomic rollback on failure.
+- **Single-Pass BM25 Rebuild & Deferred Search Indexing (`Xitdb.Ash.Search`, `Xitdb.Ash.Mutator`, `Xitdb.Ash.Indexer`):**
+  - Added `Xitdb.Ash.Search.rebuild_index!/2,3` to rebuild `idx.search` in a single atomic commit with optional parallel term extraction (`:parallel`, `:max_concurrency`, `:chunk_size`, `:tenant`, and `:tx_opts`).
+  - Added `context: %{xitdb: %{skip_search_index?: true}}` support across coalesced, `nested_in :one`, and `:row_group` `Ash.bulk_create` batches to defer BM25 indexing until a single `Search.rebuild_index!/3` pass.
+
+### Changed
+- **Coalesced `Ash.bulk_create` Engine, Fast Attribute Plan & ASCII Tokenizer (`Xitdb.Ash.Mutator`, `Xitdb.Ash.Codec`, `Xitdb.Ash.Search`):**
+  - Coalesced standard and `nested_in :many` `Ash.bulk_create` streams into a single staging pass compiling directly to bulk NIF operations with cached sequence, cursor, parent, and index-slot lookups.
+  - Added precompiled primitive attribute fast paths in `Xitdb.Ash.Codec.compile_attr_plan/1` and `to_cursor_map_fast/2`, and replaced regex tokenization in `Xitdb.Ash.Search.tokenize/1` with a fast binary-scanning ASCII tokenizer (falling back to Unicode regex only on non-ASCII bytes).
+
+### Fixed
+- **Bulk Overwrite Cleanup, Compression & Base-Moment Adaptation (`Xitdb.Ash.Mutator`, `Xitdb.Ash.Indexer`, `Xitdb.Ash.Search`, `native/xitdb_nif.odin`):**
+  - Preserved `Xitdb.Encoder` struct encoding in `:map`/embedded attributes and deduplicated `__blobs` value compression during coalesced `Ash.bulk_create`.
+  - Cleaned up stale unique identity keys (supporting same-batch key reuse), pruned obsolete secondary index memberships and empty B+Tree buckets, cleared `nil`'d attributes, and removed orphaned old-parent subtrees on `allow_existing_cursor?: true` overwrites for top-level and `nested_in :many` resources.
+  - Preserved all tenants during `Search.rebuild_index!/3` on `:attribute`-multitenant resources, re-raised exception structs unwrapped on commit failures, propagated `skip_search_index?: true` to `nested_in :one` evictions, and tracked child container `pending_tags` / `fork_aliases` across bulk callbacks in `adapt_tx_ops_for_base_moment`.
+
 ## [2.2.1] - 2026-11-21
 
 ### Changed
