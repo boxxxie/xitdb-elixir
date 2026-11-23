@@ -78,11 +78,11 @@ def expand_group_tokens(groups_str: Optional[str]) -> Optional[Set[str]]:
     return {GROUP_ALIASES.get(tok, tok) for tok in tokens}
 
 GROUP_RANGES = {
-    "access": "#1–#5, #28 (Lazy Access Navigation, Point Lookups & Pre-Tokenized DSL Select)",
+    "access": "#1–#5, #28, #32 (Lazy Access Navigation, Point Lookups, Batched Key Fetch & Pre-Tokenized DSL Select)",
     "enumerable": "#6–#11 (Enumerable Protocol & Subtree Materialization)",
-    "transactions": "#12–#16 (Transactions, Incremental Put, List Edit & Zero-Copy Fork)",
+    "transactions": "#12–#16, #29–#30 (Transactions, Incremental Put, Bulk NIF Ops, List Edit & Zero-Copy Fork)",
     "time_travel": "#17–#20 (Historical as_of, history_of, diff_moments & Compaction)",
-    "queries": "#21–#27 (Pull Projections, Datalog Engine, Buffered Sync, Search & Indexer)",
+    "queries": "#21–#27, #31 (Pull Projections, Datalog Engine, Buffered Sync, Search & Indexer)",
 }
 
 BENCHMARK_CATALOG: List[Dict[str, Any]] = [
@@ -292,6 +292,34 @@ BENCHMARK_CATALOG: List[Dict[str, Any]] = [
             ("lib/xitdb.ex", "do_select!"),
         ],
         "nif_entries": ["odin_nif_select", "decode_selector_term_buf", "decode_steps_term_buf"],
+    },
+    {
+        "rank": 29,
+        "group": "transactions",
+        "name": "Tx: Bulk NIF :bulk_put_maps (100 entities in 1 commit)",
+        "elixir_entries": [("lib/xitdb.ex", "transact_ops"), ("lib/xitdb.ex", "do_transact_ops")],
+        "nif_entries": ["odin_nif_transact", "bulk_put_maps_callback", "validate_bulk_put_maps_cold"],
+    },
+    {
+        "rank": 30,
+        "group": "transactions",
+        "name": "Tx: Bulk NIF :bulk_put_nested_maps (100 nested entities)",
+        "elixir_entries": [("lib/xitdb.ex", "transact_ops"), ("lib/xitdb.ex", "do_transact_ops")],
+        "nif_entries": ["odin_nif_transact", "bulk_put_nested_maps_callback", "validate_bulk_put_nested_maps_cold"],
+    },
+    {
+        "rank": 31,
+        "group": "queries",
+        "name": "Indexer: Bulk NIF :bulk_index_puts (:hash_map_merge, 100 terms)",
+        "elixir_entries": [("lib/xitdb.ex", "transact_ops"), ("lib/xitdb.ex", "do_transact_ops")],
+        "nif_entries": ["odin_nif_transact", "bulk_index_puts_callback", "validate_bulk_index_puts_cold"],
+    },
+    {
+        "rank": 32,
+        "group": "access",
+        "name": "Access: Batched nif_slot_get_keys (100 keys in 1 NIF call)",
+        "elixir_entries": [("lib/xitdb/nif.ex", "nif_slot_get_keys")],
+        "nif_entries": ["odin_nif_slot_get_keys"],
     },
 ]
 
@@ -1779,7 +1807,7 @@ def generate_all_slices() -> List[Dict[str, Any]]:
 
     # Generate benchmarks/slices/README.md index
     idx_md: List[str] = [
-        "# Benchmark Code Slices (`#1–#28`)",
+        f"# Benchmark Code Slices (`#1–#{len(BENCHMARK_CATALOG)}`)",
         "",
         "[← Back to Benchmarks Overview](../README.md)",
         "",
@@ -1878,6 +1906,7 @@ def extract_enclosing_procs(rel_path: str, changed_lines: Set[int]) -> Set[str]:
 
 NIF_PROC_ATTRIBUTION: Dict[str, Tuple[List[str], List[str]]] = {
     "odin_nif_slot_get_key": (["access"], ["3-hop lazy HAMT", "Sorted_Map B+Tree key"]),
+    "odin_nif_slot_get_keys": (["access"], ["Batched nif_slot_get_keys"]),
     "odin_nif_select": (["access"], ["Single-call selector", "Pre-tokenized path_steps"]),
     "decode_selector_term_buf": (["access"], ["Single-call selector", "Pre-tokenized path_steps"]),
     "decode_steps_term_buf": (["access"], ["Pre-tokenized path_steps"]),
@@ -1894,6 +1923,15 @@ NIF_PROC_ATTRIBUTION: Dict[str, Tuple[List[str], List[str]]] = {
     "odin_nif_slot_materialize": (["enumerable"], ["Materialize:"]),
     "materialize_slot": (["enumerable"], ["Materialize:"]),
     "odin_nif_transact": (["transactions"], []),
+    "bulk_put_maps_callback": (["transactions"], ["Bulk NIF :bulk_put_maps"]),
+    "validate_bulk_put_maps_cold": (["transactions"], ["Bulk NIF :bulk_put_maps"]),
+    "record_bulk_put_maps_pending_tags": (["transactions"], ["Bulk NIF :bulk_put_maps"]),
+    "bulk_put_nested_maps_callback": (["transactions"], ["Bulk NIF :bulk_put_nested_maps"]),
+    "validate_bulk_put_nested_maps_cold": (["transactions"], ["Bulk NIF :bulk_put_nested_maps"]),
+    "record_bulk_put_nested_maps_pending_tags": (["transactions"], ["Bulk NIF :bulk_put_nested_maps"]),
+    "bulk_index_puts_callback": (["queries"], ["Bulk NIF :bulk_index_puts"]),
+    "validate_bulk_index_puts_cold": (["queries"], ["Bulk NIF :bulk_index_puts"]),
+    "record_bulk_index_puts_pending_tags": (["queries"], ["Bulk NIF :bulk_index_puts"]),
     "odin_nif_moment_slot": (["time_travel"], ["as_of(db, m)"]),
     "odin_nif_history_of": (["time_travel"], ["history_of"]),
     "odin_nif_diff_moments": (["time_travel"], ["diff_moments"]),
@@ -2158,7 +2196,7 @@ def map_changes_to_benchmarks(git_ref: Optional[str] = None) -> Dict[str, Any]:
     if not groups_set:
         ordered_groups = list(ALL_GROUPS)
         filter_str = ""
-        reasons = ["No specific client/NIF slice matched (or clean diff) -> full client benchmark suite (#1–#28)"]
+        reasons = [f"No specific client/NIF slice matched (or clean diff) -> full client benchmark suite (#1–#{len(BENCHMARK_CATALOG)})"]
     else:
         ordered_groups = [g for g in ALL_GROUPS if g in groups_set]
         # Drop narrow filter if any affected group needs full group coverage

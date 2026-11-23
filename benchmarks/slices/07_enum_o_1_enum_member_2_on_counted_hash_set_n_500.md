@@ -8,13 +8,13 @@
 
 | Metric | Elixir NIF Wrapper | Raw Odin Baseline | Comparison |
 | :--- | ---: | ---: | ---: |
-| **Median (`ns/op`)** | 810.0 ns (810.0 ns) | 264.0 ns (264.0 ns) | **`3.07x`** NIF Ratio |
-| **Mean ± σ (CV)** | 859.0 ns ± 139.5 ns (16.2%) | 278.2 ns ± 31.5 ns (11.3%) | Welch `z` = `9.08` |
-| **p95 / Max (`ns/op`)** | 1.05 µs / 1.10 µs | 321.6 ns / 334.0 ns | `5` vs `5` pooled samples |
+| **Median (`ns/op`)** | 278.0 ns (278.0 ns) | 168.0 ns (168.0 ns) | **`1.65x`** NIF Ratio |
+| **Mean ± σ (CV)** | 280.2 ns ± 4.1 ns (1.5%) | 168.2 ns ± 1.6 ns (1.0%) | Welch `z` = `56.86` |
+| **p95 / Max (`ns/op`)** | 285.8 ns / 287.0 ns | 170.4 ns / 171.0 ns | `5` vs `5` pooled samples |
 
 ## Benchmark Harnesses (Elixir vs. Raw Odin)
 
-### Elixir Harness ([`bench_elixir.exs#L272-L279`](../bench_elixir.exs#L272-L279))
+### Elixir Harness ([`bench_elixir.exs#L283-L290`](../bench_elixir.exs#L283-L290))
 
 ```elixir
       {7, "Enum: O(1) Enum.member?/2 on Counted_Hash_Set (N=500)", 1000,
@@ -27,7 +27,7 @@
        end},
 ```
 
-### Raw Odin Harness ([`bench_client.odin#L975-L989`](../bench_client.odin#L975-L989))
+### Raw Odin Harness ([`bench_client.odin#L1048-L1062`](../bench_client.odin#L1048-L1062))
 
 ```odin
 	// #7: O(1) Counted_Hash_Set membership check
@@ -50,7 +50,7 @@
 ## Elixir Wrapper & NIF Bridge
 
 <details>
-<summary>Elixir <code>member?</code> — <a href="../../lib/xitdb/cursor.ex#L2686-L2775">lib/xitdb/cursor.ex#L2686-L2775</a></summary>
+<summary>Elixir <code>member?</code> — <a href="../../lib/xitdb/cursor.ex#L2718-L2807">lib/xitdb/cursor.ex#L2718-L2807</a></summary>
 
 ```elixir
   def member?(
@@ -148,7 +148,7 @@
 </details>
 
 <details>
-<summary>NIF <code>odin_nif_slot_contains</code> — <a href="../../native/xitdb_nif.odin#L1321-L1419">native/xitdb_nif.odin#L1321-L1419</a></summary>
+<summary>NIF <code>odin_nif_slot_contains</code> — <a href="../../native/xitdb_nif.odin#L1719-L1817">native/xitdb_nif.odin#L1719-L1817</a></summary>
 
 ```odin
 odin_nif_slot_contains :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {
@@ -407,7 +407,7 @@ sorted_map_get_slot :: proc(m: Read_Sorted_Map, key: string) -> (Maybe(Slot), Er
 </details>
 
 <details>
-<summary><code>xitdb.database_digest_string_buf</code> — <a href="../../native/xitdb-odin/xitdb/database.odin#L280-L282">database.odin#L280-L282</a></summary>
+<summary><code>xitdb.database_digest_string_buf</code> — <a href="../../native/xitdb-odin/xitdb/database.odin#L283-L285">database.odin#L283-L285</a></summary>
 
 ```odin
 database_digest_string_buf :: proc(db: ^Database, s: string, buf: []u8) -> []u8 {

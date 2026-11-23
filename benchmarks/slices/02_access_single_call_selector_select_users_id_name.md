@@ -2,19 +2,19 @@
 
 [← Back to Benchmarks Overview](../README.md) · [All Slices](README.md)
 
-**Group:** `access` — #1–#5, #28 (Lazy Access Navigation, Point Lookups & Pre-Tokenized DSL Select)
+**Group:** `access` — #1–#5, #28, #32 (Lazy Access Navigation, Point Lookups, Batched Key Fetch & Pre-Tokenized DSL Select)
 
 ## Latest 1v1 Metrics
 
 | Metric | Elixir NIF Wrapper | Raw Odin Baseline | Comparison |
 | :--- | ---: | ---: | ---: |
-| **Median (`ns/op`)** | 2.20 µs (2200.0 ns) | 1.17 µs (1173.0 ns) | **`1.88x`** NIF Ratio |
-| **Mean ± σ (CV)** | 2.24 µs ± 130.9 ns (5.9%) | 1.16 µs ± 66.3 ns (5.7%) | Welch `z` = `16.36` |
-| **p95 / Max (`ns/op`)** | 2.40 µs / 2.42 µs | 1.22 µs / 1.22 µs | `5` vs `5` pooled samples |
+| **Median (`ns/op`)** | 701.0 ns (701.0 ns) | 648.0 ns (648.0 ns) | **`1.08x`** NIF Ratio |
+| **Mean ± σ (CV)** | 699.6 ns ± 7.9 ns (1.1%) | 648.0 ns ± 4.3 ns (0.7%) | Welch `z` = `12.84` |
+| **p95 / Max (`ns/op`)** | 707.6 ns / 708.0 ns | 653.0 ns / 654.0 ns | `5` vs `5` pooled samples |
 
 ## Benchmark Harnesses (Elixir vs. Raw Odin)
 
-### Elixir Harness ([`bench_elixir.exs#L232-L239`](../bench_elixir.exs#L232-L239))
+### Elixir Harness ([`bench_elixir.exs#L243-L250`](../bench_elixir.exs#L243-L250))
 
 ```elixir
       {2, "Access: Single-call selector select(.users.<id>.name)", 500,
@@ -27,7 +27,7 @@
        end},
 ```
 
-### Raw Odin Harness ([`bench_client.odin#L896-L910`](../bench_client.odin#L896-L910))
+### Raw Odin Harness ([`bench_client.odin#L969-L983`](../bench_client.odin#L969-L983))
 
 ```odin
 	// #2: Single-call selector
@@ -50,21 +50,23 @@
 ## Elixir Wrapper & NIF Bridge
 
 <details>
-<summary>Elixir <code>select!</code> — <a href="../../lib/xitdb.ex#L714-L729">lib/xitdb.ex#L714-L729</a></summary>
+<summary>Elixir <code>select!</code> — <a href="../../lib/xitdb.ex#L1057-L1074">lib/xitdb.ex#L1057-L1074</a></summary>
 
 ```elixir
-  def select!(%__MODULE__{db_ref: db_ref}, selector)
-      when is_binary(selector) or is_list(selector) do
-    do_select!(db_ref, -1, selector)
+  def select!(target, selector, opts \\ [])
+
+  def select!(%__MODULE__{db_ref: db_ref}, selector, opts)
+      when (is_binary(selector) or is_list(selector)) and is_list(opts) do
+    do_select!(db_ref, -1, selector, opts)
   end
 
-  def select!(%Cursor{root: true, tx_mode: false, db_ref: db_ref, moment: moment}, selector)
-      when is_binary(selector) or is_list(selector) do
-    do_select!(db_ref, moment, selector)
+  def select!(%Cursor{root: true, tx_mode: false, db_ref: db_ref, moment: moment}, selector, opts)
+      when (is_binary(selector) or is_list(selector)) and is_list(opts) do
+    do_select!(db_ref, moment, selector, opts)
   end
 
-  def select!(%Cursor{tag: tag, tx_mode: tx_mode}, selector)
-      when is_binary(selector) or is_list(selector) do
+  def select!(%Cursor{tag: tag, tx_mode: tx_mode}, selector, opts)
+      when (is_binary(selector) or is_list(selector)) and is_list(opts) do
     raise Error,
       reason: :non_root_cursor,
       details: %{tag: tag, tx_mode: tx_mode, selector: selector}
@@ -74,21 +76,23 @@
 </details>
 
 <details>
-<summary>Elixir <code>select</code> — <a href="../../lib/xitdb.ex#L618-L635">lib/xitdb.ex#L618-L635</a></summary>
+<summary>Elixir <code>select</code> — <a href="../../lib/xitdb.ex#L936-L955">lib/xitdb.ex#L936-L955</a></summary>
 
 ```elixir
-  def select(%__MODULE__{db_ref: db_ref}, selector)
-      when is_binary(selector) or is_list(selector) do
-    do_select(db_ref, -1, selector)
+  def select(target, selector, opts \\ [])
+
+  def select(%__MODULE__{db_ref: db_ref}, selector, opts)
+      when (is_binary(selector) or is_list(selector)) and is_list(opts) do
+    do_select(db_ref, -1, selector, opts)
   end
 
-  def select(%Cursor{root: true, tx_mode: false, db_ref: db_ref, moment: moment}, selector)
-      when is_binary(selector) or is_list(selector) do
-    do_select(db_ref, moment, selector)
+  def select(%Cursor{root: true, tx_mode: false, db_ref: db_ref, moment: moment}, selector, opts)
+      when (is_binary(selector) or is_list(selector)) and is_list(opts) do
+    do_select(db_ref, moment, selector, opts)
   end
 
-  def select(%Cursor{tag: tag, tx_mode: tx_mode}, selector)
-      when is_binary(selector) or is_list(selector) do
+  def select(%Cursor{tag: tag, tx_mode: tx_mode}, selector, opts)
+      when (is_binary(selector) or is_list(selector)) and is_list(opts) do
     {:error,
      %Error{
        reason: :non_root_cursor,
@@ -100,19 +104,42 @@
 </details>
 
 <details>
-<summary>Elixir <code>do_select</code> — <a href="../../lib/xitdb.ex#L637-L648">lib/xitdb.ex#L637-L648</a></summary>
+<summary>Elixir <code>do_select</code> — <a href="../../lib/xitdb.ex#L957-L991">lib/xitdb.ex#L957-L991</a></summary>
 
 ```elixir
-  defp do_select(db_ref, moment, selector) do
-    case NIF.nif_select(db_ref, moment, selector) do
-      {:ok, raw} when is_binary(raw) or is_number(raw) or is_boolean(raw) or is_nil(raw) ->
-        {:ok, raw}
+  defp do_select(db_ref, moment, selector, opts) do
+    raw_tagged? = Keyword.get(opts, :raw_tagged, false)
 
-      {:ok, raw} ->
-        {:ok, wrap_selected(db_ref, raw, moment, selector)}
+    with {:ok, max_bytes} <- fetch_max_decompressed_bytes(opts) do
+      case NIF.nif_select(db_ref, moment, selector, raw_tagged?, max_bytes) do
+        {:ok, raw} when is_binary(raw) or is_number(raw) or is_boolean(raw) or is_nil(raw) ->
+          {:ok, raw}
 
-      {:error, reason} ->
-        {:error, %Error{reason: reason, details: %{selector: selector}}}
+        {:ok, raw} ->
+          if raw_tagged? do
+            case raw do
+              {:tagged, _, _} -> {:ok, raw}
+              _ -> {:ok, wrap_selected(db_ref, raw, moment, selector)}
+            end
+          else
+            eff_moment = effective_moment(moment, selector)
+
+            case raw do
+              {:tagged, tag, payload} when is_binary(payload) ->
+                if Compression.compression_tag?(tag) do
+                  Compression.resolve_tagged(tag, payload, db_ref, eff_moment, opts)
+                else
+                  {:ok, raw}
+                end
+
+              _ ->
+                {:ok, wrap_selected(db_ref, raw, moment, selector)}
+            end
+          end
+
+        {:error, reason} ->
+          {:error, %Error{reason: reason, details: %{selector: selector}}}
+      end
     end
   end
 ```
@@ -120,19 +147,13 @@
 </details>
 
 <details>
-<summary>Elixir <code>do_select!</code> — <a href="../../lib/xitdb.ex#L731-L742">lib/xitdb.ex#L731-L742</a></summary>
+<summary>Elixir <code>do_select!</code> — <a href="../../lib/xitdb.ex#L1076-L1081">lib/xitdb.ex#L1076-L1081</a></summary>
 
 ```elixir
-  defp do_select!(db_ref, moment, selector) do
-    case NIF.nif_select(db_ref, moment, selector) do
-      {:ok, raw} when is_binary(raw) or is_number(raw) or is_boolean(raw) or is_nil(raw) ->
-        raw
-
-      {:ok, raw} ->
-        wrap_selected(db_ref, raw, moment, selector)
-
-      {:error, reason} ->
-        raise Error, reason: reason, details: %{selector: selector}
+  defp do_select!(db_ref, moment, selector, opts) do
+    case do_select(db_ref, moment, selector, opts) do
+      {:ok, val} -> val
+      {:error, %Error{} = err} -> raise err
     end
   end
 ```
@@ -140,15 +161,31 @@
 </details>
 
 <details>
-<summary>NIF <code>odin_nif_select</code> — <a href="../../native/xitdb_nif.odin#L5333-L5413">native/xitdb_nif.odin#L5333-L5413</a></summary>
+<summary>NIF <code>odin_nif_select</code> — <a href="../../native/xitdb_nif.odin#L6681-L6781">native/xitdb_nif.odin#L6681-L6781</a></summary>
 
 ```odin
 odin_nif_select :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {
 	context = runtime.default_context()
 	defer free_all(context.temp_allocator)
 
-	if argc != 3 {
+	if argc != 3 && argc != 4 && argc != 5 {
 		return make_err(env, "badarg")
+	}
+	raw_tagged := false
+	if argc >= 4 {
+		bt, ok_rt := parse_bool_arg(argv[3])
+		if !ok_rt {
+			return make_err(env, "badarg")
+		}
+		raw_tagged = bt
+	}
+	max_bytes: u64 = MAX_NIF_DECOMPRESSED_BYTES
+	if argc == 5 {
+		mb, ok_mb := parse_max_bytes_arg(env, argv[4])
+		if !ok_mb {
+			return make_err(env, "badarg")
+		}
+		max_bytes = mb
 	}
 	moment_idx: i64 = -1
 	if nif_get_int64(env, argv[1], &moment_idx) == 0 {
@@ -218,8 +255,12 @@ odin_nif_select :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM)
 		cur = found_cur
 	}
 
-	term, t_err := slot_to_term(env, &handle.db, cur.slot_ptr.slot)
+	codec_err := ""
+	term, t_err := slot_to_term(env, &handle.db, cur.slot_ptr.slot, raw_tagged, &codec_err, max_bytes)
 	if t_err != nil {
+		if len(codec_err) > 0 {
+			return make_err(env, codec_err)
+		}
 		return make_xitdb_err(env, t_err)
 	}
 	return make_ok(env, term)
@@ -229,7 +270,7 @@ odin_nif_select :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM)
 </details>
 
 <details>
-<summary>NIF <code>decode_selector_term_buf</code> — <a href="../../native/xitdb_nif.odin#L2276-L2372">native/xitdb_nif.odin#L2276-L2372</a></summary>
+<summary>NIF <code>decode_selector_term_buf</code> — <a href="../../native/xitdb_nif.odin#L2717-L2813">native/xitdb_nif.odin#L2717-L2813</a></summary>
 
 ```odin
 decode_selector_term_buf :: proc(
@@ -334,7 +375,7 @@ decode_selector_term_buf :: proc(
 </details>
 
 <details>
-<summary>NIF <code>read_steps_cursor_adaptive</code> — <a href="../../native/xitdb_nif.odin#L3984-L4043">native/xitdb_nif.odin#L3984-L4043</a></summary>
+<summary>NIF <code>read_steps_cursor_adaptive</code> — <a href="../../native/xitdb_nif.odin#L4776-L4835">native/xitdb_nif.odin#L4776-L4835</a></summary>
 
 ```odin
 read_steps_cursor_adaptive :: proc(root: xitdb.Read_Cursor, steps: []xitdb.Path_Step) -> (res: Maybe(xitdb.Read_Cursor), hit_scalar: bool, err: xitdb.Error) {
@@ -402,10 +443,17 @@ read_steps_cursor_adaptive :: proc(root: xitdb.Read_Cursor, steps: []xitdb.Path_
 </details>
 
 <details>
-<summary>NIF <code>slot_to_term</code> — <a href="../../native/xitdb_nif.odin#L353-L434">native/xitdb_nif.odin#L353-L434</a></summary>
+<summary>NIF <code>slot_to_term</code> — <a href="../../native/xitdb_nif.odin#L467-L565">native/xitdb_nif.odin#L467-L565</a></summary>
 
 ```odin
-slot_to_term :: proc(env: ErlNifEnv, db: ^xitdb.Database, slot: xitdb.Slot) -> (res: ERL_NIF_TERM, err: xitdb.Error) {
+slot_to_term :: proc(
+	env: ErlNifEnv,
+	db: ^xitdb.Database,
+	slot: xitdb.Slot,
+	raw_tagged: bool = false,
+	codec_err: ^string = nil,
+	max_bytes: u64 = MAX_NIF_DECOMPRESSED_BYTES,
+) -> (res: ERL_NIF_TERM, err: xitdb.Error) {
 	if slot.tag == .None && !slot.full {
 		return ATOM_NIL, nil
 	}
@@ -461,6 +509,16 @@ slot_to_term :: proc(env: ErlNifEnv, db: ^xitdb.Database, slot: xitdb.Slot) -> (
 				}
 				return ATOM_FALSE, nil
 			}
+			if !raw_tagged && len(obj.format_tag) == 2 && obj.format_tag[0] == 'c' && obj.format_tag[1] == 'z' {
+				decoded_term, cz_err := decode_cz_to_term(env, obj.value, max_bytes)
+				if cz_err != "" {
+					if codec_err != nil && len(codec_err^) == 0 {
+						codec_err^ = cz_err
+					}
+					return ATOM_NIL, .Unexpected_Tag
+				}
+				return decoded_term, nil
+			}
 			return nif_make_tuple3(
 				env,
 				ATOM_TAGGED,
@@ -492,7 +550,7 @@ slot_to_term :: proc(env: ErlNifEnv, db: ^xitdb.Database, slot: xitdb.Slot) -> (
 </details>
 
 <details>
-<summary>NIF <code>parse_escaped_selector_buf</code> — <a href="../../native/xitdb_nif.odin#L1952-L1987">native/xitdb_nif.odin#L1952-L1987</a></summary>
+<summary>NIF <code>parse_escaped_selector_buf</code> — <a href="../../native/xitdb_nif.odin#L2393-L2428">native/xitdb_nif.odin#L2393-L2428</a></summary>
 
 ```odin
 parse_escaped_selector_buf :: proc(
@@ -536,7 +594,7 @@ parse_escaped_selector_buf :: proc(
 </details>
 
 <details>
-<summary>NIF <code>convert_raw_steps_buf</code> — <a href="../../native/xitdb_nif.odin#L2133-L2179">native/xitdb_nif.odin#L2133-L2179</a></summary>
+<summary>NIF <code>convert_raw_steps_buf</code> — <a href="../../native/xitdb_nif.odin#L2574-L2620">native/xitdb_nif.odin#L2574-L2620</a></summary>
 
 ```odin
 convert_raw_steps_buf :: proc(
@@ -591,7 +649,7 @@ convert_raw_steps_buf :: proc(
 </details>
 
 <details>
-<summary>NIF <code>decode_steps_list_buf</code> — <a href="../../native/xitdb_nif.odin#L2181-L2189">native/xitdb_nif.odin#L2181-L2189</a></summary>
+<summary>NIF <code>decode_steps_list_buf</code> — <a href="../../native/xitdb_nif.odin#L2622-L2630">native/xitdb_nif.odin#L2622-L2630</a></summary>
 
 ```odin
 decode_steps_list_buf :: proc(
@@ -608,7 +666,7 @@ decode_steps_list_buf :: proc(
 </details>
 
 <details>
-<summary>NIF <code>decode_one_step_term</code> — <a href="../../native/xitdb_nif.odin#L2022-L2068">native/xitdb_nif.odin#L2022-L2068</a></summary>
+<summary>NIF <code>decode_one_step_term</code> — <a href="../../native/xitdb_nif.odin#L2463-L2509">native/xitdb_nif.odin#L2463-L2509</a></summary>
 
 ```odin
 decode_one_step_term :: proc(
@@ -780,7 +838,7 @@ read_steps_cursor :: proc(start: Read_Cursor, steps: []Path_Step) -> (res: Maybe
 </details>
 
 <details>
-<summary><code>xitdb.cursor_resolved</code> — <a href="../../native/xitdb-odin/xitdb/cursor.odin#L48-L55">cursor.odin#L48-L55</a></summary>
+<summary><code>xitdb.cursor_resolved</code> — <a href="../../native/xitdb-odin/xitdb/cursor.odin#L50-L57">cursor.odin#L50-L57</a></summary>
 
 ```odin
 cursor_resolved :: proc(c: Read_Cursor) -> (res: Slot_Pointer, err: Error) {

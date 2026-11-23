@@ -2,19 +2,19 @@
 
 [← Back to Benchmarks Overview](../README.md) · [All Slices](README.md)
 
-**Group:** `transactions` — #12–#16 (Transactions, Incremental Put, List Edit & Zero-Copy Fork)
+**Group:** `transactions` — #12–#16, #29–#30 (Transactions, Incremental Put, Bulk NIF Ops, List Edit & Zero-Copy Fork)
 
 ## Latest 1v1 Metrics
 
 | Metric | Elixir NIF Wrapper | Raw Odin Baseline | Comparison |
 | :--- | ---: | ---: | ---: |
-| **Median (`ns/op`)** | 445.96 µs (445957.0 ns) | 300.18 µs (300183.0 ns) | **`1.49x`** NIF Ratio |
-| **Mean ± σ (CV)** | 438.27 µs ± 50.95 µs (11.6%) | 326.42 µs ± 76.42 µs (23.4%) | Welch `z` = `2.72` |
-| **p95 / Max (`ns/op`)** | 493.16 µs / 499.49 µs | 430.09 µs / 462.33 µs | `5` vs `5` pooled samples |
+| **Median (`ns/op`)** | 158.97 µs (158967.0 ns) | 112.80 µs (112801.0 ns) | **`1.41x`** NIF Ratio |
+| **Mean ± σ (CV)** | 158.14 µs ± 2.82 µs (1.8%) | 114.29 µs ± 3.16 µs (2.8%) | Welch `z` = `23.12` |
+| **p95 / Max (`ns/op`)** | 161.14 µs / 161.67 µs | 118.59 µs / 119.51 µs | `5` vs `5` pooled samples |
 
 ## Benchmark Harnesses (Elixir vs. Raw Odin)
 
-### Elixir Harness ([`bench_elixir.exs#L339-L354`](../bench_elixir.exs#L339-L354))
+### Elixir Harness ([`bench_elixir.exs#L350-L365`](../bench_elixir.exs#L350-L365))
 
 ```elixir
       {13, "Tx: Bulk batch transact (100 entities in 1 commit)", 1,
@@ -35,7 +35,7 @@
        end},
 ```
 
-### Raw Odin Harness ([`bench_client.odin#L1096-L1110`](../bench_client.odin#L1096-L1110))
+### Raw Odin Harness ([`bench_client.odin#L1169-L1183`](../bench_client.odin#L1169-L1183))
 
 ```odin
 	// #13: Bulk batch transact (100 entities in 1 commit)
@@ -58,21 +58,50 @@
 ## Elixir Wrapper & NIF Bridge
 
 <details>
-<summary>Elixir <code>transact</code> — <a href="../../lib/xitdb.ex#L329-L352">lib/xitdb.ex#L329-L352</a></summary>
+<summary>Elixir <code>transact</code> — <a href="../../lib/xitdb.ex#L362-L414">lib/xitdb.ex#L362-L414</a></summary>
 
 ```elixir
   def transact(db, map_or_fun, opts \\ [])
 
   def transact(%__MODULE__{db_ref: db_ref} = db, map, [])
       when is_map(map) and not is_struct(map) do
-    ops = TxCompiler.compile_moment_map(map)
-    do_transact_ops_default(db, db_ref, ops)
+    encoded_map = TxCompiler.encode_value(map)
+
+    if Compression.needs_prepare?(encoded_map, false) do
+      {:ok, prepared_map, blob_ops} = Compression.prepare_write(db, encoded_map, false)
+      ops = blob_ops ++ TxCompiler.compile_moment_map(prepared_map)
+      do_transact_ops_default(db, db_ref, ops)
+    else
+      ops = TxCompiler.compile_moment_map(encoded_map)
+      do_transact_ops_default(db, db_ref, ops)
+    end
+  rescue
+    e in Protocol.UndefinedError ->
+      {:error, %Error{reason: :transaction_exception, details: %{exception: e}}}
   end
 
   def transact(%__MODULE__{} = db, map, opts) when is_map(map) and not is_struct(map) do
     with {:ok, validated} <- validate_opts(opts, @transact_schema) do
-      ops = TxCompiler.compile_moment_map(map)
-      do_transact_ops(db, ops, validated)
+      try do
+        compress_opt = validated[:compress]
+        encoded_map = TxCompiler.encode_value(map)
+
+        if Compression.needs_prepare?(encoded_map, compress_opt) do
+          target = if validated[:base_moment] == -1, do: db, else: {db, validated[:base_moment]}
+
+          {:ok, prepared_map, blob_ops} =
+            Compression.prepare_write(target, encoded_map, compress_opt)
+
+          ops = blob_ops ++ TxCompiler.compile_moment_map(prepared_map)
+          do_transact_ops(db, ops, Keyword.put(validated, :compress, false))
+        else
+          ops = TxCompiler.compile_moment_map(encoded_map)
+          do_transact_ops(db, ops, validated)
+        end
+      rescue
+        e in Protocol.UndefinedError ->
+          {:error, %Error{reason: :transaction_exception, details: %{exception: e}}}
+      end
     end
   end
 
@@ -90,7 +119,7 @@
 </details>
 
 <details>
-<summary>Elixir <code>compile_moment_map</code> — <a href="../../lib/xitdb/tx_compiler.ex#L15-L47">lib/xitdb/tx_compiler.ex#L15-L47</a></summary>
+<summary>Elixir <code>compile_moment_map</code> — <a href="../../lib/xitdb/tx_compiler.ex#L15-L48">lib/xitdb/tx_compiler.ex#L15-L48</a></summary>
 
 ```elixir
   def compile_moment_map(map, opts \\ []) when is_map(map) do
@@ -122,7 +151,8 @@
       if map_size(map) == 0 do
         index_ops
       else
-        index_ops ++ [{:merge_map, map}]
+        encoded_map = encode_value(map)
+        index_ops ++ [{:merge_map, encoded_map}]
       end
     end
   end
@@ -131,7 +161,7 @@
 </details>
 
 <details>
-<summary>NIF <code>odin_nif_transact</code> — <a href="../../native/xitdb_nif.odin#L5239-L5326">native/xitdb_nif.odin#L5239-L5326</a></summary>
+<summary>NIF <code>odin_nif_transact</code> — <a href="../../native/xitdb_nif.odin#L6566-L6674">native/xitdb_nif.odin#L6566-L6674</a></summary>
 
 ```odin
 odin_nif_transact :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {
@@ -164,8 +194,29 @@ odin_nif_transact :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TER
 	}
 	defer nif_rwlock_rwunlock(handle.rwlock)
 
+	if handle.read_only {
+		return make_err(env, "read_only")
+	}
+
 	tx := xitdb.tx_init(&handle.db, base_moment = base_moment, track_changes = false, allocator = context.temp_allocator)
 	defer xitdb.tx_destroy(&tx)
+
+	base_slot, _, base_empty, base_err, _ := resolve_slot_arg(handle, -1, base_moment)
+	if base_err == nil && !base_empty && base_slot.tag == .Hash_Map {
+		base_cur := xitdb.Read_Cursor{
+			slot_ptr = xitdb.Slot_Pointer{position = nil, slot = base_slot},
+			db       = &handle.db,
+		}
+		if base_map, bm_err := xitdb.read_hash_map_init(base_cur); bm_err == nil {
+			if tx_cur_maybe, tc_err := xitdb.hash_map_get_cursor(base_map, "__tx"); tc_err == nil {
+				if _, has_tx := tx_cur_maybe.?; has_tx {
+					clear_steps := make([]xitdb.Path_Step, 1, tx.allocator)
+					clear_steps[0] = xitdb.hm("__tx")
+					append(&tx.ops, xitdb.Tx_Op{kind = .Remove, steps = clear_steps})
+				}
+			}
+		}
+	}
 
 	if len(doc_str) > 0 {
 		xitdb.tx_doc(&tx, doc_str)
@@ -227,7 +278,7 @@ odin_nif_transact :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TER
 </details>
 
 <details>
-<summary>NIF <code>parse_tx_ops</code> — <a href="../../native/xitdb_nif.odin#L4942-L5236">native/xitdb_nif.odin#L4942-L5236</a></summary>
+<summary>NIF <code>parse_tx_ops</code> — <a href="../../native/xitdb_nif.odin#L6201-L6563">native/xitdb_nif.odin#L6201-L6563</a></summary>
 
 ```odin
 parse_tx_ops :: proc(
@@ -519,6 +570,74 @@ parse_tx_ops :: proc(
 			xitdb.tx_with_cursor(tx, merge_map_callback, mc)
 			has_deferred^ = true
 
+		case ATOM_BULK_PUT_MAPS:
+			if arity != 3 {
+				return "invalid_put_op", nil
+			}
+			steps, er, ok_steps := decode_steps_term(env, elems[1], tx.allocator)
+			if !ok_steps || er != "" || len(steps) == 0 {
+				return er if er != "" else "invalid_put_op", nil
+			}
+			if nif_is_list(env, elems[2]) == 0 {
+				return "invalid_put_op", nil
+			}
+			bc := new(Bulk_Put_Maps_Ctx, tx.allocator)
+			bc.steps = steps
+			bc.env = env
+			bc.entries_term = elems[2]
+			bc.validation_err = validation_err
+			xitdb.tx_with_cursor(tx, bulk_put_maps_callback, bc)
+			has_deferred^ = true
+
+		case ATOM_BULK_PUT_NESTED_MAPS:
+			if arity != 3 {
+				return "invalid_put_op", nil
+			}
+			steps, er, ok_steps := decode_steps_term(env, elems[1], tx.allocator)
+			if !ok_steps || er != "" || len(steps) == 0 {
+				return er if er != "" else "invalid_put_op", nil
+			}
+			if nif_is_list(env, elems[2]) == 0 {
+				return "invalid_put_op", nil
+			}
+			bc := new(Bulk_Put_Nested_Maps_Ctx, tx.allocator)
+			bc.steps = steps
+			bc.env = env
+			bc.entries_term = elems[2]
+			bc.validation_err = validation_err
+			xitdb.tx_with_cursor(tx, bulk_put_nested_maps_callback, bc)
+			has_deferred^ = true
+
+		case ATOM_BULK_INDEX_PUTS:
+			if arity != 4 {
+				return "invalid_put_op", nil
+			}
+			steps, er, ok_steps := decode_steps_term(env, elems[1], tx.allocator)
+			if !ok_steps || er != "" || len(steps) == 0 {
+				return er if er != "" else "invalid_put_op", nil
+			}
+			mode: Bulk_Index_Mode
+			if elems[2] == ATOM_UNIQUE {
+				mode = .Unique
+			} else if elems[2] == ATOM_COUNTED_SET_ADD {
+				mode = .Counted_Set_Add
+			} else if elems[2] == ATOM_HASH_MAP_MERGE {
+				mode = .Hash_Map_Merge
+			} else {
+				return "invalid_put_op", nil
+			}
+			if nif_is_list(env, elems[3]) == 0 {
+				return "invalid_put_op", nil
+			}
+			bc := new(Bulk_Index_Puts_Ctx, tx.allocator)
+			bc.steps = steps
+			bc.mode = mode
+			bc.env = env
+			bc.entries_term = elems[3]
+			bc.validation_err = validation_err
+			xitdb.tx_with_cursor(tx, bulk_index_puts_callback, bc)
+			has_deferred^ = true
+
 		case:
 			return "unknown_tx_op", nil
 		}
@@ -530,7 +649,7 @@ parse_tx_ops :: proc(
 </details>
 
 <details>
-<summary>NIF <code>validate_deferred_tx_ops</code> — <a href="../../native/xitdb_nif.odin#L4922-L4940">native/xitdb_nif.odin#L4922-L4940</a></summary>
+<summary>NIF <code>validate_deferred_tx_ops</code> — <a href="../../native/xitdb_nif.odin#L6166-L6199">native/xitdb_nif.odin#L6166-L6199</a></summary>
 
 ```odin
 validate_deferred_tx_ops :: proc(tx: ^xitdb.Tx) -> string {
@@ -548,6 +667,21 @@ validate_deferred_tx_ops :: proc(tx: ^xitdb.Tx) -> string {
 			if !validate_write_term_cold(mc.env, mc.map_term) {
 				return "invalid_put_op"
 			}
+		} else if op.callback == bulk_put_maps_callback {
+			bc := (^Bulk_Put_Maps_Ctx)(op.user_data)
+			if !validate_bulk_put_maps_cold(bc.env, bc.entries_term) {
+				return "invalid_put_op"
+			}
+		} else if op.callback == bulk_put_nested_maps_callback {
+			bc := (^Bulk_Put_Nested_Maps_Ctx)(op.user_data)
+			if !validate_bulk_put_nested_maps_cold(bc.env, bc.entries_term) {
+				return "invalid_put_op"
+			}
+		} else if op.callback == bulk_index_puts_callback {
+			bc := (^Bulk_Index_Puts_Ctx)(op.user_data)
+			if !validate_bulk_index_puts_cold(bc.env, bc.mode, bc.entries_term) {
+				return "invalid_put_op"
+			}
 		}
 	}
 	return ""
@@ -557,7 +691,7 @@ validate_deferred_tx_ops :: proc(tx: ^xitdb.Tx) -> string {
 </details>
 
 <details>
-<summary>NIF <code>rollback_failed_tx</code> — <a href="../../native/xitdb_nif.odin#L4725-L4763">native/xitdb_nif.odin#L4725-L4763</a></summary>
+<summary>NIF <code>rollback_failed_tx</code> — <a href="../../native/xitdb_nif.odin#L5834-L5872">native/xitdb_nif.odin#L5834-L5872</a></summary>
 
 ```odin
 rollback_failed_tx :: proc(
@@ -604,7 +738,7 @@ rollback_failed_tx :: proc(
 </details>
 
 <details>
-<summary>NIF <code>adapt_tx_ops_for_base_moment</code> — <a href="../../native/xitdb_nif.odin#L4559-L4723">native/xitdb_nif.odin#L4559-L4723</a></summary>
+<summary>NIF <code>adapt_tx_ops_for_base_moment</code> — <a href="../../native/xitdb_nif.odin#L5626-L5832">native/xitdb_nif.odin#L5626-L5832</a></summary>
 
 ```odin
 adapt_tx_ops_for_base_moment :: proc(handle: ^Db_Handle, tx: ^xitdb.Tx) -> bool {
@@ -767,6 +901,48 @@ adapt_tx_ops_for_base_moment :: proc(handle: ^Db_Handle, tx: ^xitdb.Tx) -> bool 
 				}
 				prefix_steps := make([dynamic]xitdb.Path_Step, 0, 4, context.temp_allocator)
 				record_merge_map_pending_tags(mc.env, base_cur, base_empty, mc.map_term, &prefix_steps, &pending_tags, &fork_aliases)
+			} else if op.callback == bulk_put_maps_callback && op.user_data != nil {
+				bc := (^Bulk_Put_Maps_Ctx)(op.user_data)
+				if nif_is_empty_list(bc.env, bc.entries_term) != 0 {
+					continue
+				}
+				if len(bc.steps) >= 1 && adapt_steps_for_base_moment(base_cur, base_empty, bc.steps, pending_tags, fork_aliases) {
+					adapted = true
+				}
+				if !bc.adapt_containers {
+					bc.adapt_containers = true
+					adapted = true
+				}
+				ensure_ancestor_pending_tags(bc.steps, &pending_tags)
+				record_bulk_put_maps_pending_tags(bc.env, base_cur, base_empty, bc.steps, bc.entries_term, &pending_tags, &fork_aliases)
+			} else if op.callback == bulk_put_nested_maps_callback && op.user_data != nil {
+				bc := (^Bulk_Put_Nested_Maps_Ctx)(op.user_data)
+				if nif_is_empty_list(bc.env, bc.entries_term) != 0 {
+					continue
+				}
+				if len(bc.steps) >= 1 && adapt_steps_for_base_moment(base_cur, base_empty, bc.steps, pending_tags, fork_aliases) {
+					adapted = true
+				}
+				if !bc.adapt_containers {
+					bc.adapt_containers = true
+					adapted = true
+				}
+				ensure_ancestor_pending_tags(bc.steps, &pending_tags)
+				record_bulk_put_nested_maps_pending_tags(bc.env, base_cur, base_empty, bc.steps, bc.entries_term, &pending_tags, &fork_aliases)
+			} else if op.callback == bulk_index_puts_callback && op.user_data != nil {
+				bc := (^Bulk_Index_Puts_Ctx)(op.user_data)
+				if nif_is_empty_list(bc.env, bc.entries_term) != 0 {
+					continue
+				}
+				if len(bc.steps) >= 1 && adapt_steps_for_base_moment(base_cur, base_empty, bc.steps, pending_tags, fork_aliases) {
+					adapted = true
+				}
+				if !bc.adapt_containers {
+					bc.adapt_containers = true
+					adapted = true
+				}
+				ensure_ancestor_pending_tags(bc.steps, &pending_tags)
+				record_bulk_index_puts_pending_tags(bc.env, base_cur, base_empty, bc.steps, bc.mode, bc.entries_term, &pending_tags, &fork_aliases)
 			}
 		}
 	}
@@ -777,7 +953,7 @@ adapt_tx_ops_for_base_moment :: proc(handle: ^Db_Handle, tx: ^xitdb.Tx) -> bool 
 </details>
 
 <details>
-<summary>NIF <code>decode_steps_term</code> — <a href="../../native/xitdb_nif.odin#L2258-L2274">native/xitdb_nif.odin#L2258-L2274</a></summary>
+<summary>NIF <code>decode_steps_term</code> — <a href="../../native/xitdb_nif.odin#L2699-L2715">native/xitdb_nif.odin#L2699-L2715</a></summary>
 
 ```odin
 decode_steps_term :: proc(
@@ -802,7 +978,7 @@ decode_steps_term :: proc(
 </details>
 
 <details>
-<summary>NIF <code>decode_writeable_value</code> — <a href="../../native/xitdb_nif.odin#L2423-L2473">native/xitdb_nif.odin#L2423-L2473</a></summary>
+<summary>NIF <code>decode_writeable_value</code> — <a href="../../native/xitdb_nif.odin#L2864-L2914">native/xitdb_nif.odin#L2864-L2914</a></summary>
 
 ```odin
 decode_writeable_value :: proc(env: ErlNifEnv, term: ERL_NIF_TERM) -> (xitdb.Writeable_Data, bool) {
@@ -861,7 +1037,7 @@ decode_writeable_value :: proc(env: ErlNifEnv, term: ERL_NIF_TERM) -> (xitdb.Wri
 </details>
 
 <details>
-<summary>NIF <code>is_structured_write_candidate</code> — <a href="../../native/xitdb_nif.odin#L2527-L2544">native/xitdb_nif.odin#L2527-L2544</a></summary>
+<summary>NIF <code>is_structured_write_candidate</code> — <a href="../../native/xitdb_nif.odin#L2968-L2985">native/xitdb_nif.odin#L2968-L2985</a></summary>
 
 ```odin
 is_structured_write_candidate :: proc(env: ErlNifEnv, term: ERL_NIF_TERM) -> bool {
@@ -963,7 +1139,7 @@ core_destroy :: proc(c: ^Core, close_file := false) -> Error {
 </details>
 
 <details>
-<summary><code>xitdb.database_init</code> — <a href="../../native/xitdb-odin/xitdb/database.odin#L182-L247">database.odin#L182-L247</a></summary>
+<summary><code>xitdb.database_init</code> — <a href="../../native/xitdb-odin/xitdb/database.odin#L184-L250">database.odin#L184-L250</a></summary>
 
 ```odin
 database_init :: proc(core: ^Core, hasher := Hasher{}) -> (db: Database, err: Error) {
@@ -984,6 +1160,7 @@ database_init :: proc(core: ^Core, hasher := Hasher{}) -> (db: Database, err: Er
 	db.core = core
 	db.hasher = h
 	db.tx_start = nil
+	db.tx_seq = 0
 	db.transaction = nil
 
 	core_seek_to(core, 0) or_return
@@ -1037,7 +1214,7 @@ database_init :: proc(core: ^Core, hasher := Hasher{}) -> (db: Database, err: Er
 </details>
 
 <details>
-<summary><code>xitdb.sha1_hasher</code> — <a href="../../native/xitdb-odin/xitdb/types.odin#L828-L837">types.odin#L828-L837</a></summary>
+<summary><code>xitdb.sha1_hasher</code> — <a href="../../native/xitdb-odin/xitdb/types.odin#L357-L366">types.odin#L357-L366</a></summary>
 
 ```odin
 sha1_hasher :: proc(id: u32 = 0, file_id: u64 = 0) -> Hasher {
@@ -1225,33 +1402,30 @@ core_length :: proc(c: ^Core) -> (length: i64, err: Error) {
 </details>
 
 <details>
-<summary><code>xitdb.tx_doc</code> — <a href="../../native/xitdb-odin/xitdb/dsl.odin#L955-L957">dsl.odin#L955-L957</a></summary>
+<summary><code>xitdb.read_hash_map_init</code> — <a href="../../native/xitdb-odin/xitdb/collections.odin#L246-L254">collections.odin#L246-L254</a></summary>
 
 ```odin
-tx_doc :: proc(tx: ^Tx, doc: string) {
-	tx.doc = doc
+read_hash_map_init :: proc(cursor: Read_Cursor) -> (res: Read_Hash_Map, err: Error) {
+	slot_ptr := cursor_resolved(cursor) or_return
+	#partial switch slot_ptr.slot.tag {
+	case .None, .Hash_Map, .Hash_Set:
+		return Read_Hash_Map{cursor = cursor}, nil
+	case:
+		return {}, .Unexpected_Tag
+	}
 }
 ```
 
 </details>
 
 <details>
-<summary><code>xitdb.database_read_root_header</code> — <a href="../../native/xitdb-odin/xitdb/database.odin#L409-L422">database.odin#L409-L422</a></summary>
+<summary><code>xitdb.hash_map_get_cursor</code> — <a href="../../native/xitdb-odin/xitdb/collections.odin#L330-L334">collections.odin#L330-L334</a></summary>
 
 ```odin
-database_read_root_header :: proc(db: ^Database) -> (res: Root_Header, err: Error) {
-	file_size_start := database_file_size_start(db.header.version)
-	file_size := core_read_i64_at(db.core, file_size_start) or_return
-	minimum_size := file_size_start + 8 + ROOT_TRAILER_LENGTH
-	if file_size < minimum_size {
-		return {}, .Invalid_Database
-	}
-	actual_size := core_length(db.core) or_return
-	if actual_size < file_size {
-		return {}, .Truncated_Database
-	}
-	trailer := database_read_root_trailer(db, file_size) or_return
-	return Root_Header{file_size = file_size, root = trailer.root}, nil
+hash_map_get_cursor :: proc(m: Read_Hash_Map, key: string) -> (Maybe(Read_Cursor), Error) {
+	buf: [64]u8 = ---
+	hash := database_digest_string_buf(m.cursor.db, key, buf[:])
+	return hash_map_get_cursor_by_hash(m, hash)
 }
 ```
 

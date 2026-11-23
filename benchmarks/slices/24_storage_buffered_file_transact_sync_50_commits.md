@@ -2,19 +2,19 @@
 
 [← Back to Benchmarks Overview](../README.md) · [All Slices](README.md)
 
-**Group:** `queries` — #21–#27 (Pull Projections, Datalog Engine, Buffered Sync, Search & Indexer)
+**Group:** `queries` — #21–#27, #31 (Pull Projections, Datalog Engine, Buffered Sync, Search & Indexer)
 
 ## Latest 1v1 Metrics
 
 | Metric | Elixir NIF Wrapper | Raw Odin Baseline | Comparison |
 | :--- | ---: | ---: | ---: |
-| **Median (`ns/op`)** | 80.20 µs (80200.0 ns) | 79.26 µs (79259.0 ns) | **`1.01x`** NIF Ratio |
-| **Mean ± σ (CV)** | 82.23 µs ± 5.95 µs (7.2%) | 78.85 µs ± 1.64 µs (2.1%) | Welch `z` = `1.22` |
-| **p95 / Max (`ns/op`)** | 90.38 µs / 92.67 µs | 80.59 µs / 80.75 µs | `5` vs `5` pooled samples |
+| **Median (`ns/op`)** | 44.49 µs (44494.0 ns) | 29.98 µs (29984.0 ns) | **`1.48x`** NIF Ratio |
+| **Mean ± σ (CV)** | 44.33 µs ± 1.32 µs (3.0%) | 30.10 µs ± 226.5 ns (0.8%) | Welch `z` = `23.68` |
+| **p95 / Max (`ns/op`)** | 45.57 µs / 45.57 µs | 30.38 µs / 30.41 µs | `5` vs `5` pooled samples |
 
 ## Benchmark Harnesses (Elixir vs. Raw Odin)
 
-### Elixir Harness ([`bench_elixir.exs#L470-L486`](../bench_elixir.exs#L470-L486))
+### Elixir Harness ([`bench_elixir.exs#L481-L497`](../bench_elixir.exs#L481-L497))
 
 ```elixir
       {24, "Storage: Buffered_File transact + sync (50 commits)", 50,
@@ -36,7 +36,7 @@
        end},
 ```
 
-### Raw Odin Harness ([`bench_client.odin#L1366-L1385`](../bench_client.odin#L1366-L1385))
+### Raw Odin Harness ([`bench_client.odin#L1439-L1458`](../bench_client.odin#L1439-L1458))
 
 ```odin
 	// #24: Storage: Buffered_File transact + sync (50 commits)
@@ -64,7 +64,7 @@
 ## Elixir Wrapper & NIF Bridge
 
 <details>
-<summary>Elixir <code>open</code> — <a href="../../lib/xitdb.ex#L183-L201">lib/xitdb.ex#L183-L201</a></summary>
+<summary>Elixir <code>open</code> — <a href="../../lib/xitdb.ex#L207-L233">lib/xitdb.ex#L207-L233</a></summary>
 
 ```elixir
   def open(opts \\ []) do
@@ -72,13 +72,21 @@
       backend = validated[:backend]
       path = validated[:path]
       hash = validated[:hash]
+      read_only = validated[:read_only]
 
       if backend in [:file, :buffered_file] and path == "" do
         {:error, %Error{reason: :missing_path, details: %{backend: backend}}}
       else
-        case NIF.nif_open(backend, path, hash) do
+        case NIF.nif_open(backend, path, hash, read_only) do
           {:ok, db_ref} ->
-            {:ok, %__MODULE__{db_ref: db_ref, backend: backend, path: path, hash: hash}}
+            {:ok,
+             %__MODULE__{
+               db_ref: db_ref,
+               backend: backend,
+               path: path,
+               hash: hash,
+               read_only: read_only
+             }}
 
           {:error, reason} ->
             {:error, %Error{reason: reason}}
@@ -91,21 +99,50 @@
 </details>
 
 <details>
-<summary>Elixir <code>transact</code> — <a href="../../lib/xitdb.ex#L329-L352">lib/xitdb.ex#L329-L352</a></summary>
+<summary>Elixir <code>transact</code> — <a href="../../lib/xitdb.ex#L362-L414">lib/xitdb.ex#L362-L414</a></summary>
 
 ```elixir
   def transact(db, map_or_fun, opts \\ [])
 
   def transact(%__MODULE__{db_ref: db_ref} = db, map, [])
       when is_map(map) and not is_struct(map) do
-    ops = TxCompiler.compile_moment_map(map)
-    do_transact_ops_default(db, db_ref, ops)
+    encoded_map = TxCompiler.encode_value(map)
+
+    if Compression.needs_prepare?(encoded_map, false) do
+      {:ok, prepared_map, blob_ops} = Compression.prepare_write(db, encoded_map, false)
+      ops = blob_ops ++ TxCompiler.compile_moment_map(prepared_map)
+      do_transact_ops_default(db, db_ref, ops)
+    else
+      ops = TxCompiler.compile_moment_map(encoded_map)
+      do_transact_ops_default(db, db_ref, ops)
+    end
+  rescue
+    e in Protocol.UndefinedError ->
+      {:error, %Error{reason: :transaction_exception, details: %{exception: e}}}
   end
 
   def transact(%__MODULE__{} = db, map, opts) when is_map(map) and not is_struct(map) do
     with {:ok, validated} <- validate_opts(opts, @transact_schema) do
-      ops = TxCompiler.compile_moment_map(map)
-      do_transact_ops(db, ops, validated)
+      try do
+        compress_opt = validated[:compress]
+        encoded_map = TxCompiler.encode_value(map)
+
+        if Compression.needs_prepare?(encoded_map, compress_opt) do
+          target = if validated[:base_moment] == -1, do: db, else: {db, validated[:base_moment]}
+
+          {:ok, prepared_map, blob_ops} =
+            Compression.prepare_write(target, encoded_map, compress_opt)
+
+          ops = blob_ops ++ TxCompiler.compile_moment_map(prepared_map)
+          do_transact_ops(db, ops, Keyword.put(validated, :compress, false))
+        else
+          ops = TxCompiler.compile_moment_map(encoded_map)
+          do_transact_ops(db, ops, validated)
+        end
+      rescue
+        e in Protocol.UndefinedError ->
+          {:error, %Error{reason: :transaction_exception, details: %{exception: e}}}
+      end
     end
   end
 
@@ -123,7 +160,7 @@
 </details>
 
 <details>
-<summary>Elixir <code>sync</code> — <a href="../../lib/xitdb.ex#L215-L217">lib/xitdb.ex#L215-L217</a></summary>
+<summary>Elixir <code>sync</code> — <a href="../../lib/xitdb.ex#L248-L250">lib/xitdb.ex#L248-L250</a></summary>
 
 ```elixir
   def sync(%__MODULE__{db_ref: db_ref}) do
@@ -134,7 +171,7 @@
 </details>
 
 <details>
-<summary>Elixir <code>info!</code> — <a href="../../lib/xitdb.ex#L227-L227">lib/xitdb.ex#L227-L227</a></summary>
+<summary>Elixir <code>info!</code> — <a href="../../lib/xitdb.ex#L260-L260">lib/xitdb.ex#L260-L260</a></summary>
 
 ```elixir
   def info!(%__MODULE__{} = db), do: db |> info() |> Error.unwrap!()
@@ -143,10 +180,11 @@
 </details>
 
 <details>
-<summary>Elixir <code>close</code> — <a href="../../lib/xitdb.ex#L209-L211">lib/xitdb.ex#L209-L211</a></summary>
+<summary>Elixir <code>close</code> — <a href="../../lib/xitdb.ex#L241-L244">lib/xitdb.ex#L241-L244</a></summary>
 
 ```elixir
-  def close(%__MODULE__{db_ref: db_ref}) do
+  def close(%__MODULE__{db_ref: db_ref} = db) do
+    Xitdb.Columnar.clear_cache(db)
     NIF.nif_close(db_ref)
   end
 ```
@@ -154,15 +192,26 @@
 </details>
 
 <details>
-<summary>NIF <code>odin_nif_open</code> — <a href="../../native/xitdb_nif.odin#L754-L829">native/xitdb_nif.odin#L754-L829</a></summary>
+<summary>NIF <code>odin_nif_open</code> — <a href="../../native/xitdb_nif.odin#L957-L1080">native/xitdb_nif.odin#L957-L1080</a></summary>
 
 ```odin
 odin_nif_open :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {
 	context = runtime.default_context()
 	defer free_all(context.temp_allocator)
 
-	if argc != 3 {
+	if argc != 3 && argc != 4 {
 		return make_err(env, "badarg")
+	}
+
+	read_only := false
+	if argc == 4 {
+		if argv[3] == ATOM_TRUE {
+			read_only = true
+		} else if argv[3] == ATOM_FALSE {
+			read_only = false
+		} else {
+			return make_err(env, "badarg")
+		}
 	}
 
 	atom_buf: [64]u8 = ---
@@ -190,6 +239,10 @@ odin_nif_open :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -
 	}
 	handle := (^Db_Handle)(raw_res)
 	handle^ = {}
+	handle.read_only = read_only
+
+	file_flags := os.File_Flags{.Read} if read_only else os.File_Flags{.Read, .Write, .Create}
+	fsync := !read_only
 
 	open_err: xitdb.Error = nil
 	switch backend_str {
@@ -197,10 +250,10 @@ odin_nif_open :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -
 		handle.core = xitdb.core_memory_init(context.allocator)
 		handle.backend = 0
 	case "file":
-		handle.core, open_err = xitdb.core_file_open(path_str, os.File_Flags{.Read, .Write, .Create}, true)
+		handle.core, open_err = xitdb.core_file_open(path_str, file_flags, fsync)
 		handle.backend = 1
 	case "buffered_file":
-		handle.core, open_err = xitdb.core_buffered_file_open(path_str, xitdb.DEFAULT_BUFFER_SIZE, os.File_Flags{.Read, .Write, .Create}, true, context.allocator)
+		handle.core, open_err = xitdb.core_buffered_file_open(path_str, 16 * 1024 * 1024, file_flags, fsync, context.allocator)
 		handle.backend = 2
 	case:
 		handle.is_closed = true
@@ -212,6 +265,39 @@ odin_nif_open :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -
 		handle.is_closed = true
 		_ = nif_make_db_resource(env, raw_res)
 		return make_xitdb_err(env, open_err)
+	}
+
+	if read_only && backend_str != "memory" {
+		len_val, len_err := xitdb.core_length(&handle.core)
+		if len_err != nil || len_val <= 0 {
+			_ = xitdb.core_destroy(&handle.core, close_file = true)
+			handle.is_closed = true
+			_ = nif_make_db_resource(env, raw_res)
+			if len_err != nil {
+				return make_xitdb_err(env, len_err)
+			}
+			return make_xitdb_err(env, xitdb.Xitdb_Error.Invalid_Database)
+		}
+
+		probe_db := xitdb.Database{core = &handle.core, hasher = hasher}
+		probe_hdr, hdr_err := xitdb.database_read_and_validate_header(&probe_db)
+		if hdr_err != nil {
+			_ = xitdb.core_destroy(&handle.core, close_file = true)
+			handle.is_closed = true
+			_ = nif_make_db_resource(env, raw_res)
+			return make_xitdb_err(env, hdr_err)
+		}
+		probe_db.header = probe_hdr
+		fsize, fs_err := xitdb.database_read_file_size(&probe_db)
+		if fs_err != nil || fsize <= 0 {
+			_ = xitdb.core_destroy(&handle.core, close_file = true)
+			handle.is_closed = true
+			_ = nif_make_db_resource(env, raw_res)
+			if fs_err != nil {
+				return make_xitdb_err(env, fs_err)
+			}
+			return make_xitdb_err(env, xitdb.Xitdb_Error.Invalid_Database)
+		}
 	}
 
 	init_err: xitdb.Error = nil
@@ -238,7 +324,7 @@ odin_nif_open :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -
 </details>
 
 <details>
-<summary>NIF <code>odin_nif_transact</code> — <a href="../../native/xitdb_nif.odin#L5239-L5326">native/xitdb_nif.odin#L5239-L5326</a></summary>
+<summary>NIF <code>odin_nif_transact</code> — <a href="../../native/xitdb_nif.odin#L6566-L6674">native/xitdb_nif.odin#L6566-L6674</a></summary>
 
 ```odin
 odin_nif_transact :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {
@@ -271,8 +357,29 @@ odin_nif_transact :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TER
 	}
 	defer nif_rwlock_rwunlock(handle.rwlock)
 
+	if handle.read_only {
+		return make_err(env, "read_only")
+	}
+
 	tx := xitdb.tx_init(&handle.db, base_moment = base_moment, track_changes = false, allocator = context.temp_allocator)
 	defer xitdb.tx_destroy(&tx)
+
+	base_slot, _, base_empty, base_err, _ := resolve_slot_arg(handle, -1, base_moment)
+	if base_err == nil && !base_empty && base_slot.tag == .Hash_Map {
+		base_cur := xitdb.Read_Cursor{
+			slot_ptr = xitdb.Slot_Pointer{position = nil, slot = base_slot},
+			db       = &handle.db,
+		}
+		if base_map, bm_err := xitdb.read_hash_map_init(base_cur); bm_err == nil {
+			if tx_cur_maybe, tc_err := xitdb.hash_map_get_cursor(base_map, "__tx"); tc_err == nil {
+				if _, has_tx := tx_cur_maybe.?; has_tx {
+					clear_steps := make([]xitdb.Path_Step, 1, tx.allocator)
+					clear_steps[0] = xitdb.hm("__tx")
+					append(&tx.ops, xitdb.Tx_Op{kind = .Remove, steps = clear_steps})
+				}
+			}
+		}
+	}
 
 	if len(doc_str) > 0 {
 		xitdb.tx_doc(&tx, doc_str)
@@ -334,7 +441,7 @@ odin_nif_transact :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TER
 </details>
 
 <details>
-<summary>NIF <code>odin_nif_sync</code> — <a href="../../native/xitdb_nif.odin#L855-L872">native/xitdb_nif.odin#L855-L872</a></summary>
+<summary>NIF <code>odin_nif_sync</code> — <a href="../../native/xitdb_nif.odin#L1106-L1127">native/xitdb_nif.odin#L1106-L1127</a></summary>
 
 ```odin
 odin_nif_sync :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {
@@ -350,6 +457,10 @@ odin_nif_sync :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -
 	}
 	defer nif_rwlock_rwunlock(handle.rwlock)
 
+	if handle.read_only {
+		return make_err(env, "read_only")
+	}
+
 	if err := xitdb.core_sync(&handle.core); err != nil {
 		return make_xitdb_err(env, err)
 	}
@@ -360,7 +471,7 @@ odin_nif_sync :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -
 </details>
 
 <details>
-<summary>NIF <code>odin_nif_info</code> — <a href="../../native/xitdb_nif.odin#L875-L910">native/xitdb_nif.odin#L875-L910</a></summary>
+<summary>NIF <code>odin_nif_info</code> — <a href="../../native/xitdb_nif.odin#L1130-L1165">native/xitdb_nif.odin#L1130-L1165</a></summary>
 
 ```odin
 odin_nif_info :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {
@@ -404,7 +515,7 @@ odin_nif_info :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -
 </details>
 
 <details>
-<summary>NIF <code>odin_nif_close</code> — <a href="../../native/xitdb_nif.odin#L832-L852">native/xitdb_nif.odin#L832-L852</a></summary>
+<summary>NIF <code>odin_nif_close</code> — <a href="../../native/xitdb_nif.odin#L1083-L1103">native/xitdb_nif.odin#L1083-L1103</a></summary>
 
 ```odin
 odin_nif_close :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {
@@ -433,7 +544,7 @@ odin_nif_close :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) 
 </details>
 
 <details>
-<summary>NIF <code>parse_tx_ops</code> — <a href="../../native/xitdb_nif.odin#L4942-L5236">native/xitdb_nif.odin#L4942-L5236</a></summary>
+<summary>NIF <code>parse_tx_ops</code> — <a href="../../native/xitdb_nif.odin#L6201-L6563">native/xitdb_nif.odin#L6201-L6563</a></summary>
 
 ```odin
 parse_tx_ops :: proc(
@@ -725,6 +836,74 @@ parse_tx_ops :: proc(
 			xitdb.tx_with_cursor(tx, merge_map_callback, mc)
 			has_deferred^ = true
 
+		case ATOM_BULK_PUT_MAPS:
+			if arity != 3 {
+				return "invalid_put_op", nil
+			}
+			steps, er, ok_steps := decode_steps_term(env, elems[1], tx.allocator)
+			if !ok_steps || er != "" || len(steps) == 0 {
+				return er if er != "" else "invalid_put_op", nil
+			}
+			if nif_is_list(env, elems[2]) == 0 {
+				return "invalid_put_op", nil
+			}
+			bc := new(Bulk_Put_Maps_Ctx, tx.allocator)
+			bc.steps = steps
+			bc.env = env
+			bc.entries_term = elems[2]
+			bc.validation_err = validation_err
+			xitdb.tx_with_cursor(tx, bulk_put_maps_callback, bc)
+			has_deferred^ = true
+
+		case ATOM_BULK_PUT_NESTED_MAPS:
+			if arity != 3 {
+				return "invalid_put_op", nil
+			}
+			steps, er, ok_steps := decode_steps_term(env, elems[1], tx.allocator)
+			if !ok_steps || er != "" || len(steps) == 0 {
+				return er if er != "" else "invalid_put_op", nil
+			}
+			if nif_is_list(env, elems[2]) == 0 {
+				return "invalid_put_op", nil
+			}
+			bc := new(Bulk_Put_Nested_Maps_Ctx, tx.allocator)
+			bc.steps = steps
+			bc.env = env
+			bc.entries_term = elems[2]
+			bc.validation_err = validation_err
+			xitdb.tx_with_cursor(tx, bulk_put_nested_maps_callback, bc)
+			has_deferred^ = true
+
+		case ATOM_BULK_INDEX_PUTS:
+			if arity != 4 {
+				return "invalid_put_op", nil
+			}
+			steps, er, ok_steps := decode_steps_term(env, elems[1], tx.allocator)
+			if !ok_steps || er != "" || len(steps) == 0 {
+				return er if er != "" else "invalid_put_op", nil
+			}
+			mode: Bulk_Index_Mode
+			if elems[2] == ATOM_UNIQUE {
+				mode = .Unique
+			} else if elems[2] == ATOM_COUNTED_SET_ADD {
+				mode = .Counted_Set_Add
+			} else if elems[2] == ATOM_HASH_MAP_MERGE {
+				mode = .Hash_Map_Merge
+			} else {
+				return "invalid_put_op", nil
+			}
+			if nif_is_list(env, elems[3]) == 0 {
+				return "invalid_put_op", nil
+			}
+			bc := new(Bulk_Index_Puts_Ctx, tx.allocator)
+			bc.steps = steps
+			bc.mode = mode
+			bc.env = env
+			bc.entries_term = elems[3]
+			bc.validation_err = validation_err
+			xitdb.tx_with_cursor(tx, bulk_index_puts_callback, bc)
+			has_deferred^ = true
+
 		case:
 			return "unknown_tx_op", nil
 		}
@@ -736,7 +915,7 @@ parse_tx_ops :: proc(
 </details>
 
 <details>
-<summary>NIF <code>validate_deferred_tx_ops</code> — <a href="../../native/xitdb_nif.odin#L4922-L4940">native/xitdb_nif.odin#L4922-L4940</a></summary>
+<summary>NIF <code>validate_deferred_tx_ops</code> — <a href="../../native/xitdb_nif.odin#L6166-L6199">native/xitdb_nif.odin#L6166-L6199</a></summary>
 
 ```odin
 validate_deferred_tx_ops :: proc(tx: ^xitdb.Tx) -> string {
@@ -754,6 +933,21 @@ validate_deferred_tx_ops :: proc(tx: ^xitdb.Tx) -> string {
 			if !validate_write_term_cold(mc.env, mc.map_term) {
 				return "invalid_put_op"
 			}
+		} else if op.callback == bulk_put_maps_callback {
+			bc := (^Bulk_Put_Maps_Ctx)(op.user_data)
+			if !validate_bulk_put_maps_cold(bc.env, bc.entries_term) {
+				return "invalid_put_op"
+			}
+		} else if op.callback == bulk_put_nested_maps_callback {
+			bc := (^Bulk_Put_Nested_Maps_Ctx)(op.user_data)
+			if !validate_bulk_put_nested_maps_cold(bc.env, bc.entries_term) {
+				return "invalid_put_op"
+			}
+		} else if op.callback == bulk_index_puts_callback {
+			bc := (^Bulk_Index_Puts_Ctx)(op.user_data)
+			if !validate_bulk_index_puts_cold(bc.env, bc.mode, bc.entries_term) {
+				return "invalid_put_op"
+			}
 		}
 	}
 	return ""
@@ -763,7 +957,7 @@ validate_deferred_tx_ops :: proc(tx: ^xitdb.Tx) -> string {
 </details>
 
 <details>
-<summary>NIF <code>rollback_failed_tx</code> — <a href="../../native/xitdb_nif.odin#L4725-L4763">native/xitdb_nif.odin#L4725-L4763</a></summary>
+<summary>NIF <code>rollback_failed_tx</code> — <a href="../../native/xitdb_nif.odin#L5834-L5872">native/xitdb_nif.odin#L5834-L5872</a></summary>
 
 ```odin
 rollback_failed_tx :: proc(
@@ -862,7 +1056,7 @@ core_destroy :: proc(c: ^Core, close_file := false) -> Error {
 </details>
 
 <details>
-<summary><code>xitdb.database_init</code> — <a href="../../native/xitdb-odin/xitdb/database.odin#L182-L247">database.odin#L182-L247</a></summary>
+<summary><code>xitdb.database_init</code> — <a href="../../native/xitdb-odin/xitdb/database.odin#L184-L250">database.odin#L184-L250</a></summary>
 
 ```odin
 database_init :: proc(core: ^Core, hasher := Hasher{}) -> (db: Database, err: Error) {
@@ -883,6 +1077,7 @@ database_init :: proc(core: ^Core, hasher := Hasher{}) -> (db: Database, err: Er
 	db.core = core
 	db.hasher = h
 	db.tx_start = nil
+	db.tx_seq = 0
 	db.transaction = nil
 
 	core_seek_to(core, 0) or_return
@@ -936,7 +1131,7 @@ database_init :: proc(core: ^Core, hasher := Hasher{}) -> (db: Database, err: Er
 </details>
 
 <details>
-<summary><code>xitdb.sha1_hasher</code> — <a href="../../native/xitdb-odin/xitdb/types.odin#L828-L837">types.odin#L828-L837</a></summary>
+<summary><code>xitdb.sha1_hasher</code> — <a href="../../native/xitdb-odin/xitdb/types.odin#L357-L366">types.odin#L357-L366</a></summary>
 
 ```odin
 sha1_hasher :: proc(id: u32 = 0, file_id: u64 = 0) -> Hasher {
@@ -1154,7 +1349,7 @@ core_length :: proc(c: ^Core) -> (length: i64, err: Error) {
 </details>
 
 <details>
-<summary><code>xitdb.sha256_hasher</code> — <a href="../../native/xitdb-odin/xitdb/types.odin#L840-L849">types.odin#L840-L849</a></summary>
+<summary><code>xitdb.sha256_hasher</code> — <a href="../../native/xitdb-odin/xitdb/types.odin#L369-L378">types.odin#L369-L378</a></summary>
 
 ```odin
 sha256_hasher :: proc(id: u32 = 0, file_id: u64 = 0) -> Hasher {

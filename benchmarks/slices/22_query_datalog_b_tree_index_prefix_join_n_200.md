@@ -2,19 +2,19 @@
 
 [← Back to Benchmarks Overview](../README.md) · [All Slices](README.md)
 
-**Group:** `queries` — #21–#27 (Pull Projections, Datalog Engine, Buffered Sync, Search & Indexer)
+**Group:** `queries` — #21–#27, #31 (Pull Projections, Datalog Engine, Buffered Sync, Search & Indexer)
 
 ## Latest 1v1 Metrics
 
 | Metric | Elixir NIF Wrapper | Raw Odin Baseline | Comparison |
 | :--- | ---: | ---: | ---: |
-| **Median (`ns/op`)** | 82.72 µs (82725.0 ns) | 42.25 µs (42252.0 ns) | **`1.96x`** NIF Ratio |
-| **Mean ± σ (CV)** | 82.75 µs ± 371.7 ns (0.4%) | 42.89 µs ± 2.08 µs (4.8%) | Welch `z` = `42.26` |
-| **p95 / Max (`ns/op`)** | 83.13 µs / 83.14 µs | 45.63 µs / 46.22 µs | `5` vs `5` pooled samples |
+| **Median (`ns/op`)** | 23.14 µs (23141.0 ns) | 15.99 µs (15995.0 ns) | **`1.45x`** NIF Ratio |
+| **Mean ± σ (CV)** | 23.96 µs ± 1.57 µs (6.6%) | 16.20 µs ± 487.7 ns (3.0%) | Welch `z` = `10.56` |
+| **p95 / Max (`ns/op`)** | 26.14 µs / 26.71 µs | 16.87 µs / 17.05 µs | `5` vs `5` pooled samples |
 
 ## Benchmark Harnesses (Elixir vs. Raw Odin)
 
-### Elixir Harness ([`bench_elixir.exs#L454-L461`](../bench_elixir.exs#L454-L461))
+### Elixir Harness ([`bench_elixir.exs#L465-L472`](../bench_elixir.exs#L465-L472))
 
 ```elixir
       {22, "Query: Datalog B+Tree index prefix + join (N=200)", 50,
@@ -27,7 +27,7 @@
        end},
 ```
 
-### Raw Odin Harness ([`bench_client.odin#L1322-L1343`](../bench_client.odin#L1322-L1343))
+### Raw Odin Harness ([`bench_client.odin#L1395-L1416`](../bench_client.odin#L1395-L1416))
 
 ```odin
 	// #22: Datalog B+Tree index prefix + join
@@ -57,7 +57,7 @@
 ## Elixir Wrapper & NIF Bridge
 
 <details>
-<summary>Elixir <code>query</code> — <a href="../../lib/xitdb.ex#L848-L863">lib/xitdb.ex#L848-L863</a></summary>
+<summary>Elixir <code>query</code> — <a href="../../lib/xitdb.ex#L1257-L1272">lib/xitdb.ex#L1257-L1272</a></summary>
 
 ```elixir
   def query(target, query_str, opts \\ [])
@@ -65,7 +65,7 @@
   def query(%__MODULE__{db_ref: db_ref}, query_str, opts) when is_binary(query_str) do
     with {:ok, validated} <- validate_opts(opts, @query_schema) do
       moment = Keyword.get(validated, :moment, -1)
-      do_query(db_ref, moment, query_str)
+      do_query(db_ref, moment, query_str, validated)
     end
   end
 
@@ -73,7 +73,7 @@
       when is_binary(query_str) do
     with {:ok, validated} <- validate_opts(opts, @query_schema) do
       moment = Keyword.get(validated, :moment, cursor_moment)
-      do_query(db_ref, moment, query_str)
+      do_query(db_ref, moment, query_str, validated)
     end
   end
 ```
@@ -81,25 +81,34 @@
 </details>
 
 <details>
-<summary>Elixir <code>do_query</code> — <a href="../../lib/xitdb.ex#L865-L867">lib/xitdb.ex#L865-L867</a></summary>
+<summary>Elixir <code>do_query</code> — <a href="../../lib/xitdb.ex#L1274-L1285">lib/xitdb.ex#L1274-L1285</a></summary>
 
 ```elixir
-  defp do_query(db_ref, moment, query_str) do
-    db_ref |> NIF.nif_query_datalog(moment, query_str) |> Error.wrap()
+  defp do_query(db_ref, moment, query_str, validated) do
+    raw_tagged = Keyword.get(validated, :raw_tagged, false)
+
+    max_bytes =
+      Keyword.get(
+        validated,
+        :max_decompressed_bytes,
+        Compression.default_max_decompressed_bytes()
+      )
+
+    run_datalog_loop(db_ref, moment, query_str, raw_tagged, max_bytes, validated, %{}, 16)
   end
 ```
 
 </details>
 
 <details>
-<summary>NIF <code>odin_nif_query_datalog</code> — <a href="../../native/xitdb_nif.odin#L8017-L8093">native/xitdb_nif.odin#L8017-L8093</a></summary>
+<summary>NIF <code>odin_nif_query_datalog</code> — <a href="../../native/xitdb_nif.odin#L9721-L9869">native/xitdb_nif.odin#L9721-L9869</a></summary>
 
 ```odin
 odin_nif_query_datalog :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {
 	context = runtime.default_context()
 	defer free_all(context.temp_allocator)
 
-	if argc != 3 {
+	if argc != 3 && argc != 6 {
 		return make_err(env, "badarg")
 	}
 	moment_idx: i64 = -1
@@ -111,12 +120,64 @@ odin_nif_query_datalog :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NI
 		return make_err(env, "badarg")
 	}
 
+	raw_tagged := false
+	allow_defer := argc == 6
+	max_decompressed_bytes: u64 = MAX_NIF_DECOMPRESSED_BYTES
+	predecoded := make(map[string]Maybe(string), 8, context.temp_allocator)
+
+	if argc == 6 {
+		rt_val, ok_rt := parse_bool_arg(argv[3])
+		if !ok_rt {
+			return make_err(env, "badarg")
+		}
+		raw_tagged = rt_val
+
+		max_b_i64: i64 = 0
+		if nif_get_int64(env, argv[4], &max_b_i64) == 0 || max_b_i64 <= 0 {
+			return make_err(env, "badarg")
+		}
+		max_decompressed_bytes = u64(max_b_i64)
+
+		if nif_is_map(env, argv[5]) == 0 {
+			return make_err(env, "badarg")
+		}
+		it: Nif_Map_Iter
+		if nif_map_iter_create(env, argv[5], &it) == 0 {
+			return make_err(env, "badarg")
+		}
+		defer nif_map_iter_destroy(env, &it)
+		k_term, v_term: ERL_NIF_TERM
+		for nif_map_iter_get_and_next(env, &it, &k_term, &v_term) != 0 {
+			k_str, ok_k := get_string_from_binary(env, k_term)
+			if !ok_k {
+				return make_err(env, "badarg")
+			}
+			if v_term == ATOM_NIL {
+				predecoded[k_str] = Maybe(string)(nil)
+			} else if v_str, ok_v := get_string_from_binary(env, v_term); ok_v {
+				predecoded[k_str] = v_str
+			} else {
+				return make_err(env, "badarg")
+			}
+		}
+	}
+
 	q_val, q_err := nif_dl_parse_query(query_str, context.temp_allocator)
 	if q_err != "" {
 		return make_err(env, q_err)
 	}
+	dl_ctx := NIF_DL_Decode_Ctx{
+		raw_tagged             = raw_tagged,
+		allow_defer            = allow_defer,
+		max_decompressed_bytes = max_decompressed_bytes,
+		predecoded             = predecoded,
+		missing_seen           = make(map[string]bool, 8, context.temp_allocator),
+		missing                = make([dynamic]NIF_DL_Missing_Tag, 0, 8, context.temp_allocator),
+	}
 	q := new(NIF_Datalog_Query, context.temp_allocator)
 	q^ = q_val
+	q.dl_ctx = &dl_ctx
+	q.iter_pool = nif_iter_pool_init(context.temp_allocator)
 
 	handle, ok := acquire_rlock(env, argv[0])
 	if !ok {
@@ -129,8 +190,24 @@ odin_nif_query_datalog :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NI
 	dl_env := new(NIF_Datalog_Env, context.temp_allocator)
 
 	_, exec_err := nif_dl_eval_clauses(&handle.db, q, 0, moment_idx, dl_env, &raw_rows, &matched_envs, false, context.temp_allocator)
+	if len(dl_ctx.codec_err) > 0 {
+		return make_err(env, dl_ctx.codec_err)
+	}
 	if exec_err != nil {
 		return make_xitdb_err(env, exec_err)
+	}
+	if len(dl_ctx.missing) > 0 {
+		missing_terms := make([]ERL_NIF_TERM, len(dl_ctx.missing), context.temp_allocator)
+		for &m, idx in dl_ctx.missing {
+			missing_terms[idx] = nif_make_tuple3(
+				env,
+				nif_make_int64(env, m.moment),
+				make_bytes_binary(env, m.tag[:]),
+				make_bytes_binary(env, m.payload),
+			)
+		}
+		missing_list := nif_make_list_from_array(env, raw_data(missing_terms), c.uint(len(missing_terms)))
+		return nif_make_tuple2(env, ATOM_NEED_DECODE, missing_list)
 	}
 
 	final_rows := raw_rows[:]
@@ -149,11 +226,15 @@ odin_nif_query_datalog :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NI
 		vars_list = nif_make_list_from_array(env, raw_data(vars_terms), c.uint(len(vars_terms)))
 	}
 
+	codec_err := ""
 	rows_terms := make([]ERL_NIF_TERM, len(final_rows), context.temp_allocator)
 	for row, r_idx in final_rows {
 		cols := make([]ERL_NIF_TERM, len(row), context.temp_allocator)
 		for cell, c_idx in row {
-			cols[c_idx] = pull_value_to_term(env, cell)
+			cols[c_idx] = pull_value_to_term(env, cell, raw_tagged, &codec_err, max_decompressed_bytes)
+			if len(codec_err) > 0 {
+				return make_err(env, codec_err)
+			}
 		}
 		if len(cols) == 0 {
 			rows_terms[r_idx] = nif_make_list_from_array(env, nil, 0)
@@ -177,7 +258,7 @@ odin_nif_query_datalog :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NI
 </details>
 
 <details>
-<summary>NIF <code>nif_dl_parse_query</code> — <a href="../../native/xitdb_nif.odin#L7105-L7154">native/xitdb_nif.odin#L7105-L7154</a></summary>
+<summary>NIF <code>nif_dl_parse_query</code> — <a href="../../native/xitdb_nif.odin#L8581-L8630">native/xitdb_nif.odin#L8581-L8630</a></summary>
 
 ```odin
 nif_dl_parse_query :: proc(query_str: string, allocator: runtime.Allocator) -> (q: NIF_Datalog_Query, err_reason: string) {
@@ -235,7 +316,21 @@ nif_dl_parse_query :: proc(query_str: string, allocator: runtime.Allocator) -> (
 </details>
 
 <details>
-<summary>NIF <code>nif_dl_eval_clauses</code> — <a href="../../native/xitdb_nif.odin#L7839-L7898">native/xitdb_nif.odin#L7839-L7898</a></summary>
+<summary>NIF <code>nif_iter_pool_init</code> — <a href="../../native/xitdb_nif.odin#L696-L701">native/xitdb_nif.odin#L696-L701</a></summary>
+
+```odin
+nif_iter_pool_init :: proc(alloc := context.temp_allocator) -> Nif_Iter_Pool {
+	return Nif_Iter_Pool{
+		free_list = make([dynamic]^xitdb.Cursor_Iterator, alloc),
+		alloc     = alloc,
+	}
+}
+```
+
+</details>
+
+<details>
+<summary>NIF <code>nif_dl_eval_clauses</code> — <a href="../../native/xitdb_nif.odin#L9537-L9602">native/xitdb_nif.odin#L9537-L9602</a></summary>
 
 ```odin
 nif_dl_eval_clauses :: proc(
@@ -249,6 +344,9 @@ nif_dl_eval_clauses :: proc(
 	stop_after_first: bool,
 	allocator: runtime.Allocator,
 ) -> (matched_any: bool, err: xitdb.Error) {
+	if q.dl_ctx != nil && len(q.dl_ctx.codec_err) > 0 {
+		return false, nil
+	}
 	if clause_idx >= len(q.clauses) {
 		if !stop_after_first {
 			if q.has_aggregates && out_envs != nil {
@@ -285,6 +383,9 @@ nif_dl_eval_clauses :: proc(
 		neg_env := new(NIF_Datalog_Env, allocator)
 		neg_env^ = env^
 		has_match := nif_dl_eval_pattern_moment(db, q, neg_clause, -1, default_moment, neg_env, out_rows, out_envs, true, allocator) or_return
+		if q.dl_ctx != nil && len(q.dl_ctx.codec_err) > 0 {
+			return false, nil
+		}
 		if has_match {
 			return false, nil
 		}
@@ -303,7 +404,7 @@ nif_dl_eval_clauses :: proc(
 </details>
 
 <details>
-<summary>NIF <code>nif_dl_compute_aggregations</code> — <a href="../../native/xitdb_nif.odin#L7900-L8014">native/xitdb_nif.odin#L7900-L8014</a></summary>
+<summary>NIF <code>nif_dl_compute_aggregations</code> — <a href="../../native/xitdb_nif.odin#L9604-L9718">native/xitdb_nif.odin#L9604-L9718</a></summary>
 
 ```odin
 nif_dl_compute_aggregations :: proc(q: ^NIF_Datalog_Query, envs: []NIF_Datalog_Env, allocator: runtime.Allocator) -> [][]xitdb.Pull_Value {
@@ -426,10 +527,16 @@ nif_dl_compute_aggregations :: proc(q: ^NIF_Datalog_Query, envs: []NIF_Datalog_E
 </details>
 
 <details>
-<summary>NIF <code>pull_value_to_term</code> — <a href="../../native/xitdb_nif.odin#L644-L692">native/xitdb_nif.odin#L644-L692</a></summary>
+<summary>NIF <code>pull_value_to_term</code> — <a href="../../native/xitdb_nif.odin#L831-L895">native/xitdb_nif.odin#L831-L895</a></summary>
 
 ```odin
-pull_value_to_term :: proc(env: ErlNifEnv, pv: xitdb.Pull_Value) -> ERL_NIF_TERM {
+pull_value_to_term :: proc(
+	env: ErlNifEnv,
+	pv: xitdb.Pull_Value,
+	raw_tagged: bool = false,
+	codec_err: ^string = nil,
+	max_bytes: u64 = MAX_NIF_DECOMPRESSED_BYTES,
+) -> ERL_NIF_TERM {
 	switch v in pv {
 	case u64:
 		return nif_make_uint64(env, v)
@@ -446,6 +553,16 @@ pull_value_to_term :: proc(env: ErlNifEnv, pv: xitdb.Pull_Value) -> ERL_NIF_TERM
 			}
 			return ATOM_FALSE
 		}
+		if !raw_tagged && len(v.format_tag) == 2 && v.format_tag[0] == 'c' && v.format_tag[1] == 'z' {
+			t, cz_err := decode_cz_to_term(env, v.value, max_bytes)
+			if cz_err != "" {
+				if codec_err != nil && len(codec_err^) == 0 {
+					codec_err^ = cz_err
+				}
+				return ATOM_NIL
+			}
+			return t
+		}
 		if len(v.format_tag) > 0 {
 			return nif_make_tuple3(
 				env,
@@ -461,7 +578,7 @@ pull_value_to_term :: proc(env: ErlNifEnv, pv: xitdb.Pull_Value) -> ERL_NIF_TERM
 		}
 		items := make([]ERL_NIF_TERM, len(v), context.temp_allocator)
 		for elem, idx in v {
-			items[idx] = pull_value_to_term(env, elem)
+			items[idx] = pull_value_to_term(env, elem, raw_tagged, codec_err, max_bytes)
 		}
 		return nif_make_list_from_array(env, raw_data(items), c.uint(len(items)))
 	case xitdb.Pull_Map:
@@ -472,7 +589,7 @@ pull_value_to_term :: proc(env: ErlNifEnv, pv: xitdb.Pull_Value) -> ERL_NIF_TERM
 		vals := make([]ERL_NIF_TERM, len(v), context.temp_allocator)
 		for entry, idx in v {
 			keys[idx] = make_binary(env, entry.key)
-			vals[idx] = pull_value_to_term(env, entry.val)
+			vals[idx] = pull_value_to_term(env, entry.val, raw_tagged, codec_err, max_bytes)
 		}
 		return make_map_safe(env, keys, vals)
 	}
@@ -483,7 +600,7 @@ pull_value_to_term :: proc(env: ErlNifEnv, pv: xitdb.Pull_Value) -> ERL_NIF_TERM
 </details>
 
 <details>
-<summary>NIF <code>nif_dl_is_ws</code> — <a href="../../native/xitdb_nif.odin#L6295-L6297">native/xitdb_nif.odin#L6295-L6297</a></summary>
+<summary>NIF <code>nif_dl_is_ws</code> — <a href="../../native/xitdb_nif.odin#L7771-L7773">native/xitdb_nif.odin#L7771-L7773</a></summary>
 
 ```odin
 nif_dl_is_ws :: proc(ch: u8) -> bool {
@@ -494,7 +611,7 @@ nif_dl_is_ws :: proc(ch: u8) -> bool {
 </details>
 
 <details>
-<summary>NIF <code>nif_dl_find_where_keyword</code> — <a href="../../native/xitdb_nif.odin#L6299-L6332">native/xitdb_nif.odin#L6299-L6332</a></summary>
+<summary>NIF <code>nif_dl_find_where_keyword</code> — <a href="../../native/xitdb_nif.odin#L7775-L7808">native/xitdb_nif.odin#L7775-L7808</a></summary>
 
 ```odin
 nif_dl_find_where_keyword :: proc(s: string) -> int {
@@ -535,54 +652,10 @@ nif_dl_find_where_keyword :: proc(s: string) -> int {
 
 </details>
 
-<details>
-<summary>NIF <code>nif_dl_parse_find_item</code> — <a href="../../native/xitdb_nif.odin#L7068-L7103">native/xitdb_nif.odin#L7068-L7103</a></summary>
-
-```odin
-nif_dl_parse_find_item :: proc(q: ^NIF_Datalog_Query, token: string) -> (item: xitdb.Datalog_Find_Item, err_reason: string) {
-	aggs := [?]struct {
-		prefix: string,
-		kind:   xitdb.Datalog_Agg_Kind,
-	}{
-		{"count(", .Count},
-		{"sum(",   .Sum},
-		{"min(",   .Min},
-		{"max(",   .Max},
-	}
-
-	for a in aggs {
-		if strings.has_prefix(token, a.prefix) && strings.has_suffix(token, ")") {
-			inner := strings.trim_space(token[len(a.prefix) : len(token) - 1])
-			v_idx, verr := nif_dl_intern_var(q, inner)
-			if verr != "" {
-				return {}, verr
-			}
-			return xitdb.Datalog_Find_Item{
-				agg     = a.kind,
-				var_idx = v_idx,
-				label   = token,
-			}, ""
-		}
-	}
-
-	v_idx, verr := nif_dl_intern_var(q, token)
-	if verr != "" {
-		return {}, verr
-	}
-	return xitdb.Datalog_Find_Item{
-		agg     = .None,
-		var_idx = v_idx,
-		label   = token,
-	}, ""
-}
-```
-
-</details>
-
 ## Reachable `xitdb` Core Procedures
 
 <details>
-<summary><code>xitdb.query_datalog</code> — <a href="../../native/xitdb-odin/xitdb/dsl.odin#L3615-L3619">dsl.odin#L3615-L3619</a></summary>
+<summary><code>xitdb.query_datalog</code> — <a href="../../native/xitdb-odin/xitdb/dsl.odin#L3773-L3777">dsl.odin#L3773-L3777</a></summary>
 
 ```odin
 query_datalog :: proc(db: ^Database, query_str: string, default_moment: i64 = -1, allocator := context.temp_allocator) -> (res: Datalog_Result, err: Error) {
@@ -595,7 +668,7 @@ query_datalog :: proc(db: ^Database, query_str: string, default_moment: i64 = -1
 </details>
 
 <details>
-<summary><code>xitdb.datalog_execute</code> — <a href="../../native/xitdb-odin/xitdb/dsl.odin#L3621-L3650">dsl.odin#L3621-L3650</a></summary>
+<summary><code>xitdb.datalog_execute</code> — <a href="../../native/xitdb-odin/xitdb/dsl.odin#L3779-L3810">dsl.odin#L3779-L3810</a></summary>
 
 ```odin
 datalog_execute :: proc(db: ^Database, q: ^Datalog_Query, default_moment: i64 = -1, allocator := context.temp_allocator) -> (res: Datalog_Result, err: Error) {
@@ -609,8 +682,10 @@ datalog_execute :: proc(db: ^Database, q: ^Datalog_Query, default_moment: i64 = 
 		delete(raw_rows)
 	}
 	env := Datalog_Env{}
+	pool := _iter_pool_init(context.allocator)
+	defer _iter_pool_destroy(&pool)
 
-	_eval_datalog_clauses(db, q, 0, default_moment, env, &raw_rows, &matched_envs, false, allocator) or_return
+	_eval_datalog_clauses(db, q, 0, default_moment, env, &raw_rows, &matched_envs, false, &pool, allocator) or_return
 
 	vars := make([]string, len(q.find_items), allocator)
 	for item, i in q.find_items {
@@ -633,7 +708,35 @@ datalog_execute :: proc(db: ^Database, q: ^Datalog_Query, default_moment: i64 = 
 </details>
 
 <details>
-<summary><code>xitdb._eval_datalog_clauses</code> — <a href="../../native/xitdb-odin/xitdb/dsl.odin#L3811-L3863">dsl.odin#L3811-L3863</a></summary>
+<summary><code>xitdb._iter_pool_init</code> — <a href="../../native/xitdb-odin/xitdb/dsl.odin#L1854-L1859">dsl.odin#L1854-L1859</a></summary>
+
+```odin
+_iter_pool_init :: proc(alloc := context.allocator) -> _Iter_Pool {
+	return _Iter_Pool{
+		free_list = make([dynamic]^Cursor_Iterator, alloc),
+		alloc     = alloc,
+	}
+}
+```
+
+</details>
+
+<details>
+<summary><code>xitdb._iter_pool_destroy</code> — <a href="../../native/xitdb-odin/xitdb/dsl.odin#L1862-L1867">dsl.odin#L1862-L1867</a></summary>
+
+```odin
+_iter_pool_destroy :: proc(pool: ^_Iter_Pool) {
+	for it in pool.free_list {
+		free(it, pool.alloc)
+	}
+	delete(pool.free_list)
+}
+```
+
+</details>
+
+<details>
+<summary><code>xitdb._eval_datalog_clauses</code> — <a href="../../native/xitdb-odin/xitdb/dsl.odin#L3971-L4024">dsl.odin#L3971-L4024</a></summary>
 
 ```odin
 _eval_datalog_clauses :: proc(
@@ -645,6 +748,7 @@ _eval_datalog_clauses :: proc(
 	out_rows: ^[dynamic][]Pull_Value,
 	out_envs: ^[dynamic]Datalog_Env,
 	stop_after_first: bool,
+	pool: ^_Iter_Pool,
 	allocator: runtime.Allocator,
 ) -> (matched_any: bool, err: Error) {
 	if clause_idx >= len(q.clauses) {
@@ -669,22 +773,22 @@ _eval_datalog_clauses :: proc(
 		if !_eval_datalog_predicate(clause, &next_env) {
 			return false, nil
 		}
-		return _eval_datalog_clauses(db, q, clause_idx + 1, default_moment, next_env, out_rows, out_envs, stop_after_first, allocator)
+		return _eval_datalog_clauses(db, q, clause_idx + 1, default_moment, next_env, out_rows, out_envs, stop_after_first, pool, allocator)
 
 	case .Not_Pattern:
 		neg_clause := clause
 		neg_clause.kind = .Pattern
-		has_match := _eval_pattern_moment(db, q, neg_clause, -1, default_moment, env, out_rows, out_envs, true, allocator) or_return
+		has_match := _eval_pattern_moment(db, q, neg_clause, -1, default_moment, env, out_rows, out_envs, true, pool, allocator) or_return
 		if has_match {
 			return false, nil
 		}
-		return _eval_datalog_clauses(db, q, clause_idx + 1, default_moment, env, out_rows, out_envs, stop_after_first, allocator)
+		return _eval_datalog_clauses(db, q, clause_idx + 1, default_moment, env, out_rows, out_envs, stop_after_first, pool, allocator)
 
 	case .Reach:
-		return _eval_reach_clause(db, q, clause, clause_idx, default_moment, env, out_rows, out_envs, stop_after_first, allocator)
+		return _eval_reach_clause(db, q, clause, clause_idx, default_moment, env, out_rows, out_envs, stop_after_first, pool, allocator)
 
 	case .Pattern:
-		return _eval_pattern_moment(db, q, clause, clause_idx, default_moment, env, out_rows, out_envs, stop_after_first, allocator)
+		return _eval_pattern_moment(db, q, clause, clause_idx, default_moment, env, out_rows, out_envs, stop_after_first, pool, allocator)
 	}
 
 	return false, nil
@@ -694,7 +798,7 @@ _eval_datalog_clauses :: proc(
 </details>
 
 <details>
-<summary><code>xitdb._compute_datalog_aggregations</code> — <a href="../../native/xitdb-odin/xitdb/dsl.odin#L3692-L3808">dsl.odin#L3692-L3808</a></summary>
+<summary><code>xitdb._compute_datalog_aggregations</code> — <a href="../../native/xitdb-odin/xitdb/dsl.odin#L3852-L3968">dsl.odin#L3852-L3968</a></summary>
 
 ```odin
 _compute_datalog_aggregations :: proc(q: ^Datalog_Query, envs: []Datalog_Env, allocator: runtime.Allocator) -> [][]Pull_Value {

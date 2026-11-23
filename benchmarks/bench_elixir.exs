@@ -33,7 +33,11 @@ defmodule Xitdb.ClientBench do
     {25, :queries, "Search: Sorted_Map B+Tree prefix seek (limit=16)"},
     {26, :queries, "Search: BM25 corpus search (N=200, 2-term prefix, limit=10)"},
     {27, :queries, "Indexer: Sorted_Map B+Tree range scan + set decode (limit=16)"},
-    {28, :access, "DSL: Pre-tokenized path_steps select(path_steps(users[id].name))"}
+    {28, :access, "DSL: Pre-tokenized path_steps select(path_steps(users[id].name))"},
+    {29, :transactions, "Tx: Bulk NIF :bulk_put_maps (100 entities in 1 commit)"},
+    {30, :transactions, "Tx: Bulk NIF :bulk_put_nested_maps (100 nested entities)"},
+    {31, :queries, "Indexer: Bulk NIF :bulk_index_puts (:hash_map_merge, 100 terms)"},
+    {32, :access, "Access: Batched nif_slot_get_keys (100 keys in 1 NIF call)"}
   ]
 
   @value_flags %{
@@ -110,7 +114,7 @@ defmodule Xitdb.ClientBench do
 
     need_main_db? =
       Enum.any?(
-        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 21, 25, 28],
+        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 21, 25, 28, 32],
         &MapSet.member?(active_ranks, &1)
       )
 
@@ -141,6 +145,13 @@ defmodule Xitdb.ClientBench do
             Xitdb.Cursor.ensure_resolved(users_cur["u#{i}"])
           end
         )
+      else
+        nil
+      end
+
+    batch_100_keys =
+      if MapSet.member?(active_ranks, 32) do
+        Enum.map(0..99, &"u#{&1}")
       else
         nil
       end
@@ -538,6 +549,91 @@ defmodule Xitdb.ClientBench do
          for i <- 0..499 do
            uid = "u#{i}"
            _ = Xitdb.select!(db, path_steps(users[uid].name))
+         end
+
+         0
+       end},
+      {29, "Tx: Bulk NIF :bulk_put_maps (100 entities in 1 commit)", 10,
+       fn ->
+         {:ok, d} = Xitdb.open(backend: :memory)
+         t0 = System.monotonic_time(:nanosecond)
+
+         for iter <- 0..9 do
+           col = "users_#{iter}"
+
+           entries =
+             Enum.map(0..99, fn i ->
+               {"u#{i}", %{"name" => "Alice", "age" => 30, "dept" => "eng"}, []}
+             end)
+
+           {:ok, _} = Xitdb.transact_ops(d, [{:bulk_put_maps, [col], entries}])
+         end
+
+         elapsed = System.monotonic_time(:nanosecond) - t0
+         sz = Xitdb.info!(d).file_size
+         Xitdb.close(d)
+         {elapsed, sz}
+       end},
+      {30, "Tx: Bulk NIF :bulk_put_nested_maps (100 nested entities)", 10,
+       fn ->
+         {:ok, d} = Xitdb.open(backend: :memory)
+         t0 = System.monotonic_time(:nanosecond)
+
+         for iter <- 0..9 do
+           col = "orgs_#{iter}"
+
+           entries =
+             Enum.map(0..99, fn i ->
+               parent_k = "org_#{10 + div(i, 5)}"
+               child_k = "m_#{100 + i}"
+
+               {parent_k, "members", child_k, %{"role" => "member", "tier" => 1, "dept" => "eng"},
+                []}
+             end)
+
+           {:ok, _} = Xitdb.transact_ops(d, [{:bulk_put_nested_maps, [col], entries}])
+         end
+
+         elapsed = System.monotonic_time(:nanosecond) - t0
+         sz = Xitdb.info!(d).file_size
+         Xitdb.close(d)
+         {elapsed, sz}
+       end},
+      {31, "Indexer: Bulk NIF :bulk_index_puts (:hash_map_merge, 100 terms)", 10,
+       fn ->
+         {:ok, d} = Xitdb.open(backend: :memory)
+         t0 = System.monotonic_time(:nanosecond)
+
+         for iter <- 0..9 do
+           col = "articles_#{iter}"
+
+           entries =
+             Enum.map(0..99, fn i ->
+               term = "term_#{100 + i}"
+               {term, %{"d0" => 300, "d1" => 200, "d2" => 100, "d3" => 100}}
+             end)
+
+           {:ok, _} =
+             Xitdb.transact_ops(d, [
+               {:bulk_index_puts, ["idx", "search", col, "terms"], :hash_map_merge, entries}
+             ])
+         end
+
+         elapsed = System.monotonic_time(:nanosecond) - t0
+         sz = Xitdb.info!(d).file_size
+         Xitdb.close(d)
+         {elapsed, sz}
+       end},
+      {32, "Access: Batched nif_slot_get_keys (100 keys in 1 NIF call)", 100,
+       fn ->
+         for _ <- 1..100 do
+           {:ok, _} =
+             Xitdb.NIF.nif_slot_get_keys(
+               users_cur.db_ref,
+               users_cur.tag_id,
+               users_cur.value,
+               batch_100_keys
+             )
          end
 
          0

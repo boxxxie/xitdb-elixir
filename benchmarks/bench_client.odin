@@ -219,15 +219,15 @@ parse_cli_args :: proc() {
 
 rank_group :: proc(rank: int) -> string {
 	switch {
-	case (rank >= 1 && rank <= 5) || rank == 28:
+	case (rank >= 1 && rank <= 5) || rank == 28 || rank == 32:
 		return "access"
 	case rank >= 6 && rank <= 11:
 		return "enumerable"
-	case rank >= 12 && rank <= 16:
+	case (rank >= 12 && rank <= 16) || rank == 29 || rank == 30:
 		return "transactions"
 	case rank >= 17 && rank <= 20:
 		return "time_travel"
-	case rank >= 21 && rank <= 27:
+	case (rank >= 21 && rank <= 27) || rank == 31:
 		return "queries"
 	case:
 		return "unknown"
@@ -798,9 +798,81 @@ bench_bulk_entities_cb :: proc(moment_cur: ^xitdb.Write_Cursor, _user_data: rawp
 	return nil
 }
 
+Bench_Col_Ctx :: struct {
+	col: string,
+}
+
+bench_bulk_put_maps_cb :: proc(moment_cur: ^xitdb.Write_Cursor, user_data: rawptr) -> xitdb.Error {
+	ctx := (^Bench_Col_Ctx)(user_data)
+	moment_hm := xitdb.write_hash_map_init(moment_cur^) or_return
+	users_cur := xitdb.hash_map_put_cursor(&moment_hm, ctx.col) or_return
+	users_hm := xitdb.write_hash_map_init(users_cur) or_return
+	for i in 0 ..< 100 {
+		uid := fmt.tprintf("u%d", i)
+		u_cur := xitdb.hash_map_put_cursor(&users_hm, uid) or_return
+		u_hm := xitdb.write_hash_map_init(u_cur) or_return
+		xitdb.hash_map_put(&u_hm, "name", "Alice") or_return
+		xitdb.hash_map_put(&u_hm, "age", i64(30)) or_return
+		xitdb.hash_map_put(&u_hm, "dept", "eng") or_return
+	}
+	return nil
+}
+
+bench_bulk_put_nested_maps_cb :: proc(moment_cur: ^xitdb.Write_Cursor, user_data: rawptr) -> xitdb.Error {
+	ctx := (^Bench_Col_Ctx)(user_data)
+	moment_hm := xitdb.write_hash_map_init(moment_cur^) or_return
+	orgs_cur := xitdb.hash_map_put_cursor(&moment_hm, ctx.col) or_return
+	orgs_hm := xitdb.write_hash_map_init(orgs_cur) or_return
+	has_parent := false
+	prev_parent := ""
+	parent_hm: xitdb.Write_Hash_Map
+	nested_hm: xitdb.Write_Hash_Map
+	for i in 0 ..< 100 {
+		parent_k := fmt.tprintf("org_%d", 10 + i / 5)
+		child_k := fmt.tprintf("m_%d", 100 + i)
+		if !has_parent || parent_k != prev_parent {
+			parent_cur := xitdb.hash_map_put_cursor(&orgs_hm, parent_k) or_return
+			parent_hm = xitdb.write_hash_map_init(parent_cur) or_return
+			nested_cur := xitdb.hash_map_put_cursor(&parent_hm, "members") or_return
+			nested_hm = xitdb.write_hash_map_init(nested_cur) or_return
+			prev_parent = parent_k
+			has_parent = true
+		}
+		doc_cur := xitdb.hash_map_put_cursor(&nested_hm, child_k) or_return
+		doc_hm := xitdb.write_hash_map_init(doc_cur) or_return
+		xitdb.hash_map_put(&doc_hm, "role", "member") or_return
+		xitdb.hash_map_put(&doc_hm, "tier", i64(1)) or_return
+		xitdb.hash_map_put(&doc_hm, "dept", "eng") or_return
+	}
+	return nil
+}
+
+bench_bulk_index_puts_cb :: proc(moment_cur: ^xitdb.Write_Cursor, user_data: rawptr) -> xitdb.Error {
+	ctx := (^Bench_Col_Ctx)(user_data)
+	moment_hm := xitdb.write_hash_map_init(moment_cur^) or_return
+	idx_cur := xitdb.hash_map_put_cursor(&moment_hm, "idx") or_return
+	idx_hm := xitdb.write_hash_map_init(idx_cur) or_return
+	search_cur := xitdb.hash_map_put_cursor(&idx_hm, "search") or_return
+	search_hm := xitdb.write_hash_map_init(search_cur) or_return
+	art_cur := xitdb.hash_map_put_cursor(&search_hm, ctx.col) or_return
+	art_hm := xitdb.write_hash_map_init(art_cur) or_return
+	terms_cur := xitdb.hash_map_put_cursor(&art_hm, "terms") or_return
+	terms_sm := xitdb.write_sorted_map_init(terms_cur) or_return
+	for i in 0 ..< 100 {
+		term := fmt.tprintf("term_%d", 100 + i)
+		inner_cur := xitdb.sorted_map_put_cursor(&terms_sm, term) or_return
+		inner_hm := xitdb.write_hash_map_init(inner_cur) or_return
+		xitdb.hash_map_put(&inner_hm, "d0", i64(300)) or_return
+		xitdb.hash_map_put(&inner_hm, "d1", i64(200)) or_return
+		xitdb.hash_map_put(&inner_hm, "d2", i64(100)) or_return
+		xitdb.hash_map_put(&inner_hm, "d3", i64(100)) or_return
+	}
+	return nil
+}
+
 main :: proc() {
 	parse_cli_args()
-	g_records = make([dynamic]Bench_Record, 0, 28)
+	g_records = make([dynamic]Bench_Record, 0, 32)
 
 	r1 := should_run_bench(1, "Access: 3-hop lazy HAMT lookup (root[users][id][name])")
 	r2 := should_run_bench(2, "Access: Single-call selector select(.users.<id>.name)")
@@ -825,8 +897,9 @@ main :: proc() {
 	r26 := should_run_bench(26, "Search: BM25 corpus search (N=200, 2-term prefix, limit=10)")
 	r27 := should_run_bench(27, "Indexer: Sorted_Map B+Tree range scan + set decode (limit=16)")
 	r28 := should_run_bench(28, "DSL: Pre-tokenized path_steps select(path_steps(users[id].name))")
+	r32 := should_run_bench(32, "Access: Batched nif_slot_get_keys (100 keys in 1 NIF call)")
 
-	need_main_db := r1 || r2 || r3 || r4 || r5 || r6 || r7 || r8 || r9 || r10 || r11 || r21 || r25 || r28
+	need_main_db := r1 || r2 || r3 || r4 || r5 || r6 || r7 || r8 || r9 || r10 || r11 || r21 || r25 || r28 || r32
 	need_hist_db := r17 || r18 || r20
 	need_diff_db := r19 || r22 || r23
 	need_search_db := r26
@@ -1580,6 +1653,91 @@ main :: proc() {
 		}
 		intrinsics.volatile_store(&g_bench_sink, g_bench_sink + acc)
 		record_samples(28, "DSL: Pre-tokenized path_steps select(path_steps(users[id].name))", 500, samples)
+	}
+
+	// #29: Bulk NIF :bulk_put_maps (100 entities in 1 commit)
+	run_bench(29, "Tx: Bulk NIF :bulk_put_maps (100 entities in 1 commit)", 10, proc() -> (time.Duration, i64) {
+		c := xitdb.core_memory_init()
+		defer xitdb.core_destroy(&c)
+		d, _ := xitdb.database_init(&c, xitdb.sha1_hasher())
+		t0 := time.now()
+		for iter in 0 ..< 10 {
+			tx := xitdb.tx_init(&d, base_moment = -1, track_changes = false, allocator = context.temp_allocator)
+			ctx := Bench_Col_Ctx{col = fmt.tprintf("users_%d", iter)}
+			xitdb.tx_with_cursor(&tx, bench_bulk_put_maps_cb, &ctx)
+			rep, _ := xitdb.tx_commit(&tx)
+			xitdb.tx_report_destroy(&rep, context.temp_allocator)
+			xitdb.tx_destroy(&tx)
+		}
+		dur := time.since(t0)
+		sz, _ := xitdb.core_length(&c)
+		return dur, sz
+	})
+
+	// #30: Bulk NIF :bulk_put_nested_maps (100 nested entities)
+	run_bench(30, "Tx: Bulk NIF :bulk_put_nested_maps (100 nested entities)", 10, proc() -> (time.Duration, i64) {
+		c := xitdb.core_memory_init()
+		defer xitdb.core_destroy(&c)
+		d, _ := xitdb.database_init(&c, xitdb.sha1_hasher())
+		t0 := time.now()
+		for iter in 0 ..< 10 {
+			tx := xitdb.tx_init(&d, base_moment = -1, track_changes = false, allocator = context.temp_allocator)
+			ctx := Bench_Col_Ctx{col = fmt.tprintf("orgs_%d", iter)}
+			xitdb.tx_with_cursor(&tx, bench_bulk_put_nested_maps_cb, &ctx)
+			rep, _ := xitdb.tx_commit(&tx)
+			xitdb.tx_report_destroy(&rep, context.temp_allocator)
+			xitdb.tx_destroy(&tx)
+		}
+		dur := time.since(t0)
+		sz, _ := xitdb.core_length(&c)
+		return dur, sz
+	})
+
+	// #31: Bulk NIF :bulk_index_puts (:hash_map_merge, 100 terms)
+	run_bench(31, "Indexer: Bulk NIF :bulk_index_puts (:hash_map_merge, 100 terms)", 10, proc() -> (time.Duration, i64) {
+		c := xitdb.core_memory_init()
+		defer xitdb.core_destroy(&c)
+		d, _ := xitdb.database_init(&c, xitdb.sha1_hasher())
+		t0 := time.now()
+		for iter in 0 ..< 10 {
+			tx := xitdb.tx_init(&d, base_moment = -1, track_changes = false, allocator = context.temp_allocator)
+			ctx := Bench_Col_Ctx{col = fmt.tprintf("articles_%d", iter)}
+			xitdb.tx_with_cursor(&tx, bench_bulk_index_puts_cb, &ctx)
+			rep, _ := xitdb.tx_commit(&tx)
+			xitdb.tx_report_destroy(&rep, context.temp_allocator)
+			xitdb.tx_destroy(&tx)
+		}
+		dur := time.since(t0)
+		sz, _ := xitdb.core_length(&c)
+		return dur, sz
+	})
+
+	// #32: Batched nif_slot_get_keys (100 keys in 1 NIF call)
+	if r32 {
+		batch_keys: [100]string
+		for i in 0 ..< 100 {
+			batch_keys[i] = fmt.aprintf("u%d", i)
+		}
+		defer for k in batch_keys {
+			delete(k)
+		}
+		acc: u64 = 0
+		for r in 0 ..< (g_warmup + g_runs) {
+			t0 := time.now()
+			for _ in 0 ..< 100 {
+				for k in batch_keys {
+					slot_maybe, _ := xitdb.hash_map_get_slot(users_map, k)
+					if slot, ok := slot_maybe.?; ok {
+						acc += u64(slot.value)
+					}
+				}
+			}
+			if r >= g_warmup {
+				samples[r - g_warmup] = f64(time.duration_nanoseconds(time.since(t0))) / 100.0
+			}
+		}
+		intrinsics.volatile_store(&g_bench_sink, g_bench_sink + acc)
+		record_samples(32, "Access: Batched nif_slot_get_keys (100 keys in 1 NIF call)", 100, samples)
 	}
 
 	emit_jsonl()

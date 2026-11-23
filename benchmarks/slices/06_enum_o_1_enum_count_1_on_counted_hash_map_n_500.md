@@ -8,13 +8,13 @@
 
 | Metric | Elixir NIF Wrapper | Raw Odin Baseline | Comparison |
 | :--- | ---: | ---: | ---: |
-| **Median (`ns/op`)** | 163.0 ns (163.0 ns) | 7.0 ns (7.0 ns) | **`23.29x`** NIF Ratio |
-| **Mean ± σ (CV)** | 168.2 ns ± 10.0 ns (6.0%) | 7.0 ns ± 0.0 ns (0.0%) | Welch `z` = `35.92` |
-| **p95 / Max (`ns/op`)** | 180.2 ns / 181.0 ns | 7.0 ns / 7.0 ns | `5` vs `5` pooled samples |
+| **Median (`ns/op`)** | 106.0 ns (106.0 ns) | 5.0 ns (5.0 ns) | **`21.20x`** NIF Ratio |
+| **Mean ± σ (CV)** | 108.6 ns ± 6.4 ns (5.9%) | 5.0 ns ± 0.0 ns (0.0%) | Welch `z` = `36.27` |
+| **p95 / Max (`ns/op`)** | 116.8 ns / 118.0 ns | 5.0 ns / 5.0 ns | `5` vs `5` pooled samples |
 
 ## Benchmark Harnesses (Elixir vs. Raw Odin)
 
-### Elixir Harness ([`bench_elixir.exs#L264-L271`](../bench_elixir.exs#L264-L271))
+### Elixir Harness ([`bench_elixir.exs#L275-L282`](../bench_elixir.exs#L275-L282))
 
 ```elixir
       {6, "Enum: O(1) Enum.count/1 on Counted_Hash_Map (N=500)", 1000,
@@ -27,7 +27,7 @@
        end},
 ```
 
-### Raw Odin Harness ([`bench_client.odin#L961-L973`](../bench_client.odin#L961-L973))
+### Raw Odin Harness ([`bench_client.odin#L1034-L1046`](../bench_client.odin#L1034-L1046))
 
 ```odin
 	// #6: O(1) Counted_Hash_Map count
@@ -48,7 +48,7 @@
 ## Elixir Wrapper & NIF Bridge
 
 <details>
-<summary>Elixir <code>count</code> — <a href="../../lib/xitdb/cursor.ex#L2652-L2683">lib/xitdb/cursor.ex#L2652-L2683</a></summary>
+<summary>Elixir <code>count</code> — <a href="../../lib/xitdb/cursor.ex#L2684-L2715">lib/xitdb/cursor.ex#L2684-L2715</a></summary>
 
 ```elixir
   def count(%Cursor{tx_mode: false, root: false, tag_id: tag_id, db_ref: db_ref, value: val})
@@ -88,7 +88,7 @@
 </details>
 
 <details>
-<summary>NIF <code>odin_nif_slot_count</code> — <a href="../../native/xitdb_nif.odin#L1247-L1318">native/xitdb_nif.odin#L1247-L1318</a></summary>
+<summary>NIF <code>odin_nif_slot_count</code> — <a href="../../native/xitdb_nif.odin#L1645-L1716">native/xitdb_nif.odin#L1645-L1716</a></summary>
 
 ```odin
 odin_nif_slot_count :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {
@@ -181,7 +181,7 @@ counted_hash_map_count :: proc(m: Read_Counted_Hash_Map) -> (res: i64, err: Erro
 </details>
 
 <details>
-<summary><code>xitdb.cursor_count</code> — <a href="../../native/xitdb-odin/xitdb/cursor.odin#L436-L472">cursor.odin#L436-L472</a></summary>
+<summary><code>xitdb.cursor_count</code> — <a href="../../native/xitdb-odin/xitdb/cursor.odin#L451-L487">cursor.odin#L451-L487</a></summary>
 
 ```odin
 cursor_count :: proc(c: Read_Cursor) -> (res: i64, err: Error) {
@@ -284,7 +284,7 @@ sorted_map_get_slot :: proc(m: Read_Sorted_Map, key: string) -> (Maybe(Slot), Er
 </details>
 
 <details>
-<summary><code>xitdb.cursor_resolved</code> — <a href="../../native/xitdb-odin/xitdb/cursor.odin#L48-L55">cursor.odin#L48-L55</a></summary>
+<summary><code>xitdb.cursor_resolved</code> — <a href="../../native/xitdb-odin/xitdb/cursor.odin#L50-L57">cursor.odin#L50-L57</a></summary>
 
 ```odin
 cursor_resolved :: proc(c: Read_Cursor) -> (res: Slot_Pointer, err: Error) {
@@ -354,7 +354,7 @@ core_read_exact_at :: proc(c: ^Core, pos: i64, p: []u8) -> Error {
 </details>
 
 <details>
-<summary><code>xitdb.check_long</code> — <a href="../../native/xitdb-odin/xitdb/types.odin#L1482-L1487">types.odin#L1482-L1487</a></summary>
+<summary><code>xitdb.check_long</code> — <a href="../../native/xitdb-odin/xitdb/types.odin#L1018-L1023">types.odin#L1018-L1023</a></summary>
 
 ```odin
 check_long :: proc(n: i64) -> (res: i64, err: Error) {
@@ -368,7 +368,7 @@ check_long :: proc(n: i64) -> (res: i64, err: Error) {
 </details>
 
 <details>
-<summary><code>xitdb.database_digest_string_buf</code> — <a href="../../native/xitdb-odin/xitdb/database.odin#L280-L282">database.odin#L280-L282</a></summary>
+<summary><code>xitdb.database_digest_string_buf</code> — <a href="../../native/xitdb-odin/xitdb/database.odin#L283-L285">database.odin#L283-L285</a></summary>
 
 ```odin
 database_digest_string_buf :: proc(db: ^Database, s: string, buf: []u8) -> []u8 {

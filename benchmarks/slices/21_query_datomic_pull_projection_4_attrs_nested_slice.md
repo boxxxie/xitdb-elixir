@@ -2,19 +2,19 @@
 
 [← Back to Benchmarks Overview](../README.md) · [All Slices](README.md)
 
-**Group:** `queries` — #21–#27 (Pull Projections, Datalog Engine, Buffered Sync, Search & Indexer)
+**Group:** `queries` — #21–#27, #31 (Pull Projections, Datalog Engine, Buffered Sync, Search & Indexer)
 
 ## Latest 1v1 Metrics
 
 | Metric | Elixir NIF Wrapper | Raw Odin Baseline | Comparison |
 | :--- | ---: | ---: | ---: |
-| **Median (`ns/op`)** | 16.36 µs (16360.0 ns) | 3.28 µs (3282.0 ns) | **`4.98x`** NIF Ratio |
-| **Mean ± σ (CV)** | 36.42 µs ± 49.57 µs (136.1%) | 3.28 µs ± 219.6 ns (6.7%) | Welch `z` = `1.49` |
-| **p95 / Max (`ns/op`)** | 103.43 µs / 124.97 µs | 3.47 µs / 3.47 µs | `5` vs `5` pooled samples |
+| **Median (`ns/op`)** | 8.37 µs (8365.0 ns) | 1.70 µs (1695.0 ns) | **`4.94x`** NIF Ratio |
+| **Mean ± σ (CV)** | 8.88 µs ± 1.12 µs (12.6%) | 1.70 µs ± 25.0 ns (1.5%) | Welch `z` = `14.38` |
+| **p95 / Max (`ns/op`)** | 10.33 µs / 10.54 µs | 1.74 µs / 1.74 µs | `5` vs `5` pooled samples |
 
 ## Benchmark Harnesses (Elixir vs. Raw Odin)
 
-### Elixir Harness ([`bench_elixir.exs#L446-L453`](../bench_elixir.exs#L446-L453))
+### Elixir Harness ([`bench_elixir.exs#L457-L464`](../bench_elixir.exs#L457-L464))
 
 ```elixir
       {21, "Query: Datomic pull projection (4 attrs + nested slice)", 200,
@@ -27,7 +27,7 @@
        end},
 ```
 
-### Raw Odin Harness ([`bench_client.odin#L1305-L1320`](../bench_client.odin#L1305-L1320))
+### Raw Odin Harness ([`bench_client.odin#L1378-L1393`](../bench_client.odin#L1378-L1393))
 
 ```odin
 	// #21: Datomic pull projection
@@ -51,47 +51,44 @@
 ## Elixir Wrapper & NIF Bridge
 
 <details>
-<summary>Elixir <code>pull!</code> — <a href="../../lib/xitdb.ex#L819-L819">lib/xitdb.ex#L819-L819</a></summary>
+<summary>Elixir <code>pull!</code> — <a href="../../lib/xitdb.ex#L1186-L1186">lib/xitdb.ex#L1186-L1186</a></summary>
 
 ```elixir
-  def pull!(target, pattern), do: target |> pull(pattern) |> Error.unwrap!()
+  def pull!(target, pattern, opts \\ []), do: target |> pull(pattern, opts) |> Error.unwrap!()
 ```
 
 </details>
 
 <details>
-<summary>Elixir <code>pull</code> — <a href="../../lib/xitdb.ex#L751-L781">lib/xitdb.ex#L751-L781</a></summary>
+<summary>Elixir <code>pull</code> — <a href="../../lib/xitdb.ex#L1094-L1121">lib/xitdb.ex#L1094-L1121</a></summary>
 
 ```elixir
-  def pull(%__MODULE__{db_ref: db_ref}, pattern) do
+  def pull(target, pattern, opts \\ [])
+
+  def pull(%__MODULE__{db_ref: db_ref}, pattern, opts) when is_list(opts) do
     pull(
       %Cursor{db_ref: db_ref, tag: :hash_map, tag_id: -1, value: -1, moment: -1, root: true},
-      pattern
+      pattern,
+      opts
     )
   end
 
-  def pull(%Cursor{} = cursor, pattern) when is_binary(pattern) do
-    if :binary.match(pattern, "*") == :nomatch do
-      do_nif_pull(cursor, pattern)
-    else
-      case Pull.split_wildcard_plan(pattern) do
-        {:single, single_pat} ->
-          do_nif_pull(cursor, single_pat)
+  def pull(%Cursor{} = cursor, pattern, opts) when is_binary(pattern) and is_list(opts) do
+    raw_tagged? = Keyword.get(opts, :raw_tagged, false)
 
-        {:merge_top, wild_pat, spec_pat} ->
-          pinned = pin_root_cursor_if_needed(cursor)
-
-          with {:ok, wild_res} <- do_nif_pull(pinned, wild_pat),
-               {:ok, spec_res} <- pull(pinned, spec_pat) do
-            {:ok, Pull.merge_wildcard_results(wild_res, spec_res)}
-          end
+    with {:ok, max_bytes} <- fetch_max_decompressed_bytes(opts),
+         {:ok, res} <- do_pull_pattern(cursor, pattern, raw_tagged?, max_bytes, opts) do
+      if raw_tagged? do
+        {:ok, res}
+      else
+        Compression.resolve_term(res, cursor.db_ref, cursor.moment, opts)
       end
     end
   end
 
-  def pull(%Cursor{} = cursor, pattern) when is_list(pattern) do
+  def pull(%Cursor{} = cursor, pattern, opts) when is_list(pattern) and is_list(opts) do
     with {:ok, compiled} <- Pull.compile(pattern) do
-      pull(cursor, compiled)
+      pull(cursor, compiled, opts)
     end
   end
 ```
@@ -99,7 +96,7 @@
 </details>
 
 <details>
-<summary>Elixir <code>do_nif_pull</code> — <a href="../../lib/xitdb.ex#L796-L815">lib/xitdb.ex#L796-L815</a></summary>
+<summary>Elixir <code>do_nif_pull</code> — <a href="../../lib/xitdb.ex#L1155-L1182">lib/xitdb.ex#L1155-L1182</a></summary>
 
 ```elixir
   defp do_nif_pull(
@@ -111,31 +108,55 @@
            db_ref: db_ref,
            moment: moment
          },
-         pattern
+         pattern,
+         raw_tagged?,
+         max_bytes
        )
        when tag != :none do
     {nid, nval} = if tag_id != -1 and val == 0, do: {tag_id, 0}, else: {-1, moment}
-    db_ref |> NIF.nif_pull(nid, nval, pattern) |> Error.wrap(%{pattern: pattern})
+
+    db_ref
+    |> NIF.nif_pull(nid, nval, pattern, raw_tagged?, max_bytes)
+    |> Error.wrap(%{pattern: pattern})
   end
 
-  defp do_nif_pull(%Cursor{} = cursor, pattern) do
+  defp do_nif_pull(%Cursor{} = cursor, pattern, raw_tagged?, max_bytes) do
     %Cursor{db_ref: db_ref, tag_id: tag_id, value: val} = Cursor.ensure_resolved(cursor)
-    db_ref |> NIF.nif_pull(tag_id, val, pattern) |> Error.wrap(%{pattern: pattern})
+
+    db_ref
+    |> NIF.nif_pull(tag_id, val, pattern, raw_tagged?, max_bytes)
+    |> Error.wrap(%{pattern: pattern})
   end
 ```
 
 </details>
 
 <details>
-<summary>NIF <code>odin_nif_pull</code> — <a href="../../native/xitdb_nif.odin#L5915-L5969">native/xitdb_nif.odin#L5915-L5969</a></summary>
+<summary>NIF <code>odin_nif_pull</code> — <a href="../../native/xitdb_nif.odin#L7304-L7379">native/xitdb_nif.odin#L7304-L7379</a></summary>
 
 ```odin
 odin_nif_pull :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {
 	context = runtime.default_context()
 	defer free_all(context.temp_allocator)
 
-	if argc != 4 {
+	if argc != 4 && argc != 5 && argc != 6 {
 		return make_err(env, "badarg")
+	}
+	raw_tagged := false
+	if argc >= 5 {
+		bt, ok_rt := parse_bool_arg(argv[4])
+		if !ok_rt {
+			return make_err(env, "badarg")
+		}
+		raw_tagged = bt
+	}
+	max_bytes: u64 = MAX_NIF_DECOMPRESSED_BYTES
+	if argc == 6 {
+		mb, ok_mb := parse_max_bytes_arg(env, argv[5])
+		if !ok_mb {
+			return make_err(env, "badarg")
+		}
+		max_bytes = mb
 	}
 	tag_int, val_int: i64
 	if nif_get_int64(env, argv[1], &tag_int) == 0 || nif_get_int64(env, argv[2], &val_int) == 0 {
@@ -176,8 +197,13 @@ odin_nif_pull :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -
 	}
 	visited: map[i64]bool
 	visited.allocator = context.temp_allocator
-	res_term, p_reason, p_err := nif_pull_cursor(env, &handle.db, cur, pattern_str, is_root, &visited)
+	codec_err := ""
+	iter_pool := nif_iter_pool_init(context.temp_allocator)
+	res_term, p_reason, p_err := nif_pull_cursor(env, &handle.db, cur, pattern_str, is_root, &visited, raw_tagged, &codec_err, max_bytes, &iter_pool)
 	if p_err != nil {
+		if len(codec_err) > 0 {
+			return make_err(env, codec_err)
+		}
 		return make_xitdb_err(env, p_err)
 	}
 	if p_reason != "" {
@@ -190,7 +216,21 @@ odin_nif_pull :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -
 </details>
 
 <details>
-<summary>NIF <code>nif_pull_cursor</code> — <a href="../../native/xitdb_nif.odin#L5711-L5909">native/xitdb_nif.odin#L5711-L5909</a></summary>
+<summary>NIF <code>nif_iter_pool_init</code> — <a href="../../native/xitdb_nif.odin#L696-L701">native/xitdb_nif.odin#L696-L701</a></summary>
+
+```odin
+nif_iter_pool_init :: proc(alloc := context.temp_allocator) -> Nif_Iter_Pool {
+	return Nif_Iter_Pool{
+		free_list = make([dynamic]^xitdb.Cursor_Iterator, alloc),
+		alloc     = alloc,
+	}
+}
+```
+
+</details>
+
+<details>
+<summary>NIF <code>nif_pull_cursor</code> — <a href="../../native/xitdb_nif.odin#L7094-L7298">native/xitdb_nif.odin#L7094-L7298</a></summary>
 
 ```odin
 nif_pull_cursor :: proc(
@@ -200,10 +240,14 @@ nif_pull_cursor :: proc(
 	pattern: string,
 	is_root: bool,
 	visited: ^map[i64]bool,
+	raw_tagged: bool = false,
+	codec_err: ^string = nil,
+	max_bytes: u64 = MAX_NIF_DECOMPRESSED_BYTES,
+	pool: ^Nif_Iter_Pool = nil,
 ) -> (res: ERL_NIF_TERM, err_reason: string, err: xitdb.Error) {
 	p := strings.trim_space(pattern)
 	if len(p) == 0 || p == "*" {
-		return nif_pull_wildcard(env, db, cur, is_root, visited)
+		return nif_pull_wildcard(env, db, cur, is_root, visited, raw_tagged, codec_err, max_bytes, pool)
 	}
 
 	if len(p) >= 2 && p[0] == '{' && p[len(p) - 1] == '}' {
@@ -227,9 +271,11 @@ nif_pull_cursor :: proc(
 		if has_star {
 			#partial switch cur_slot.tag {
 			case .Hash_Map, .Counted_Hash_Map, .Sorted_Map:
-				it := xitdb.cursor_iterator(cur) or_return
+				it := nif_iter_pool_acquire(pool) or_return
+				defer nif_iter_pool_release(pool, it)
+				xitdb.cursor_iterator_init(it, cur) or_return
 				for {
-					next_maybe := xitdb.cursor_iterator_next(&it) or_return
+					next_maybe := xitdb.cursor_iterator_next(it) or_return
 					elem_cur, ok := next_maybe.?
 					if !ok {
 						break
@@ -239,7 +285,7 @@ nif_pull_cursor :: proc(
 					if is_root && k_str == "__tx" {
 						continue
 					}
-					v, v_reason, v_err := nif_pull_wildcard(env, db, val_cur, false, visited)
+					v, v_reason, v_err := nif_pull_wildcard(env, db, val_cur, false, visited, raw_tagged, codec_err, max_bytes, pool)
 					if v_err != nil {
 						return 0, "", v_err
 					}
@@ -354,7 +400,7 @@ nif_pull_cursor :: proc(
 
 			pulled: ERL_NIF_TERM
 			if has_range {
-				pr, pr_reason, pr_err := nif_pull_range(env, db, target_cur, range_start, range_end, sub_pattern, visited)
+				pr, pr_reason, pr_err := nif_pull_range(env, db, target_cur, range_start, range_end, sub_pattern, visited, raw_tagged, codec_err, max_bytes, pool)
 				if pr_err != nil {
 					return 0, "", pr_err
 				}
@@ -365,9 +411,9 @@ nif_pull_cursor :: proc(
 			} else if len(sub_pattern) == 0 || sub_pattern == "*" {
 				t_slot := xitdb.cursor_slot(target_cur) or_return
 				if !is_container_tag(t_slot.tag) {
-					pulled = slot_to_term(env, db, t_slot) or_return
+					pulled = slot_to_term(env, db, t_slot, raw_tagged, codec_err, max_bytes) or_return
 				} else {
-					pc, pc_reason, pc_err := nif_pull_cursor(env, db, target_cur, sub_pattern, false, visited)
+					pc, pc_reason, pc_err := nif_pull_cursor(env, db, target_cur, sub_pattern, false, visited, raw_tagged, codec_err, max_bytes, pool)
 					if pc_err != nil {
 						return 0, "", pc_err
 					}
@@ -377,7 +423,7 @@ nif_pull_cursor :: proc(
 					pulled = pc
 				}
 			} else {
-				pc, pc_reason, pc_err := nif_pull_cursor(env, db, target_cur, sub_pattern, false, visited)
+				pc, pc_reason, pc_err := nif_pull_cursor(env, db, target_cur, sub_pattern, false, visited, raw_tagged, codec_err, max_bytes, pool)
 				if pc_err != nil {
 					return 0, "", pc_err
 				}
@@ -397,7 +443,7 @@ nif_pull_cursor :: proc(
 </details>
 
 <details>
-<summary>NIF <code>nif_pull_wildcard</code> — <a href="../../native/xitdb_nif.odin#L5541-L5633">native/xitdb_nif.odin#L5541-L5633</a></summary>
+<summary>NIF <code>nif_pull_wildcard</code> — <a href="../../native/xitdb_nif.odin#L6909-L7011">native/xitdb_nif.odin#L6909-L7011</a></summary>
 
 ```odin
 nif_pull_wildcard :: proc(
@@ -406,10 +452,14 @@ nif_pull_wildcard :: proc(
 	cur: xitdb.Read_Cursor,
 	is_root: bool,
 	visited: ^map[i64]bool,
+	raw_tagged: bool = false,
+	codec_err: ^string = nil,
+	max_bytes: u64 = MAX_NIF_DECOMPRESSED_BYTES,
+	pool: ^Nif_Iter_Pool = nil,
 ) -> (res: ERL_NIF_TERM, err_reason: string, err: xitdb.Error) {
 	slot := xitdb.cursor_slot(cur) or_return
 	if !is_container_tag(slot.tag) {
-		term := slot_to_term(env, db, slot) or_return
+		term := slot_to_term(env, db, slot, raw_tagged, codec_err, max_bytes) or_return
 		return term, "", nil
 	}
 	if slot.value > 0 {
@@ -424,15 +474,17 @@ nif_pull_wildcard :: proc(
 
 	#partial switch slot.tag {
 	case .Array_List, .Linked_Array_List:
-		it := xitdb.cursor_iterator(cur) or_return
+		it := nif_iter_pool_acquire(pool) or_return
+		defer nif_iter_pool_release(pool, it)
+		xitdb.cursor_iterator_init(it, cur) or_return
 		items := make([dynamic]ERL_NIF_TERM, 0, 16, context.temp_allocator)
 		for {
-			next_maybe := xitdb.cursor_iterator_next(&it) or_return
+			next_maybe := xitdb.cursor_iterator_next(it) or_return
 			elem_cur, ok := next_maybe.?
 			if !ok {
 				break
 			}
-			v, v_reason, v_err := nif_pull_wildcard(env, db, elem_cur, false, visited)
+			v, v_reason, v_err := nif_pull_wildcard(env, db, elem_cur, false, visited, raw_tagged, codec_err, max_bytes, pool)
 			if v_err != nil {
 				return 0, "", v_err
 			}
@@ -447,16 +499,18 @@ nif_pull_wildcard :: proc(
 		return nif_make_list_from_array(env, raw_data(items[:]), c.uint(len(items))), "", nil
 
 	case .Hash_Set, .Counted_Hash_Set, .Sorted_Set:
-		it := xitdb.cursor_iterator(cur) or_return
+		it := nif_iter_pool_acquire(pool) or_return
+		defer nif_iter_pool_release(pool, it)
+		xitdb.cursor_iterator_init(it, cur) or_return
 		items := make([dynamic]ERL_NIF_TERM, 0, 16, context.temp_allocator)
 		for {
-			next_maybe := xitdb.cursor_iterator_next(&it) or_return
+			next_maybe := xitdb.cursor_iterator_next(it) or_return
 			elem_cur, ok := next_maybe.?
 			if !ok {
 				break
 			}
 			key_cur, _ := xitdb.cursor_read_kv_pair_slots(elem_cur) or_return
-			v := slot_to_term(env, db, key_cur.slot_ptr.slot) or_return
+			v := slot_to_term(env, db, key_cur.slot_ptr.slot, raw_tagged, codec_err, max_bytes) or_return
 			append(&items, v)
 		}
 		if len(items) == 0 {
@@ -465,11 +519,13 @@ nif_pull_wildcard :: proc(
 		return nif_make_list_from_array(env, raw_data(items[:]), c.uint(len(items))), "", nil
 
 	case .Hash_Map, .Counted_Hash_Map, .Sorted_Map:
-		it := xitdb.cursor_iterator(cur) or_return
+		it := nif_iter_pool_acquire(pool) or_return
+		defer nif_iter_pool_release(pool, it)
+		xitdb.cursor_iterator_init(it, cur) or_return
 		keys := make([dynamic]ERL_NIF_TERM, 0, 16, context.temp_allocator)
 		vals := make([dynamic]ERL_NIF_TERM, 0, 16, context.temp_allocator)
 		for {
-			next_maybe := xitdb.cursor_iterator_next(&it) or_return
+			next_maybe := xitdb.cursor_iterator_next(it) or_return
 			elem_cur, ok := next_maybe.?
 			if !ok {
 				break
@@ -479,7 +535,7 @@ nif_pull_wildcard :: proc(
 			if is_root && k_str == "__tx" {
 				continue
 			}
-			v, v_reason, v_err := nif_pull_wildcard(env, db, val_cur, false, visited)
+			v, v_reason, v_err := nif_pull_wildcard(env, db, val_cur, false, visited, raw_tagged, codec_err, max_bytes, pool)
 			if v_err != nil {
 				return 0, "", v_err
 			}
@@ -498,7 +554,7 @@ nif_pull_wildcard :: proc(
 </details>
 
 <details>
-<summary>NIF <code>split_top_level_pull_specs</code> — <a href="../../native/xitdb_nif.odin#L5417-L5463">native/xitdb_nif.odin#L5417-L5463</a></summary>
+<summary>NIF <code>split_top_level_pull_specs</code> — <a href="../../native/xitdb_nif.odin#L6785-L6831">native/xitdb_nif.odin#L6785-L6831</a></summary>
 
 ```odin
 split_top_level_pull_specs :: proc(inner: string, allocator: runtime.Allocator) -> []string {
@@ -553,7 +609,40 @@ split_top_level_pull_specs :: proc(inner: string, allocator: runtime.Allocator) 
 </details>
 
 <details>
-<summary>NIF <code>find_top_level_pull_brace</code> — <a href="../../native/xitdb_nif.odin#L5473-L5508">native/xitdb_nif.odin#L5473-L5508</a></summary>
+<summary>NIF <code>nif_iter_pool_acquire</code> — <a href="../../native/xitdb_nif.odin#L713-L721">native/xitdb_nif.odin#L713-L721</a></summary>
+
+```odin
+nif_iter_pool_acquire :: proc(pool: ^Nif_Iter_Pool) -> (it: ^xitdb.Cursor_Iterator, err: xitdb.Error) {
+	if pool == nil || pool.alloc.procedure == nil {
+		return nif_alloc_cursor_iterator(context.temp_allocator)
+	}
+	if len(pool.free_list) > 0 {
+		return pop(&pool.free_list), nil
+	}
+	return nif_alloc_cursor_iterator(pool.alloc)
+}
+```
+
+</details>
+
+<details>
+<summary>NIF <code>nif_iter_pool_release</code> — <a href="../../native/xitdb_nif.odin#L723-L730">native/xitdb_nif.odin#L723-L730</a></summary>
+
+```odin
+nif_iter_pool_release :: proc(pool: ^Nif_Iter_Pool, it: ^xitdb.Cursor_Iterator) {
+	if pool == nil || pool.alloc.procedure == nil || it == nil {
+		return
+	}
+	if _, alloc_err := append(&pool.free_list, it); alloc_err != nil {
+		free(it, pool.alloc)
+	}
+}
+```
+
+</details>
+
+<details>
+<summary>NIF <code>find_top_level_pull_brace</code> — <a href="../../native/xitdb_nif.odin#L6841-L6876">native/xitdb_nif.odin#L6841-L6876</a></summary>
 
 ```odin
 find_top_level_pull_brace :: proc(s: string) -> int {
@@ -596,86 +685,6 @@ find_top_level_pull_brace :: proc(s: string) -> int {
 
 </details>
 
-<details>
-<summary>NIF <code>find_last_unquoted_lbracket</code> — <a href="../../native/xitdb_nif.odin#L5510-L5537">native/xitdb_nif.odin#L5510-L5537</a></summary>
-
-```odin
-find_last_unquoted_lbracket :: proc(s: string) -> int {
-	in_quote: u8 = 0
-	last_idx := -1
-	i := 0
-	for i < len(s) {
-		ch := s[i]
-		if in_quote != 0 {
-			if ch == '\\' && i + 1 < len(s) {
-				i += 2
-				continue
-			}
-			if ch == in_quote {
-				in_quote = 0
-			}
-			i += 1
-			continue
-		}
-		if ch == '\\' && i + 1 < len(s) {
-			i += 2
-			continue
-		}
-		if ch == '"' || ch == '\'' {
-			in_quote = ch
-		} else if ch == '[' {
-			last_idx = i
-		}
-		i += 1
-	}
-```
-
-</details>
-
-<details>
-<summary>NIF <code>is_simple_hash_map_ident</code> — <a href="../../native/xitdb_nif.odin#L5635-L5649">native/xitdb_nif.odin#L5635-L5649</a></summary>
-
-```odin
-is_simple_hash_map_ident :: proc(s: string) -> (string, bool) {
-	p := s
-	if len(p) > 0 && p[0] == '.' {
-		p = p[1:]
-	}
-	if len(p) == 0 {
-		return "", false
-	}
-	for i := 0; i < len(p); i += 1 {
-		ch := p[i]
-		if ch == '.' || ch == '[' || ch == ']' || ch == '#' || ch == '$' || ch == '%' || ch == '^' ||
-		   ch == '"' || ch == '\'' || ch == '\\' || ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' {
-			return "", false
-		}
-	}
-```
-
-</details>
-
-<details>
-<summary>NIF <code>parse_escaped_steps</code> — <a href="../../native/xitdb_nif.odin#L1938-L1950">native/xitdb_nif.odin#L1938-L1950</a></summary>
-
-```odin
-parse_escaped_steps :: proc(path_str: string, allocator := context.temp_allocator) -> (res: []xitdb.Path_Step, err_reason: string) {
-	stack_buf: [16]xitdb.Path_Step = ---
-	steps, er := parse_escaped_steps_buf(path_str, stack_buf[:], allocator)
-	if er != "" || len(steps) == 0 {
-		return steps, er
-	}
-	if raw_data(steps) == raw_data(stack_buf[:]) {
-		out := make([]xitdb.Path_Step, len(steps), allocator)
-		copy(out, steps)
-		return out, ""
-	}
-	return steps, ""
-}
-```
-
-</details>
-
 ## Reachable `xitdb` Core Procedures
 
 <details>
@@ -692,7 +701,7 @@ hash_map_get_cursor :: proc(m: Read_Hash_Map, key: string) -> (Maybe(Read_Cursor
 </details>
 
 <details>
-<summary><code>xitdb.pull</code> — <a href="../../native/xitdb-odin/xitdb/dsl.odin#L2020-L2030">dsl.odin#L2020-L2030</a></summary>
+<summary><code>xitdb.pull</code> — <a href="../../native/xitdb-odin/xitdb/dsl.odin#L2104-L2116">dsl.odin#L2104-L2116</a></summary>
 
 ```odin
 pull :: proc(cursor: Read_Cursor, pattern: string, allocator := context.temp_allocator) -> (res: Pull_Value, err: Error) {
@@ -704,14 +713,16 @@ pull :: proc(cursor: Read_Cursor, pattern: string, allocator := context.temp_all
 		}
 	}
 	visited := make(map[i64]bool, 16, context.temp_allocator)
-	return _pull_with_visited(cursor, pattern, &visited, allocator)
+	pool := _iter_pool_init(context.allocator)
+	defer _iter_pool_destroy(&pool)
+	return _pull_with_visited(cursor, pattern, &visited, &pool, allocator)
 }
 ```
 
 </details>
 
 <details>
-<summary><code>xitdb.cursor_slot</code> — <a href="../../native/xitdb-odin/xitdb/cursor.odin#L62-L65">cursor.odin#L62-L65</a></summary>
+<summary><code>xitdb.cursor_slot</code> — <a href="../../native/xitdb-odin/xitdb/cursor.odin#L64-L67">cursor.odin#L64-L67</a></summary>
 
 ```odin
 cursor_slot :: proc(c: Read_Cursor) -> (res: Slot, err: Error) {
@@ -723,18 +734,21 @@ cursor_slot :: proc(c: Read_Cursor) -> (res: Slot, err: Error) {
 </details>
 
 <details>
-<summary><code>xitdb.cursor_iterator</code> — <a href="../../native/xitdb-odin/xitdb/cursor.odin#L891-L935">cursor.odin#L891-L935</a></summary>
+<summary><code>xitdb.cursor_iterator_init</code> — <a href="../../native/xitdb-odin/xitdb/cursor.odin#L1041-L1082">cursor.odin#L1041-L1082</a></summary>
 
 ```odin
-cursor_iterator :: proc(unresolved_cursor: Read_Cursor) -> (res: Cursor_Iterator, err: Error) {
+cursor_iterator_init :: proc(res: ^Cursor_Iterator, unresolved_cursor: Read_Cursor) -> (err: Error) {
+	_reset_cursor_iterator(res)
+	defer if err != nil {
+		mem.zero_item(res)
+	}
 	cursor := cursor_resolved_cursor(unresolved_cursor) or_return
-	res.cursor = cursor
 
 	#partial switch cursor.slot_ptr.slot.tag {
 	case .None:
-		res.size = 0
-		res.index = 0
+		res.cursor = cursor
 	case .Array_List:
+		res.cursor = cursor
 		position := cursor.slot_ptr.slot.value
 		hb: [ARRAY_LIST_HEADER_LENGTH]u8 = ---
 		core_read_exact_at(cursor.db.core, position, hb[:]) or_return
@@ -742,41 +756,35 @@ cursor_iterator :: proc(unresolved_cursor: Read_Cursor) -> (res: Cursor_Iterator
 		res.size = header.size
 		res.index = 0
 		if header.size > 0 {
-			_init_iter_level(cursor, header.ptr, &res.stack[0]) or_return
-			res.stack_len = 1
+			_init_array_list_stack(res, cursor, header, 0, false) or_return
 		}
 	case .Linked_Array_List, .Sorted_Map, .Sorted_Set:
+		res.cursor = cursor
 		position := cursor.slot_ptr.slot.value
 		hb: [BTREE_HEADER_LENGTH]u8 = ---
 		core_read_exact_at(cursor.db.core, position, hb[:]) or_return
 		header := btree_header_from_bytes(hb) or_return
 		res.size = header.size
 		res.index = 0
-		if header.size > 0 {
-			_init_btree_iter_level(cursor, header.root_ptr, &res.stack[0]) or_return
-			res.stack_len = 1
-		}
+		_init_btree_stack(res, cursor, header, false) or_return
 	case .Hash_Map, .Hash_Set:
-		res.size = 0
-		res.index = 0
+		res.cursor = cursor
 		_init_iter_level(cursor, cursor.slot_ptr.slot.value, &res.stack[0]) or_return
 		res.stack_len = 1
 	case .Counted_Hash_Map, .Counted_Hash_Set:
-		res.size = 0
-		res.index = 0
-		_init_iter_level(cursor, cursor.slot_ptr.slot.value + 8, &res.stack[0]) or_return
-		res.stack_len = 1
+		res.cursor = cursor
+		_init_counted_hash_iter(res, cursor, false) or_return
 	case:
-		return {}, .Unexpected_Tag
+		return .Unexpected_Tag
 	}
-	return res, nil
+	return nil
 }
 ```
 
 </details>
 
 <details>
-<summary><code>xitdb.cursor_iterator_next</code> — <a href="../../native/xitdb-odin/xitdb/cursor.odin#L1614-L1635">cursor.odin#L1614-L1635</a></summary>
+<summary><code>xitdb.cursor_iterator_next</code> — <a href="../../native/xitdb-odin/xitdb/cursor.odin#L1799-L1838">cursor.odin#L1799-L1838</a></summary>
 
 ```odin
 cursor_iterator_next :: proc(it: ^Cursor_Iterator) -> (res: Maybe(Read_Cursor), err: Error) {
@@ -787,16 +795,34 @@ cursor_iterator_next :: proc(it: ^Cursor_Iterator) -> (res: Maybe(Read_Cursor), 
 		if it.index == it.size {
 			return nil, nil
 		}
+		item := _iterator_step_internal(it, false) or_return
+		if item == nil {
+			return nil, .Unexpected_Tag
+		}
 		it.index += 1
-		return _iterator_next_internal(it, 0)
+		return item, nil
 	case .Linked_Array_List, .Sorted_Map, .Sorted_Set:
 		if it.index == it.size {
 			return nil, nil
 		}
+		item := _iterator_step_internal(it, false) or_return
+		if item == nil {
+			return nil, .Invalid_BTree_Node
+		}
 		it.index += 1
-		return _iterator_next_internal(it, BTREE_NODE_HEADER_SIZE)
-	case .Hash_Map, .Hash_Set, .Counted_Hash_Map, .Counted_Hash_Set:
-		return _iterator_next_internal(it, 0)
+		return item, nil
+	case .Counted_Hash_Map, .Counted_Hash_Set:
+		if it.index == it.size {
+			return nil, nil
+		}
+		item := _iterator_step_internal(it, false) or_return
+		if item == nil {
+			return nil, .Invalid_Database
+		}
+		it.index += 1
+		return item, nil
+	case .Hash_Map, .Hash_Set:
+		return _iterator_step_internal(it, false)
 	case:
 		return nil, .Unexpected_Tag
 	}
@@ -806,7 +832,7 @@ cursor_iterator_next :: proc(it: ^Cursor_Iterator) -> (res: Maybe(Read_Cursor), 
 </details>
 
 <details>
-<summary><code>xitdb.cursor_read_kv_pair_slots</code> — <a href="../../native/xitdb-odin/xitdb/cursor.odin#L404-L425">cursor.odin#L404-L425</a></summary>
+<summary><code>xitdb.cursor_read_kv_pair_slots</code> — <a href="../../native/xitdb-odin/xitdb/cursor.odin#L413-L440">cursor.odin#L413-L440</a></summary>
 
 ```odin
 cursor_read_kv_pair_slots :: proc(c: Read_Cursor) -> (key_cursor: Read_Cursor, value_cursor: Read_Cursor, err: Error) {
@@ -819,8 +845,14 @@ cursor_read_kv_pair_slots :: proc(c: Read_Cursor) -> (key_cursor: Read_Cursor, v
 	if slot_ptr.slot.tag != .KV_Pair && slot_ptr.slot.tag != .Sorted_KV_Pair {
 		return {}, {}, .Unexpected_Tag
 	}
-	key_pos := slot_ptr.slot.value + database_kv_key_offset(c.db, slot_ptr.slot.tag)
-	val_pos := key_pos + SLOT_LENGTH
+	key_pos, k_ok := _checked_add_i64(slot_ptr.slot.value, database_kv_key_offset(c.db, slot_ptr.slot.tag))
+	if !k_ok {
+		return {}, {}, .End_Of_Stream
+	}
+	val_pos, v_ok := _checked_add_i64(key_pos, SLOT_LENGTH)
+	if !v_ok {
+		return {}, {}, .End_Of_Stream
+	}
 	b: [SLOT_LENGTH * 2]u8 = ---
 	core_read_exact_at(c.db.core, key_pos, b[:]) or_return
 	key_slot := slot_from_slice_raw(b[0:SLOT_LENGTH])
@@ -836,7 +868,7 @@ cursor_read_kv_pair_slots :: proc(c: Read_Cursor) -> (key_cursor: Read_Cursor, v
 </details>
 
 <details>
-<summary><code>xitdb.cursor_read_string</code> — <a href="../../native/xitdb-odin/xitdb/cursor.odin#L233-L236">cursor.odin#L233-L236</a></summary>
+<summary><code>xitdb.cursor_read_string</code> — <a href="../../native/xitdb-odin/xitdb/cursor.odin#L242-L245">cursor.odin#L242-L245</a></summary>
 
 ```odin
 cursor_read_string :: proc(c: Read_Cursor, max_size: i64 = 0, allocator := context.allocator) -> (res: string, err: Error) {
@@ -981,7 +1013,7 @@ read_steps_cursor :: proc(start: Read_Cursor, steps: []Path_Step) -> (res: Maybe
 </details>
 
 <details>
-<summary><code>xitdb.database_digest_string_buf</code> — <a href="../../native/xitdb-odin/xitdb/database.odin#L280-L282">database.odin#L280-L282</a></summary>
+<summary><code>xitdb.database_digest_string_buf</code> — <a href="../../native/xitdb-odin/xitdb/database.odin#L283-L285">database.odin#L283-L285</a></summary>
 
 ```odin
 database_digest_string_buf :: proc(db: ^Database, s: string, buf: []u8) -> []u8 {

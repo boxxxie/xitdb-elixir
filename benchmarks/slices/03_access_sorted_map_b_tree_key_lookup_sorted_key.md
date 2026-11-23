@@ -2,19 +2,19 @@
 
 [← Back to Benchmarks Overview](../README.md) · [All Slices](README.md)
 
-**Group:** `access` — #1–#5, #28 (Lazy Access Navigation, Point Lookups & Pre-Tokenized DSL Select)
+**Group:** `access` — #1–#5, #28, #32 (Lazy Access Navigation, Point Lookups, Batched Key Fetch & Pre-Tokenized DSL Select)
 
 ## Latest 1v1 Metrics
 
 | Metric | Elixir NIF Wrapper | Raw Odin Baseline | Comparison |
 | :--- | ---: | ---: | ---: |
-| **Median (`ns/op`)** | 814.0 ns (814.0 ns) | 398.0 ns (398.0 ns) | **`2.05x`** NIF Ratio |
-| **Mean ± σ (CV)** | 743.0 ns ± 167.7 ns (22.6%) | 397.2 ns ± 4.7 ns (1.2%) | Welch `z` = `4.61` |
-| **p95 / Max (`ns/op`)** | 899.8 ns / 908.0 ns | 401.8 ns / 402.0 ns | `5` vs `5` pooled samples |
+| **Median (`ns/op`)** | 570.0 ns (570.0 ns) | 441.0 ns (441.0 ns) | **`1.29x`** NIF Ratio |
+| **Mean ± σ (CV)** | 571.2 ns ± 4.1 ns (0.7%) | 440.8 ns ± 2.9 ns (0.6%) | Welch `z` = `57.86` |
+| **p95 / Max (`ns/op`)** | 576.8 ns / 578.0 ns | 444.2 ns / 445.0 ns | `5` vs `5` pooled samples |
 
 ## Benchmark Harnesses (Elixir vs. Raw Odin)
 
-### Elixir Harness ([`bench_elixir.exs#L240-L247`](../bench_elixir.exs#L240-L247))
+### Elixir Harness ([`bench_elixir.exs#L251-L258`](../bench_elixir.exs#L251-L258))
 
 ```elixir
       {3, "Access: Sorted_Map B+Tree key lookup (sorted[key])", 500,
@@ -27,7 +27,7 @@
        end},
 ```
 
-### Raw Odin Harness ([`bench_client.odin#L912-L927`](../bench_client.odin#L912-L927))
+### Raw Odin Harness ([`bench_client.odin#L985-L1000`](../bench_client.odin#L985-L1000))
 
 ```odin
 	// #3: Sorted_Map B+Tree key lookup
@@ -51,7 +51,7 @@
 ## Elixir Wrapper & NIF Bridge
 
 <details>
-<summary>Elixir <code>fetch</code> — <a href="../../lib/xitdb/cursor.ex#L202-L264">lib/xitdb/cursor.ex#L202-L264</a></summary>
+<summary>Elixir <code>fetch</code> — <a href="../../lib/xitdb/cursor.ex#L207-L269">lib/xitdb/cursor.ex#L207-L269</a></summary>
 
 ```elixir
   def fetch(%__MODULE__{} = cursor, key) when is_atom(key) do
@@ -122,7 +122,7 @@
 </details>
 
 <details>
-<summary>Elixir <code>nif_slot_get</code> — <a href="../../lib/xitdb/cursor.ex#L399-L407">lib/xitdb/cursor.ex#L399-L407</a></summary>
+<summary>Elixir <code>nif_slot_get</code> — <a href="../../lib/xitdb/cursor.ex#L409-L417">lib/xitdb/cursor.ex#L409-L417</a></summary>
 
 ```elixir
   defp nif_slot_get(%__MODULE__{} = cursor, idx) when is_integer(idx) do
@@ -139,7 +139,7 @@
 </details>
 
 <details>
-<summary>NIF <code>odin_nif_slot_get_key</code> — <a href="../../native/xitdb_nif.odin#L1076-L1154">native/xitdb_nif.odin#L1076-L1154</a></summary>
+<summary>NIF <code>odin_nif_slot_get_key</code> — <a href="../../native/xitdb_nif.odin#L1331-L1413">native/xitdb_nif.odin#L1331-L1413</a></summary>
 
 ```odin
 odin_nif_slot_get_key :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {
@@ -215,8 +215,12 @@ odin_nif_slot_get_key :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF
 		return ATOM_ERROR
 	}
 
-	term, t_err := slot_to_term(env, &handle.db, child_slot)
+	codec_err := ""
+	term, t_err := slot_to_term(env, &handle.db, child_slot, false, &codec_err)
 	if t_err != nil {
+		if len(codec_err) > 0 {
+			return make_err(env, codec_err)
+		}
 		return make_xitdb_err(env, t_err)
 	}
 	return make_ok(env, term)
@@ -226,10 +230,17 @@ odin_nif_slot_get_key :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF
 </details>
 
 <details>
-<summary>NIF <code>slot_to_term</code> — <a href="../../native/xitdb_nif.odin#L353-L434">native/xitdb_nif.odin#L353-L434</a></summary>
+<summary>NIF <code>slot_to_term</code> — <a href="../../native/xitdb_nif.odin#L467-L565">native/xitdb_nif.odin#L467-L565</a></summary>
 
 ```odin
-slot_to_term :: proc(env: ErlNifEnv, db: ^xitdb.Database, slot: xitdb.Slot) -> (res: ERL_NIF_TERM, err: xitdb.Error) {
+slot_to_term :: proc(
+	env: ErlNifEnv,
+	db: ^xitdb.Database,
+	slot: xitdb.Slot,
+	raw_tagged: bool = false,
+	codec_err: ^string = nil,
+	max_bytes: u64 = MAX_NIF_DECOMPRESSED_BYTES,
+) -> (res: ERL_NIF_TERM, err: xitdb.Error) {
 	if slot.tag == .None && !slot.full {
 		return ATOM_NIL, nil
 	}
@@ -285,6 +296,16 @@ slot_to_term :: proc(env: ErlNifEnv, db: ^xitdb.Database, slot: xitdb.Slot) -> (
 				}
 				return ATOM_FALSE, nil
 			}
+			if !raw_tagged && len(obj.format_tag) == 2 && obj.format_tag[0] == 'c' && obj.format_tag[1] == 'z' {
+				decoded_term, cz_err := decode_cz_to_term(env, obj.value, max_bytes)
+				if cz_err != "" {
+					if codec_err != nil && len(codec_err^) == 0 {
+						codec_err^ = cz_err
+					}
+					return ATOM_NIL, .Unexpected_Tag
+				}
+				return decoded_term, nil
+			}
 			return nif_make_tuple3(
 				env,
 				ATOM_TAGGED,
@@ -316,7 +337,7 @@ slot_to_term :: proc(env: ErlNifEnv, db: ^xitdb.Database, slot: xitdb.Slot) -> (
 </details>
 
 <details>
-<summary>NIF <code>validate_bytes_slot_bounds</code> — <a href="../../native/xitdb_nif.odin#L334-L351">native/xitdb_nif.odin#L334-L351</a></summary>
+<summary>NIF <code>validate_bytes_slot_bounds</code> — <a href="../../native/xitdb_nif.odin#L350-L367">native/xitdb_nif.odin#L350-L367</a></summary>
 
 ```odin
 validate_bytes_slot_bounds :: proc(db: ^xitdb.Database, slot: xitdb.Slot) -> (val_size: i64, err: xitdb.Error) {
@@ -341,6 +362,53 @@ validate_bytes_slot_bounds :: proc(db: ^xitdb.Database, slot: xitdb.Slot) -> (va
 
 </details>
 
+<details>
+<summary>NIF <code>decode_cz_to_term</code> — <a href="../../native/xitdb_nif.odin#L409-L447">native/xitdb_nif.odin#L409-L447</a></summary>
+
+```odin
+decode_cz_to_term :: proc(
+	env: ErlNifEnv,
+	payload: []u8,
+	max_bytes: u64 = MAX_NIF_DECOMPRESSED_BYTES,
+) -> (term: ERL_NIF_TERM, err_atom: string) {
+	if len(payload) < 5 {
+		return ATOM_NIL, "corrupt_compressed_payload"
+	}
+	if (payload[0] & 0xFE) != 0x10 {
+		return ATOM_NIL, "corrupt_compressed_payload"
+	}
+	raw_len := u64(payload[1]) | (u64(payload[2]) << 8) | (u64(payload[3]) << 16) | (u64(payload[4]) << 24)
+	if raw_len > max_bytes {
+		return ATOM_NIL, "decompressed_size_exceeded"
+	}
+	comp := payload[5:]
+	if len(comp) == 0 {
+		return ATOM_NIL, "corrupt_compressed_payload"
+	}
+	if raw_len == 0 {
+		zero_buf: [1]u8
+		dest_len := zlib.uLongf(len(zero_buf))
+		rc := zlib.uncompress(&zero_buf[0], &dest_len, raw_data(comp), zlib.uLong(len(comp)))
+		if rc != zlib.OK || dest_len != 0 {
+			return ATOM_NIL, "corrupt_compressed_payload"
+		}
+		return nif_make_binary_slice(env, nil, 0), ""
+	}
+	dst := nif_alloc_binary_term(env, c.size_t(raw_len), &term)
+	if dst == nil {
+		return ATOM_NIL, "alloc_failed"
+	}
+	dest_len := zlib.uLongf(raw_len)
+	rc := zlib.uncompress(dst, &dest_len, raw_data(comp), zlib.uLong(len(comp)))
+	if rc != zlib.OK || u64(dest_len) != raw_len {
+		return ATOM_NIL, "corrupt_compressed_payload"
+	}
+	return term, ""
+}
+```
+
+</details>
+
 ## Reachable `xitdb` Core Procedures
 
 <details>
@@ -355,7 +423,7 @@ sorted_map_get_cursor :: proc(m: Read_Sorted_Map, key: string) -> (Maybe(Read_Cu
 </details>
 
 <details>
-<summary><code>xitdb.cursor_read_string</code> — <a href="../../native/xitdb-odin/xitdb/cursor.odin#L233-L236">cursor.odin#L233-L236</a></summary>
+<summary><code>xitdb.cursor_read_string</code> — <a href="../../native/xitdb-odin/xitdb/cursor.odin#L242-L245">cursor.odin#L242-L245</a></summary>
 
 ```odin
 cursor_read_string :: proc(c: Read_Cursor, max_size: i64 = 0, allocator := context.allocator) -> (res: string, err: Error) {
@@ -442,7 +510,7 @@ sorted_map_get_slot :: proc(m: Read_Sorted_Map, key: string) -> (Maybe(Slot), Er
 </details>
 
 <details>
-<summary><code>xitdb.cursor_read_uint</code> — <a href="../../native/xitdb-odin/xitdb/cursor.odin#L198-L207">cursor.odin#L198-L207</a></summary>
+<summary><code>xitdb.cursor_read_uint</code> — <a href="../../native/xitdb-odin/xitdb/cursor.odin#L207-L216">cursor.odin#L207-L216</a></summary>
 
 ```odin
 cursor_read_uint :: proc(c: Read_Cursor) -> (res: u64, err: Error) {
@@ -460,7 +528,7 @@ cursor_read_uint :: proc(c: Read_Cursor) -> (res: u64, err: Error) {
 </details>
 
 <details>
-<summary><code>xitdb.cursor_read_int</code> — <a href="../../native/xitdb-odin/xitdb/cursor.odin#L209-L215">cursor.odin#L209-L215</a></summary>
+<summary><code>xitdb.cursor_read_int</code> — <a href="../../native/xitdb-odin/xitdb/cursor.odin#L218-L224">cursor.odin#L218-L224</a></summary>
 
 ```odin
 cursor_read_int :: proc(c: Read_Cursor) -> (res: i64, err: Error) {
@@ -475,7 +543,7 @@ cursor_read_int :: proc(c: Read_Cursor) -> (res: i64, err: Error) {
 </details>
 
 <details>
-<summary><code>xitdb.cursor_read_float</code> — <a href="../../native/xitdb-odin/xitdb/cursor.odin#L217-L223">cursor.odin#L217-L223</a></summary>
+<summary><code>xitdb.cursor_read_float</code> — <a href="../../native/xitdb-odin/xitdb/cursor.odin#L226-L232">cursor.odin#L226-L232</a></summary>
 
 ```odin
 cursor_read_float :: proc(c: Read_Cursor) -> (res: f64, err: Error) {
@@ -490,7 +558,7 @@ cursor_read_float :: proc(c: Read_Cursor) -> (res: f64, err: Error) {
 </details>
 
 <details>
-<summary><code>xitdb.cursor_read_bytes_buf</code> — <a href="../../native/xitdb-odin/xitdb/cursor.odin#L305-L381">cursor.odin#L305-L381</a></summary>
+<summary><code>xitdb.cursor_read_bytes_buf</code> — <a href="../../native/xitdb-odin/xitdb/cursor.odin#L314-L390">cursor.odin#L314-L390</a></summary>
 
 ```odin
 cursor_read_bytes_buf :: proc(c: Read_Cursor, buffer: []u8) -> (res: Bytes, err: Error) {
@@ -575,7 +643,7 @@ cursor_read_bytes_buf :: proc(c: Read_Cursor, buffer: []u8) -> (res: Bytes, err:
 </details>
 
 <details>
-<summary><code>xitdb.cursor_read_bytes_object</code> — <a href="../../native/xitdb-odin/xitdb/cursor.odin#L238-L303">cursor.odin#L238-L303</a></summary>
+<summary><code>xitdb.cursor_read_bytes_object</code> — <a href="../../native/xitdb-odin/xitdb/cursor.odin#L247-L312">cursor.odin#L247-L312</a></summary>
 
 ```odin
 cursor_read_bytes_object :: proc(c: Read_Cursor, max_size: i64 = 0, allocator := context.allocator) -> (res: Bytes, err: Error) {
