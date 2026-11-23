@@ -2591,28 +2591,78 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       end
 
       test "coalesced bulk_create with allow_existing_cursor?: true populates missing secondary indexes on pre-existing raw cursors" do
+        require Ash.Query
+
+        # 1. Pre-existing raw cursor while idx.bulk_parents.attr_sector does not exist yet (slot_cur == nil)
         {:ok, :ok} =
           Store.mutate(BulkStore, fn {db, _m} ->
             Xitdb.transact_ops_with_moment(db, [
-              {:put, ["bulk_parents", "99"],
-               %{"id" => 99, "name" => "Raw Org", "slug" => "raw-org", "sector" => "fintech"}}
+              {:put, ["bulk_parents", "97"],
+               %{"id" => 97, "name" => "Raw Seed", "slug" => "raw-seed", "sector" => "fintech"}}
             ])
             |> then(fn {:ok, next_db, next_m} -> {:ok, {next_db, next_m}, :ok} end)
           end)
 
         Ash.bulk_create!(
-          [%{id: 99, name: "Raw Org", slug: "raw-org", sector: "fintech"}],
+          [%{id: 97, name: "Raw Seed", slug: "raw-seed", sector: "fintech"}],
           BulkParent,
           :create,
           domain: BulkDomain,
           context: %{xitdb: %{allow_existing_cursor?: true}}
         )
 
-        require Ash.Query
-
-        assert [99] ==
+        assert [97] ==
                  BulkParent
                  |> Ash.Query.filter(sector == "fintech")
+                 |> Ash.read!(domain: BulkDomain)
+                 |> Enum.map(& &1.id)
+
+        assert [97] ==
+                 BulkParent
+                 |> Ash.Query.filter(slug == "raw-seed")
+                 |> Ash.read!(domain: BulkDomain)
+                 |> Enum.map(& &1.id)
+
+        # 2. Pre-existing raw cursors with slot_cur != nil:
+        #    - id 99 shares "fintech" (existing bucket, set_container_member? == false)
+        #    - id 100 uses "health" (missing bucket, slot_cur[new_hex] == nil)
+        {:ok, :ok} =
+          Store.mutate(BulkStore, fn {db, _m} ->
+            Xitdb.transact_ops_with_moment(db, [
+              {:put, ["bulk_parents", "99"],
+               %{"id" => 99, "name" => "Raw Org", "slug" => "raw-org", "sector" => "fintech"}},
+              {:put, ["bulk_parents", "100"],
+               %{
+                 "id" => 100,
+                 "name" => "Raw Health",
+                 "slug" => "raw-health",
+                 "sector" => "health"
+               }}
+            ])
+            |> then(fn {:ok, next_db, next_m} -> {:ok, {next_db, next_m}, :ok} end)
+          end)
+
+        Ash.bulk_create!(
+          [
+            %{id: 99, name: "Raw Org", slug: "raw-org", sector: "fintech"},
+            %{id: 100, name: "Raw Health", slug: "raw-health", sector: "health"}
+          ],
+          BulkParent,
+          :create,
+          domain: BulkDomain,
+          context: %{xitdb: %{allow_existing_cursor?: true}}
+        )
+
+        assert [97, 99] ==
+                 BulkParent
+                 |> Ash.Query.filter(sector == "fintech")
+                 |> Ash.read!(domain: BulkDomain)
+                 |> Enum.map(& &1.id)
+                 |> Enum.sort()
+
+        assert [100] ==
+                 BulkParent
+                 |> Ash.Query.filter(sector == "health")
                  |> Ash.read!(domain: BulkDomain)
                  |> Enum.map(& &1.id)
 
@@ -2622,6 +2672,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
                  |> Ash.read!(domain: BulkDomain)
                  |> Enum.map(& &1.id)
 
+        # 3. Updating sector on an existing cursor moves it cleanly between buckets
         Ash.bulk_create!(
           [%{id: 99, name: "Raw Org", slug: "raw-org", sector: "clean"}],
           BulkParent,
@@ -2630,10 +2681,11 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           context: %{xitdb: %{allow_existing_cursor?: true}}
         )
 
-        assert [] ==
+        assert [97] ==
                  BulkParent
                  |> Ash.Query.filter(sector == "fintech")
                  |> Ash.read!(domain: BulkDomain)
+                 |> Enum.map(& &1.id)
 
         assert [99] ==
                  BulkParent
@@ -2641,6 +2693,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
                  |> Ash.read!(domain: BulkDomain)
                  |> Enum.map(& &1.id)
 
+        # 4. Re-running with unchanged sector hits already_indexed? == true cleanly
         Ash.bulk_create!(
           [%{id: 99, name: "Raw Org", slug: "raw-org", sector: "clean"}],
           BulkParent,

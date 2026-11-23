@@ -1431,6 +1431,27 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       end
     end
 
+    defp fetch_cached_set_cur(cursor_root, scoped_col, slot, hex_key, st) do
+      {slot_cur, st1} = fetch_cached_idx_slot(cursor_root, scoped_col, slot, st)
+
+      case slot_cur do
+        %Xitdb.Cursor{} ->
+          cache_key = {:set_cur, scoped_col, slot, hex_key}
+
+          case Map.fetch(st1.idx_slots, cache_key) do
+            {:ok, cached} ->
+              {cached, st1}
+
+            :error ->
+              set_cur = slot_cur[hex_key]
+              {set_cur, %{st1 | idx_slots: Map.put(st1.idx_slots, cache_key, set_cur)}}
+          end
+
+        _ ->
+          {nil, st1}
+      end
+    end
+
     defp build_bulk_cursor_map(
            cursor_root,
            resource,
@@ -1702,19 +1723,12 @@ if Code.ensure_loaded?(Ash.DataLayer) do
             # whose secondary index buckets have never been populated. Only skip
             # writing when `doc_id` is already present in `idx.<col>.<slot>[new_hex]`.
             new_hex = IndexStorage.encode_btree_key(new_raw)
-            {slot_cur, acc_st1} = fetch_cached_idx_slot(cursor_root, scoped_col, slot, acc_st)
+
+            {set_cur, acc_st1} =
+              fetch_cached_set_cur(cursor_root, scoped_col, slot, new_hex, acc_st)
 
             already_indexed? =
-              case slot_cur do
-                %Xitdb.Cursor{} ->
-                  case slot_cur[new_hex] do
-                    nil -> false
-                    set_cur -> IndexStorage.set_container_member?(set_cur, doc_id)
-                  end
-
-                _ ->
-                  false
-              end
+              set_cur != nil and IndexStorage.set_container_member?(set_cur, doc_id)
 
             if already_indexed? do
               acc_st1
