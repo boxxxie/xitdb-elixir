@@ -61,19 +61,24 @@ When you navigate into a collection (`root["users"]["alice"]`, `Xitdb.db(db)`, o
 
 Every BEAM-to-Odin NIF crossing pays a predictable marshaling and `ErlNifRWLock` acquisition cost. Understanding this cost model makes it straightforward to pick the fastest `Xitdb` API for a hot path:
 
-### Fixed Per-Call NIF Floor (`~150–250 ns`)
+### Fixed Per-Call NIF Floor (`~100–250 ns`)
 
-Each RW-locked NIF call (`enif_get_resource` + `enif_rwlock_rlock` + slot resolution + Erlang term construction) carries a fixed overhead of `~150–250 ns` compared to in-process Raw Odin execution:
+Each RW-locked NIF call (`enif_get_resource` + `enif_rwlock_rlock` + slot resolution + Erlang term construction) carries a fixed overhead of `~100–250 ns` compared to in-process Raw Odin execution:
 
-- **`O(1)` header read (`Enum.count/1` on `Counted_Hash_Map`):** `~155–199 ns` in Elixir vs. `~6–8 ns` in Raw Odin.
-- **Single-hop container lookups (`Array_List`, `Linked_Array_List`, `Sorted_Map`):** `~340–580 ns` in Elixir vs. `~108–391 ns` in Raw Odin (adding `~185–255 ns` of boundary overhead).
+- **`O(1)` header read (`Enum.count/1` on `Counted_Hash_Map`):** `~106 ns` in Elixir vs. `~5 ns` in Raw Odin.
+- **Single-hop container lookups (`Array_List`, `Linked_Array_List`, `Sorted_Map`):** `~215–570 ns` in Elixir vs. `~73–441 ns` in Raw Odin (adding `~130–170 ns` of boundary overhead).
 
 ### Multi-Hop `Access` vs. `Xitdb.select/2` & `Xitdb.pull/2`
 
-- **Chained `Access` (`root["users"][id]["name"]`):** Crosses the NIF boundary once per bracket hop (`3 × nif_slot_get_key`, `~2.28–2.33 µs` for 3 hops vs. `~0.63–0.66 µs` in Raw Odin).
-- **Single-call string selector (`Xitdb.select!(db, path(users[id].name))`):** Resolves the entire selector path inside Odin in **1 NIF crossing** (`~2.04–2.08 µs` for 3 hops), keeping boundary overhead constant as path depth grows to 4+ hops.
-- **Pre-tokenized `path_steps/1` (`Xitdb.select!(db, path_steps(users[id].name))`):** Compiles the path at compile time into a flat step list decoded directly in C (`decode_steps_term_buf`, `~1.99 µs`), skipping both Elixir selector string formatting and Odin selector parsing on dynamic keys.
-- **Structural Pull (`Xitdb.pull!(cursor, [:username, :age, todos: 0..2, profile: [:city]])`):** Projects multiple fields and bounded list slices in **1 NIF crossing** (`~6.28–6.49 µs`) instead of issuing `K` separate `cursor[field]` calls across the boundary.
+- **Chained `Access` (`root["users"][id]["name"]`):** Crosses the NIF boundary once per bracket hop (`3 × nif_slot_get_key`, `~854 ns` for 3 hops vs. `~385 ns` in Raw Odin).
+- **Single-call string selector (`Xitdb.select!(db, path(users[id].name))`):** Resolves the entire selector path inside Odin in **1 NIF crossing** (`~701 ns` for 3 hops), keeping boundary overhead constant as path depth grows to 4+ hops.
+- **Pre-tokenized `path_steps/1` (`Xitdb.select!(db, path_steps(users[id].name))`):** Compiles the path at compile time into a flat step list decoded directly in C (`decode_steps_term_buf`, `~698 ns`), skipping both Elixir selector string formatting and Odin selector parsing on dynamic keys.
+- **Structural Pull (`Xitdb.pull!(cursor, [:username, :age, todos: 0..2, profile: [:city]])`):** Projects multiple fields and bounded list slices in **1 NIF crossing** (`~3.2–8.4 µs`) instead of issuing `K` separate `cursor[field]` calls across the boundary.
+
+### Batched Multi-Key Reads & Bulk Transaction Callbacks
+
+- **Multi-key slot fetch (`Xitdb.NIF.nif_slot_get_keys/4`):** Fetches `K` keys from a `Hash_Map`, `Counted_Hash_Map`, or `Sorted_Map` in a single read-locked NIF crossing (`~18.8 µs` for 100 keys, `~188 ns/key` vs. `8.46 µs` in Raw Odin), powering `Xitdb.Ash.Codec.from_cursor_fast/3`, `Xitdb.Ash.Search.Storage.read_docs_from_cursor/2`, and `Xitdb.Ash.Mutator` bulk-create prefetching.
+- **Coarse bulk callbacks (`:bulk_put_maps`, `:bulk_put_nested_maps`, `:bulk_index_puts`):** Write 100 entities, nested child subtrees, or `:unique` / `:counted_set_add` / `:hash_map_merge` index buckets inside one transaction callback (`~137.9–167.9 µs` vs. `~111.6–136.7 µs` Raw Odin, `1.23x–1.34x`), avoiding per-op tuple parsing and Elixir staging overhead.
 
 ### `Enumerable` Pushdowns & Adaptive Chunking
 
@@ -86,15 +91,15 @@ Each RW-locked NIF call (`enif_get_resource` + `enif_rwlock_rlock` + slot resolu
 
 ### Fused B+Tree Prefix & Range Scans (`nif_sorted_map_seek`)
 
-When scanning a `Sorted_Map` whose values are child containers (such as `Xitdb.Ash.Search` term postings or `Xitdb.Ash.Indexer` secondary index ID sets), fetching the B+Tree keys first and then calling `nif_slot_entries` per key would pay the `~150–250 ns` NIF floor on every child container:
+When scanning a `Sorted_Map` whose values are child containers (such as `Xitdb.Ash.Search` term postings or `Xitdb.Ash.Indexer` secondary index ID sets), fetching the B+Tree keys first and then calling `nif_slot_entries` per key would pay the fixed NIF floor on every child container:
 
 - **Fused decode (`decode_children: true`):** Passing `true` as the 7th argument to `Xitdb.NIF.nif_sorted_map_seek/7` (used by `Xitdb.Ash.Search`) seeks in the B+Tree and materializes each bounded child container inside Odin in a single dirty-CPU NIF crossing, falling back to lazy 3-tuples `{key, tag_id, val}` if a container is oversized.
 - **Lazy cursor scan (`decode_children: false`):** `Xitdb.NIF.nif_sorted_map_seek/5` (and 6-arity range seek used by `Xitdb.Ash.Indexer`) returns lazy `%Xitdb.Cursor{}` handles (`Cursor.from_compact_slot/4`) without decoding out-of-range child containers.
 
 ### Transactional Writes (`put_in/3` vs. `Xitdb.DSL.tx` / `Xitdb.transact/3`)
 
-- **Nested `put_in/3` (`put_in(root["users"][id]["score"], val)`):** In `tx_mode`, intermediate map brackets stage virtual write cursors without intermediate read NIF calls (`~13.9–14.2 µs` for a 3-hop `put_in/3` commit vs. `~3.60–3.77 µs` in Raw Odin). Inside `odin_nif_transact`, writes commit optimistically for `Hash_Map` and adapt lazily on `.Unexpected_Tag` with atomic rollback of `Root_Header` and file length on failure.
-- **Declarative `Xitdb.DSL.tx` & Map `Xitdb.transact/3`:** Eliminate Elixir virtual-cursor closure staging overhead as well, auto-vivifying missing intermediate maps inside Odin and batching all operations into one `nif_transact` commit.
+- **Nested `put_in/3` (`put_in(root["users"][id]["score"], val)`):** In `tx_mode`, intermediate map brackets stage virtual write cursors without intermediate read NIF calls (`~7.86 µs` for a 3-hop `put_in/3` commit vs. `~2.27 µs` in Raw Odin). Inside `odin_nif_transact`, writes commit optimistically for `Hash_Map` and adapt lazily on `.Unexpected_Tag` with atomic rollback of `Root_Header` and file length on failure.
+- **Declarative `Xitdb.DSL.tx` & Map `Xitdb.transact/3`:** Eliminate Elixir virtual-cursor closure staging overhead (`~6.58 µs` vs. `~4.08 µs` for single nested commits), auto-vivifying missing intermediate maps inside Odin and batching all operations into one `nif_transact` commit.
 
 ### Choosing the Right API
 
@@ -106,7 +111,7 @@ When scanning a `Sorted_Map` whose values are child containers (such as `Xitdb.A
 | Projecting multiple fields + bounded list slices from an entity | **`Xitdb.pull(cursor, [:username, todos: 0..5])`** | Projects the exact shape in 1 NIF call without materializing unneeded subtrees. |
 | Deep writes, auto-vivifying missing maps, or batching list `append`/`insert`/`slice`/`fork` | **`Xitdb.DSL.tx db do ... end`** | Zero intermediate NIF reads, zero virtual-cursor closure overhead, one atomic commit. |
 
-For full latency tables comparing Elixir vs. Raw Odin across all 28 workloads, see the [1v1 Client Benchmarks (`benchmarks/README.md`)](https://github.com/boxxxie/xitdb-elixir/blob/master/benchmarks/README.md).
+For full latency tables comparing Elixir vs. Raw Odin across all 32 workloads, see the [1v1 Client Benchmarks (`benchmarks/README.md`)](https://github.com/boxxxie/xitdb-elixir/blob/master/benchmarks/README.md).
 
 ---
 

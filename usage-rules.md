@@ -366,6 +366,12 @@ update :rename do
 end
 ```
 
+#### Bulk Imports, Deferred Search & `select` Narrowing
+- **DO** use `context: %{xitdb: %{skip_search_index?: true}}` followed by `Xitdb.Ash.Search.rebuild_index!/3` (`only_attrs:` + `worker_wrapper:` for `resolver:` caches) for large **initial/cold** `Ash.bulk_create!` imports.
+- **DON'T** call `Search.rebuild_index!/3` after small appends into an already-populated collection—it deletes and re-scans every existing row. Instead, either keep default eager indexing (already coalesced + parallelized at `>= 500` non-resolver rows) or pass `skip_search_index?: true, return_records?: true` and commit `Xitdb.Ash.Search.index_records!(Store, Resource, appended_records, assume_new?: true)` once at the end.
+- **DO** pass `context: %{xitdb: %{allow_existing_cursor?: true}}` on `Ash.bulk_create!` when projecting/overwriting existing PKs in place so unique identities, secondary buckets, `nil`'d attributes, and search postings stay clean.
+- **DO** use `Ash.Query.select/2` on wide resources (compressed or uncompressed): Stage 2 narrows `nif_slot_get_keys/4` reads to only selected fields and attributes referenced by `filter`, `sort`, `distinct`, and calculations.
+
 ### Time-Travel Queries (`with_as_of/3`, `xitdb_moment`, `as_of:`)
 
 Pin historical moments across `Ash.read`, `Ash.count`, aggregates, relationship loads, and BM25 search without touching the `Store` GenServer. Use `Store.with_as_of/3` or `context: %{shared: %{xitdb_moment: prev_moment}}` when loading relationships or calculations (Ash 3 only copies `context[:shared]` to child queries, dropping top-level `context[:xitdb_moment]`):

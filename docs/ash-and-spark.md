@@ -138,6 +138,60 @@ profiles =
 
 When a referenced parent record updates a field pulled into a child's `search_field` via `resolver:` (such as `Organization.name` indexed onto `Profile`), call `Xitdb.Ash.Search.reindex_records/4` inside an `after_action` hook on the same store so both changes commit in the same transaction. (When destroying a parent with `on_delete: :nilify`, `Xitdb.Ash.Mutator` automatically re-runs child `search_field` resolvers and `Xitdb.Ash.Search.lookup_field/5` returns `nil` for a `nil` ID, clearing stale postings; `on_delete: :nothing` requires explicit `reindex_records/4`.)
 
+### Bulk Imports, Deferred Search Indexing & Overwrites
+
+`Xitdb.Ash.Mutator` coalesces standard and `nested_in :many` `Ash.bulk_create!` batches into a single transaction (`:bulk_put_maps`, `:bulk_put_nested_maps`, `:bulk_index_puts`) with batched `nif_slot_get_keys/4` prefetching, precompiled `Codec` attribute plans, and `parallel: :auto` search extraction (parallelizing at `>= 500` rows when no `search_field` uses a `resolver:` callback).
+
+For multi-batch imports, you can also defer search writes via `context: %{xitdb: %{skip_search_index?: true}}` and build postings in one pass afterward:
+
+| Scenario | Recommended Pattern | Why |
+| :--- | :--- | :--- |
+| **Cold / initial bulk import** | `skip_search_index?: true` + `Search.rebuild_index!/3` | Inserts records without touching `idx.search`, then hydrates only search attributes (`only_attrs: :auto`) across parallel workers into one atomic write. |
+| **Multi-batch append into a populated collection** | `skip_search_index?: true`, `return_records?: true` + `Search.index_records!/4` | Avoids `rebuild_index!/3` re-scanning existing rows; indexes only the newly appended structs (pass `assume_new?: true` when all PKs are fresh). |
+| **Single batch / routine writes** | Default eager indexing | Coalesces writes and BM25 postings into one atomic transaction with zero extra round-trips. |
+
+```elixir
+# 1. Cold import with resolver cache warmed once per parallel worker
+Ash.bulk_create!(profiles, MyApp.Accounts.Profile, :create,
+  batch_size: 1_000,
+  return_records?: false,
+  context: %{xitdb: %{skip_search_index?: true}}
+)
+
+:ok =
+  Xitdb.Ash.Search.rebuild_index!(MyApp.Store, MyApp.Accounts.Profile,
+    parallel: true,
+    only_attrs: [:full_name, :title, :organization_id],
+    worker_wrapper: fn cursor_root, work ->
+      names = Map.new(cursor_root["organizations"] || %{}, fn {id, org} -> {id, org["name"]} end)
+      Process.put(:org_names, names)
+      try do
+        work.()
+      after
+        Process.delete(:org_names)
+      end
+    end
+  )
+
+# 2. Populated-table multi-batch append (avoids re-scanning existing records)
+%{records: appended} =
+  Ash.bulk_create!(new_orgs, MyApp.Accounts.Organization, :create,
+    batch_size: 500,
+    return_records?: true,
+    context: %{xitdb: %{skip_search_index?: true}}
+  )
+
+:ok =
+  Xitdb.Ash.Search.index_records!(MyApp.Store, MyApp.Accounts.Organization, appended,
+    parallel: true,
+    assume_new?: true
+  )
+```
+
+- **`Search.rebuild_index!/2,3` options:** `:tenant` (`nil`), `:parallel` (`true`, parallelizes at `>= 128` records), `:only_attrs` (`:auto` | `:all` | `[atom()]` | `MapSet`), `:worker_wrapper` (1-arity or 2-arity), `:timeout`, `:lease_timeout`. Accepts a `Store` module, `{db, moment}`, or `%Xitdb{}` (preserving all tenants on `:attribute`-multitenant resources).
+- **`Search.index_records!/3,4` options:** `:tenant` (`nil`), `:parallel` (`true`), `:assume_new?` (`false` — skips batched `idx.search.<col>.docs` reads when inserting new PKs), `:worker_wrapper`, `:timeout`, `:lease_timeout`. Deduplicates duplicate PKs keeping the last occurrence.
+- **Idempotent bulk overwrites (`allow_existing_cursor?: true`):** Pass `context: %{xitdb: %{allow_existing_cursor?: true}}` to `Ash.bulk_create!` (usable alongside `skip_search_index?: true`) to overwrite existing PKs in place while automatically cleaning up stale unique identity keys, obsolete secondary index memberships and empty B+Tree buckets, `nil`'d fields, old `nested_in :many` parent subtrees, and changed BM25 postings.
+
 ---
 
 ## 4. Time-Travel Ash Queries (`Store.with_as_of/3`)
@@ -329,5 +383,5 @@ end
 Key operational guarantees:
 - **Shared dictionaries on a Store**: call `Xitdb.Compression.Dictionary.train_and_put(MyApp.AppStore, :email_html, sample_bodies)` inside store startup/backfill to seed `.__dicts.email_html`.
 - **BM25 Search Compatibility**: `idx.search` tokenizes plaintext attribute values **before** compression or page packing, so `Xitdb.Ash.Search.query/3` works without scanning or decompressing body blobs.
-- **Zero-Decompression `select`**: when a query specifies `Ash.Query.select([:id, :title])`, `Xitdb.Ash.Query` hydrates only needed attributes and leaves unselected compressed attributes as `%Ash.NotLoaded{}`—performing `0` page reads and `0` decompressions.
+- **Narrowed `select` Hydration (Zero Decompression & Fewer Slot Reads)**: when a query specifies `Ash.Query.select([:id, :title])` (with no query aggregates), `Xitdb.Ash.Query` computes the exact attribute dependency closure (`select`, primary keys, `always_select?` fields, relationship foreign keys, tenant attributes, and `filter`/`sort`/`distinct`/`calculation` references) and uses `nif_slot_get_keys/4` to hydrate only needed attributes on **all** resources—performing `0` compressed page reads/decompressions, skipping unselected slots on uncompressed records, and leaving unrequested attributes as `%Ash.NotLoaded{}`. (Queries using `exists(...)` or `parent(...)` filters conservatively hydrate `:all` before Stage 6 projection.)
 - **Atomic `create`/`update` History**: single-record writes and updates compress individual attributes atomically while preserving earlier `Xitdb.Columnar` row-group pages across `Store.with_as_of/3` snapshots.

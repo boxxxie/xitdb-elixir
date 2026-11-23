@@ -6,7 +6,7 @@
 [![Odin](https://img.shields.io/badge/Odin-dev--2026--09%2B-3882D2.svg)](https://odin-lang.org)
 [![Ash](https://img.shields.io/badge/Ash-3.37.2%2B-E04F5F.svg)](https://ash-hq.org)
 [![Format](https://img.shields.io/badge/xitdb-v2%20wire%20format-5C6BC0.svg)](https://github.com/xit-vcs/xitdb)
-[![Benchmarks](https://img.shields.io/badge/benchmarks-28%20workloads-orange.svg)](https://github.com/boxxxie/xitdb-elixir/blob/master/benchmarks/README.md)
+[![Benchmarks](https://img.shields.io/badge/benchmarks-32%20workloads-orange.svg)](https://github.com/boxxxie/xitdb-elixir/blob/master/benchmarks/README.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 `Xitdb` brings [`xitdb`](https://github.com/xit-vcs/xitdb) to Elixir—an embedded, single-file database where you store nested maps, lists, sorted maps, and sets directly on disk, and every transaction commits an immutable snapshot in time.
@@ -242,7 +242,7 @@ Compiling `xitdb` builds an embedded Erlang NIF wrapping the Odin database engin
 
 ## Under the Hood & Development
 
-`Xitdb` embeds [`odin-xitdb`](https://github.com/boxxxie/odin-xitdb) in-process via a C-ABI Erlang NIF (`native/nif_entry.c` + `native/xitdb_nif.odin`), giving Elixir applications direct access to `xitdb`'s persistent tries, B+Trees, Datalog engine, and BM25 search without serialization overhead or an external daemon. See [Architecture, Internals & Performance](docs/architecture-and-internals.md) for the full technical design and [1v1 Client Benchmarks (`benchmarks/README.md`)](https://github.com/boxxxie/xitdb-elixir/blob/master/benchmarks/README.md) for latency and throughput numbers across 28 workloads.
+`Xitdb` embeds [`odin-xitdb`](https://github.com/boxxxie/odin-xitdb) in-process via a C-ABI Erlang NIF (`native/nif_entry.c` + `native/xitdb_nif.odin`), giving Elixir applications direct access to `xitdb`'s persistent tries, B+Trees, Datalog engine, and BM25 search without serialization overhead or an external daemon. See [Architecture, Internals & Performance](docs/architecture-and-internals.md) for the full technical design and [1v1 Client Benchmarks (`benchmarks/README.md`)](https://github.com/boxxxie/xitdb-elixir/blob/master/benchmarks/README.md) for latency and throughput numbers across 32 workloads.
 
 ```bash
 # Run formatting, --warnings-as-errors compile, and tests
