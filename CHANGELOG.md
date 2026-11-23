@@ -2,13 +2,33 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.4.0] - 2026-11-23
+
+### Added
+- **Batched Multi-Key Slot Lookup (`native/xitdb_nif.odin`, `native/nif_entry.c`, `Xitdb.NIF`):**
+  - Added `Xitdb.NIF.nif_slot_get_keys/4` (`odin_nif_slot_get_keys`) to fetch multiple keys from `Hash_Map`, `Counted_Hash_Map`, or `Sorted_Map` slots in a single read-locked NIF crossing.
+- **Incremental Batch BM25 Indexing (`Xitdb.Ash.Search`):**
+  - Added `Xitdb.Ash.Search.index_records!/3,4` (`:tenant`, `:parallel`, `:assume_new?`, `:worker_wrapper`, `:timeout`, `:lease_timeout`) to incrementally index or update deferred batches into populated collections in one atomic commit without re-scanning existing rows.
+- **Ash & Bulk NIF Benchmark Suites (`benchmarks/`):**
+  - Added [`benchmarks/bench_ash_bulk.exs`](benchmarks/bench_ash_bulk.exs) and 1v1 client benchmark workloads `#29` (`:bulk_put_maps`), `#30` (`:bulk_put_nested_maps`), `#31` (`:bulk_index_puts`), and `#32` (`nif_slot_get_keys/4`).
+
+### Changed
+- **Precompiled Read Plans & Batched Bulk Prefetching (`Xitdb.Ash.Codec`, `Xitdb.Ash.Mutator`, `Xitdb.Ash.Query`):**
+  - Added `Xitdb.Ash.Codec.compile_read_plan/3` and `from_cursor_fast/3` using `nif_slot_get_keys/4`, prebuilt struct templates, and primitive attribute fast paths across `Query.stage2_hydrate/3`, `Search.rebuild_index!/3`, and `Mutator` overwrites.
+  - Enabled Stage 2 `Ash.Query.select/2` hydration narrowing on all resources (including uncompressed resources), falling back conservatively to `:all` on `exists(...)` / `parent(...)` filters and skipping redundant `stage6_project/4` passes when no extra attributes were hydrated.
+  - Added probe-first batched `Mutator` prefetching (`prefetch_bulk_lookups/10`) in 2,048-key chunks and switched coalesced `Ash.bulk_create` search staging to shared `Search.plan_bulk_index_ops/4` with precompiled zero-closure term extraction, batched `Search.Storage.read_docs_from_cursor/2`, and `parallel: :auto` (`>= 500` non-resolver rows).
+
+### Fixed
+- **Unselected Filter & Sort Dependencies in `Xitdb.Ash.Query`:**
+  - Fixed `collect_expr_ref_names/2` and `add_sort_key_names/2` to retain `%Ash.Query.Ref{attribute: %Ash.Resource.Attribute{}}` and `%Ash.Resource.Attribute{}` dependencies when narrowing Stage 2 hydration on `select` queries.
+
 ## [2.3.0] - 2026-11-23
 
 ### Added
 - **Bulk NIF Transaction Operations (`native/xitdb_nif.odin`):**
   - Added coarse-grained `:bulk_put_maps`, `:bulk_put_nested_maps`, and `:bulk_index_puts` (`:unique`, `:counted_set_add`, `:hash_map_merge`) transaction callbacks with deferred cold validation, adaptive container initialization, and atomic rollback on failure.
 - **Single-Pass BM25 Rebuild & Deferred Search Indexing (`Xitdb.Ash.Search`, `Xitdb.Ash.Mutator`, `Xitdb.Ash.Indexer`):**
-  - Added `Xitdb.Ash.Search.rebuild_index!/2,3` to rebuild `idx.search` in a single atomic commit with optional parallel term extraction (`:parallel`, `:max_concurrency`, `:chunk_size`, `:tenant`, and `:tx_opts`).
+  - Added `Xitdb.Ash.Search.rebuild_index!/2,3` to rebuild `idx.search` in a single atomic commit with optional parallel term extraction (`:tenant`, `:parallel`, `:only_attrs`, `:worker_wrapper`, `:timeout`, and `:lease_timeout`).
   - Added `context: %{xitdb: %{skip_search_index?: true}}` support across coalesced, `nested_in :one`, and `:row_group` `Ash.bulk_create` batches to defer BM25 indexing until a single `Search.rebuild_index!/3` pass.
 
 ### Changed

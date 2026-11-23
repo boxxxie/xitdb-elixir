@@ -160,7 +160,7 @@ defmodule Xitdb.AshBulkBench do
     warmup = env_int("WARMUP", @default_warmup, 0)
 
     IO.puts(
-      "\n=== Xitdb v2.3.0 Ash & Search Bulk Benchmark (ROWS=#{total_rows}, RUNS=#{runs}, WARMUP=#{warmup}) ===\n"
+      "\n=== Xitdb v2.4.0 Ash & Search Bulk Benchmark (ROWS=#{total_rows}, RUNS=#{runs}, WARMUP=#{warmup}) ===\n"
     )
 
     warm_ash_runtime()
