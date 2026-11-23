@@ -1413,6 +1413,141 @@ odin_nif_slot_get_key :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF
 }
 
 @(export)
+odin_nif_slot_get_keys :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {
+	context = runtime.default_context()
+	defer free_all(context.temp_allocator)
+
+	if argc != 4 {
+		return make_err(env, "badarg")
+	}
+	tag_int: i64 = 0
+	val_int: i64 = 0
+	if nif_get_int64(env, argv[1], &tag_int) == 0 || nif_get_int64(env, argv[2], &val_int) == 0 {
+		return make_err(env, "badarg")
+	}
+	if nif_is_list(env, argv[3]) == 0 {
+		return make_err(env, "badarg")
+	}
+
+	handle, ok := acquire_rlock(env, argv[0])
+	if !ok {
+		return make_err(env, "closed")
+	}
+	defer nif_rwlock_runlock(handle.rwlock)
+
+	slot, is_root, is_empty, r_err, err_reason := resolve_slot_arg(handle, tag_int, val_int)
+	if r_err != nil {
+		return make_xitdb_err(env, r_err)
+	}
+	if err_reason != "" {
+		return make_err(env, err_reason)
+	}
+	if is_empty {
+		tail := argv[3]
+		head: ERL_NIF_TERM
+		for nif_is_empty_list(env, tail) == 0 {
+			if nif_get_list_cell(env, tail, &head, &tail) == 0 {
+				return make_err(env, "badarg")
+			}
+			_, ok_k := get_string_from_binary(env, head)
+			if !ok_k {
+				return make_err(env, "badarg")
+			}
+		}
+		return make_ok(env, nif_make_new_map(env))
+	}
+
+	cur := xitdb.Read_Cursor{
+		slot_ptr = xitdb.Slot_Pointer{position = nil, slot = slot},
+		db       = &handle.db,
+	}
+
+	hm: xitdb.Read_Hash_Map
+	sm: xitdb.Read_Sorted_Map
+	is_sorted := false
+	init_err: xitdb.Error = nil
+
+	#partial switch slot.tag {
+	case .Hash_Map:
+		hm, init_err = xitdb.read_hash_map_init(cur)
+	case .Counted_Hash_Map:
+		chm: xitdb.Read_Counted_Hash_Map
+		chm, init_err = xitdb.read_counted_hash_map_init(cur)
+		if init_err == nil {
+			hm = chm.read_hash_map
+		}
+	case .Sorted_Map:
+		sm, init_err = xitdb.read_sorted_map_init(cur)
+		is_sorted = true
+	case:
+		return make_err(env, "unsupported")
+	}
+
+	if init_err != nil {
+		return make_xitdb_err(env, init_err)
+	}
+
+	k_buf: [16]ERL_NIF_TERM = ---
+	v_buf: [16]ERL_NIF_TERM = ---
+	k_len := 0
+	v_len := 0
+	k_dyn: [dynamic]ERL_NIF_TERM
+	v_dyn: [dynamic]ERL_NIF_TERM
+	using_k_dyn := false
+	using_v_dyn := false
+
+	tail := argv[3]
+	head: ERL_NIF_TERM
+	for nif_is_empty_list(env, tail) == 0 {
+		if nif_get_list_cell(env, tail, &head, &tail) == 0 {
+			return make_err(env, "badarg")
+		}
+		key_str, ok_k := get_string_from_binary(env, head)
+		if !ok_k {
+			return make_err(env, "badarg")
+		}
+		if is_root && key_str == "__tx" {
+			continue
+		}
+
+		child_slot_maybe: Maybe(xitdb.Slot) = nil
+		lookup_err: xitdb.Error = nil
+		if is_sorted {
+			child_slot_maybe, lookup_err = xitdb.sorted_map_get_slot(sm, key_str)
+		} else {
+			child_slot_maybe, lookup_err = xitdb.hash_map_get_slot(hm, key_str)
+		}
+		if lookup_err == .Key_Not_Found {
+			continue
+		}
+		if lookup_err != nil {
+			return make_xitdb_err(env, lookup_err)
+		}
+
+		child_slot, has_child := child_slot_maybe.?
+		if !has_child || (child_slot.tag == .None && !child_slot.full) {
+			continue
+		}
+
+		codec_err := ""
+		val_term, t_err := slot_to_term(env, &handle.db, child_slot, false, &codec_err)
+		if t_err != nil {
+			if len(codec_err) > 0 {
+				return make_err(env, codec_err)
+			}
+			return make_xitdb_err(env, t_err)
+		}
+
+		push_nif_term(k_buf[:], &k_len, &k_dyn, &using_k_dyn, head, context.temp_allocator)
+		push_nif_term(v_buf[:], &v_len, &v_dyn, &using_v_dyn, val_term, context.temp_allocator)
+	}
+
+	k_slice := k_dyn[:] if using_k_dyn else k_buf[:k_len]
+	v_slice := v_dyn[:] if using_v_dyn else v_buf[:v_len]
+	return make_ok(env, make_map_safe(env, k_slice, v_slice))
+}
+
+@(export)
 odin_nif_slot_get_index :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {
 	context = runtime.default_context()
 	defer free_all(context.temp_allocator)

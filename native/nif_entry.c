@@ -13,6 +13,7 @@ extern ERL_NIF_TERM odin_nif_sync(ErlNifEnv* env, int argc, const ERL_NIF_TERM a
 extern ERL_NIF_TERM odin_nif_info(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 extern ERL_NIF_TERM odin_nif_moment_slot(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 extern ERL_NIF_TERM odin_nif_slot_get_key(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+extern ERL_NIF_TERM odin_nif_slot_get_keys(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 extern ERL_NIF_TERM odin_nif_slot_get_index(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 extern ERL_NIF_TERM odin_nif_slot_count(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 extern ERL_NIF_TERM odin_nif_slot_contains(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
@@ -401,6 +402,7 @@ static ErlNifFunc nif_funcs[] = {
     {"nif_moment_slot",      2, odin_nif_moment_slot,      0},
     {"nif_moment_slot",      3, odin_nif_moment_slot,      0},
     {"nif_slot_get_key",     4, odin_nif_slot_get_key,     0},
+    {"nif_slot_get_keys",    4, odin_nif_slot_get_keys,    0},
     {"nif_slot_get_index",   4, odin_nif_slot_get_index,   0},
     {"nif_slot_count",       3, odin_nif_slot_count,       0},
     {"nif_slot_contains",    4, odin_nif_slot_contains,    0},

@@ -60,6 +60,7 @@ defmodule Xitdb.NifSafetyTest do
       assert {:error, _} = NIF.nif_slot_entries(db.db_ref, tag_id, val, 0, 10)
       assert {:error, _} = NIF.nif_pull(db.db_ref, tag_id, val, "*")
       assert {:error, :invalid_slot} = NIF.nif_slot_get_key(db.db_ref, tag_id, val, "k")
+      assert {:error, :invalid_slot} = NIF.nif_slot_get_keys(db.db_ref, tag_id, val, ["k"])
       assert {:error, :invalid_slot} = NIF.nif_slot_get_index(db.db_ref, tag_id, val, 0)
       assert {:error, _} = NIF.nif_slot_contains(db.db_ref, tag_id, val, "k")
       assert {:error, _} = NIF.nif_slot_slice(db.db_ref, tag_id, val, 0, 5)
@@ -1301,5 +1302,82 @@ defmodule Xitdb.NifSafetyTest do
     assert Enum.to_list(snap["idx"]["col"]["s"]["k1"]) == ["doc2"]
     assert Enum.to_list(snap["docs"]["d1"]["tags"]) == ["b"]
     assert :ok = Xitdb.close(db)
+  end
+
+  test "nif_slot_get_keys supports all map types, root __tx isolation, duplicates, empty DBs, and invalid input rejections" do
+    {:ok, empty_db} = Xitdb.open(backend: :memory)
+    assert {:ok, %{}} = NIF.nif_slot_get_keys(empty_db.db_ref, -1, -1, ["a", "b"])
+    assert {:error, :badarg} = NIF.nif_slot_get_keys(empty_db.db_ref, -1, -1, ["a", 123])
+    assert {:error, :badarg} = NIF.nif_slot_get_keys(empty_db.db_ref, -1, -1, ["a" | "b"])
+    :ok = Xitdb.close(empty_db)
+
+    {:ok, db} = Xitdb.open(backend: :memory)
+
+    {:ok, db} =
+      Xitdb.transact(
+        db,
+        %{
+          "hm" => %{"a" => 1, "b" => "two", "nested" => %{"x" => 9}},
+          "chm" => Xitdb.counted_map(%{"k1" => "v1", "k2" => 22}),
+          "sm" => Xitdb.sorted_map(%{"s1" => "one", "s2" => "two"}),
+          "arr" => [1, 2, 3],
+          "cset" => Xitdb.counted_set(["m1"]),
+          "comp_cz" => {:compressed, String.duplicate("hello ", 40), codec: :zlib},
+          "comp_zs" => {:compressed, String.duplicate("world ", 40), codec: :zstd}
+        },
+        doc: "root metadata"
+      )
+
+    root = Xitdb.db(db)
+    assert {:ok, %{}} = NIF.nif_slot_get_keys(db.db_ref, -1, -1, [])
+
+    {:ok, root_map} =
+      NIF.nif_slot_get_keys(db.db_ref, -1, -1, ["__tx", "hm", "comp_cz", "comp_zs", "missing"])
+
+    refute Map.has_key?(root_map, "__tx")
+    refute Map.has_key?(root_map, "missing")
+    assert {:cursor, _tag_id, _val} = root_map["hm"]
+    assert root_map["comp_cz"] == String.duplicate("hello ", 40)
+    assert {:tagged, "zs", payload} = root_map["comp_zs"]
+    assert is_binary(payload)
+
+    hm_cur = root["hm"]
+    chm_cur = root["chm"]
+    sm_cur = root["sm"]
+    arr_cur = root["arr"]
+    cset_cur = root["cset"]
+
+    assert {:ok, %{"a" => 1, "b" => "two", "nested" => {:cursor, _, _}}} =
+             NIF.nif_slot_get_keys(db.db_ref, hm_cur.tag_id, hm_cur.value, [
+               "a",
+               "b",
+               "b",
+               "nested",
+               "nope"
+             ])
+
+    assert {:ok, %{"k1" => "v1"}} =
+             NIF.nif_slot_get_keys(db.db_ref, chm_cur.tag_id, chm_cur.value, ["k1", "nope"])
+
+    assert {:ok, %{"s2" => "two"}} =
+             NIF.nif_slot_get_keys(db.db_ref, sm_cur.tag_id, sm_cur.value, ["s2", "missing"])
+
+    assert {:error, :unsupported} =
+             NIF.nif_slot_get_keys(db.db_ref, arr_cur.tag_id, arr_cur.value, ["0"])
+
+    assert {:error, :unsupported} =
+             NIF.nif_slot_get_keys(db.db_ref, cset_cur.tag_id, cset_cur.value, ["m1"])
+
+    assert {:error, :badarg} =
+             NIF.nif_slot_get_keys(db.db_ref, hm_cur.tag_id, hm_cur.value, "not_a_list")
+
+    assert {:error, :badarg} =
+             NIF.nif_slot_get_keys(db.db_ref, hm_cur.tag_id, hm_cur.value, [:atom_key])
+
+    assert {:error, :badarg} =
+             NIF.nif_slot_get_keys(db.db_ref, hm_cur.tag_id, hm_cur.value, ["a" | "improper"])
+
+    assert :ok = Xitdb.close(db)
+    assert {:error, :closed} = NIF.nif_slot_get_keys(db.db_ref, -1, -1, ["hm"])
   end
 end

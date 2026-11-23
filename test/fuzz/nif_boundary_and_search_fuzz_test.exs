@@ -97,6 +97,10 @@ defmodule Xitdb.Fuzz.NifBoundaryAndSearchFuzzTest do
     assert_nif_result(fn -> Xitdb.query(ro_db, data) end)
     assert_nif_result(fn -> Xitdb.history_of(ro_db, data) end)
 
+    assert_nif_result(fn ->
+      Xitdb.NIF.nif_slot_get_keys(ro_db.db_ref, -1, -1, [data, "users", "__tx"])
+    end)
+
     {:ok, tx_db} = Xitdb.open(backend: :memory)
 
     try do
@@ -175,14 +179,48 @@ defmodule Xitdb.Fuzz.NifBoundaryAndSearchFuzzTest do
     Enum.with_index(parts, fn bytes, idx ->
       selector = safe_selector_from_bytes(bytes)
       val = :erlang.list_to_binary(bytes)
+      key = sanitize_token(bytes)
+      col = "c_#{rem(hd(bytes), 3)}"
 
-      case rem((hd(bytes) + idx) |> abs(), 6) do
-        0 -> {:put, selector, val}
-        1 -> {:rm, selector}
-        2 -> {:merge_map, %{"k#{idx}" => val}}
-        3 -> {:append, ".items", val}
-        4 -> {:slice, ".items", 0, max(rem(hd(bytes), 5), 0)}
-        5 -> {:put, val, hd(bytes)}
+      case rem((hd(bytes) + idx) |> abs(), 11) do
+        0 ->
+          {:put, selector, val}
+
+        1 ->
+          {:rm, selector}
+
+        2 ->
+          {:merge_map, %{"k#{idx}" => val}}
+
+        3 ->
+          {:append, ".items", val}
+
+        4 ->
+          {:slice, ".items", 0, max(rem(hd(bytes), 5), 0)}
+
+        5 ->
+          {:put, val, hd(bytes)}
+
+        6 ->
+          {:bulk_put_maps, [col], [{key, %{"v" => val}, []}]}
+
+        7 ->
+          {:bulk_put_maps, [col], [val]}
+
+        8 ->
+          {:bulk_put_nested_maps, [col], [{key, "sub", "k#{idx}", %{"v" => val}, []}]}
+
+        9 ->
+          {:bulk_index_puts, ["idx", col, "u"], :unique, [{key, val}]}
+
+        10 ->
+          case rem(idx, 2) do
+            0 ->
+              {:bulk_index_puts, ["idx", col, "s"], :counted_set_add, [{key, [val]}]}
+
+            1 ->
+              {:bulk_index_puts, ["idx", col, "t"], :hash_map_merge, [{key, %{val => hd(bytes)}}]}
+          end
       end
     end)
   end

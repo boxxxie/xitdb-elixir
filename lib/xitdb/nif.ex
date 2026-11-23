@@ -20,6 +20,7 @@ defmodule Xitdb.NIF do
   def nif_moment_slot(_db_ref, _moment_idx), do: :erlang.nif_error(:nif_not_loaded)
   def nif_moment_slot(_db_ref, _moment_idx, _with_index), do: :erlang.nif_error(:nif_not_loaded)
   def nif_slot_get_key(_db_ref, _tag_id, _val, _key), do: :erlang.nif_error(:nif_not_loaded)
+  def nif_slot_get_keys(_db_ref, _tag_id, _val, _keys), do: :erlang.nif_error(:nif_not_loaded)
   def nif_slot_get_index(_db_ref, _tag_id, _val, _index), do: :erlang.nif_error(:nif_not_loaded)
   def nif_slot_count(_db_ref, _tag_id, _val), do: :erlang.nif_error(:nif_not_loaded)
   def nif_slot_contains(_db_ref, _tag_id, _val, _key), do: :erlang.nif_error(:nif_not_loaded)
