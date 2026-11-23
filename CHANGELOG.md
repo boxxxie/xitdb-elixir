@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.4.1] - 2026-11-23
+
+### Fixed
+- **Missing Secondary Indexes on `allow_existing_cursor?: true` Coalesced `Ash.bulk_create` (`Xitdb.Ash.Mutator`):**
+  - Updated `accumulate_bulk_secondary/7` to check actual `idx.<col>.<slot>[new_hex]` set membership via `fetch_cached_set_cur/5` and `IndexStorage.set_container_member?/2` before skipping `old_raw == new_raw` entries, so hydrating pre-existing raw entity cursors whose secondary index buckets have not yet been populated still populates all `attr_*` secondary indexes while caching per-key bucket cursors across repeated rows.
+
 ## [2.4.0] - 2026-11-23
 
 ### Added
