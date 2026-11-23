@@ -2060,5 +2060,635 @@ if Code.ensure_loaded?(Ash.DataLayer) do
                  )
       end
     end
+
+    describe "Coalesced Bulk Create Engine, nested_in :many, allow_existing_cursor?, and skip_search_index?" do
+      defmodule BulkStore do
+        use Xitdb.Ash.Store
+      end
+
+      defmodule BulkParent do
+        use Ash.Resource,
+          domain: Xitdb.Ash.MutatorTest.BulkDomain,
+          data_layer: Xitdb.Ash.DataLayer
+
+        xitdb do
+          store(BulkStore)
+          collection(:bulk_parents)
+          index([:sector])
+          search_field(:name, boost: 2.0)
+          search_field(:notes, boost: 1.0)
+        end
+
+        attributes do
+          attribute(:id, :integer,
+            primary_key?: true,
+            allow_nil?: false,
+            generated?: true,
+            writable?: true,
+            public?: true
+          )
+
+          attribute(:name, :string, allow_nil?: false, public?: true)
+          attribute(:slug, :string, allow_nil?: false, public?: true)
+          attribute(:sector, :string, allow_nil?: false, public?: true)
+          attribute(:notes, :string, public?: true)
+        end
+
+        identities do
+          identity(:unique_slug, [:slug])
+        end
+
+        actions do
+          defaults([:read, :destroy])
+
+          create :create do
+            primary?(true)
+            accept([:id, :name, :slug, :sector, :notes])
+          end
+        end
+      end
+
+      defmodule BulkChild do
+        use Ash.Resource,
+          domain: Xitdb.Ash.MutatorTest.BulkDomain,
+          data_layer: Xitdb.Ash.DataLayer
+
+        xitdb do
+          store(BulkStore)
+          collection(:bulk_children)
+          nested_in(:bulk_parents, foreign_key: :parent_id, path: :children, cardinality: :many)
+          index([:tag])
+          search_field(:label, boost: 1.5)
+        end
+
+        attributes do
+          attribute(:id, :integer,
+            primary_key?: true,
+            allow_nil?: false,
+            generated?: true,
+            writable?: true,
+            public?: true
+          )
+
+          attribute(:parent_id, :integer, allow_nil?: false, public?: true)
+          attribute(:code, :string, allow_nil?: false, public?: true)
+          attribute(:tag, :string, allow_nil?: false, public?: true)
+          attribute(:label, :string, public?: true)
+        end
+
+        identities do
+          identity(:unique_code, [:code])
+        end
+
+        actions do
+          defaults([:read, :destroy])
+
+          create :create do
+            primary?(true)
+            accept([:id, :parent_id, :code, :tag, :label])
+          end
+        end
+      end
+
+      defmodule BulkCompressedDoc do
+        use Ash.Resource,
+          domain: Xitdb.Ash.MutatorTest.BulkDomain,
+          data_layer: Xitdb.Ash.DataLayer
+
+        xitdb do
+          store(BulkStore)
+          collection(:bulk_compressed_docs)
+          compress([:body], mode: :value, codec: :zstd, min_bytes: 32, intern_above: 64)
+          search_field(:title, boost: 1.0)
+        end
+
+        attributes do
+          attribute(:id, :integer,
+            primary_key?: true,
+            allow_nil?: false,
+            generated?: true,
+            writable?: true,
+            public?: true
+          )
+
+          attribute(:title, :string, allow_nil?: false, public?: true)
+          attribute(:body, :string, allow_nil?: false, public?: true)
+          attribute(:meta, :map, default: %{}, public?: true)
+        end
+
+        actions do
+          defaults([:read, :destroy])
+
+          create :create do
+            primary?(true)
+            accept([:id, :title, :body, :meta])
+          end
+        end
+      end
+
+      defmodule BulkNestedOne do
+        use Ash.Resource,
+          domain: Xitdb.Ash.MutatorTest.BulkDomain,
+          data_layer: Xitdb.Ash.DataLayer
+
+        xitdb do
+          store(BulkStore)
+          collection(:bulk_nested_ones)
+          nested_in(:bulk_parents, foreign_key: :parent_id, path: :profile, cardinality: :one)
+          search_field(:bio, boost: 1.0)
+        end
+
+        attributes do
+          attribute(:id, :integer,
+            primary_key?: true,
+            allow_nil?: false,
+            generated?: true,
+            writable?: true,
+            public?: true
+          )
+
+          attribute(:parent_id, :integer, allow_nil?: false, public?: true)
+          attribute(:bio, :string, allow_nil?: false, public?: true)
+        end
+
+        actions do
+          defaults([:read, :destroy])
+
+          create :create do
+            primary?(true)
+            accept([:id, :parent_id, :bio])
+          end
+        end
+      end
+
+      defmodule BulkRowGroupDoc do
+        use Ash.Resource,
+          domain: Xitdb.Ash.MutatorTest.BulkDomain,
+          data_layer: Xitdb.Ash.DataLayer
+
+        xitdb do
+          store(BulkStore)
+          collection(:bulk_row_group_docs)
+          compress([:body], mode: :row_group, codec: :zstd, row_group_size: 4, min_bytes: 16)
+          search_field(:title, boost: 1.0)
+        end
+
+        attributes do
+          attribute(:id, :integer,
+            primary_key?: true,
+            allow_nil?: false,
+            generated?: true,
+            writable?: true,
+            public?: true
+          )
+
+          attribute(:title, :string, allow_nil?: false, public?: true)
+          attribute(:body, :string, allow_nil?: false, public?: true)
+        end
+
+        actions do
+          defaults([:read, :destroy])
+
+          create :create do
+            primary?(true)
+            accept([:id, :title, :body])
+          end
+        end
+      end
+
+      defmodule BulkDomain do
+        use Ash.Domain, validate_config_inclusion?: false
+
+        resources do
+          resource(BulkParent)
+          resource(BulkChild)
+          resource(BulkCompressedDoc)
+          resource(BulkNestedOne)
+          resource(BulkRowGroupDoc)
+        end
+      end
+
+      setup do
+        {:ok, pid} =
+          Store.start_link(
+            name: BulkStore,
+            path: :memory,
+            domains: [BulkDomain]
+          )
+
+        on_exit(fn ->
+          if Process.alive?(pid) do
+            try do
+              GenServer.stop(pid, :normal, 1_000)
+            catch
+              :exit, _ -> :ok
+            end
+          end
+        end)
+
+        :ok
+      end
+
+      test "handles mixed explicit/nil PK sequences, nested_in :many, sibling preservation, identities, and skip_search_index?" do
+        # 1. Mixed nil and explicit integer IDs must never collide within batch or sequence floor
+        parents_res =
+          Ash.bulk_create!(
+            [
+              %{name: "Alpha Corp", slug: "alpha", sector: "tech", notes: "legacy notes"},
+              %{id: 100, name: "Beta Fund", slug: "beta", sector: "finance"},
+              %{name: "Gamma Group", slug: "gamma", sector: "tech", notes: "cloud"},
+              %{id: 50, name: "Delta Partners", slug: "delta", sector: "finance"},
+              %{name: "Epsilon Bio", slug: "epsilon", sector: "health"}
+            ],
+            BulkParent,
+            :create,
+            domain: BulkDomain,
+            return_records?: true
+          )
+
+        parent_ids = Enum.map(parents_res.records, & &1.id)
+        assert parent_ids == [101, 100, 102, 50, 103]
+        assert Store.root(BulkStore)["meta"]["sequences"]["bulk_parents"] == 103
+
+        # Duplicate unique identity inside a batch rejects cleanly
+        dup_res =
+          Ash.bulk_create(
+            [
+              %{name: "One", slug: "dup-slug", sector: "tech"},
+              %{name: "Two", slug: "dup-slug", sector: "tech"}
+            ],
+            BulkParent,
+            :create,
+            domain: BulkDomain,
+            return_errors?: true
+          )
+
+        assert dup_res.status == :error
+
+        # Secondary index and BM25 work immediately after coalesced bulk_create
+        require Ash.Query
+
+        tech_parents =
+          BulkParent
+          |> Ash.Query.filter(sector == "tech")
+          |> Ash.read!(domain: BulkDomain)
+          |> Enum.map(& &1.slug)
+          |> Enum.sort()
+
+        assert tech_parents == ["alpha", "gamma"]
+        assert Xitdb.Ash.Search.ids(BulkParent, "legacy") == [101]
+
+        # 2. nested_in :many bulk create populates nested subtree, _parent locator, secondary, search
+        children_res =
+          Ash.bulk_create!(
+            [
+              %{parent_id: 101, code: "c1", tag: "core", label: "Primary Partner"},
+              %{parent_id: 101, code: "c2", tag: "core", label: "Managing Partner"},
+              %{parent_id: 100, code: "c3", tag: "ops", label: "Operations Lead"}
+            ],
+            BulkChild,
+            :create,
+            domain: BulkDomain,
+            return_records?: true
+          )
+
+        assert length(children_res.records) == 3
+        root = Store.root(BulkStore)
+        assert root["bulk_parents"]["101"]["children"]["1"]["code"] == "c1"
+        assert root["bulk_parents"]["101"]["children"]["2"]["code"] == "c2"
+        assert root["bulk_parents"]["100"]["children"]["3"]["code"] == "c3"
+
+        assert {:ok, c1_cur} = Xitdb.Ash.Indexer.fetch_cursor(root, BulkChild, 1)
+        assert c1_cur["code"] == "c1"
+        assert length(Xitdb.Ash.Indexer.all_cursors(root, BulkChild)) == 3
+        assert 1 in Xitdb.Ash.Search.ids(BulkChild, "primary")
+
+        core_children =
+          BulkChild
+          |> Ash.Query.filter(tag == "core")
+          |> Ash.read!(domain: BulkDomain)
+          |> Enum.map(& &1.code)
+          |> Enum.sort()
+
+        assert core_children == ["c1", "c2"]
+
+        # Missing parent rejects cleanly
+        missing_parent_res =
+          Ash.bulk_create(
+            [%{parent_id: 999_999, code: "orphan", tag: "ops"}],
+            BulkChild,
+            :create,
+            domain: BulkDomain,
+            return_errors?: true
+          )
+
+        assert missing_parent_res.status == :error
+
+        # 3. allow_existing_cursor? preserves nested .children subtree, drops removed fields, updates BM25
+        Ash.bulk_create!(
+          [
+            %{id: 101, name: "Alpha Renamed", slug: "alpha", sector: "tech", notes: nil}
+          ],
+          BulkParent,
+          :create,
+          domain: BulkDomain,
+          context: %{xitdb: %{allow_existing_cursor?: true}},
+          return_records?: false
+        )
+
+        root_after = Store.root(BulkStore)
+        assert root_after["bulk_parents"]["101"]["name"] == "Alpha Renamed"
+        assert is_nil(root_after["bulk_parents"]["101"]["notes"])
+        assert root_after["bulk_parents"]["101"]["children"]["1"]["code"] == "c1"
+        assert root_after["bulk_parents"]["101"]["children"]["2"]["code"] == "c2"
+        assert Xitdb.Ash.Search.ids(BulkParent, "legacy") == []
+        assert Xitdb.Ash.Search.ids(BulkParent, "renamed") == [101]
+
+        # 4. skip_search_index?: true skips BM25 writes until Search.rebuild_index!
+        Ash.bulk_create!(
+          [%{id: 200, name: "Deferred Zeta", slug: "zeta", sector: "ai"}],
+          BulkParent,
+          :create,
+          domain: BulkDomain,
+          context: %{xitdb: %{skip_search_index?: true}},
+          return_records?: false
+        )
+
+        assert Xitdb.Ash.Search.ids(BulkParent, "zeta") == []
+        :ok = Xitdb.Ash.Search.rebuild_index!(BulkStore, BulkParent, parallel: false)
+        assert Xitdb.Ash.Search.ids(BulkParent, "zeta") == [200]
+      end
+
+      test "coalesced bulk_create handles mode: :value compression with __blobs deduplication and Xitdb.Encoder structs in :map" do
+        shared_body = String.duplicate("CAASA bulk compressed payload block.", 5)
+
+        ru = %Xitdb.Ash.Types.RangedUnit{
+          bound_kind: :closed_range,
+          dimension: :currency,
+          currency: :usd,
+          min_val: Decimal.new("100"),
+          max_val: Decimal.new("500")
+        }
+
+        meta = %{
+          "date" => ~D[2026-11-19],
+          "dec" => Decimal.new("199.95"),
+          "ru" => ru
+        }
+
+        res =
+          Ash.bulk_create!(
+            [
+              %{title: "First Doc", body: shared_body, meta: meta},
+              %{title: "Second Doc", body: shared_body, meta: meta}
+            ],
+            BulkCompressedDoc,
+            :create,
+            domain: BulkDomain,
+            return_records?: true
+          )
+
+        assert length(res.records) == 2
+
+        root = Store.root(BulkStore)
+        assert Enum.count(root["__blobs"]) == 1
+
+        loaded =
+          BulkCompressedDoc
+          |> Ash.read!(domain: BulkDomain)
+          |> Enum.sort_by(& &1.id)
+
+        assert Enum.map(loaded, & &1.body) == [shared_body, shared_body]
+
+        for doc <- loaded do
+          assert doc.meta["date"] == {:tagged, "dt", "2026-11-19"}
+          assert doc.meta["dec"] == {:tagged, "dc", "199.95"}
+
+          assert {:ok, loaded_ru} =
+                   Ash.Type.cast_stored(Xitdb.Ash.Types.RangedUnit, doc.meta["ru"], [])
+
+          assert Xitdb.Ash.Types.RangedUnit.equal?(loaded_ru, ru)
+        end
+      end
+
+      test "skip_search_index?: true is honored on nested_in :one (legacy) and :row_group (columnar) bulk_create" do
+        parent =
+          Ash.create!(
+            BulkParent,
+            %{id: 1, name: "Host Org", slug: "host-org", sector: "tech"},
+            domain: BulkDomain
+          )
+
+        Ash.bulk_create!(
+          [%{id: 10, parent_id: parent.id, bio: "Unique NestedBioToken"}],
+          BulkNestedOne,
+          :create,
+          domain: BulkDomain,
+          context: %{xitdb: %{skip_search_index?: true}},
+          return_records?: false
+        )
+
+        Ash.bulk_create!(
+          [
+            %{
+              id: 20,
+              title: "Columnar DeferredAlpha",
+              body: String.duplicate("Columnar body content ", 4)
+            },
+            %{
+              id: 21,
+              title: "Columnar DeferredBeta",
+              body: String.duplicate("Columnar body content ", 4)
+            }
+          ],
+          BulkRowGroupDoc,
+          :create,
+          domain: BulkDomain,
+          context: %{xitdb: %{skip_search_index?: true}},
+          return_records?: false
+        )
+
+        assert Search.ids(BulkNestedOne, "nestedbiotoken") == []
+        assert Search.ids(BulkRowGroupDoc, "deferredalpha") == []
+
+        :ok = Search.rebuild_index!(BulkStore, BulkNestedOne, parallel: false)
+        :ok = Search.rebuild_index!(BulkStore, BulkRowGroupDoc, parallel: false)
+
+        assert Search.ids(BulkNestedOne, "nestedbiotoken") == [10]
+        assert Search.ids(BulkRowGroupDoc, "deferredalpha") == [20]
+        assert Search.ids(BulkRowGroupDoc, "deferredbeta") == [21]
+      end
+
+      test "coalesced bulk_create with allow_existing_cursor?: true cleans up stale unique identity keys and secondary index buckets" do
+        Ash.bulk_create!(
+          [
+            %{id: 10, name: "Ten", slug: "old-slug", sector: "legacy"},
+            %{id: 11, name: "Eleven", slug: "keep-slug", sector: "shared"},
+            %{id: 12, name: "Twelve", slug: "other-slug", sector: "shared"}
+          ],
+          BulkParent,
+          :create,
+          domain: BulkDomain
+        )
+
+        # Overwrite id 10 (releasing "old-slug" and leaving "legacy" empty), overwrite id 11
+        # (removing it from "shared" while keeping id 12), and claim "old-slug" on id 13 in the same batch.
+        Ash.bulk_create!(
+          [
+            %{id: 10, name: "Ten Updated", slug: "new-slug", sector: "modern"},
+            %{id: 11, name: "Eleven Updated", slug: "keep-slug", sector: "modern"},
+            %{id: 13, name: "Thirteen", slug: "old-slug", sector: "ai"}
+          ],
+          BulkParent,
+          :create,
+          domain: BulkDomain,
+          context: %{xitdb: %{allow_existing_cursor?: true}}
+        )
+
+        require Ash.Query
+
+        old_slug_ids =
+          BulkParent
+          |> Ash.Query.filter(slug == "old-slug")
+          |> Ash.read!(domain: BulkDomain)
+          |> Enum.map(& &1.id)
+
+        assert old_slug_ids == [13]
+
+        new_slug_ids =
+          BulkParent
+          |> Ash.Query.filter(slug == "new-slug")
+          |> Ash.read!(domain: BulkDomain)
+          |> Enum.map(& &1.id)
+
+        assert new_slug_ids == [10]
+
+        assert [] ==
+                 BulkParent
+                 |> Ash.Query.filter(sector == "legacy")
+                 |> Ash.read!(domain: BulkDomain)
+
+        root = Store.root(BulkStore)
+        legacy_hex = Base.encode16(<<1>> <> "legacy", case: :lower)
+        assert is_nil(root["idx"]["bulk_parents"]["attr_sector"][legacy_hex])
+
+        shared_ids =
+          BulkParent
+          |> Ash.Query.filter(sector == "shared")
+          |> Ash.read!(domain: BulkDomain)
+          |> Enum.map(& &1.id)
+
+        assert shared_ids == [12]
+
+        modern_ids =
+          BulkParent
+          |> Ash.Query.filter(sector == "modern")
+          |> Ash.read!(domain: BulkDomain)
+          |> Enum.map(& &1.id)
+          |> Enum.sort()
+
+        assert modern_ids == [10, 11]
+      end
+
+      test "coalesced bulk_create with allow_existing_cursor?: true clears nil'd fields and reparents nested :many children cleanly" do
+        Ash.bulk_create!(
+          [
+            %{id: 1, name: "Parent One", slug: "p1", sector: "tech"},
+            %{id: 2, name: "Parent Two", slug: "p2", sector: "tech"}
+          ],
+          BulkParent,
+          :create,
+          domain: BulkDomain
+        )
+
+        Ash.bulk_create!(
+          [%{id: 50, parent_id: 1, code: "c-old", tag: "t1", label: "initial"}],
+          BulkChild,
+          :create,
+          domain: BulkDomain
+        )
+
+        # In-place overwrite under parent 1 with label cleared to nil, new code, and new tag
+        Ash.bulk_create!(
+          [%{id: 50, parent_id: 1, code: "c-mid", tag: "t2", label: nil}],
+          BulkChild,
+          :create,
+          domain: BulkDomain,
+          context: %{xitdb: %{allow_existing_cursor?: true}}
+        )
+
+        root_mid = Store.root(BulkStore)
+        assert is_nil(root_mid["bulk_parents"]["1"]["children"]["50"]["label"])
+
+        old_code_hex = Base.encode16("c-old", case: :lower)
+        assert is_nil(root_mid["idx"]["bulk_children"]["id_unique_code"][old_code_hex])
+
+        require Ash.Query
+
+        assert [] ==
+                 BulkChild
+                 |> Ash.Query.filter(tag == "t1")
+                 |> Ash.read!(domain: BulkDomain)
+
+        # Reparent id 50 from parent 1 to parent 2
+        Ash.bulk_create!(
+          [%{id: 50, parent_id: 2, code: "c-new", tag: "t3", label: "moved"}],
+          BulkChild,
+          :create,
+          domain: BulkDomain,
+          context: %{xitdb: %{allow_existing_cursor?: true}}
+        )
+
+        root_after = Store.root(BulkStore)
+        assert is_nil(root_after["bulk_parents"]["1"]["children"]["50"])
+        assert root_after["bulk_parents"]["2"]["children"]["50"]["label"] == "moved"
+        assert length(Xitdb.Ash.Indexer.all_cursors(root_after, BulkChild)) == 1
+
+        assert [] ==
+                 BulkChild
+                 |> Ash.Query.filter(tag == "t2")
+                 |> Ash.read!(domain: BulkDomain)
+      end
+
+      test "skip_search_index?: true is propagated to nested_in :one eviction in bulk_create" do
+        parent =
+          Ash.create!(
+            BulkParent,
+            %{id: 1, name: "Evict Host", slug: "evict-host", sector: "tech"},
+            domain: BulkDomain
+          )
+
+        Ash.create!(
+          BulkNestedOne,
+          %{id: 10, parent_id: parent.id, bio: "OriginalAlpha"},
+          domain: BulkDomain
+        )
+
+        assert Search.ids(BulkNestedOne, "originalalpha") == [10]
+
+        Ash.bulk_create!(
+          [
+            %{id: 11, parent_id: parent.id, bio: "MiddleBeta"},
+            %{id: 12, parent_id: parent.id, bio: "FinalGamma"}
+          ],
+          BulkNestedOne,
+          :create,
+          domain: BulkDomain,
+          context: %{xitdb: %{skip_search_index?: true}},
+          return_records?: false
+        )
+
+        # idx.search.bulk_nested_ones must remain untouched during skipped bulk create
+        assert Search.ids(BulkNestedOne, "originalalpha") == [10]
+        assert Search.ids(BulkNestedOne, "middlebeta") == []
+        assert Search.ids(BulkNestedOne, "finalgamma") == []
+
+        :ok = Search.rebuild_index!(BulkStore, BulkNestedOne, parallel: false)
+
+        assert Search.ids(BulkNestedOne, "finalgamma") == [12]
+        assert Search.ids(BulkNestedOne, "originalalpha") == []
+        assert Search.ids(BulkNestedOne, "middlebeta") == []
+      end
+    end
   end
 end

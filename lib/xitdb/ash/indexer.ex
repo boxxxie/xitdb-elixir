@@ -75,7 +75,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
                old_record,
                new_record,
                tenant,
-               batch_state
+               batch_state,
+               opts
              ),
            {:ok, cursor_map, extra_blob_ops, batch_after_comp} <-
              build_or_compress_cursor_map(
@@ -121,7 +122,11 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           )
 
         {search_ops, batch_after_search} =
-          plan_search_ops(db_or_cursor, resource, collection, new_record, nil, batch_after_idx)
+          if Keyword.get(opts, :skip_search_index?, false) do
+            {[], batch_after_idx}
+          else
+            plan_search_ops(db_or_cursor, resource, collection, new_record, nil, batch_after_idx)
+          end
 
         next_batch =
           batch_after_search
@@ -223,10 +228,17 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       {:ok, ops}
     end
 
-    @spec plan_delete_ops_batched(term(), module(), struct(), term(), batch_state()) ::
+    @spec plan_delete_ops_batched(term(), module(), struct(), term(), batch_state(), keyword()) ::
             {:ok, [tuple()], batch_state()}
-    def plan_delete_ops_batched(db_or_cursor, resource, %_{} = record, tenant, batch_state)
-        when is_atom(resource) and is_map(batch_state) do
+    def plan_delete_ops_batched(
+          db_or_cursor,
+          resource,
+          %_{} = record,
+          tenant,
+          batch_state,
+          opts \\ []
+        )
+        when is_atom(resource) and is_map(batch_state) and is_list(opts) do
       collection = Codec.scoped_collection(resource, tenant)
       pk_attr = pk_attribute(resource)
       pk_val = Map.fetch!(record, pk_attr.name)
@@ -239,7 +251,14 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         batch_state = Map.put(batch_state, deleted_key, true)
 
         {child_ops, batch_after_children} =
-          plan_purge_nested_children_ops(db_or_cursor, resource, pk_val, tenant, batch_state)
+          plan_purge_nested_children_ops(
+            db_or_cursor,
+            resource,
+            pk_val,
+            tenant,
+            batch_state,
+            opts
+          )
 
         {:ok, identity_ops} =
           plan_identity_ops(db_or_cursor, resource, record, nil, tenant, batch_after_children)
@@ -258,7 +277,11 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           )
 
         {search_ops, batch_after_search} =
-          plan_search_ops(db_or_cursor, resource, collection, nil, doc_id, batch_after_idx)
+          if Keyword.get(opts, :skip_search_index?, false) do
+            {[], batch_after_idx}
+          else
+            plan_search_ops(db_or_cursor, resource, collection, nil, doc_id, batch_after_idx)
+          end
 
         next_batch = track_nested_one_delete(batch_after_search, resource, record, tenant)
 
@@ -588,6 +611,9 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       end)
     end
 
+    @doc false
+    def parent_slot, do: @parent_slot
+
     @doc """
     Returns the canonical slot name under `idx.<collection>` for a `%Xitdb.Ash.Index{}`.
     """
@@ -705,7 +731,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       end
     end
 
-    defp encode_parent_doc_id(resource, nested, val) do
+    @doc false
+    def encode_parent_doc_id(resource, nested, val) do
       case resolve_parent_resource(resource, nested) do
         parent_res when is_atom(parent_res) and not is_nil(parent_res) ->
           Codec.encode_pk_doc_id(pk_attribute(parent_res), val)
@@ -726,7 +753,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
            old_record,
            new_record,
            tenant,
-           batch_state
+           batch_state,
+           opts
          ) do
       case resolve_nested_spec(resource) do
         %{cardinality: :one, foreign_key: fk_attr, path: path} = nested ->
@@ -802,7 +830,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
                       resource,
                       existing_old,
                       tenant,
-                      batch_state
+                      batch_state,
+                      opts
                     )
 
                   {:ok, {old_record, evict_ops, next_batch}}
@@ -884,7 +913,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       end
     end
 
-    defp resolve_nested_spec(resource) do
+    @doc false
+    def resolve_nested_spec(resource) do
       resource
       |> Info.nested_in()
       |> normalize_nested_spec()
@@ -907,7 +937,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       }
     end
 
-    defp resolve_parent_collection(%{parent_collection: parent_col}, tenant, resource) do
+    @doc false
+    def resolve_parent_collection(%{parent_collection: parent_col}, tenant, resource) do
       if Ash.Resource.Info.multitenancy_strategy(resource) == :context and not is_nil(tenant) do
         "t:" <> Codec.encode_doc_id(tenant) <> ":" <> Atom.to_string(parent_col)
       else
@@ -920,7 +951,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
            parent_resource,
            parent_pk_val,
            tenant,
-           batch_state
+           batch_state,
+           opts
          ) do
       nested_children = discover_nested_children(parent_resource)
 
@@ -936,7 +968,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
                   child_resource,
                   child_record,
                   tenant,
-                  inner_batch
+                  inner_batch,
+                  opts
                 )
 
               {ops, next_batch}
@@ -1036,7 +1069,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       end)
     end
 
-    defp identity_collection(resource, identity, tenant) do
+    @doc false
+    def identity_collection(resource, identity, tenant) do
       if Map.get(identity, :all_tenants?, false) do
         Atom.to_string(Info.collection!(resource))
       else
@@ -1044,7 +1078,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       end
     end
 
-    defp encode_identity_owner(resource, identity, scoped_col, doc_id) do
+    @doc false
+    def encode_identity_owner(resource, identity, scoped_col, doc_id) do
       if Ash.Resource.Info.multitenancy_strategy(resource) == :context and
            Map.get(identity, :all_tenants?, false) do
         scoped_col <> <<0>> <> doc_id
@@ -1067,9 +1102,10 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       end
     end
 
-    defp active_identity_key(_resource, _identity, nil, _tenant), do: nil
+    @doc false
+    def active_identity_key(_resource, _identity, nil, _tenant), do: nil
 
-    defp active_identity_key(resource, identity, record, tenant) do
+    def active_identity_key(resource, identity, record, tenant) do
       if matches_identity_where?(resource, record, Map.get(identity, :where), tenant) do
         case Codec.encode_identity_key(resource, identity, record, tenant) do
           {:ok, key} -> key
@@ -1235,9 +1271,10 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       end)
     end
 
-    defp encode_record_index_key(_attrs, _fields, nil), do: nil
+    @doc false
+    def encode_record_index_key(_attrs, _fields, nil), do: nil
 
-    defp encode_record_index_key(attrs, fields, record) do
+    def encode_record_index_key(attrs, fields, record) do
       values = Enum.map(fields, &Map.get(record, &1))
       Codec.encode_index_key(attrs, values)
     end
@@ -2154,17 +2191,18 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       end
     end
 
-    defp set_has_member_outside?(
-           %Xitdb.Cursor{
-             tx_mode: false,
-             db_ref: db_ref,
-             tag_id: tag_id,
-             value: val,
-             moment: moment
-           },
-           excluded
-         )
-         when tag_id in [11, 13, 15] do
+    @doc false
+    def set_has_member_outside?(
+          %Xitdb.Cursor{
+            tx_mode: false,
+            db_ref: db_ref,
+            tag_id: tag_id,
+            value: val,
+            moment: moment
+          },
+          excluded
+        )
+        when tag_id in [11, 13, 15] do
       excluded_count = MapSet.size(excluded)
 
       case Xitdb.NIF.nif_slot_count(db_ref, tag_id, val) do
@@ -2189,35 +2227,36 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       end
     end
 
-    defp set_has_member_outside?(%MapSet{} = set, excluded) do
+    def set_has_member_outside?(%MapSet{} = set, excluded) do
       Enum.any?(set, fn k -> not MapSet.member?(excluded, k) end)
     end
 
-    defp set_has_member_outside?(%Xitdb.Collection{data: data}, excluded) do
+    def set_has_member_outside?(%Xitdb.Collection{data: data}, excluded) do
       Enum.any?(data, fn k -> not MapSet.member?(excluded, k) end)
     end
 
-    defp set_has_member_outside?(other, excluded) do
+    def set_has_member_outside?(other, excluded) do
       Enum.any?(other, fn k -> not MapSet.member?(excluded, to_string(k)) end)
     end
 
-    defp set_container_member?(
-           %Xitdb.Cursor{tx_mode: false, db_ref: db_ref, tag_id: tag_id, value: val},
-           doc_id
-         )
-         when tag_id in [11, 13, 15] and is_binary(doc_id) do
+    @doc false
+    def set_container_member?(
+          %Xitdb.Cursor{tx_mode: false, db_ref: db_ref, tag_id: tag_id, value: val},
+          doc_id
+        )
+        when tag_id in [11, 13, 15] and is_binary(doc_id) do
       case Xitdb.NIF.nif_slot_contains(db_ref, tag_id, val, doc_id) do
         {:ok, bool} -> bool
         _ -> false
       end
     end
 
-    defp set_container_member?(%MapSet{} = set, doc_id), do: MapSet.member?(set, doc_id)
+    def set_container_member?(%MapSet{} = set, doc_id), do: MapSet.member?(set, doc_id)
 
-    defp set_container_member?(%Xitdb.Collection{data: data}, doc_id),
+    def set_container_member?(%Xitdb.Collection{data: data}, doc_id),
       do: Enum.member?(data, doc_id)
 
-    defp set_container_member?(other, doc_id), do: Enum.member?(other, doc_id)
+    def set_container_member?(other, doc_id), do: Enum.member?(other, doc_id)
 
     defp diff_search_terms(old_terms, new_terms) do
       deletes_and_updates =
@@ -2282,7 +2321,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       end)
     end
 
-    defp encode_btree_key(bin) when is_binary(bin), do: Base.encode16(bin, case: :lower)
+    @doc false
+    def encode_btree_key(bin) when is_binary(bin), do: Base.encode16(bin, case: :lower)
     defp decode_btree_key(hex) when is_binary(hex), do: Base.decode16!(hex, case: :lower)
 
     defp root_cursor({%Xitdb{} = db, moment}) when is_integer(moment), do: Xitdb.as_of(db, moment)
@@ -2290,7 +2330,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     defp root_cursor(%Xitdb{} = db), do: Xitdb.db(db)
     defp root_cursor(_), do: nil
 
-    defp get_index_slot(db_or_cursor, collection, slot) do
+    @doc false
+    def get_index_slot(db_or_cursor, collection, slot) do
       with %Xitdb.Cursor{} = root <- root_cursor(db_or_cursor),
            %Xitdb.Cursor{} = idx <- root["idx"],
            %Xitdb.Cursor{} = col <- idx[collection] do

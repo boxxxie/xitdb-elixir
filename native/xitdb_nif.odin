@@ -158,6 +158,12 @@ ATOM_COUNTED_SET:           ERL_NIF_TERM
 ATOM_COUNTED_SET_MEMBER:    ERL_NIF_TERM
 ATOM_SORTED_SET_MEMBER:     ERL_NIF_TERM
 ATOM_AT_MOMENT:             ERL_NIF_TERM
+ATOM_BULK_PUT_MAPS:         ERL_NIF_TERM
+ATOM_BULK_PUT_NESTED_MAPS:  ERL_NIF_TERM
+ATOM_BULK_INDEX_PUTS:       ERL_NIF_TERM
+ATOM_UNIQUE:                ERL_NIF_TERM
+ATOM_COUNTED_SET_ADD:       ERL_NIF_TERM
+ATOM_HASH_MAP_MERGE:        ERL_NIF_TERM
 TAG_ATOMS:                  [17]ERL_NIF_TERM
 
 make_atom :: proc(env: ErlNifEnv, s: string) -> ERL_NIF_TERM {
@@ -233,6 +239,12 @@ odin_nif_init_atoms :: proc "c" (env: ErlNifEnv) {
 	ATOM_COUNTED_SET_MEMBER    = make_atom(env, "counted_set_member")
 	ATOM_SORTED_SET_MEMBER     = make_atom(env, "sorted_set_member")
 	ATOM_AT_MOMENT             = make_atom(env, "at_moment")
+	ATOM_BULK_PUT_MAPS         = make_atom(env, "bulk_put_maps")
+	ATOM_BULK_PUT_NESTED_MAPS  = make_atom(env, "bulk_put_nested_maps")
+	ATOM_BULK_INDEX_PUTS       = make_atom(env, "bulk_index_puts")
+	ATOM_UNIQUE                = make_atom(env, "unique")
+	ATOM_COUNTED_SET_ADD       = make_atom(env, "counted_set_add")
+	ATOM_HASH_MAP_MERGE        = make_atom(env, "hash_map_merge")
 
 	for i in 0 ..< 17 {
 		TAG_ATOMS[i] = make_atom(env, tag_to_atom_name(xitdb.Tag(u8(i))))
@@ -1000,7 +1012,7 @@ odin_nif_open :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -
 		handle.core, open_err = xitdb.core_file_open(path_str, file_flags, fsync)
 		handle.backend = 1
 	case "buffered_file":
-		handle.core, open_err = xitdb.core_buffered_file_open(path_str, xitdb.DEFAULT_BUFFER_SIZE, file_flags, fsync, context.allocator)
+		handle.core, open_err = xitdb.core_buffered_file_open(path_str, 16 * 1024 * 1024, file_flags, fsync, context.allocator)
 		handle.backend = 2
 	case:
 		handle.is_closed = true
@@ -4276,6 +4288,356 @@ merge_map_callback :: proc(moment_cur: ^xitdb.Write_Cursor, user_data: rawptr) -
 	return nil
 }
 
+Bulk_Put_Maps_Ctx :: struct {
+	steps:            []xitdb.Path_Step,
+	env:              ErlNifEnv,
+	entries_term:     ERL_NIF_TERM,
+	adapt_containers: bool,
+	validation_err:   ^string,
+}
+
+Bulk_Put_Nested_Maps_Ctx :: struct {
+	steps:            []xitdb.Path_Step,
+	env:              ErlNifEnv,
+	entries_term:     ERL_NIF_TERM,
+	adapt_containers: bool,
+	validation_err:   ^string,
+}
+
+Bulk_Index_Mode :: enum u8 {
+	Unique,
+	Counted_Set_Add,
+	Hash_Map_Merge,
+}
+
+Bulk_Index_Puts_Ctx :: struct {
+	steps:            []xitdb.Path_Step,
+	mode:             Bulk_Index_Mode,
+	env:              ErlNifEnv,
+	entries_term:     ERL_NIF_TERM,
+	adapt_containers: bool,
+	validation_err:   ^string,
+}
+
+init_bulk_hm :: proc(cur: xitdb.Write_Cursor, adapt_containers: bool) -> (res: xitdb.Write_Hash_Map, err: xitdb.Error) {
+	if adapt_containers {
+		sp := xitdb.cursor_resolved(cur.read_cursor) or_return
+		if sp.slot.tag == .Counted_Hash_Map {
+			chm := xitdb.write_counted_hash_map_init(cur) or_return
+			return chm.write_hash_map, nil
+		}
+	}
+	return xitdb.write_hash_map_init(cur)
+}
+
+write_hm_kv_entry :: proc(
+	env: ErlNifEnv,
+	hm: ^xitdb.Write_Hash_Map,
+	k_term: ERL_NIF_TERM,
+	v_term: ERL_NIF_TERM,
+	validation_err: ^string,
+) -> xitdb.Error {
+	k_str, ok_k := term_to_key_string(env, k_term)
+	if !ok_k {
+		return fail_validation(validation_err, "invalid_put_op")
+	}
+	if wdata, ok_s := decode_writeable_value(env, v_term); ok_s {
+		return xitdb.hash_map_put(hm, k_str, wdata)
+	}
+	v_cur := xitdb.hash_map_put_cursor(hm, k_str) or_return
+	xitdb.cursor_write(&v_cur, xitdb.Slot{}) or_return
+	return write_term_to_cursor(env, &v_cur, v_term, validation_err, "invalid_put_op", 1)
+}
+
+write_entity_fields_into_hm :: proc(
+	env: ErlNifEnv,
+	hm: ^xitdb.Write_Hash_Map,
+	fields_map: ERL_NIF_TERM,
+	removed_list: ERL_NIF_TERM,
+	validation_err: ^string,
+) -> xitdb.Error {
+	st: ERL_NIF_TERM
+	if nif_is_map(env, fields_map) == 0 || nif_get_map_value(env, fields_map, ATOM_STRUCT, &st) != 0 {
+		return fail_validation(validation_err, "invalid_put_op")
+	}
+	it: Nif_Map_Iter = ---
+	if nif_map_iter_create(env, fields_map, &it) == 0 {
+		return fail_validation(validation_err, "invalid_put_op")
+	}
+	defer nif_map_iter_destroy(env, &it)
+	k, v: ERL_NIF_TERM
+	for nif_map_iter_get_and_next(env, &it, &k, &v) != 0 {
+		write_hm_kv_entry(env, hm, k, v, validation_err) or_return
+	}
+	if nif_is_empty_list(env, removed_list) == 0 {
+		if nif_is_list(env, removed_list) == 0 {
+			return fail_validation(validation_err, "invalid_put_op")
+		}
+		rem_head: ERL_NIF_TERM
+		rem_tail := removed_list
+		for nif_is_empty_list(env, rem_tail) == 0 {
+			if nif_get_list_cell(env, rem_tail, &rem_head, &rem_tail) == 0 {
+				return fail_validation(validation_err, "invalid_put_op")
+			}
+			rem_str, ok_r := term_to_key_string(env, rem_head)
+			if !ok_r {
+				return fail_validation(validation_err, "invalid_put_op")
+			}
+			_, rm_err := xitdb.hash_map_remove(hm, rem_str)
+			if rm_err != nil {
+				return rm_err
+			}
+		}
+	}
+	return nil
+}
+
+bulk_put_maps_callback :: proc(moment_cur: ^xitdb.Write_Cursor, user_data: rawptr) -> xitdb.Error {
+	bc := (^Bulk_Put_Maps_Ctx)(user_data)
+	if nif_is_empty_list(bc.env, bc.entries_term) != 0 {
+		return nil
+	}
+	col_cur := xitdb.write_steps_cursor(moment_cur^, bc.steps) or_return
+	col_sp := xitdb.cursor_resolved(col_cur.read_cursor) or_return
+	use_sm := false
+	col_hm: xitdb.Write_Hash_Map
+	col_sm: xitdb.Write_Sorted_Map
+	#partial switch col_sp.slot.tag {
+	case .None, .Hash_Map:
+		col_hm = xitdb.write_hash_map_init(col_cur) or_return
+	case .Counted_Hash_Map:
+		chm := xitdb.write_counted_hash_map_init(col_cur) or_return
+		col_hm = chm.write_hash_map
+	case .Sorted_Map:
+		col_sm = xitdb.write_sorted_map_init(col_cur) or_return
+		use_sm = true
+	case:
+		return .Unexpected_Tag
+	}
+
+	head: ERL_NIF_TERM
+	tail := bc.entries_term
+	for nif_is_empty_list(bc.env, tail) == 0 {
+		if nif_get_list_cell(bc.env, tail, &head, &tail) == 0 {
+			return fail_validation(bc.validation_err, "invalid_put_op")
+		}
+		arity: c.int = 0
+		elems: [^]ERL_NIF_TERM = nil
+		if nif_get_tuple(bc.env, head, &arity, &elems) == 0 || arity != 3 {
+			return fail_validation(bc.validation_err, "invalid_put_op")
+		}
+		k_str, ok_k := term_to_key_string(bc.env, elems[0])
+		if !ok_k {
+			return fail_validation(bc.validation_err, "invalid_put_op")
+		}
+		doc_cur := xitdb.sorted_map_put_cursor(&col_sm, k_str) or_return if use_sm else xitdb.hash_map_put_cursor(&col_hm, k_str) or_return
+		doc_hm := init_bulk_hm(doc_cur, bc.adapt_containers) or_return
+		write_entity_fields_into_hm(bc.env, &doc_hm, elems[1], elems[2], bc.validation_err) or_return
+	}
+	return nil
+}
+
+bulk_put_nested_maps_callback :: proc(moment_cur: ^xitdb.Write_Cursor, user_data: rawptr) -> xitdb.Error {
+	bc := (^Bulk_Put_Nested_Maps_Ctx)(user_data)
+	if nif_is_empty_list(bc.env, bc.entries_term) != 0 {
+		return nil
+	}
+	col_cur := xitdb.write_steps_cursor(moment_cur^, bc.steps) or_return
+	col_sp := xitdb.cursor_resolved(col_cur.read_cursor) or_return
+	use_sm := false
+	col_hm: xitdb.Write_Hash_Map
+	col_sm: xitdb.Write_Sorted_Map
+	#partial switch col_sp.slot.tag {
+	case .None, .Hash_Map:
+		col_hm = xitdb.write_hash_map_init(col_cur) or_return
+	case .Counted_Hash_Map:
+		chm := xitdb.write_counted_hash_map_init(col_cur) or_return
+		col_hm = chm.write_hash_map
+	case .Sorted_Map:
+		col_sm = xitdb.write_sorted_map_init(col_cur) or_return
+		use_sm = true
+	case:
+		return .Unexpected_Tag
+	}
+
+	has_parent := false
+	prev_parent := ""
+	parent_hm: xitdb.Write_Hash_Map
+	has_nested := false
+	prev_field := ""
+	nested_hm: xitdb.Write_Hash_Map
+
+	head: ERL_NIF_TERM
+	tail := bc.entries_term
+	for nif_is_empty_list(bc.env, tail) == 0 {
+		if nif_get_list_cell(bc.env, tail, &head, &tail) == 0 {
+			return fail_validation(bc.validation_err, "invalid_put_op")
+		}
+		arity: c.int = 0
+		elems: [^]ERL_NIF_TERM = nil
+		if nif_get_tuple(bc.env, head, &arity, &elems) == 0 || arity != 5 {
+			return fail_validation(bc.validation_err, "invalid_put_op")
+		}
+		parent_k, ok_p := term_to_key_string(bc.env, elems[0])
+		field_k, ok_f := term_to_key_string(bc.env, elems[1])
+		pk_k, ok_pk := term_to_key_string(bc.env, elems[2])
+		if !ok_p || !ok_f || !ok_pk {
+			return fail_validation(bc.validation_err, "invalid_put_op")
+		}
+		if !has_parent || parent_k != prev_parent {
+			parent_cur := xitdb.sorted_map_put_cursor(&col_sm, parent_k) or_return if use_sm else xitdb.hash_map_put_cursor(&col_hm, parent_k) or_return
+			parent_hm = init_bulk_hm(parent_cur, bc.adapt_containers) or_return
+			prev_parent = parent_k
+			has_parent = true
+			has_nested = false
+		}
+		if !has_nested || field_k != prev_field {
+			nested_cur := xitdb.hash_map_put_cursor(&parent_hm, field_k) or_return
+			nested_hm = init_bulk_hm(nested_cur, bc.adapt_containers) or_return
+			prev_field = field_k
+			has_nested = true
+		}
+		doc_cur := xitdb.hash_map_put_cursor(&nested_hm, pk_k) or_return
+		doc_hm := init_bulk_hm(doc_cur, bc.adapt_containers) or_return
+		write_entity_fields_into_hm(bc.env, &doc_hm, elems[3], elems[4], bc.validation_err) or_return
+	}
+	return nil
+}
+
+bulk_index_puts_callback :: proc(moment_cur: ^xitdb.Write_Cursor, user_data: rawptr) -> xitdb.Error {
+	bc := (^Bulk_Index_Puts_Ctx)(user_data)
+	if nif_is_empty_list(bc.env, bc.entries_term) != 0 {
+		return nil
+	}
+	col_cur := xitdb.write_steps_cursor(moment_cur^, bc.steps) or_return
+	col_sp := xitdb.cursor_resolved(col_cur.read_cursor) or_return
+	use_hm := false
+	sm: xitdb.Write_Sorted_Map
+	hm: xitdb.Write_Hash_Map
+	#partial switch col_sp.slot.tag {
+	case .None, .Sorted_Map:
+		sm = xitdb.write_sorted_map_init(col_cur) or_return
+	case .Hash_Map:
+		hm = xitdb.write_hash_map_init(col_cur) or_return
+		use_hm = true
+	case .Counted_Hash_Map:
+		chm := xitdb.write_counted_hash_map_init(col_cur) or_return
+		hm = chm.write_hash_map
+		use_hm = true
+	case:
+		return .Unexpected_Tag
+	}
+
+	head: ERL_NIF_TERM
+	tail := bc.entries_term
+	for nif_is_empty_list(bc.env, tail) == 0 {
+		if nif_get_list_cell(bc.env, tail, &head, &tail) == 0 {
+			return fail_validation(bc.validation_err, "invalid_put_op")
+		}
+		arity: c.int = 0
+		elems: [^]ERL_NIF_TERM = nil
+		if nif_get_tuple(bc.env, head, &arity, &elems) == 0 || arity != 2 {
+			return fail_validation(bc.validation_err, "invalid_put_op")
+		}
+		k_str, ok_k := term_to_key_string(bc.env, elems[0])
+		if !ok_k {
+			return fail_validation(bc.validation_err, "invalid_put_op")
+		}
+
+		switch bc.mode {
+		case .Unique:
+			if wdata, ok_s := decode_writeable_value(bc.env, elems[1]); ok_s {
+				if use_hm {
+					xitdb.hash_map_put(&hm, k_str, wdata) or_return
+				} else {
+					xitdb.sorted_map_put(&sm, k_str, wdata) or_return
+				}
+			} else {
+				v_cur := xitdb.hash_map_put_cursor(&hm, k_str) or_return if use_hm else xitdb.sorted_map_put_cursor(&sm, k_str) or_return
+				xitdb.cursor_write(&v_cur, xitdb.Slot{}) or_return
+				write_term_to_cursor(bc.env, &v_cur, elems[1], bc.validation_err, "invalid_put_op", 1) or_return
+			}
+
+		case .Counted_Set_Add:
+			if nif_is_list(bc.env, elems[1]) != 0 {
+				if nif_is_empty_list(bc.env, elems[1]) != 0 {
+					continue
+				}
+				set_cur := xitdb.hash_map_put_cursor(&hm, k_str) or_return if use_hm else xitdb.sorted_map_put_cursor(&sm, k_str) or_return
+				chs := xitdb.write_counted_hash_set_init(set_cur) or_return
+				m_head: ERL_NIF_TERM
+				m_tail := elems[1]
+				for nif_is_empty_list(bc.env, m_tail) == 0 {
+					if nif_get_list_cell(bc.env, m_tail, &m_head, &m_tail) == 0 {
+						return fail_validation(bc.validation_err, "invalid_put_op")
+					}
+					m_str, ok_m := term_to_key_string(bc.env, m_head)
+					if !ok_m {
+						return fail_validation(bc.validation_err, "invalid_put_op")
+					}
+					xitdb.hash_set_put(&chs.write_hash_set, m_str) or_return
+				}
+			} else {
+				m_str, ok_m := term_to_key_string(bc.env, elems[1])
+				if !ok_m {
+					return fail_validation(bc.validation_err, "invalid_put_op")
+				}
+				set_cur := xitdb.hash_map_put_cursor(&hm, k_str) or_return if use_hm else xitdb.sorted_map_put_cursor(&sm, k_str) or_return
+				chs := xitdb.write_counted_hash_set_init(set_cur) or_return
+				xitdb.hash_set_put(&chs.write_hash_set, m_str) or_return
+			}
+
+		case .Hash_Map_Merge:
+			if nif_is_map(bc.env, elems[1]) != 0 {
+				st: ERL_NIF_TERM
+				if nif_get_map_value(bc.env, elems[1], ATOM_STRUCT, &st) != 0 {
+					return fail_validation(bc.validation_err, "invalid_put_op")
+				}
+				map_sz: c.size_t = 0
+				if nif_get_map_size(bc.env, elems[1], &map_sz) == 0 {
+					return fail_validation(bc.validation_err, "invalid_put_op")
+				}
+				if map_sz == 0 {
+					continue
+				}
+				inner_cur := xitdb.hash_map_put_cursor(&hm, k_str) or_return if use_hm else xitdb.sorted_map_put_cursor(&sm, k_str) or_return
+				inner_hm := init_bulk_hm(inner_cur, bc.adapt_containers) or_return
+				it: Nif_Map_Iter = ---
+				if nif_map_iter_create(bc.env, elems[1], &it) == 0 {
+					return fail_validation(bc.validation_err, "invalid_put_op")
+				}
+				defer nif_map_iter_destroy(bc.env, &it)
+				ik, iv: ERL_NIF_TERM
+				for nif_map_iter_get_and_next(bc.env, &it, &ik, &iv) != 0 {
+					write_hm_kv_entry(bc.env, &inner_hm, ik, iv, bc.validation_err) or_return
+				}
+			} else if nif_is_list(bc.env, elems[1]) != 0 {
+				if nif_is_empty_list(bc.env, elems[1]) != 0 {
+					continue
+				}
+				inner_cur := xitdb.hash_map_put_cursor(&hm, k_str) or_return if use_hm else xitdb.sorted_map_put_cursor(&sm, k_str) or_return
+				inner_hm := init_bulk_hm(inner_cur, bc.adapt_containers) or_return
+				kv_head: ERL_NIF_TERM
+				kv_tail := elems[1]
+				for nif_is_empty_list(bc.env, kv_tail) == 0 {
+					if nif_get_list_cell(bc.env, kv_tail, &kv_head, &kv_tail) == 0 {
+						return fail_validation(bc.validation_err, "invalid_put_op")
+					}
+					kv_arity: c.int = 0
+					kv_elems: [^]ERL_NIF_TERM = nil
+					if nif_get_tuple(bc.env, kv_head, &kv_arity, &kv_elems) == 0 || kv_arity != 2 {
+						return fail_validation(bc.validation_err, "invalid_put_op")
+					}
+					write_hm_kv_entry(bc.env, &inner_hm, kv_elems[0], kv_elems[1], bc.validation_err) or_return
+				}
+			} else {
+				return fail_validation(bc.validation_err, "invalid_put_op")
+			}
+		}
+	}
+	return nil
+}
+
 read_steps_cursor_adaptive :: proc(root: xitdb.Read_Cursor, steps: []xitdb.Path_Step) -> (res: Maybe(xitdb.Read_Cursor), hit_scalar: bool, err: xitdb.Error) {
 	cur := root
 	for i := 0; i < len(steps); i += 1 {
@@ -4603,6 +4965,281 @@ record_merge_map_pending_tags :: proc(
 			record_term_pending_tags(env, p_key, val, pending_tags, depth + 1)
 		}
 		pop(prefix_steps)
+	}
+}
+
+ensure_bulk_container_pending_tag :: proc(
+	base_cur: xitdb.Read_Cursor,
+	base_empty: bool,
+	steps: []xitdb.Path_Step,
+	default_tag: xitdb.Tag,
+	pending_tags: ^map[string]xitdb.Tag,
+	fork_aliases: ^map[string][]xitdb.Path_Step,
+) -> string {
+	k := pending_path_key(steps)
+	live_tag, exists := resolve_live_tag(base_cur, base_empty, steps, pending_tags^, fork_aliases^)
+	if !exists || !is_container_tag(live_tag) {
+		purge_pending_prefix(pending_tags, k)
+		purge_fork_aliases_prefix(fork_aliases, k)
+		pending_tags[k] = default_tag
+	}
+	return k
+}
+
+step_ancestor_tag :: proc(kind: xitdb.Step_Kind) -> xitdb.Tag {
+	#partial switch kind {
+	case .Array_List_Idx:
+		return .Array_List
+	case .Linked_List_Idx:
+		return .Linked_Array_List
+	case .Counted_Hash_Map_Key:
+		return .Counted_Hash_Map
+	case .Sorted_Map_Key:
+		return .Sorted_Map
+	case .Hash_Set_Member:
+		return .Hash_Set
+	case .Counted_Set_Member:
+		return .Counted_Hash_Set
+	case .Sorted_Set_Member:
+		return .Sorted_Set
+	case:
+		return .Hash_Map
+	}
+}
+
+ensure_bulk_path_pending_tags :: proc(
+	base_cur: xitdb.Read_Cursor,
+	base_empty: bool,
+	steps: []xitdb.Path_Step,
+	leaf_default_tag: xitdb.Tag,
+	pending_tags: ^map[string]xitdb.Tag,
+	fork_aliases: ^map[string][]xitdb.Path_Step,
+) -> string {
+	for i := 1; i < len(steps); i += 1 {
+		anc_tag := step_ancestor_tag(steps[i].kind)
+		ensure_bulk_container_pending_tag(base_cur, base_empty, steps[:i], anc_tag, pending_tags, fork_aliases)
+	}
+	return ensure_bulk_container_pending_tag(base_cur, base_empty, steps, leaf_default_tag, pending_tags, fork_aliases)
+}
+
+record_bulk_kv_entry_pending_tags :: proc(
+	env: ErlNifEnv,
+	parent_key: string,
+	key_term: ERL_NIF_TERM,
+	val_term: ERL_NIF_TERM,
+	pending_tags: ^map[string]xitdb.Tag,
+	fork_aliases: ^map[string][]xitdb.Path_Step,
+) {
+	if k_str, ok_k := term_to_key_string(env, key_term); ok_k {
+		child_key := fmt.tprintf("%s.%d:%s", parent_key, len(k_str), k_str)
+		purge_pending_prefix(pending_tags, child_key)
+		purge_fork_aliases_prefix(fork_aliases, child_key)
+		record_term_pending_tags(env, child_key, val_term, pending_tags, 1)
+	}
+}
+
+record_bulk_fields_pending_tags :: proc(
+	env: ErlNifEnv,
+	doc_key: string,
+	fields_map: ERL_NIF_TERM,
+	removed_list: ERL_NIF_TERM,
+	pending_tags: ^map[string]xitdb.Tag,
+	fork_aliases: ^map[string][]xitdb.Path_Step,
+) {
+	st: ERL_NIF_TERM
+	if nif_is_map(env, fields_map) != 0 && nif_get_map_value(env, fields_map, ATOM_STRUCT, &st) == 0 {
+		it: Nif_Map_Iter = ---
+		if nif_map_iter_create(env, fields_map, &it) != 0 {
+			defer nif_map_iter_destroy(env, &it)
+			k, v: ERL_NIF_TERM
+			for nif_map_iter_get_and_next(env, &it, &k, &v) != 0 {
+				record_bulk_kv_entry_pending_tags(env, doc_key, k, v, pending_tags, fork_aliases)
+			}
+		}
+	}
+	if nif_is_empty_list(env, removed_list) == 0 && nif_is_list(env, removed_list) != 0 {
+		rem_head: ERL_NIF_TERM
+		rem_tail := removed_list
+		for nif_is_empty_list(env, rem_tail) == 0 {
+			if nif_get_list_cell(env, rem_tail, &rem_head, &rem_tail) == 0 {
+				break
+			}
+			if rem_str, ok_r := term_to_key_string(env, rem_head); ok_r {
+				rem_key := fmt.tprintf("%s.%d:%s", doc_key, len(rem_str), rem_str)
+				purge_pending_prefix(pending_tags, rem_key)
+				purge_fork_aliases_prefix(fork_aliases, rem_key)
+			}
+		}
+	}
+}
+
+record_bulk_put_maps_pending_tags :: proc(
+	env: ErlNifEnv,
+	base_cur: xitdb.Read_Cursor,
+	base_empty: bool,
+	steps: []xitdb.Path_Step,
+	entries_term: ERL_NIF_TERM,
+	pending_tags: ^map[string]xitdb.Tag,
+	fork_aliases: ^map[string][]xitdb.Path_Step,
+) {
+	ensure_bulk_path_pending_tags(base_cur, base_empty, steps, .Hash_Map, pending_tags, fork_aliases)
+	prefix_steps := make([dynamic]xitdb.Path_Step, len(steps), len(steps) + 2, context.temp_allocator)
+	copy(prefix_steps[:], steps)
+	base_len := len(steps)
+
+	head: ERL_NIF_TERM
+	tail := entries_term
+	for nif_is_empty_list(env, tail) == 0 {
+		resize(&prefix_steps, base_len)
+		if nif_get_list_cell(env, tail, &head, &tail) == 0 {
+			break
+		}
+		arity: c.int = 0
+		elems: [^]ERL_NIF_TERM = nil
+		if nif_get_tuple(env, head, &arity, &elems) == 0 || arity != 3 {
+			continue
+		}
+		k_str, ok_k := term_to_key_string(env, elems[0])
+		if !ok_k {
+			continue
+		}
+		append(&prefix_steps, xitdb.hm(k_str))
+		doc_key := ensure_bulk_container_pending_tag(base_cur, base_empty, prefix_steps[:], .Hash_Map, pending_tags, fork_aliases)
+		record_bulk_fields_pending_tags(env, doc_key, elems[1], elems[2], pending_tags, fork_aliases)
+	}
+}
+
+record_bulk_put_nested_maps_pending_tags :: proc(
+	env: ErlNifEnv,
+	base_cur: xitdb.Read_Cursor,
+	base_empty: bool,
+	steps: []xitdb.Path_Step,
+	entries_term: ERL_NIF_TERM,
+	pending_tags: ^map[string]xitdb.Tag,
+	fork_aliases: ^map[string][]xitdb.Path_Step,
+) {
+	ensure_bulk_path_pending_tags(base_cur, base_empty, steps, .Hash_Map, pending_tags, fork_aliases)
+	prefix_steps := make([dynamic]xitdb.Path_Step, len(steps), len(steps) + 4, context.temp_allocator)
+	copy(prefix_steps[:], steps)
+	base_len := len(steps)
+
+	head: ERL_NIF_TERM
+	tail := entries_term
+	for nif_is_empty_list(env, tail) == 0 {
+		resize(&prefix_steps, base_len)
+		if nif_get_list_cell(env, tail, &head, &tail) == 0 {
+			break
+		}
+		arity: c.int = 0
+		elems: [^]ERL_NIF_TERM = nil
+		if nif_get_tuple(env, head, &arity, &elems) == 0 || arity != 5 {
+			continue
+		}
+		parent_k, ok_p := term_to_key_string(env, elems[0])
+		field_k, ok_f := term_to_key_string(env, elems[1])
+		pk_k, ok_pk := term_to_key_string(env, elems[2])
+		if !ok_p || !ok_f || !ok_pk {
+			continue
+		}
+		append(&prefix_steps, xitdb.hm(parent_k))
+		ensure_bulk_container_pending_tag(base_cur, base_empty, prefix_steps[:], .Hash_Map, pending_tags, fork_aliases)
+		append(&prefix_steps, xitdb.hm(field_k))
+		ensure_bulk_container_pending_tag(base_cur, base_empty, prefix_steps[:], .Hash_Map, pending_tags, fork_aliases)
+		append(&prefix_steps, xitdb.hm(pk_k))
+		doc_key := ensure_bulk_container_pending_tag(base_cur, base_empty, prefix_steps[:], .Hash_Map, pending_tags, fork_aliases)
+		record_bulk_fields_pending_tags(env, doc_key, elems[3], elems[4], pending_tags, fork_aliases)
+	}
+}
+
+record_bulk_index_puts_pending_tags :: proc(
+	env: ErlNifEnv,
+	base_cur: xitdb.Read_Cursor,
+	base_empty: bool,
+	steps: []xitdb.Path_Step,
+	mode: Bulk_Index_Mode,
+	entries_term: ERL_NIF_TERM,
+	pending_tags: ^map[string]xitdb.Tag,
+	fork_aliases: ^map[string][]xitdb.Path_Step,
+) {
+	ensure_bulk_path_pending_tags(base_cur, base_empty, steps, .Sorted_Map, pending_tags, fork_aliases)
+	prefix_steps := make([dynamic]xitdb.Path_Step, len(steps), len(steps) + 2, context.temp_allocator)
+	copy(prefix_steps[:], steps)
+	base_len := len(steps)
+
+	head: ERL_NIF_TERM
+	tail := entries_term
+	for nif_is_empty_list(env, tail) == 0 {
+		resize(&prefix_steps, base_len)
+		if nif_get_list_cell(env, tail, &head, &tail) == 0 {
+			break
+		}
+		arity: c.int = 0
+		elems: [^]ERL_NIF_TERM = nil
+		if nif_get_tuple(env, head, &arity, &elems) == 0 || arity != 2 {
+			continue
+		}
+		k_str, ok_k := term_to_key_string(env, elems[0])
+		if !ok_k {
+			continue
+		}
+		append(&prefix_steps, xitdb.hm(k_str))
+		entry_key := pending_path_key(prefix_steps[:])
+
+		switch mode {
+		case .Unique:
+			purge_pending_prefix(pending_tags, entry_key)
+			purge_fork_aliases_prefix(fork_aliases, entry_key)
+			record_term_pending_tags(env, entry_key, elems[1], pending_tags, 1)
+
+		case .Counted_Set_Add:
+			if nif_is_list(env, elems[1]) != 0 {
+				if nif_is_empty_list(env, elems[1]) != 0 {
+					continue
+				}
+				ensure_bulk_container_pending_tag(base_cur, base_empty, prefix_steps[:], .Counted_Hash_Set, pending_tags, fork_aliases)
+			} else if _, ok_m := term_to_key_string(env, elems[1]); ok_m {
+				ensure_bulk_container_pending_tag(base_cur, base_empty, prefix_steps[:], .Counted_Hash_Set, pending_tags, fork_aliases)
+			}
+
+		case .Hash_Map_Merge:
+			if nif_is_map(env, elems[1]) != 0 {
+				st: ERL_NIF_TERM
+				if nif_get_map_value(env, elems[1], ATOM_STRUCT, &st) != 0 {
+					continue
+				}
+				map_sz: c.size_t = 0
+				if nif_get_map_size(env, elems[1], &map_sz) == 0 || map_sz == 0 {
+					continue
+				}
+				hm_key := ensure_bulk_container_pending_tag(base_cur, base_empty, prefix_steps[:], .Hash_Map, pending_tags, fork_aliases)
+				it: Nif_Map_Iter = ---
+				if nif_map_iter_create(env, elems[1], &it) != 0 {
+					defer nif_map_iter_destroy(env, &it)
+					ik, iv: ERL_NIF_TERM
+					for nif_map_iter_get_and_next(env, &it, &ik, &iv) != 0 {
+						record_bulk_kv_entry_pending_tags(env, hm_key, ik, iv, pending_tags, fork_aliases)
+					}
+				}
+			} else if nif_is_list(env, elems[1]) != 0 {
+				if nif_is_empty_list(env, elems[1]) != 0 {
+					continue
+				}
+				hm_key := ensure_bulk_container_pending_tag(base_cur, base_empty, prefix_steps[:], .Hash_Map, pending_tags, fork_aliases)
+				kv_head: ERL_NIF_TERM
+				kv_tail := elems[1]
+				for nif_is_empty_list(env, kv_tail) == 0 {
+					if nif_get_list_cell(env, kv_tail, &kv_head, &kv_tail) == 0 {
+						break
+					}
+					kv_arity: c.int = 0
+					kv_elems: [^]ERL_NIF_TERM = nil
+					if nif_get_tuple(env, kv_head, &kv_arity, &kv_elems) == 0 || kv_arity != 2 {
+						continue
+					}
+					record_bulk_kv_entry_pending_tags(env, hm_key, kv_elems[0], kv_elems[1], pending_tags, fork_aliases)
+				}
+			}
+		}
 	}
 }
 
@@ -5011,6 +5648,48 @@ adapt_tx_ops_for_base_moment :: proc(handle: ^Db_Handle, tx: ^xitdb.Tx) -> bool 
 				}
 				prefix_steps := make([dynamic]xitdb.Path_Step, 0, 4, context.temp_allocator)
 				record_merge_map_pending_tags(mc.env, base_cur, base_empty, mc.map_term, &prefix_steps, &pending_tags, &fork_aliases)
+			} else if op.callback == bulk_put_maps_callback && op.user_data != nil {
+				bc := (^Bulk_Put_Maps_Ctx)(op.user_data)
+				if nif_is_empty_list(bc.env, bc.entries_term) != 0 {
+					continue
+				}
+				if len(bc.steps) >= 1 && adapt_steps_for_base_moment(base_cur, base_empty, bc.steps, pending_tags, fork_aliases) {
+					adapted = true
+				}
+				if !bc.adapt_containers {
+					bc.adapt_containers = true
+					adapted = true
+				}
+				ensure_ancestor_pending_tags(bc.steps, &pending_tags)
+				record_bulk_put_maps_pending_tags(bc.env, base_cur, base_empty, bc.steps, bc.entries_term, &pending_tags, &fork_aliases)
+			} else if op.callback == bulk_put_nested_maps_callback && op.user_data != nil {
+				bc := (^Bulk_Put_Nested_Maps_Ctx)(op.user_data)
+				if nif_is_empty_list(bc.env, bc.entries_term) != 0 {
+					continue
+				}
+				if len(bc.steps) >= 1 && adapt_steps_for_base_moment(base_cur, base_empty, bc.steps, pending_tags, fork_aliases) {
+					adapted = true
+				}
+				if !bc.adapt_containers {
+					bc.adapt_containers = true
+					adapted = true
+				}
+				ensure_ancestor_pending_tags(bc.steps, &pending_tags)
+				record_bulk_put_nested_maps_pending_tags(bc.env, base_cur, base_empty, bc.steps, bc.entries_term, &pending_tags, &fork_aliases)
+			} else if op.callback == bulk_index_puts_callback && op.user_data != nil {
+				bc := (^Bulk_Index_Puts_Ctx)(op.user_data)
+				if nif_is_empty_list(bc.env, bc.entries_term) != 0 {
+					continue
+				}
+				if len(bc.steps) >= 1 && adapt_steps_for_base_moment(base_cur, base_empty, bc.steps, pending_tags, fork_aliases) {
+					adapted = true
+				}
+				if !bc.adapt_containers {
+					bc.adapt_containers = true
+					adapted = true
+				}
+				ensure_ancestor_pending_tags(bc.steps, &pending_tags)
+				record_bulk_index_puts_pending_tags(bc.env, base_cur, base_empty, bc.steps, bc.mode, bc.entries_term, &pending_tags, &fork_aliases)
 			}
 		}
 	}
@@ -5214,6 +5893,141 @@ validate_write_term_cold :: proc(env: ErlNifEnv, term: ERL_NIF_TERM, depth: int 
 	return false
 }
 
+validate_bulk_fields_and_removed_cold :: proc(env: ErlNifEnv, fields_map: ERL_NIF_TERM, removed_list: ERL_NIF_TERM) -> bool {
+	st: ERL_NIF_TERM
+	if nif_is_map(env, fields_map) == 0 || nif_get_map_value(env, fields_map, ATOM_STRUCT, &st) != 0 {
+		return false
+	}
+	if !validate_col_data_cold(env, "hash_map", fields_map, 1) {
+		return false
+	}
+	if nif_is_list(env, removed_list) == 0 {
+		return false
+	}
+	head: ERL_NIF_TERM
+	tail := removed_list
+	for nif_is_empty_list(env, tail) == 0 {
+		if nif_get_list_cell(env, tail, &head, &tail) == 0 {
+			return false
+		}
+		if _, ok := term_to_key_string(env, head); !ok {
+			return false
+		}
+	}
+	return true
+}
+
+validate_bulk_put_maps_cold :: proc(env: ErlNifEnv, entries_term: ERL_NIF_TERM) -> bool {
+	if nif_is_list(env, entries_term) == 0 {
+		return false
+	}
+	head: ERL_NIF_TERM
+	tail := entries_term
+	for nif_is_empty_list(env, tail) == 0 {
+		if nif_get_list_cell(env, tail, &head, &tail) == 0 {
+			return false
+		}
+		arity: c.int = 0
+		elems: [^]ERL_NIF_TERM = nil
+		if nif_get_tuple(env, head, &arity, &elems) == 0 || arity != 3 {
+			return false
+		}
+		if _, ok_k := term_to_key_string(env, elems[0]); !ok_k {
+			return false
+		}
+		if !validate_bulk_fields_and_removed_cold(env, elems[1], elems[2]) {
+			return false
+		}
+	}
+	return true
+}
+
+validate_bulk_put_nested_maps_cold :: proc(env: ErlNifEnv, entries_term: ERL_NIF_TERM) -> bool {
+	if nif_is_list(env, entries_term) == 0 {
+		return false
+	}
+	head: ERL_NIF_TERM
+	tail := entries_term
+	for nif_is_empty_list(env, tail) == 0 {
+		if nif_get_list_cell(env, tail, &head, &tail) == 0 {
+			return false
+		}
+		arity: c.int = 0
+		elems: [^]ERL_NIF_TERM = nil
+		if nif_get_tuple(env, head, &arity, &elems) == 0 || arity != 5 {
+			return false
+		}
+		if _, ok_p := term_to_key_string(env, elems[0]); !ok_p {
+			return false
+		}
+		if _, ok_f := term_to_key_string(env, elems[1]); !ok_f {
+			return false
+		}
+		if _, ok_pk := term_to_key_string(env, elems[2]); !ok_pk {
+			return false
+		}
+		if !validate_bulk_fields_and_removed_cold(env, elems[3], elems[4]) {
+			return false
+		}
+	}
+	return true
+}
+
+validate_bulk_index_puts_cold :: proc(env: ErlNifEnv, mode: Bulk_Index_Mode, entries_term: ERL_NIF_TERM) -> bool {
+	if nif_is_list(env, entries_term) == 0 {
+		return false
+	}
+	head: ERL_NIF_TERM
+	tail := entries_term
+	for nif_is_empty_list(env, tail) == 0 {
+		if nif_get_list_cell(env, tail, &head, &tail) == 0 {
+			return false
+		}
+		arity: c.int = 0
+		elems: [^]ERL_NIF_TERM = nil
+		if nif_get_tuple(env, head, &arity, &elems) == 0 || arity != 2 {
+			return false
+		}
+		if _, ok_k := term_to_key_string(env, elems[0]); !ok_k {
+			return false
+		}
+		switch mode {
+		case .Unique:
+			if !validate_write_term_cold(env, elems[1], 1) {
+				return false
+			}
+		case .Counted_Set_Add:
+			if nif_is_list(env, elems[1]) != 0 {
+				mh: ERL_NIF_TERM
+				mt := elems[1]
+				for nif_is_empty_list(env, mt) == 0 {
+					if nif_get_list_cell(env, mt, &mh, &mt) == 0 {
+						return false
+					}
+					if _, ok_m := term_to_key_string(env, mh); !ok_m {
+						return false
+					}
+				}
+			} else if _, ok_m := term_to_key_string(env, elems[1]); !ok_m {
+				return false
+			}
+		case .Hash_Map_Merge:
+			if nif_is_map(env, elems[1]) != 0 {
+				if !validate_col_data_cold(env, "hash_map", elems[1], 1) {
+					return false
+				}
+			} else if nif_is_list(env, elems[1]) != 0 {
+				if !validate_col_data_cold(env, "hash_map", elems[1], 1) {
+					return false
+				}
+			} else {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 validate_deferred_tx_ops :: proc(tx: ^xitdb.Tx) -> string {
 	for &op in tx.ops {
 		if op.kind != .Callback || op.user_data == nil {
@@ -5227,6 +6041,21 @@ validate_deferred_tx_ops :: proc(tx: ^xitdb.Tx) -> string {
 		} else if op.callback == merge_map_callback {
 			mc := (^Merge_Map_Ctx)(op.user_data)
 			if !validate_write_term_cold(mc.env, mc.map_term) {
+				return "invalid_put_op"
+			}
+		} else if op.callback == bulk_put_maps_callback {
+			bc := (^Bulk_Put_Maps_Ctx)(op.user_data)
+			if !validate_bulk_put_maps_cold(bc.env, bc.entries_term) {
+				return "invalid_put_op"
+			}
+		} else if op.callback == bulk_put_nested_maps_callback {
+			bc := (^Bulk_Put_Nested_Maps_Ctx)(op.user_data)
+			if !validate_bulk_put_nested_maps_cold(bc.env, bc.entries_term) {
+				return "invalid_put_op"
+			}
+		} else if op.callback == bulk_index_puts_callback {
+			bc := (^Bulk_Index_Puts_Ctx)(op.user_data)
+			if !validate_bulk_index_puts_cold(bc.env, bc.mode, bc.entries_term) {
 				return "invalid_put_op"
 			}
 		}
@@ -5521,6 +6350,74 @@ parse_tx_ops :: proc(
 			mc.tx = tx
 			mc.validation_err = validation_err
 			xitdb.tx_with_cursor(tx, merge_map_callback, mc)
+			has_deferred^ = true
+
+		case ATOM_BULK_PUT_MAPS:
+			if arity != 3 {
+				return "invalid_put_op", nil
+			}
+			steps, er, ok_steps := decode_steps_term(env, elems[1], tx.allocator)
+			if !ok_steps || er != "" || len(steps) == 0 {
+				return er if er != "" else "invalid_put_op", nil
+			}
+			if nif_is_list(env, elems[2]) == 0 {
+				return "invalid_put_op", nil
+			}
+			bc := new(Bulk_Put_Maps_Ctx, tx.allocator)
+			bc.steps = steps
+			bc.env = env
+			bc.entries_term = elems[2]
+			bc.validation_err = validation_err
+			xitdb.tx_with_cursor(tx, bulk_put_maps_callback, bc)
+			has_deferred^ = true
+
+		case ATOM_BULK_PUT_NESTED_MAPS:
+			if arity != 3 {
+				return "invalid_put_op", nil
+			}
+			steps, er, ok_steps := decode_steps_term(env, elems[1], tx.allocator)
+			if !ok_steps || er != "" || len(steps) == 0 {
+				return er if er != "" else "invalid_put_op", nil
+			}
+			if nif_is_list(env, elems[2]) == 0 {
+				return "invalid_put_op", nil
+			}
+			bc := new(Bulk_Put_Nested_Maps_Ctx, tx.allocator)
+			bc.steps = steps
+			bc.env = env
+			bc.entries_term = elems[2]
+			bc.validation_err = validation_err
+			xitdb.tx_with_cursor(tx, bulk_put_nested_maps_callback, bc)
+			has_deferred^ = true
+
+		case ATOM_BULK_INDEX_PUTS:
+			if arity != 4 {
+				return "invalid_put_op", nil
+			}
+			steps, er, ok_steps := decode_steps_term(env, elems[1], tx.allocator)
+			if !ok_steps || er != "" || len(steps) == 0 {
+				return er if er != "" else "invalid_put_op", nil
+			}
+			mode: Bulk_Index_Mode
+			if elems[2] == ATOM_UNIQUE {
+				mode = .Unique
+			} else if elems[2] == ATOM_COUNTED_SET_ADD {
+				mode = .Counted_Set_Add
+			} else if elems[2] == ATOM_HASH_MAP_MERGE {
+				mode = .Hash_Map_Merge
+			} else {
+				return "invalid_put_op", nil
+			}
+			if nif_is_list(env, elems[3]) == 0 {
+				return "invalid_put_op", nil
+			}
+			bc := new(Bulk_Index_Puts_Ctx, tx.allocator)
+			bc.steps = steps
+			bc.mode = mode
+			bc.env = env
+			bc.entries_term = elems[3]
+			bc.validation_err = validation_err
+			xitdb.tx_with_cursor(tx, bulk_index_puts_callback, bc)
 			has_deferred^ = true
 
 		case:

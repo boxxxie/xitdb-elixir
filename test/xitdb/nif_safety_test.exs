@@ -1131,4 +1131,175 @@ defmodule Xitdb.NifSafetyTest do
     assert Enum.all?(Task.await_many(tasks, 15_000), &(&1 == :ok))
     assert :ok = Xitdb.close(db)
   end
+
+  test "bulk_put_maps, bulk_put_nested_maps, and bulk_index_puts support creates, sibling-safe updates, container adaptation, and invalid-shape rejection" do
+    {:ok, db} = Xitdb.open(backend: :memory)
+
+    # 1. bulk_put_maps create + update preserving siblings & nested subtrees + removed_fields
+    {:ok, db, m0} =
+      Xitdb.transact_ops_with_moment(
+        db,
+        [
+          {:bulk_put_maps, ["orgs"],
+           [
+             {"1",
+              %{
+                "id" => 1,
+                "name" => "Northleaf",
+                "legacy" => "drop_me",
+                "tags" => ["old_tag", "other"]
+              }, []},
+             {"2", %{"id" => 2, "name" => "Southbank", "meta" => %{"tier" => "a"}}, []}
+           ]},
+          {:bulk_put_nested_maps, ["orgs"],
+           [
+             {"1", "affiliations", "10", %{"id" => 10, "role" => "partner"}, []},
+             {"1", "affiliations", "11", %{"id" => 11, "role" => "analyst"}, []},
+             {"2", "affiliations", "20", %{"id" => 20, "role" => "director"}, []}
+           ]}
+        ],
+        doc: "bulk create"
+      )
+
+    {:ok, db, m1} =
+      Xitdb.transact_ops_with_moment(
+        db,
+        [
+          {:bulk_put_maps, ["orgs"],
+           [
+             {"1", %{"name" => "Northleaf Capital", "tags" => %{"kind" => "pe"}}, ["legacy"]}
+           ]},
+          {:bulk_put_nested_maps, ["orgs"],
+           [
+             {"1", "affiliations", "10", %{"role" => "managing_partner"}, []},
+             {"1", "affiliations", "12", %{"id" => 12, "role" => "associate"}, []}
+           ]},
+          # Empty entries lists cleanly no-op
+          {:bulk_put_maps, ["orgs"], []},
+          {:bulk_put_nested_maps, ["orgs"], []}
+        ],
+        base_moment: m0,
+        doc: "bulk sibling-safe update"
+      )
+
+    mat = db |> Xitdb.as_of(m1) |> Xitdb.materialize()
+    org1 = mat["orgs"]["1"]
+    assert org1["id"] == 1
+    assert org1["name"] == "Northleaf Capital"
+    refute Map.has_key?(org1, "legacy")
+    assert org1["tags"] == %{"kind" => "pe"}
+    assert org1["affiliations"]["10"] == %{"id" => 10, "role" => "managing_partner"}
+    assert org1["affiliations"]["11"] == %{"id" => 11, "role" => "analyst"}
+    assert org1["affiliations"]["12"] == %{"id" => 12, "role" => "associate"}
+    assert mat["orgs"]["2"]["affiliations"]["20"] == %{"id" => 20, "role" => "director"}
+
+    # 2. Container adaptation for sorted_map and counted_hash_map + bulk_index_puts modes
+    {:ok, db, m2} =
+      Xitdb.transact_ops_with_moment(
+        db,
+        [
+          {:init_col, ["counted_items"], "counted_hash_map"},
+          {:init_col, ["sorted_items"], "sorted_map"},
+          {:bulk_put_maps, ["counted_items"], [{"a", %{"k" => "va"}, []}]},
+          {:bulk_put_maps, ["sorted_items"], [{"b", %{"k" => "vb"}, []}]},
+          {:bulk_index_puts, ["idx", "orgs", "id_slug"], :unique,
+           [{"6e6f7274", "1"}, {"736f7574", "2"}]},
+          {:bulk_index_puts, ["idx", "orgs", "attr_tier"], :counted_set_add,
+           [{"61", ["1", "2"]}, {"62", "2"}, {"63", []}]},
+          {:bulk_index_puts, ["idx", "search", "orgs", "terms"], :hash_map_merge,
+           [
+             {"capital", %{"1" => 800}},
+             {"empty_map", %{}},
+             {"empty_list", []},
+             {"northleaf", [{"1", 800}, {"2", 100}]}
+           ]}
+        ],
+        base_moment: m1
+      )
+
+    mat2 = db |> Xitdb.as_of(m2) |> Xitdb.materialize()
+    assert mat2["counted_items"]["a"] == %{"k" => "va"}
+    assert mat2["sorted_items"]["b"] == %{"k" => "vb"}
+    assert mat2["idx"]["orgs"]["id_slug"] == %{"6e6f7274" => "1", "736f7574" => "2"}
+    assert MapSet.new(mat2["idx"]["orgs"]["attr_tier"]["61"]) == MapSet.new(["1", "2"])
+    assert MapSet.new(mat2["idx"]["orgs"]["attr_tier"]["62"]) == MapSet.new(["2"])
+    refute Map.has_key?(mat2["idx"]["orgs"]["attr_tier"], "63")
+    assert mat2["idx"]["search"]["orgs"]["terms"]["northleaf"] == %{"1" => 800, "2" => 100}
+    refute Map.has_key?(mat2["idx"]["search"]["orgs"]["terms"], "empty_map")
+    refute Map.has_key?(mat2["idx"]["search"]["orgs"]["terms"], "empty_list")
+
+    # 3. Invalid shape rejections do not crash or mutate state
+    bad_ops = [
+      [{:bulk_put_maps, ["orgs"], [{"bad_tuple"}]}],
+      [{:bulk_put_maps, ["orgs"], [{"1", %URI{}, []}]}],
+      [{:bulk_put_maps, ["orgs"], [{"1", %{"a" => 1}, "not_list"}]}],
+      [{:bulk_put_maps, ["orgs"], [{"1", %{"a" => 1}, [nil]}]}],
+      [{:bulk_put_nested_maps, ["orgs"], [{"1", "affiliations", "bad"}]}],
+      [{:bulk_index_puts, ["idx", "orgs", "t"], :bad_mode, []}],
+      [{:bulk_index_puts, ["idx", "orgs", "t"], :unique, [{nil, "1"}]}],
+      [{:bulk_index_puts, ["idx", "orgs", "t"], :hash_map_merge, [{"bad", %URI{}}]}],
+      [{:bulk_index_puts, ["idx", "orgs", "t"], :hash_map_merge, [{"bad", "not_map_or_list"}]}],
+      [
+        {:bulk_index_puts, ["idx", "orgs", "t"], :hash_map_merge,
+         [{"bad_elem", [{"1", 100}, {:not_a_pair}]}]}
+      ],
+      [
+        {:bulk_index_puts, ["idx", "orgs", "t"], :hash_map_merge,
+         [{"improper", [{"1", 100} | :tail]}]}
+      ],
+      [{:bulk_put_maps, [], []}]
+    ]
+
+    for ops <- bad_ops do
+      assert {:error, _reason} = Xitdb.transact_ops_with_moment(db, ops, base_moment: m2)
+    end
+
+    assert Xitdb.moment_count(db) == m2 + 1
+    assert :ok = Xitdb.close(db)
+  end
+
+  test "empty bulk ops do not pollute base-moment adaptation pending_tags" do
+    {:ok, db} = Xitdb.open(backend: :memory)
+    {:ok, db, m0} = Xitdb.transact_ops_with_moment(db, [{:init_col, ["cm"], "counted_hash_map"}])
+
+    {:ok, db, m1} =
+      Xitdb.transact_ops_with_moment(
+        db,
+        [
+          {:put, ["cm", "k"], "v"},
+          {:bulk_index_puts, ["plain_map"], :unique, []},
+          {:put, ["plain_map", "k"], "v"}
+        ],
+        base_moment: m0
+      )
+
+    snap = Xitdb.as_of(db, m1)
+    assert snap["plain_map"].tag == :hash_map
+    assert snap["plain_map"]["k"] == "v"
+    assert snap["cm"]["k"] == "v"
+    assert :ok = Xitdb.close(db)
+  end
+
+  test "bulk ops record child pending_tags for subsequent ops in base-moment adaptation" do
+    {:ok, db} = Xitdb.open(backend: :memory)
+    {:ok, db, m0} = Xitdb.transact_ops_with_moment(db, [{:init_col, ["cm"], "counted_hash_map"}])
+
+    {:ok, db, m1} =
+      Xitdb.transact_ops_with_moment(
+        db,
+        [
+          {:put, ["cm", "k"], "v"},
+          {:bulk_index_puts, ["idx", "col", "s"], :counted_set_add, [{"k1", ["doc1", "doc2"]}]},
+          {:rm, ["idx", "col", "s", "k1", "doc1"]},
+          {:bulk_put_maps, ["docs"], [{"d1", %{"tags" => Xitdb.counted_set(["a", "b"])}, []}]},
+          {:rm, ["docs", "d1", "tags", "a"]}
+        ],
+        base_moment: m0
+      )
+
+    snap = Xitdb.as_of(db, m1)
+    assert Enum.to_list(snap["idx"]["col"]["s"]["k1"]) == ["doc2"]
+    assert Enum.to_list(snap["docs"]["d1"]["tags"]) == ["b"]
+    assert :ok = Xitdb.close(db)
+  end
 end

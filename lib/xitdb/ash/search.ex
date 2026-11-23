@@ -16,7 +16,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     require Ash.Expr
     require Ash.Sort
 
-    alias Xitdb.Ash.{Codec, Info}
+    alias Xitdb.Ash.{Codec, Indexer, Info, Store}
     alias Xitdb.Ash.Search.Storage
 
     @weight_scale 100
@@ -182,8 +182,44 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     @spec tokenize(String.t() | Ash.CiString.t() | nil) :: [String.t()]
     def tokenize(nil), do: []
     def tokenize(%Ash.CiString{} = ci), do: ci |> Ash.CiString.value() |> tokenize()
+    def tokenize(""), do: []
 
     def tokenize(text) when is_binary(text) do
+      tokenize_ascii_scan(text, [], [], text)
+    end
+
+    defp tokenize_ascii_scan(<<c, rest::binary>>, cur, acc, orig) do
+      cond do
+        c >= ?a and c <= ?z ->
+          tokenize_ascii_scan(rest, [c | cur], acc, orig)
+
+        c >= ?0 and c <= ?9 ->
+          tokenize_ascii_scan(rest, [c | cur], acc, orig)
+
+        c >= ?A and c <= ?Z ->
+          tokenize_ascii_scan(rest, [c + 32 | cur], acc, orig)
+
+        c < 128 ->
+          if cur == [] do
+            tokenize_ascii_scan(rest, [], acc, orig)
+          else
+            token = cur |> :lists.reverse() |> :erlang.list_to_binary()
+            tokenize_ascii_scan(rest, [], [token | acc], orig)
+          end
+
+        true ->
+          tokenize_unicode(orig)
+      end
+    end
+
+    defp tokenize_ascii_scan(<<>>, [], acc, _orig), do: :lists.reverse(acc)
+
+    defp tokenize_ascii_scan(<<>>, cur, acc, _orig) do
+      token = cur |> :lists.reverse() |> :erlang.list_to_binary()
+      :lists.reverse([token | acc])
+    end
+
+    defp tokenize_unicode(text) do
       valid_utf8 = if String.valid?(text), do: text, else: String.replace_invalid(text)
 
       nfc =
@@ -196,6 +232,76 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       |> String.downcase()
       |> String.split(~r/[^\p{L}\p{N}]+/u, trim: true)
       |> Enum.map(&:binary.copy/1)
+    end
+
+    @doc """
+    Rebuilds `idx.search.<collection>` for `resource` in a single atomic transaction
+    (`Xitdb.Ash.Store` module, `{db, moment}`, or `%Xitdb{}`), scanning all live records,
+    extracting BM25 term weights (optionally in parallel across worker processes), and writing
+    `.meta`, `.docs`, and sorted `.terms` postings in bulk.
+
+    ## Options
+    - `:tenant` (`term()`) — optional multitenant scope (defaults to `nil`).
+    - `:parallel` (`boolean()`) — enable parallel worker extraction when at least 128 records
+      are indexed (defaults to `true`).
+    - `:only_attrs` (`:auto | :all | [atom()] | MapSet.t(atom())`) — restricts hydrated attributes;
+      `:auto` inspects `Info.search_fields(resource)` and loads `:all` when any search field
+      declares a `resolver`, otherwise only declared search fields (plus tenant attribute).
+    - `:worker_wrapper` (`(-> result) | (Xitdb.Cursor.t(), (-> result) -> result)`) — optional
+      wrapper invoked once per worker slice (for example, initializing process-local lookup caches).
+    """
+    @spec rebuild_index!(
+            module() | {Xitdb.t(), integer()} | Xitdb.t(),
+            module(),
+            keyword()
+          ) :: :ok | {Xitdb.t(), integer()} | Xitdb.t()
+    def rebuild_index!(store_or_db, resource, opts \\ [])
+
+    def rebuild_index!(store, resource, opts)
+        when is_atom(store) and is_atom(resource) and is_list(opts) do
+      if Info.search_fields(resource) == [] do
+        :ok
+      else
+        mutate_opts = Keyword.take(opts, [:timeout, :lease_timeout])
+
+        case Store.mutate(
+               store,
+               fn {db, moment} ->
+                 next_snapshot = do_rebuild_snapshot({db, moment}, resource, opts)
+                 {:ok, next_snapshot, :ok}
+               end,
+               mutate_opts
+             ) do
+          {:ok, :ok} -> :ok
+          {:error, %_{} = err} when is_exception(err) -> raise err
+          {:error, reason} -> raise Xitdb.Error, reason: reason
+        end
+      end
+    end
+
+    def rebuild_index!({%Xitdb{} = db, moment}, resource, opts)
+        when is_integer(moment) and is_atom(resource) and is_list(opts) do
+      if Info.search_fields(resource) == [] do
+        {db, moment}
+      else
+        do_rebuild_snapshot({db, moment}, resource, opts)
+      end
+    end
+
+    def rebuild_index!(%Xitdb{} = db, resource, opts)
+        when is_atom(resource) and is_list(opts) do
+      if Info.search_fields(resource) == [] do
+        db
+      else
+        moment = max(Xitdb.moment_count(db) - 1, -1)
+        {next_db, _next_moment} = do_rebuild_snapshot({db, moment}, resource, opts)
+        next_db
+      end
+    end
+
+    @doc false
+    def extract_weighted_terms_for_record(record, search_fields, db) do
+      extract_weighted_terms(record, search_fields, db)
     end
 
     @doc """
@@ -597,6 +703,230 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           acc
         else
           [{:put, term, new_w} | acc]
+        end
+      end)
+    end
+
+    defp do_rebuild_snapshot({%Xitdb{} = db, moment}, resource, opts) do
+      search_fields = Info.search_fields(resource)
+      tenant = opts[:tenant]
+      collection = Codec.scoped_collection(resource, tenant)
+      cursor_root = Xitdb.as_of(db, moment)
+      parallel? = Keyword.get(opts, :parallel, true)
+      worker_wrapper = Keyword.get(opts, :worker_wrapper)
+
+      only_attrs =
+        resolve_rebuild_only_attrs(resource, search_fields, Keyword.get(opts, :only_attrs, :auto))
+
+      cursors = Indexer.all_cursors(cursor_root, resource, tenant)
+
+      {doc_count, total_len, doc_entries, term_postings_map} =
+        extract_corpus_entries(
+          cursor_root,
+          cursors,
+          resource,
+          tenant,
+          only_attrs,
+          search_fields,
+          parallel?,
+          worker_wrapper
+        )
+
+      existing_search? =
+        case cursor_root["idx"] do
+          %Xitdb.Cursor{} = idx ->
+            case idx["search"] do
+              %Xitdb.Cursor{} = s -> s[collection] != nil
+              _ -> false
+            end
+
+          _ ->
+            false
+        end
+
+      if doc_count == 0 and not existing_search? do
+        {db, moment}
+      else
+        rm_op = {:rm_if_exists, ["idx", "search", collection]}
+
+        ops =
+          if doc_count == 0 do
+            [rm_op]
+          else
+            sorted_terms = :lists.keysort(1, :maps.to_list(term_postings_map))
+
+            [
+              rm_op,
+              {:put, ["idx", "search", collection, "meta"],
+               %{"doc_count" => doc_count, "total_len" => total_len}},
+              {:bulk_put_maps, ["idx", "search", collection, "docs"], doc_entries},
+              {:bulk_index_puts, ["idx", "search", collection, "terms"], :hash_map_merge,
+               sorted_terms}
+            ]
+          end
+
+        base_opts = Storage.search_reindex_tx_opts(collection)
+
+        tx_opts =
+          if moment >= 0 do
+            Keyword.put(base_opts, :base_moment, moment)
+          else
+            base_opts
+          end
+
+        case Xitdb.transact_ops_with_moment(db, ops, tx_opts) do
+          {:ok, next_db, next_moment} -> {next_db, next_moment}
+          {:error, %_{} = err} when is_exception(err) -> raise err
+          {:error, reason} -> raise Xitdb.Error, reason: reason
+        end
+      end
+    end
+
+    defp resolve_rebuild_only_attrs(resource, search_fields, :auto) do
+      if Enum.any?(search_fields, &(&1.resolver != nil)) do
+        :all
+      else
+        search_fields
+        |> Enum.map(& &1.field)
+        |> maybe_add_tenant_attr(resource)
+        |> MapSet.new()
+      end
+    end
+
+    defp resolve_rebuild_only_attrs(_resource, _search_fields, :all), do: :all
+
+    defp resolve_rebuild_only_attrs(resource, _search_fields, %MapSet{} = set) do
+      set |> MapSet.to_list() |> maybe_add_tenant_attr(resource) |> MapSet.new()
+    end
+
+    defp resolve_rebuild_only_attrs(resource, _search_fields, list) when is_list(list) do
+      list |> maybe_add_tenant_attr(resource) |> MapSet.new()
+    end
+
+    defp maybe_add_tenant_attr(attrs, resource) do
+      if Ash.Resource.Info.multitenancy_strategy(resource) == :attribute do
+        [Ash.Resource.Info.multitenancy_attribute(resource) | attrs]
+      else
+        attrs
+      end
+    end
+
+    defp extract_corpus_entries(
+           _cursor_root,
+           [],
+           _resource,
+           _tenant,
+           _only_attrs,
+           _search_fields,
+           _parallel?,
+           _worker_wrapper
+         ) do
+      {0, 0, [], %{}}
+    end
+
+    defp extract_corpus_entries(
+           cursor_root,
+           cursors,
+           resource,
+           tenant,
+           only_attrs,
+           search_fields,
+           parallel?,
+           worker_wrapper
+         ) do
+      total = length(cursors)
+
+      if parallel? and total >= 128 do
+        concurrency = min(System.schedulers_online(), 8)
+        slice_size = max(div(total + concurrency - 1, concurrency), 1)
+
+        cursors
+        |> Enum.chunk_every(slice_size)
+        |> Task.async_stream(
+          fn slice ->
+            run_with_worker_wrapper(worker_wrapper, cursor_root, fn ->
+              extract_corpus_slice(
+                slice,
+                cursor_root,
+                resource,
+                tenant,
+                only_attrs,
+                search_fields
+              )
+            end)
+          end,
+          max_concurrency: concurrency,
+          ordered: false,
+          timeout: :infinity
+        )
+        |> Enum.reduce({0, 0, [], %{}}, fn {:ok, {sc, sl, sdocs, sterms}},
+                                           {ac, al, adocs, aterms} ->
+          merged_docs = sdocs ++ adocs
+
+          merged_terms =
+            if map_size(aterms) == 0 do
+              sterms
+            else
+              merge_term_postings(aterms, sterms)
+            end
+
+          {ac + sc, al + sl, merged_docs, merged_terms}
+        end)
+      else
+        run_with_worker_wrapper(worker_wrapper, cursor_root, fn ->
+          extract_corpus_slice(cursors, cursor_root, resource, tenant, only_attrs, search_fields)
+        end)
+      end
+    end
+
+    defp run_with_worker_wrapper(nil, _cursor_root, fun), do: fun.()
+
+    defp run_with_worker_wrapper(wrapper, _cursor_root, fun) when is_function(wrapper, 1),
+      do: wrapper.(fun)
+
+    defp run_with_worker_wrapper(wrapper, cursor_root, fun) when is_function(wrapper, 2),
+      do: wrapper.(cursor_root, fun)
+
+    defp extract_corpus_slice(slice, cursor_root, resource, tenant, only_attrs, search_fields) do
+      filter_tenant? = Ash.Resource.Info.multitenancy_strategy(resource) != :attribute
+
+      Enum.reduce(slice, {0, 0, [], %{}}, fn {doc_id, cursor},
+                                             {c_acc, l_acc, docs_acc, terms_acc} ->
+        with {:ok, record} <- Codec.from_cursor(resource, cursor, tenant, only_attrs),
+             true <- not filter_tenant? or Codec.matches_tenant?(resource, record, tenant) do
+          terms = extract_weighted_terms(record, search_fields, cursor_root)
+          len = Enum.reduce(terms, 0, fn {_t, w}, sum -> sum + w end)
+
+          if len > 0 do
+            doc_entry = {doc_id, %{"len" => len, "terms" => terms}, []}
+
+            next_terms =
+              Enum.reduce(terms, terms_acc, fn {term, weight}, t_acc ->
+                case Map.fetch(t_acc, term) do
+                  {:ok, existing} -> Map.put(t_acc, term, [{doc_id, weight} | existing])
+                  :error -> Map.put(t_acc, term, [{doc_id, weight}])
+                end
+              end)
+
+            {c_acc + 1, l_acc + len, [doc_entry | docs_acc], next_terms}
+          else
+            {c_acc, l_acc, docs_acc, terms_acc}
+          end
+        else
+          _ -> {c_acc, l_acc, docs_acc, terms_acc}
+        end
+      end)
+    end
+
+    defp merge_term_postings(target, source) when map_size(target) < map_size(source) do
+      merge_term_postings(source, target)
+    end
+
+    defp merge_term_postings(target, source) do
+      Enum.reduce(source, target, fn {term, postings}, acc ->
+        case Map.fetch(acc, term) do
+          {:ok, existing} -> Map.put(acc, term, postings ++ existing)
+          :error -> Map.put(acc, term, postings)
         end
       end)
     end
@@ -1064,7 +1394,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       end
     end
 
-    defp search_reindex_tx_opts(collection) do
+    @doc false
+    def search_reindex_tx_opts(collection) do
       ctx = Xitdb.current_tx_context()
 
       doc =

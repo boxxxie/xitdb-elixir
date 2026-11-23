@@ -35,6 +35,73 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       end
     end
 
+    @doc false
+    @spec compile_attr_plan(module()) :: [tuple()]
+    def compile_attr_plan(resource) when is_atom(resource) do
+      counted_sets = counted_set_fields(resource)
+
+      resource
+      |> Ash.Resource.Info.attributes()
+      |> Enum.map(fn %Attribute{} = attr ->
+        as_counted_set? = MapSet.member?(counted_sets, attr.name)
+
+        fast_kind =
+          if as_counted_set? do
+            :general
+          else
+            {kind, _constraints} = unwrap_type(attr.type, attr.constraints)
+
+            case kind do
+              k when k in [:string, :binary] -> :binary
+              :boolean -> :boolean
+              :integer -> :integer
+              :float -> :float
+              _ -> :general
+            end
+          end
+
+        {attr, attr.name, Atom.to_string(attr.name), as_counted_set?, fast_kind}
+      end)
+    end
+
+    @doc false
+    @spec to_cursor_map_fast([tuple()], struct() | map()) ::
+            {:ok, %{String.t() => term()}} | {:error, term()}
+    def to_cursor_map_fast(plan, record) when is_list(plan) and is_map(record) do
+      Enum.reduce_while(plan, {:ok, %{}}, fn {attr, name, key, as_counted_set?, fast_kind},
+                                             {:ok, acc} ->
+        case Map.get(record, name) do
+          nil ->
+            {:cont, {:ok, acc}}
+
+          value ->
+            case fast_kind do
+              :binary when is_binary(value) ->
+                {:cont, {:ok, Map.put(acc, key, :binary.copy(value))}}
+
+              :boolean when is_boolean(value) ->
+                {:cont, {:ok, Map.put(acc, key, value)}}
+
+              :integer when is_integer(value) and value >= @min_i64 and value <= @max_i64 ->
+                {:cont, {:ok, Map.put(acc, key, value)}}
+
+              :float when is_float(value) ->
+                {:cont, {:ok, Map.put(acc, key, value)}}
+
+              :float when is_integer(value) ->
+                {:cont, {:ok, Map.put(acc, key, value * 1.0)}}
+
+              _ ->
+                case dump_attribute_or_set(attr, value, as_counted_set?) do
+                  {:ok, nil} -> {:cont, {:ok, acc}}
+                  {:ok, dumped} -> {:cont, {:ok, Map.put(acc, key, dumped)}}
+                  {:error, _reason} = err -> {:halt, err}
+                end
+            end
+        end
+      end)
+    end
+
     @doc """
     Encodes a `%Resource{}` struct (or attribute map) into a string-keyed map suitable
     for compiling into a Xitdb `:hash_map` cursor, wrapping `counted_set_fields` in
