@@ -375,5 +375,159 @@ defmodule Xitdb.ColumnarTest do
                  codec: :zstd
                )
     end
+
+    test "resolves negative moments (-1) to concrete moment indices in :xitdb_page_cache" do
+      payload = String.duplicate("Negative moment resolution block. ", 10)
+      rows = [{"1", %{"body" => payload}}]
+
+      db =
+        Xitdb.open!(backend: :memory)
+        |> Columnar.put_rows!("items", rows, columns: [:body], codec: :zstd)
+
+      on_exit(fn -> Xitdb.close(db) end)
+
+      Columnar.clear_cache(db)
+      Columnar.reset_stats()
+
+      # Xitdb.select!(db, ...) uses moment: -1; first read populates cache under concrete moment 0
+      assert Xitdb.select!(db, ~s(.items["1"].body)) == payload
+      assert %{page_reads: 1, page_cache_hits: 0} = Columnar.stats()
+
+      ref_list = :erlang.ref_to_list(db.db_ref)
+
+      assert Enum.any?(:ets.tab2list(:xitdb_page_cache), fn
+               {{^ref_list, 0, "items", "body", _page_id}, _, _, _} -> true
+               _ -> false
+             end)
+
+      refute Enum.any?(:ets.tab2list(:xitdb_page_cache), fn
+               {{^ref_list, -1, _, _, _}, _, _, _} -> true
+               _ -> false
+             end)
+
+      # Subsequent reads via concrete moment 0 and select!(db, -1) hit the same cache entry
+      assert Xitdb.as_of(db, 0)["items"]["1"]["body"] == payload
+      assert %{page_reads: 1, page_cache_hits: 1} = Columnar.stats()
+
+      assert Xitdb.select!(db, ~s(.items["1"].body)) == payload
+      assert %{page_reads: 1, page_cache_hits: 2} = Columnar.stats()
+    end
+  end
+end
+
+defmodule Xitdb.CacheOwnerResilienceTest do
+  use ExUnit.Case, async: false
+
+  import ExUnit.CaptureLog
+
+  alias Xitdb.Columnar
+
+  test "CacheOwner kill preserves :xitdb_page_cache and :xitdb_dict_cache via CacheHeir across supervisor restarts without error logs" do
+    payload = String.duplicate("Heir preservation block. ", 10)
+    rows = [{"1", %{"body" => payload}}]
+
+    db =
+      Xitdb.open!(backend: :memory)
+      |> Columnar.put_rows!("items", rows, columns: [:body], codec: :zstd)
+
+    on_exit(fn -> Xitdb.close(db) end)
+
+    Columnar.clear_cache(:all)
+    assert Xitdb.as_of(db, 0)["items"]["1"]["body"] == payload
+
+    log =
+      capture_log(fn ->
+        sup_pid = Process.whereis(Xitdb.Supervisor)
+        assert is_pid(sup_pid)
+
+        pid1 = Process.whereis(Xitdb.CacheOwner)
+        assert is_pid(pid1)
+
+        # Concurrent ensure_started/0 callers racing a CacheOwner kill must not spawn
+        # an unsupervised CacheOwner or crash Xitdb.Supervisor.
+        stop_racing = :atomics.new(1, signed: false)
+
+        racers =
+          for _ <- 1..8 do
+            Task.async(fn ->
+              Stream.repeatedly(fn ->
+                if :atomics.get(stop_racing, 1) == 0 do
+                  assert :ok = Xitdb.CacheOwner.ensure_started()
+                  :erlang.yield()
+                  true
+                else
+                  false
+                end
+              end)
+              |> Enum.take_while(& &1)
+            end)
+          end
+
+        ref1 = Process.monitor(pid1)
+        Process.exit(pid1, :kill)
+        assert_receive {:DOWN, ^ref1, :process, ^pid1, :killed}, 1_000
+
+        pid2 = wait_for_registered_restart(Xitdb.CacheOwner, pid1, 200)
+        :ok = :atomics.put(stop_racing, 1, 1)
+        Enum.each(racers, &Task.await(&1, 2_000))
+
+        assert Process.whereis(Xitdb.Supervisor) == sup_pid
+
+        assert Enum.any?(Supervisor.which_children(sup_pid), fn
+                 {Xitdb.CacheOwner, ^pid2, :worker, _} -> true
+                 _ -> false
+               end)
+
+        assert :ok = GenServer.call(pid2, :ping)
+        assert :ets.info(:xitdb_page_cache, :owner) == pid2
+        assert :ets.info(:xitdb_dict_cache, :owner) == pid2
+
+        # Killing CacheHeir causes CacheOwner to re-attach the restarted heir
+        heir1 = Process.whereis(Xitdb.CacheHeir)
+        assert is_pid(heir1)
+        heir_ref = Process.monitor(heir1)
+        Process.exit(heir1, :kill)
+        assert_receive {:DOWN, ^heir_ref, :process, ^heir1, :killed}, 1_000
+
+        heir2 = wait_for_registered_restart(Xitdb.CacheHeir, heir1, 200)
+        _ = :sys.get_state(heir2)
+        _ = :sys.get_state(pid2)
+        assert :ets.info(:xitdb_page_cache, :heir) == heir2
+        assert :ets.info(:xitdb_dict_cache, :heir) == heir2
+
+        # Second kill verifies CacheOwner re-attaches CacheHeir after ETS-TRANSFER and CacheHeir restart
+        ref2 = Process.monitor(pid2)
+        Process.exit(pid2, :kill)
+        assert_receive {:DOWN, ^ref2, :process, ^pid2, :killed}, 1_000
+
+        pid3 = wait_for_registered_restart(Xitdb.CacheOwner, pid2, 200)
+        assert Process.whereis(Xitdb.Supervisor) == sup_pid
+        assert :ok = GenServer.call(pid3, :ping)
+        assert :ets.info(:xitdb_page_cache, :owner) == pid3
+        assert :ets.info(:xitdb_dict_cache, :owner) == pid3
+        assert :ets.info(:xitdb_page_cache, :heir) == heir2
+        assert :ets.info(:xitdb_dict_cache, :heir) == heir2
+      end)
+
+    refute log =~ "ETS-TRANSFER"
+    refute log =~ "unexpected message"
+
+    Columnar.reset_stats()
+    assert Xitdb.as_of(db, 0)["items"]["1"]["body"] == payload
+    assert %{page_cache_hits: 1, page_reads: 0} = Columnar.stats()
+  end
+
+  defp wait_for_registered_restart(name, _old_pid, 0),
+    do: flunk("#{inspect(name)} did not restart")
+
+  defp wait_for_registered_restart(name, old_pid, attempts) do
+    case Process.whereis(name) do
+      pid when is_pid(pid) and pid != old_pid ->
+        pid
+
+      _ ->
+        Process.sleep(5)
+        wait_for_registered_restart(name, old_pid, attempts - 1)
+    end
   end
 end

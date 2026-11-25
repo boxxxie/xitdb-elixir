@@ -323,5 +323,145 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       assert Store.root(store_name)["entries"]["ghost_abort"] == nil
       assert Store.root(store_name)["entries"]["ghost_lease"] == nil
     end
+
+    test "cleans up :allow entries on allowed pid exit, fences sandbox zombies, and wakes queued waiters on owner crash" do
+      store = start_sandboxed_store()
+      :ok = TestSandbox.checkout([store], lease_timeout: 30)
+      owner = self()
+
+      # Allowed process exit removes its :allow ETS entry
+      allowed =
+        spawn(fn ->
+          receive do: (:die -> :ok)
+        end)
+
+      :ok = TestSandbox.allow([store], owner, allowed)
+      # Repeated allow/3 calls for the same {store, pid} do not leak duplicate monitors
+      :ok = TestSandbox.allow([store], owner, allowed)
+      [{_, coord_pid}] = :ets.lookup(:xitdb_ash_sandbox_checkouts, {:coord, store, owner})
+      assert map_size(:sys.get_state(coord_pid).allowed_monitors) == 1
+
+      ref = Process.monitor(allowed)
+      send(allowed, :die)
+      assert_receive {:DOWN, ^ref, :process, ^allowed, :normal}, 1_000
+
+      wait_until_sandbox(fn ->
+        :ets.lookup(:xitdb_ash_sandbox_checkouts, {:allow, store, allowed}) == [] and
+          map_size(:sys.get_state(coord_pid).allowed_monitors) == 0
+      end)
+
+      # Stale :allow pointing to a checked-in owner is evicted and falls back to $callers
+      stale_owner =
+        spawn(fn ->
+          receive do: (:stop -> :ok)
+        end)
+
+      Task.async(fn ->
+        :ets.insert(:xitdb_ash_sandbox_checkouts, {{:allow, store, self()}, stale_owner})
+        assert TestSandbox.checked_out?(store) == true
+        assert :ets.lookup(:xitdb_ash_sandbox_checkouts, {:allow, store, self()}) == []
+      end)
+      |> Task.await()
+
+      send(stale_owner, :stop)
+
+      # Explicit rollback inside sandbox advances reconciled moment and updates ETS Snapshot
+      pre_rb_moment = Store.current_db(store).moment
+
+      assert {:error, :test_abort} =
+               Store.transact(store, fn ->
+                 {:ok, :staged} =
+                   Store.mutate(store, fn {db, moment} ->
+                     {:ok, db2} =
+                       Xitdb.transact_ops(db, [{:put, "entries[\"rolled_back\"]", "bad"}],
+                         base_moment: moment
+                       )
+
+                     {:ok, {db2, Xitdb.moment_count(db2) - 1}, :staged}
+                   end)
+
+                 Store.rollback(store, :test_abort)
+               end)
+
+      assert Store.current_db(store).moment > pre_rb_moment
+      assert Store.root(store)["entries"]["rolled_back"] == nil
+
+      # Zombie writer in sandbox is fenced with :stale_write_epoch and ETS reflects restored tip
+      pre_exp_moment = Store.current_db(store).moment
+
+      assert {:error, %LeaseError{store: ^store, reason: :lease_expired}} =
+               Store.transact(
+                 store,
+                 fn ->
+                   {:ok, :staged} =
+                     Store.mutate(store, fn {db, moment} ->
+                       {:ok, db2} =
+                         Xitdb.transact_ops(db, [{:put, "entries[\"z_staged\"]", "stale"}],
+                           base_moment: moment
+                         )
+
+                       {:ok, {db2, Xitdb.moment_count(db2) - 1}, :staged}
+                     end)
+
+                   wait_until_sandbox(fn ->
+                     :sys.get_state(coord_pid).queues[store].active == nil
+                   end)
+
+                   {db, moment} = Process.get({:xitdb_tx_state, store})
+
+                   assert {:error, %Xitdb.Error{reason: :stale_write_epoch}} =
+                            Xitdb.transact_ops(db, [{:put, "entries[\"z\"]", "stale"}],
+                              base_moment: moment
+                            )
+
+                   :zombie
+                 end,
+                 timeout: 500
+               )
+
+      assert Store.current_db(store).moment > pre_exp_moment
+      assert Store.root(store)["entries"]["z_staged"] == nil
+      assert Store.root(store)["entries"]["z"] == nil
+
+      # Queued waiter receives {:error, :sandbox_checked_in} promptly when owner terminates/checks in
+      owner2_pid =
+        spawn(fn ->
+          :ok = TestSandbox.checkout([store], lease_timeout: 5_000)
+
+          Store.transact(store, fn ->
+            send(owner, {:owner2_ready, self()})
+            receive do: (:hold -> :ok)
+          end)
+        end)
+
+      assert_receive {:owner2_ready, ^owner2_pid}, 1_000
+
+      [{_, coord2}] = :ets.lookup(:xitdb_ash_sandbox_checkouts, {:coord, store, owner2_pid})
+
+      waiter =
+        Task.async(fn ->
+          TestSandbox.allow([store], owner2_pid, self())
+          Store.transact(store, fn -> :never end, timeout: 5_000)
+        end)
+
+      wait_until_sandbox(fn ->
+        :queue.len(:sys.get_state(coord2).queues[store].waiters) == 1
+      end)
+
+      Process.exit(owner2_pid, :kill)
+      assert {:error, :sandbox_checked_in} = Task.await(waiter, 1_000)
+    end
+
+    defp wait_until_sandbox(pred, attempts \\ 200)
+    defp wait_until_sandbox(_pred, 0), do: flunk("Sandbox condition not met")
+
+    defp wait_until_sandbox(pred, attempts) do
+      if pred.() do
+        :ok
+      else
+        Process.sleep(5)
+        wait_until_sandbox(pred, attempts - 1)
+      end
+    end
   end
 end

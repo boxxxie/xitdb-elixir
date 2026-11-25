@@ -108,14 +108,24 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           caller_dict_lookup(callers, tx_key, tx_key) ||
           sandbox_or_committed_db(store)
 
-      base_db =
+      {base_db, visible_moment} =
         case active_handle do
-          %Xitdb{} = db -> db
-          %Xitdb.Cursor{db_ref: db_ref} -> struct(Xitdb, db_ref: db_ref)
-          {%Xitdb{} = db, _moment} -> db
+          %Xitdb{} = db -> {db, nil}
+          %Xitdb.Cursor{db_ref: db_ref, moment: m} -> {struct(Xitdb, db_ref: db_ref), m}
+          {%Xitdb{} = db, m} -> {db, m}
         end
 
-      Xitdb.as_of(base_db, moment)
+      if moment < 0 and is_integer(visible_moment) and visible_moment >= 0 do
+        resolved = visible_moment + 1 + moment
+
+        if resolved >= 0 do
+          Xitdb.as_of(base_db, resolved)
+        else
+          raise Xitdb.Error, reason: :invalid_moment, details: %{moment_index: moment}
+        end
+      else
+        Xitdb.as_of(base_db, moment)
+      end
     end
 
     @doc """

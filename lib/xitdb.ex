@@ -183,14 +183,15 @@ defmodule Xitdb do
   @tx_context_key :xitdb_tx_context
 
   @enforce_keys [:db_ref, :backend]
-  defstruct [:db_ref, :backend, :path, hash: :sha1, read_only: false]
+  defstruct [:db_ref, :backend, :path, hash: :sha1, read_only: false, write_epoch: nil]
 
   @type t :: %__MODULE__{
           db_ref: reference(),
           backend: :memory | :file | :buffered_file,
           path: String.t(),
           hash: :sha1 | :sha256,
-          read_only: boolean()
+          read_only: boolean(),
+          write_epoch: non_neg_integer() | nil
         }
 
   # ============================================================================
@@ -247,6 +248,18 @@ defmodule Xitdb do
   @spec sync(t()) :: :ok | {:error, Error.t()}
   def sync(%__MODULE__{db_ref: db_ref}) do
     db_ref |> NIF.nif_sync() |> Error.wrap()
+  end
+
+  @doc false
+  @spec bump_write_epoch(t()) :: {:ok, non_neg_integer()} | {:error, Error.t()}
+  def bump_write_epoch(%__MODULE__{db_ref: db_ref}) do
+    db_ref |> NIF.nif_bump_write_epoch() |> Error.wrap()
+  end
+
+  @doc false
+  @spec bump_write_epoch!(t()) :: non_neg_integer()
+  def bump_write_epoch!(%__MODULE__{} = db) do
+    db |> bump_write_epoch() |> Error.unwrap!()
   end
 
   @doc "Returns database metadata (`%{moment_count: integer(), file_size: integer()}`)."
@@ -704,7 +717,7 @@ defmodule Xitdb do
   defp timed_nif_transact(db, db_ref, base_moment, nif_ops, user_op_count, doc) do
     started = System.monotonic_time()
 
-    case NIF.nif_transact(db_ref, base_moment, nif_ops, doc) do
+    case NIF.nif_transact(db_ref, base_moment, nif_ops, doc, db.write_epoch) do
       {:ok, moment_idx} ->
         duration = System.monotonic_time() - started
 

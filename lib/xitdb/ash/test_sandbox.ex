@@ -139,12 +139,15 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       init()
 
       Enum.each(List.wrap(store_or_stores), fn store ->
-        if :ets.lookup(@checkouts_table, {:db, store, owner_pid}) == [] do
-          raise ArgumentError,
-                "#{inspect(owner_pid)} has not checked out Xitdb.Ash.TestSandbox for #{inspect(store)}"
+        with [{_, coord_pid}] when is_pid(coord_pid) <-
+               :ets.lookup(@checkouts_table, {:coord, store, owner_pid}),
+             :ok <- Coordinator.allow(coord_pid, store, allowed_pid) do
+          :ok
+        else
+          _ ->
+            raise ArgumentError,
+                  "#{inspect(owner_pid)} has not checked out Xitdb.Ash.TestSandbox for #{inspect(store)}"
         end
-
-        :ets.insert(@checkouts_table, {{:allow, store, allowed_pid}, owner_pid})
       end)
 
       :ok
@@ -273,8 +276,16 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
           :none ->
             case :ets.lookup(@checkouts_table, {:shared, store}) do
-              [{_, shared_owner}] -> {:ok, shared_owner}
-              [] -> :none
+              [{_, shared_owner}] ->
+                if :ets.member(@checkouts_table, {:db, store, shared_owner}) do
+                  {:ok, shared_owner}
+                else
+                  :ets.match_delete(@checkouts_table, {{:shared, store}, shared_owner})
+                  :none
+                end
+
+              [] ->
+                :none
             end
         end
       end
@@ -294,8 +305,16 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         {:ok, pid}
       else
         case :ets.lookup(@checkouts_table, {:allow, store, pid}) do
-          [{_, owner} | _] -> {:ok, owner}
-          [] -> find_chain_owner(store, rest)
+          [{_, owner} | _] ->
+            if :ets.member(@checkouts_table, {:db, store, owner}) do
+              {:ok, owner}
+            else
+              :ets.match_delete(@checkouts_table, {{:allow, store, pid}, owner})
+              find_chain_owner(store, rest)
+            end
+
+          [] ->
+            find_chain_owner(store, rest)
         end
       end
     end
@@ -365,7 +384,15 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     alias Xitdb.Ash.{Store, TestSandbox}
     alias Xitdb.Ash.Store.{Backend, LeaseQueue}
 
-    defstruct [:owner, :owner_mref, :table, :lease_timeout, :snapshots, :queues]
+    defstruct [
+      :owner,
+      :owner_mref,
+      :table,
+      :lease_timeout,
+      :snapshots,
+      :queues,
+      allowed_monitors: %{}
+    ]
 
     @type t :: %__MODULE__{
             owner: pid(),
@@ -373,13 +400,26 @@ if Code.ensure_loaded?(Ash.DataLayer) do
             table: atom(),
             lease_timeout: timeout(),
             snapshots: %{optional(module()) => Store.working_snapshot()},
-            queues: %{optional(module()) => LeaseQueue.t()}
+            queues: %{optional(module()) => LeaseQueue.t()},
+            allowed_monitors: %{optional(reference()) => {module(), pid()}}
           }
 
     @spec start(pid(), %{module() => Store.working_snapshot()}, timeout(), atom()) ::
             GenServer.on_start()
     def start(owner, initial_snapshots, lease_timeout, table) do
       GenServer.start(__MODULE__, {owner, initial_snapshots, lease_timeout, table})
+    end
+
+    @spec allow(pid(), module(), pid()) :: :ok | {:error, :not_checked_out}
+    def allow(pid, store, allowed_pid)
+        when is_pid(pid) and is_atom(store) and is_pid(allowed_pid) do
+      if Process.alive?(pid) do
+        GenServer.call(pid, {:allow, store, allowed_pid}, 5_000)
+      else
+        {:error, :not_checked_out}
+      end
+    catch
+      :exit, _ -> {:error, :not_checked_out}
     end
 
     @spec checkin_stores(pid(), [module()]) :: :ok
@@ -428,6 +468,18 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     def handle_call({:checkin_stores, stores}, _from, %__MODULE__{} = state) do
       TestSandbox.purge_owner_entries(state.table, stores, state.owner)
 
+      store_set = MapSet.new(stores)
+
+      next_allowed_monitors =
+        Enum.reduce(state.allowed_monitors, %{}, fn {mref, {store, _pid} = target}, acc ->
+          if MapSet.member?(store_set, store) do
+            Process.demonitor(mref, [:flush])
+            acc
+          else
+            Map.put(acc, mref, target)
+          end
+        end)
+
       {closing, remaining_snapshots} = Map.split(state.snapshots, stores)
 
       Enum.each(stores, fn store ->
@@ -438,16 +490,43 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       end)
 
       Enum.each(closing, fn {_store, {db, _moment}} ->
+        Backend.bump_write_epoch(db)
         Backend.close_db(db)
       end)
 
       next_queues = Map.drop(state.queues, stores)
-      next_state = %__MODULE__{state | snapshots: remaining_snapshots, queues: next_queues}
+
+      next_state = %__MODULE__{
+        state
+        | snapshots: remaining_snapshots,
+          queues: next_queues,
+          allowed_monitors: next_allowed_monitors
+      }
 
       if map_size(remaining_snapshots) == 0 do
         {:stop, :normal, :ok, next_state}
       else
         {:reply, :ok, next_state}
+      end
+    end
+
+    def handle_call({:allow, store, allowed_pid}, _from, %__MODULE__{} = state) do
+      if Map.has_key?(state.snapshots, store) do
+        :ets.insert(state.table, {{:allow, store, allowed_pid}, state.owner})
+
+        next_monitors =
+          if Enum.any?(state.allowed_monitors, fn {_mref, target} ->
+               target == {store, allowed_pid}
+             end) do
+            state.allowed_monitors
+          else
+            mref = Process.monitor(allowed_pid)
+            Map.put(state.allowed_monitors, mref, {store, allowed_pid})
+          end
+
+        {:reply, :ok, %__MODULE__{state | allowed_monitors: next_monitors}}
+      else
+        {:reply, {:error, :not_checked_out}, state}
       end
     end
 
@@ -464,7 +543,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         {{:ok, queue}, {:ok, snapshot}} ->
           lease_timeout =
             if explicit_lease_timeout == nil do
-              Store.min_timeout(state.lease_timeout, call_timeout)
+              state.lease_timeout
             else
               explicit_lease_timeout
             end
@@ -479,7 +558,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
                  snapshot
                ) do
             {:granted, lease_ref, next_queue} ->
-              {:reply, {:ok, lease_ref, snapshot}, put_queue(state, store, next_queue)}
+              {:reply, {:ok, lease_ref, Backend.fence_snapshot(snapshot)},
+               put_queue(state, store, next_queue)}
 
             {:queued, next_queue} ->
               {:noreply, put_queue(state, store, next_queue)}
@@ -491,7 +571,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     end
 
     def handle_call(
-          {:commit, store, lease_ref, {new_db, new_moment}},
+          {:commit, store, lease_ref, {%Xitdb{} = new_db, new_moment}},
           {caller_pid, _},
           %__MODULE__{} = state
         ) do
@@ -502,8 +582,12 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         {:ok, queue} ->
           case LeaseQueue.verify_holder(queue, lease_ref, caller_pid) do
             :ok ->
+              {old_db, _old_moment} = Map.fetch!(state.snapshots, store)
+              Backend.bump_write_epoch(old_db)
+              base_db = %Xitdb{new_db | write_epoch: nil}
+
               {committed_db, committed_moment} =
-                Backend.reconcile_tip(new_db, new_moment, :reconcile_commit)
+                Backend.reconcile_tip(base_db, new_moment, :reconcile_commit)
 
               next_snapshot = {committed_db, committed_moment}
 
@@ -512,7 +596,12 @@ if Code.ensure_loaded?(Ash.DataLayer) do
                 {{:db, store, state.owner}, Xitdb.as_of(committed_db, committed_moment)}
               )
 
-              next_queue = LeaseQueue.release_and_grant_next(queue, store, next_snapshot)
+              next_queue =
+                LeaseQueue.release_and_grant_next(
+                  queue,
+                  store,
+                  fn -> Backend.fence_snapshot(next_snapshot) end
+                )
 
               next_state = %__MODULE__{
                 state
@@ -526,7 +615,17 @@ if Code.ensure_loaded?(Ash.DataLayer) do
               next_state =
                 if is_nil(queue.active) do
                   {db, moment} = Map.fetch!(state.snapshots, store)
-                  restored_snap = Backend.reconcile_tip(db, moment, :sandbox_checkin)
+                  Backend.bump_write_epoch(db)
+
+                  {restored_db, restored_moment} =
+                    Backend.reconcile_tip(db, moment, :sandbox_checkin)
+
+                  :ets.insert(
+                    state.table,
+                    {{:db, store, state.owner}, Xitdb.as_of(restored_db, restored_moment)}
+                  )
+
+                  restored_snap = {restored_db, restored_moment}
                   %__MODULE__{state | snapshots: Map.put(state.snapshots, store, restored_snap)}
                 else
                   state
@@ -549,8 +648,43 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     def handle_cast({:cancel_waiter, store, req_ref}, %__MODULE__{} = state) do
       case {Map.fetch(state.queues, store), Map.fetch(state.snapshots, store)} do
         {{:ok, queue}, {:ok, snapshot}} ->
-          next_queue = LeaseQueue.cancel_waiter(queue, req_ref, store, snapshot)
-          {:noreply, put_queue(state, store, next_queue)}
+          if match?(%{req_ref: ^req_ref}, queue.active) do
+            {db, moment} = snapshot
+            Backend.bump_write_epoch(db)
+            {restored_db, restored_moment} = Backend.reconcile_tip(db, moment, :sandbox_checkin)
+
+            :ets.insert(
+              state.table,
+              {{:db, store, state.owner}, Xitdb.as_of(restored_db, restored_moment)}
+            )
+
+            restored_snap = {restored_db, restored_moment}
+
+            next_queue =
+              LeaseQueue.cancel_waiter(
+                queue,
+                req_ref,
+                store,
+                fn -> Backend.fence_snapshot(restored_snap) end
+              )
+
+            {:noreply,
+             %__MODULE__{
+               state
+               | snapshots: Map.put(state.snapshots, store, restored_snap),
+                 queues: Map.put(state.queues, store, next_queue)
+             }}
+          else
+            next_queue =
+              LeaseQueue.cancel_waiter(
+                queue,
+                req_ref,
+                store,
+                fn -> Backend.fence_snapshot(snapshot) end
+              )
+
+            {:noreply, put_queue(state, store, next_queue)}
+          end
 
         _ ->
           {:noreply, state}
@@ -564,21 +698,45 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     end
 
     def handle_info({:DOWN, mref, :process, _pid, _reason}, %__MODULE__{} = state) do
-      {next_snapshots, next_queues} =
-        Enum.reduce(state.queues, {state.snapshots, state.queues}, fn {store, queue},
-                                                                      {snaps_acc, queues_acc} ->
-          if match?(%{monitor_ref: ^mref}, queue.active) do
-            {db, moment} = Map.fetch!(snaps_acc, store)
-            {restored_db, restored_moment} = Backend.reconcile_tip(db, moment, :sandbox_checkin)
-            restored_snap = {restored_db, restored_moment}
-            {:matched, updated} = LeaseQueue.handle_down(queue, mref, store, restored_snap)
-            {Map.put(snaps_acc, store, restored_snap), Map.put(queues_acc, store, updated)}
-          else
-            {snaps_acc, queues_acc}
-          end
-        end)
+      case Map.pop(state.allowed_monitors, mref) do
+        {{store, allowed_pid}, remaining_allowed} ->
+          :ets.match_delete(state.table, {{:allow, store, allowed_pid}, state.owner})
+          {:noreply, %__MODULE__{state | allowed_monitors: remaining_allowed}}
 
-      {:noreply, %__MODULE__{state | snapshots: next_snapshots, queues: next_queues}}
+        {nil, _} ->
+          {next_snapshots, next_queues} =
+            Enum.reduce(state.queues, {state.snapshots, state.queues}, fn {store, queue},
+                                                                          {snaps_acc, queues_acc} ->
+              if match?(%{monitor_ref: ^mref}, queue.active) do
+                {db, moment} = Map.fetch!(snaps_acc, store)
+                Backend.bump_write_epoch(db)
+
+                {restored_db, restored_moment} =
+                  Backend.reconcile_tip(db, moment, :sandbox_checkin)
+
+                :ets.insert(
+                  state.table,
+                  {{:db, store, state.owner}, Xitdb.as_of(restored_db, restored_moment)}
+                )
+
+                restored_snap = {restored_db, restored_moment}
+
+                {:matched, updated} =
+                  LeaseQueue.handle_down(
+                    queue,
+                    mref,
+                    store,
+                    fn -> Backend.fence_snapshot(restored_snap) end
+                  )
+
+                {Map.put(snaps_acc, store, restored_snap), Map.put(queues_acc, store, updated)}
+              else
+                {snaps_acc, queues_acc}
+              end
+            end)
+
+          {:noreply, %__MODULE__{state | snapshots: next_snapshots, queues: next_queues}}
+      end
     end
 
     def handle_info({:xitdb_lease_expired, store, lease_ref}, %__MODULE__{} = state) do
@@ -586,11 +744,23 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         {:ok, queue} ->
           if match?(%{ref: ^lease_ref}, queue.active) do
             {db, moment} = Map.fetch!(state.snapshots, store)
+            Backend.bump_write_epoch(db)
             {restored_db, restored_moment} = Backend.reconcile_tip(db, moment, :sandbox_checkin)
+
+            :ets.insert(
+              state.table,
+              {{:db, store, state.owner}, Xitdb.as_of(restored_db, restored_moment)}
+            )
+
             restored_snap = {restored_db, restored_moment}
 
             {:matched, next_queue} =
-              LeaseQueue.handle_expired(queue, lease_ref, store, restored_snap)
+              LeaseQueue.handle_expired(
+                queue,
+                lease_ref,
+                store,
+                fn -> Backend.fence_snapshot(restored_snap) end
+              )
 
             {:noreply,
              %__MODULE__{
@@ -613,7 +783,12 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     def terminate(_reason, %__MODULE__{} = state) do
       TestSandbox.purge_owner_entries(state.table, Map.keys(state.snapshots), state.owner)
 
+      Enum.each(state.queues, fn {_store, queue} ->
+        LeaseQueue.cancel_all(queue, {:error, :sandbox_checked_in})
+      end)
+
       Enum.each(state.snapshots, fn {_store, {db, _moment}} ->
+        Backend.bump_write_epoch(db)
         Backend.close_db(db)
       end)
 
@@ -629,9 +804,24 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           case LeaseQueue.verify_holder(queue, lease_ref, caller_pid) do
             :ok ->
               {db, moment} = Map.fetch!(state.snapshots, store)
-              {restored_db, restored_moment} = Backend.reconcile_tip(db, moment, :sandbox_checkin)
+              Backend.bump_write_epoch(db)
+
+              {restored_db, restored_moment} =
+                Backend.reconcile_tip(db, moment, :sandbox_checkin)
+
+              :ets.insert(
+                state.table,
+                {{:db, store, state.owner}, Xitdb.as_of(restored_db, restored_moment)}
+              )
+
               restored_snap = {restored_db, restored_moment}
-              next_queue = LeaseQueue.release_and_grant_next(queue, store, restored_snap)
+
+              next_queue =
+                LeaseQueue.release_and_grant_next(
+                  queue,
+                  store,
+                  fn -> Backend.fence_snapshot(restored_snap) end
+                )
 
               %__MODULE__{
                 state
@@ -640,7 +830,23 @@ if Code.ensure_loaded?(Ash.DataLayer) do
               }
 
             {:error, :lease_expired} ->
-              state
+              if is_nil(queue.active) do
+                {db, moment} = Map.fetch!(state.snapshots, store)
+                Backend.bump_write_epoch(db)
+
+                {restored_db, restored_moment} =
+                  Backend.reconcile_tip(db, moment, :sandbox_checkin)
+
+                :ets.insert(
+                  state.table,
+                  {{:db, store, state.owner}, Xitdb.as_of(restored_db, restored_moment)}
+                )
+
+                restored_snap = {restored_db, restored_moment}
+                %__MODULE__{state | snapshots: Map.put(state.snapshots, store, restored_snap)}
+              else
+                state
+              end
           end
       end
     end

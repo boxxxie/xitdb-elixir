@@ -37,7 +37,12 @@ defmodule Xitdb.NIF do
   def nif_slot_materialize(_db_ref, _tag_id, _val, _full, _raw_tagged, _max_decompressed_bytes),
     do: :erlang.nif_error(:nif_not_loaded)
 
+  def nif_bump_write_epoch(_db_ref), do: :erlang.nif_error(:nif_not_loaded)
   def nif_transact(_db_ref, _base_moment, _ops, _doc), do: :erlang.nif_error(:nif_not_loaded)
+
+  def nif_transact(_db_ref, _base_moment, _ops, _doc, _expected_epoch),
+    do: :erlang.nif_error(:nif_not_loaded)
+
   def nif_select(_db_ref, _moment_idx, _selector), do: :erlang.nif_error(:nif_not_loaded)
 
   def nif_select(_db_ref, _moment_idx, _selector, _raw_tagged),

@@ -741,6 +741,51 @@ defmodule Xitdb.NifSafetyTest do
     assert :ok = Xitdb.close(reopened)
   end
 
+  test "bump_write_epoch fences stale writer handles while matching or unfenced handles succeed" do
+    {:ok, db} = Xitdb.open(backend: :memory)
+    on_exit(fn -> Xitdb.close(db) end)
+
+    epoch1 = Xitdb.bump_write_epoch!(db)
+    assert epoch1 == 1
+    fenced1 = %Xitdb{db | write_epoch: epoch1}
+
+    assert {:ok, _} = Xitdb.transact(fenced1, %{"v" => 1})
+    assert {:ok, _} = Xitdb.transact_ops(fenced1, [{:put, ".v", 2}])
+
+    epoch2 = Xitdb.bump_write_epoch!(db)
+    assert epoch2 == 2
+    fenced2 = %Xitdb{db | write_epoch: epoch2}
+
+    assert {:error, %Error{reason: :stale_write_epoch}} =
+             Xitdb.transact(fenced1, %{"v" => :zombie})
+
+    assert {:error, %Error{reason: :stale_write_epoch}} =
+             Xitdb.transact_ops(fenced1, [{:put, ".v", :zombie}])
+
+    assert {:ok, _} = Xitdb.transact_ops(fenced2, [{:put, ".v", 3}])
+    assert {:ok, _} = Xitdb.transact_ops(db, [{:put, ".v", 4}])
+    assert Xitdb.db(db)["v"] == 4
+  end
+
+  test "buffered_file mid-file overwrite followed by reads past buffered offset does not hit spurious EOF" do
+    tmp_dir = Path.join(System.tmp_dir!(), "xitdb_buf_pos_#{System.unique_integer([:positive])}")
+    File.mkdir_p!(tmp_dir)
+    path = Path.join(tmp_dir, "buffered.xit")
+    on_exit(fn -> File.rm_rf!(tmp_dir) end)
+
+    {:ok, db} = Xitdb.open(backend: :buffered_file, path: path)
+    on_exit(fn -> Xitdb.close(db) end)
+
+    large_a = String.duplicate("A", 8_192)
+    large_b = String.duplicate("B", 8_192)
+    {:ok, db} = Xitdb.transact(db, %{"a" => large_a, "b" => large_b})
+    {:ok, db} = Xitdb.transact(db, fn root -> put_in(root["a"], "small") end)
+
+    assert Xitdb.db(db)["a"] == "small"
+    assert Xitdb.db(db)["b"] == large_b
+    assert Xitdb.as_of(db, 0)["a"] == large_a
+  end
+
   test "BUG-015/016/047: secondary index swap, overwrite eviction, and missing field rm_if_exists" do
     idx_rules = [{:index_on, :users, :email, "idx_email"}]
     db = Xitdb.open!(backend: :memory)

@@ -138,6 +138,11 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
         @spec rollback(term()) :: no_return()
         def rollback(reason), do: Xitdb.Ash.Store.rollback(__MODULE__, reason)
+
+        @spec swap_compacted_base(Xitdb.t(), non_neg_integer() | nil, keyword()) ::
+                :ok | {:error, term()}
+        def swap_compacted_base(compacted_db, moment \\ nil, opts \\ []),
+          do: Xitdb.Ash.Store.swap_compacted_base(__MODULE__, compacted_db, moment, opts)
       end
     end
 
@@ -258,8 +263,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
             put_working_snapshot(store, next_snapshot)
             {:ok, result}
 
-          {:error, _reason} = error ->
-            error
+          {:error, reason} ->
+            {:error, normalize_lease_error(store, reason)}
         end
       else
         transact(
@@ -273,7 +278,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
                 result
 
               {:error, reason} ->
-                rollback(store, reason)
+                rollback(store, normalize_lease_error(store, reason))
             end
           end,
           opts
@@ -334,6 +339,22 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       end)
     end
 
+    @doc """
+    Atomically replaces the active `%Xitdb{}` handle inside an exclusive transaction on `store`.
+    """
+    @spec swap_compacted_base(module(), Xitdb.t(), non_neg_integer() | nil, keyword()) ::
+            :ok | {:error, term()}
+    def swap_compacted_base(store, %Xitdb{} = compacted_db, moment \\ nil, opts \\ [])
+        when is_atom(store) and is_list(opts) do
+      target_moment =
+        if is_integer(moment), do: moment, else: max(Xitdb.moment_count(compacted_db) - 1, 0)
+
+      case mutate(store, fn _snapshot -> {:ok, {compacted_db, target_moment}, :ok} end, opts) do
+        {:ok, :ok} -> :ok
+        {:error, _} = err -> err
+      end
+    end
+
     # -- GenServer Callbacks --
 
     @impl GenServer
@@ -371,7 +392,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         ) do
       lease_timeout =
         if explicit_lease_timeout == nil do
-          min_timeout(state.lease_timeout, call_timeout)
+          state.lease_timeout
         else
           normalize_timeout(explicit_lease_timeout)
         end
@@ -388,7 +409,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
              snapshot
            ) do
         {:granted, lease_ref, next_queue} ->
-          {:reply, {:ok, lease_ref, snapshot}, %State{state | queue: next_queue}}
+          {:reply, {:ok, lease_ref, Backend.fence_snapshot(snapshot)},
+           %State{state | queue: next_queue}}
 
         {:queued, next_queue} ->
           {:noreply, %State{state | queue: next_queue}}
@@ -396,18 +418,32 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     end
 
     def handle_call(
-          {:commit_lease, lease_ref, {new_db, new_moment}},
+          {:commit_lease, lease_ref, {%Xitdb{} = new_db, new_moment}},
           {caller_pid, _},
           %State{} = state
         ) do
       case LeaseQueue.verify_holder(state.queue, lease_ref, caller_pid) do
         :ok ->
-          {committed_db, committed_moment} =
-            Backend.reconcile_tip(new_db, new_moment, :reconcile_commit)
+          Backend.bump_write_epoch(state.db)
+          base_db = %Xitdb{new_db | write_epoch: nil}
 
-          :ok = Backend.publish_commit(state.name, state.moment, committed_moment)
+          {committed_db, committed_moment} =
+            Backend.reconcile_tip(base_db, new_moment, :reconcile_commit)
+
+          if committed_db.db_ref != state.db.db_ref do
+            :ok = Snapshot.swap_compacted_base(state.name, committed_db, committed_moment)
+          else
+            :ok = Backend.publish_commit(state.name, state.moment, committed_moment)
+          end
+
           next_snapshot = {committed_db, committed_moment}
-          next_queue = LeaseQueue.release_and_grant_next(state.queue, state.name, next_snapshot)
+
+          next_queue =
+            LeaseQueue.release_and_grant_next(
+              state.queue,
+              state.name,
+              fn -> Backend.fence_snapshot(next_snapshot) end
+            )
 
           {:reply, :ok,
            %State{state | db: committed_db, moment: committed_moment, queue: next_queue}}
@@ -415,6 +451,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         {:error, :lease_expired} = err ->
           next_state =
             if is_nil(state.queue.active) do
+              Backend.bump_write_epoch(state.db)
+
               {restored_db, restored_moment} =
                 Backend.reconcile_tip(state.db, state.moment, :lease_expired)
 
@@ -438,20 +476,58 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     end
 
     def handle_cast({:cancel_waiter, req_ref}, %State{} = state) do
-      snapshot = {state.db, state.moment}
-      next_queue = LeaseQueue.cancel_waiter(state.queue, req_ref, state.name, snapshot)
-      {:noreply, %State{state | queue: next_queue}}
+      if match?(%{req_ref: ^req_ref}, state.queue.active) do
+        Backend.bump_write_epoch(state.db)
+
+        {restored_db, restored_moment} =
+          Backend.reconcile_tip(state.db, state.moment, :lease_timeout)
+
+        :ok = Backend.publish_commit(state.name, state.moment, restored_moment)
+        snapshot = {restored_db, restored_moment}
+
+        next_queue =
+          LeaseQueue.cancel_waiter(
+            state.queue,
+            req_ref,
+            state.name,
+            fn -> Backend.fence_snapshot(snapshot) end
+          )
+
+        {:noreply, %State{state | db: restored_db, moment: restored_moment, queue: next_queue}}
+      else
+        snapshot = {state.db, state.moment}
+
+        next_queue =
+          LeaseQueue.cancel_waiter(
+            state.queue,
+            req_ref,
+            state.name,
+            fn -> Backend.fence_snapshot(snapshot) end
+          )
+
+        {:noreply, %State{state | queue: next_queue}}
+      end
     end
 
     @impl GenServer
     def handle_info({:DOWN, mref, :process, _pid, _reason}, %State{} = state) do
       if match?(%{monitor_ref: ^mref}, state.queue.active) do
+        Backend.bump_write_epoch(state.db)
+
         {restored_db, restored_moment} =
           Backend.reconcile_tip(state.db, state.moment, :process_down)
 
         :ok = Backend.publish_commit(state.name, state.moment, restored_moment)
         snapshot = {restored_db, restored_moment}
-        {:matched, next_queue} = LeaseQueue.handle_down(state.queue, mref, state.name, snapshot)
+
+        {:matched, next_queue} =
+          LeaseQueue.handle_down(
+            state.queue,
+            mref,
+            state.name,
+            fn -> Backend.fence_snapshot(snapshot) end
+          )
+
         {:noreply, %State{state | db: restored_db, moment: restored_moment, queue: next_queue}}
       else
         {:noreply, state}
@@ -460,6 +536,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
     def handle_info({:xitdb_lease_expired, name, lease_ref}, %State{name: name} = state) do
       if match?(%{ref: ^lease_ref}, state.queue.active) do
+        Backend.bump_write_epoch(state.db)
+
         {restored_db, restored_moment} =
           Backend.reconcile_tip(state.db, state.moment, :lease_expired)
 
@@ -467,7 +545,12 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         snapshot = {restored_db, restored_moment}
 
         {:matched, next_queue} =
-          LeaseQueue.handle_expired(state.queue, lease_ref, state.name, snapshot)
+          LeaseQueue.handle_expired(
+            state.queue,
+            lease_ref,
+            state.name,
+            fn -> Backend.fence_snapshot(snapshot) end
+          )
 
         {:noreply, %State{state | db: restored_db, moment: restored_moment, queue: next_queue}}
       else
@@ -479,34 +562,58 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
     @impl GenServer
     def terminate(_reason, %State{} = state) do
-      final_db =
+      _ = LeaseQueue.cancel_all(state.queue, {:error, :store_stopped})
+      Backend.bump_write_epoch(state.db)
+
+      try do
         case state.db do
           %Xitdb{} = db when is_integer(state.moment) and state.moment >= 0 ->
-            {reconciled_db, _restored_moment} =
-              Backend.reconcile_tip(db, state.moment, :terminate)
+            _ = Backend.reconcile_tip(db, state.moment, :terminate)
+            :ok
 
-            reconciled_db
-
-          other ->
-            other
+          _ ->
+            :ok
         end
+      after
+        Snapshot.erase(state.name)
+        Backend.close_db(state.db)
+      end
 
-      Snapshot.erase(state.name)
-      Backend.close_db(final_db)
       :ok
     end
 
     defp release_aborted_lease(%State{} = state, lease_ref, caller_pid) do
       case LeaseQueue.verify_holder(state.queue, lease_ref, caller_pid) do
         :ok ->
-          {restored_db, restored_moment} = Backend.reconcile_tip(state.db, state.moment, :aborted)
+          Backend.bump_write_epoch(state.db)
+
+          {restored_db, restored_moment} =
+            Backend.reconcile_tip(state.db, state.moment, :aborted)
+
           :ok = Backend.publish_commit(state.name, state.moment, restored_moment)
           snapshot = {restored_db, restored_moment}
-          next_queue = LeaseQueue.release_and_grant_next(state.queue, state.name, snapshot)
+
+          next_queue =
+            LeaseQueue.release_and_grant_next(
+              state.queue,
+              state.name,
+              fn -> Backend.fence_snapshot(snapshot) end
+            )
+
           %State{state | db: restored_db, moment: restored_moment, queue: next_queue}
 
         {:error, :lease_expired} ->
-          state
+          if is_nil(state.queue.active) do
+            Backend.bump_write_epoch(state.db)
+
+            {restored_db, restored_moment} =
+              Backend.reconcile_tip(state.db, state.moment, :lease_expired)
+
+            :ok = Backend.publish_commit(state.name, state.moment, restored_moment)
+            %State{state | db: restored_db, moment: restored_moment}
+          else
+            state
+          end
       end
     end
 
@@ -530,7 +637,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           :throw, {:xitdb_ash_rollback, ^store, reason} ->
             delete_working_snapshot(store)
             abort_fn.()
-            {:error, reason}
+            {:error, normalize_lease_error(store, reason)}
 
           kind, payload ->
             stacktrace = __STACKTRACE__
@@ -565,7 +672,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       catch
         :throw, {:xitdb_ash_rollback, ^store, reason} ->
           put_working_snapshot(store, prev_snapshot)
-          {:error, reason}
+          {:error, normalize_lease_error(store, reason)}
 
         kind, payload ->
           stacktrace = __STACKTRACE__
@@ -573,6 +680,11 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           :erlang.raise(kind, payload, stacktrace)
       end
     end
+
+    defp normalize_lease_error(store, %Xitdb.Error{reason: :stale_write_epoch}),
+      do: %LeaseError{store: store, reason: :lease_expired}
+
+    defp normalize_lease_error(_store, reason), do: reason
 
     defp run_leased_transaction(store, fun, call_timeout, explicit_lease_timeout) do
       req_ref = make_ref()
@@ -857,6 +969,21 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         else
           {db, target_moment}
         end
+      end
+
+      @spec bump_write_epoch(term()) :: :ok
+      def bump_write_epoch(%Xitdb{} = db) do
+        _ = Xitdb.bump_write_epoch(db)
+        :ok
+      end
+
+      def bump_write_epoch(_other), do: :ok
+
+      @spec fence_snapshot(Xitdb.Ash.Store.working_snapshot()) ::
+              Xitdb.Ash.Store.working_snapshot()
+      def fence_snapshot({%Xitdb{} = db, moment}) do
+        epoch = Xitdb.bump_write_epoch!(db)
+        {%Xitdb{db | write_epoch: epoch}, moment}
       end
 
       @spec publish_commit(module(), non_neg_integer(), non_neg_integer()) :: :ok

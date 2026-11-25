@@ -146,7 +146,10 @@ if Code.ensure_loaded?(Ash.DataLayer) do
             {lease_ref, active} =
               build_active_lease(owner_key, waiter.req_ref, caller_pid, waiter.lease_timeout)
 
-            GenServer.reply(waiter.from, {:ok, lease_ref, latest_snapshot})
+            granted_snapshot =
+              if is_function(latest_snapshot, 0), do: latest_snapshot.(), else: latest_snapshot
+
+            GenServer.reply(waiter.from, {:ok, lease_ref, granted_snapshot})
             %__MODULE__{next_queue | active: active}
           else
             grant_next_waiter(next_queue, owner_key, latest_snapshot)
