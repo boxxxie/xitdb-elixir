@@ -49,7 +49,7 @@ defmodule Xitdb.MixProject do
 
   defp deps do
     [
-      {:ash, "~> 3.37 and >= 3.37.2", optional: true},
+      {:ash, ">= 3.38.1 and < 4.0.0", optional: true},
       {:spark, "~> 2.2", optional: true},
       {:nimble_options, "~> 1.1 and >= 1.1.1"},
       {:telemetry, "~> 1.3"},
