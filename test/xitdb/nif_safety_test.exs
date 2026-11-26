@@ -46,7 +46,7 @@ defmodule Xitdb.NifSafetyTest do
           {:bogus_op, ".a", 1},
           :not_a_tuple
         ] do
-      assert {:error, _reason} = NIF.nif_transact(db.db_ref, -1, [bad_op], "")
+      assert {:error, _reason} = NIF.nif_transact(db.db_ref, -1, [bad_op], "", nil)
     end
   end
 
@@ -742,19 +742,19 @@ defmodule Xitdb.NifSafetyTest do
   end
 
   test "bump_write_epoch fences stale writer handles while matching or unfenced handles succeed" do
-    {:ok, db} = Xitdb.open(backend: :memory)
+    {:ok, %Xitdb{} = db} = Xitdb.open(backend: :memory)
     on_exit(fn -> Xitdb.close(db) end)
 
     epoch1 = Xitdb.bump_write_epoch!(db)
     assert epoch1 == 1
-    fenced1 = %Xitdb{db | write_epoch: epoch1}
+    fenced1 = %{db | write_epoch: epoch1}
 
     assert {:ok, _} = Xitdb.transact(fenced1, %{"v" => 1})
     assert {:ok, _} = Xitdb.transact_ops(fenced1, [{:put, ".v", 2}])
 
     epoch2 = Xitdb.bump_write_epoch!(db)
     assert epoch2 == 2
-    fenced2 = %Xitdb{db | write_epoch: epoch2}
+    fenced2 = %{db | write_epoch: epoch2}
 
     assert {:error, %Error{reason: :stale_write_epoch}} =
              Xitdb.transact(fenced1, %{"v" => :zombie})
@@ -765,6 +765,21 @@ defmodule Xitdb.NifSafetyTest do
     assert {:ok, _} = Xitdb.transact_ops(fenced2, [{:put, ".v", 3}])
     assert {:ok, _} = Xitdb.transact_ops(db, [{:put, ".v", 4}])
     assert Xitdb.db(db)["v"] == 4
+
+    # Read-only and closed handles return explicit errors
+    tmp_dir = Path.join(System.tmp_dir!(), "xitdb_epoch_ro_#{System.unique_integer([:positive])}")
+    File.mkdir_p!(tmp_dir)
+    path = Path.join(tmp_dir, "ro_epoch.xit")
+    on_exit(fn -> File.rm_rf!(tmp_dir) end)
+
+    {:ok, rw} = Xitdb.open(backend: :file, path: path)
+    {:ok, rw} = Xitdb.transact(rw, %{"ok" => true})
+    :ok = Xitdb.close(rw)
+
+    {:ok, ro} = Xitdb.open(backend: :file, path: path, read_only: true)
+    assert {:error, %Error{reason: :read_only}} = Xitdb.bump_write_epoch(ro)
+    assert :ok = Xitdb.close(ro)
+    assert {:error, %Error{reason: :closed}} = Xitdb.bump_write_epoch(ro)
   end
 
   test "buffered_file mid-file overwrite followed by reads past buffered offset does not hit spurious EOF" do

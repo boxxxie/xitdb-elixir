@@ -188,7 +188,7 @@ defmodule Xitdb do
   @type t :: %__MODULE__{
           db_ref: reference(),
           backend: :memory | :file | :buffered_file,
-          path: String.t(),
+          path: String.t() | nil,
           hash: :sha1 | :sha256,
           read_only: boolean(),
           write_epoch: non_neg_integer() | nil
@@ -251,13 +251,13 @@ defmodule Xitdb do
   end
 
   @doc false
-  @spec bump_write_epoch(t()) :: {:ok, non_neg_integer()} | {:error, Error.t()}
+  @spec bump_write_epoch(t()) :: {:ok, pos_integer()} | {:error, Error.t()}
   def bump_write_epoch(%__MODULE__{db_ref: db_ref}) do
     db_ref |> NIF.nif_bump_write_epoch() |> Error.wrap()
   end
 
   @doc false
-  @spec bump_write_epoch!(t()) :: non_neg_integer()
+  @spec bump_write_epoch!(t()) :: pos_integer()
   def bump_write_epoch!(%__MODULE__{} = db) do
     db |> bump_write_epoch() |> Error.unwrap!()
   end
@@ -427,30 +427,107 @@ defmodule Xitdb do
   end
 
   defp run_transact_fun(db, db_ref, fun, base_moment, validated_or_default) do
-    root_cursor = %Cursor{
-      db_ref: db_ref,
-      tag: :hash_map,
-      tag_id: -1,
-      value: base_moment,
-      moment: base_moment,
-      root: true,
-      tx_mode: true
-    }
+    {root_cursor, pinned_validated} =
+      cond do
+        base_moment == -1 ->
+          case NIF.nif_moment_slot(db_ref, -1, true) do
+            {:ok, _tuple, resolved_moment} when resolved_moment >= 0 ->
+              opts = put_base_moment_opt(validated_or_default, {:strict, resolved_moment})
+
+              cursor = %Cursor{
+                db_ref: db_ref,
+                tag: :hash_map,
+                tag_id: -1,
+                value: resolved_moment,
+                moment: resolved_moment,
+                root: true,
+                tx_mode: true
+              }
+
+              {cursor, opts}
+
+            _ ->
+              case NIF.nif_info(db_ref) do
+                {:ok, %{moment_count: 0}} ->
+                  opts = put_base_moment_opt(validated_or_default, {:strict, -1})
+
+                  cursor = %Cursor{
+                    db_ref: db_ref,
+                    tag: :hash_map,
+                    tag_id: 4,
+                    value: 0,
+                    moment: -1,
+                    root: true,
+                    tx_mode: true
+                  }
+
+                  {cursor, opts}
+
+                _ ->
+                  cursor = %Cursor{
+                    db_ref: db_ref,
+                    tag: :hash_map,
+                    tag_id: -1,
+                    value: base_moment,
+                    moment: base_moment,
+                    root: true,
+                    tx_mode: true
+                  }
+
+                  {cursor, validated_or_default}
+              end
+          end
+
+        base_moment < -1 ->
+          {pinned_moment, opts} =
+            case NIF.nif_moment_slot(db_ref, base_moment, true) do
+              {:ok, _tuple, resolved_moment} ->
+                {resolved_moment, put_base_moment_opt(validated_or_default, resolved_moment)}
+
+              {:error, _} ->
+                {base_moment, validated_or_default}
+            end
+
+          cursor = %Cursor{
+            db_ref: db_ref,
+            tag: :hash_map,
+            tag_id: -1,
+            value: pinned_moment,
+            moment: pinned_moment,
+            root: true,
+            tx_mode: true
+          }
+
+          {cursor, opts}
+
+        true ->
+          cursor = %Cursor{
+            db_ref: db_ref,
+            tag: :hash_map,
+            tag_id: -1,
+            value: base_moment,
+            moment: base_moment,
+            root: true,
+            tx_mode: true
+          }
+
+          {cursor, validated_or_default}
+      end
 
     try do
       case fun.(root_cursor) do
         %Cursor{staged_ops: [_] = ops} ->
-          dispatch_transact_ops(db, db_ref, ops, validated_or_default)
+          dispatch_transact_ops(db, db_ref, ops, pinned_validated)
 
         %Cursor{staged_ops: ops} ->
-          dispatch_transact_ops(db, db_ref, :lists.reverse(ops), validated_or_default)
+          dispatch_transact_ops(db, db_ref, :lists.reverse(ops), pinned_validated)
 
         {:abort, reason} ->
           {:error, %Error{reason: reason}}
 
         other when is_map(other) and not is_struct(other) ->
           ops = TxCompiler.compile_moment_map(other)
-          dispatch_transact_ops(db, db_ref, ops, validated_or_default)
+          dispatch_transact_ops(db, db_ref, ops, pinned_validated)
 
         other ->
           {:error, %Error{reason: :invalid_transaction_return, details: %{value: other}}}
@@ -463,6 +540,12 @@ defmodule Xitdb do
         {:error, %Error{reason: :transaction_exception, details: %{exception: e}}}
     end
   end
+
+  defp put_base_moment_opt(:default, base_moment),
+    do: Keyword.put(@default_transact_opts, :base_moment, base_moment)
+
+  defp put_base_moment_opt(validated, base_moment),
+    do: Keyword.put(validated, :base_moment, base_moment)
 
   defp dispatch_transact_ops(db, db_ref, ops, :default) do
     if Compression.needs_prepare?(ops, false) do
@@ -555,6 +638,8 @@ defmodule Xitdb do
   def tx_meta(%__MODULE__{db_ref: db_ref}, moment) when is_integer(moment) do
     fetch_tx_meta(db_ref, moment)
   end
+
+  def tx_meta(%Cursor{root: true, tx_mode: false, tag: :none}, nil), do: {:ok, %{}}
 
   def tx_meta(%Cursor{db_ref: db_ref, moment: cursor_moment}, moment)
       when is_nil(moment) or is_integer(moment) do
@@ -662,7 +747,13 @@ defmodule Xitdb do
 
     {prepared_ops, blob_ops} =
       if Compression.needs_prepare?(ops, compress_opt) do
-        target = if base_moment == -1, do: db, else: {db, base_moment}
+        target =
+          case base_moment do
+            m when m in [-1, {:strict, -1}] -> db
+            {:strict, m} -> {db, m}
+            m -> {db, m}
+          end
+
         {:ok, p_ops, b_ops} = Compression.prepare_write(target, ops, compress_opt)
         {p_ops, b_ops}
       else
@@ -865,6 +956,9 @@ defmodule Xitdb do
     materialize(as_of(db, -1), opts)
   end
 
+  def materialize(%Cursor{root: true, tx_mode: false, tag: :none}, opts) when is_list(opts),
+    do: %{}
+
   def materialize(%Cursor{} = cursor, opts) when is_list(opts) do
     raw_tagged? = Keyword.get(opts, :raw_tagged, false)
     max_bytes = fetch_max_decompressed_bytes!(opts)
@@ -953,6 +1047,11 @@ defmodule Xitdb do
     do_select(db_ref, -1, selector, opts)
   end
 
+  def select(%Cursor{root: true, tx_mode: false, tag: :none} = cursor, selector, opts)
+      when (is_binary(selector) or is_list(selector)) and is_list(opts) do
+    if root_selector?(selector), do: {:ok, cursor}, else: {:ok, nil}
+  end
+
   def select(%Cursor{root: true, tx_mode: false, db_ref: db_ref, moment: moment}, selector, opts)
       when (is_binary(selector) or is_list(selector)) and is_list(opts) do
     do_select(db_ref, moment, selector, opts)
@@ -968,10 +1067,12 @@ defmodule Xitdb do
   end
 
   defp do_select(db_ref, moment, selector, opts) do
+    eff_moment = resolve_pinned_moment(db_ref, effective_moment(moment, selector))
+    pinned_selector = pin_selector_moment(selector, eff_moment)
     raw_tagged? = Keyword.get(opts, :raw_tagged, false)
 
     with {:ok, max_bytes} <- fetch_max_decompressed_bytes(opts) do
-      case NIF.nif_select(db_ref, moment, selector, raw_tagged?, max_bytes) do
+      case NIF.nif_select(db_ref, eff_moment, pinned_selector, raw_tagged?, max_bytes) do
         {:ok, raw} when is_binary(raw) or is_number(raw) or is_boolean(raw) or is_nil(raw) ->
           {:ok, raw}
 
@@ -979,11 +1080,9 @@ defmodule Xitdb do
           if raw_tagged? do
             case raw do
               {:tagged, _, _} -> {:ok, raw}
-              _ -> {:ok, wrap_selected(db_ref, raw, moment, selector)}
+              _ -> {:ok, wrap_selected(db_ref, raw, eff_moment, pinned_selector)}
             end
           else
-            eff_moment = effective_moment(moment, selector)
-
             case raw do
               {:tagged, tag, payload} when is_binary(payload) ->
                 if Compression.compression_tag?(tag) do
@@ -993,7 +1092,7 @@ defmodule Xitdb do
                 end
 
               _ ->
-                {:ok, wrap_selected(db_ref, raw, moment, selector)}
+                {:ok, wrap_selected(db_ref, raw, eff_moment, pinned_selector)}
             end
           end
 
@@ -1003,19 +1102,40 @@ defmodule Xitdb do
     end
   end
 
-  defp wrap_selected(db_ref, raw, moment, selector) do
-    eff_moment = effective_moment(moment, selector)
+  defp wrap_selected(db_ref, raw, eff_moment, selector) do
+    eff_moment = resolve_pinned_moment(db_ref, eff_moment)
 
     case Cursor.unwrap_nif_value(db_ref, raw, eff_moment, []) do
       %Cursor{} = cursor ->
-        pinned_moment = resolve_pinned_moment(db_ref, eff_moment)
-        cursor = %Cursor{cursor | moment: pinned_moment}
-        if root_selector?(selector), do: %Cursor{cursor | root: true}, else: cursor
+        cursor = %{cursor | moment: eff_moment}
+        if root_selector?(selector), do: %{cursor | root: true}, else: cursor
 
       other ->
         other
     end
   end
+
+  defp pin_selector_moment(sel, eff_moment) when is_binary(sel) and eff_moment >= 0 do
+    trimmed = String.trim_leading(sel)
+
+    case trimmed do
+      <<"@", rest::binary>> ->
+        case Integer.parse(rest) do
+          {m, tail} when m < 0 -> "@#{eff_moment}" <> tail
+          _ -> sel
+        end
+
+      _ ->
+        sel
+    end
+  end
+
+  defp pin_selector_moment([{:at_moment, m} | rest], eff_moment)
+       when is_integer(m) and m < 0 and eff_moment >= 0 do
+    [{:at_moment, eff_moment} | rest]
+  end
+
+  defp pin_selector_moment(sel, _eff_moment), do: sel
 
   defp resolve_pinned_moment(_db_ref, m) when is_integer(m) and m >= 0, do: m
 
@@ -1074,6 +1194,11 @@ defmodule Xitdb do
     do_select!(db_ref, -1, selector, opts)
   end
 
+  def select!(%Cursor{root: true, tx_mode: false, tag: :none} = cursor, selector, opts)
+      when (is_binary(selector) or is_list(selector)) and is_list(opts) do
+    if root_selector?(selector), do: cursor, else: nil
+  end
+
   def select!(%Cursor{root: true, tx_mode: false, db_ref: db_ref, moment: moment}, selector, opts)
       when (is_binary(selector) or is_list(selector)) and is_list(opts) do
     do_select!(db_ref, moment, selector, opts)
@@ -1114,7 +1239,13 @@ defmodule Xitdb do
     )
   end
 
+  def pull(%Cursor{root: true, tx_mode: false, tag: :none}, pattern, opts)
+      when is_binary(pattern) and is_list(opts) do
+    {:ok, %{}}
+  end
+
   def pull(%Cursor{} = cursor, pattern, opts) when is_binary(pattern) and is_list(opts) do
+    cursor = pin_root_cursor_if_needed(cursor)
     raw_tagged? = Keyword.get(opts, :raw_tagged, false)
 
     with {:ok, max_bytes} <- fetch_max_decompressed_bytes(opts),
@@ -1152,15 +1283,23 @@ defmodule Xitdb do
     end
   end
 
-  defp pin_root_cursor_if_needed(%Cursor{root: true, tag_id: -1, moment: moment} = cursor)
+  defp pin_root_cursor_if_needed(
+         %Cursor{root: true, tx_mode: false, tag_id: -1, moment: moment} = cursor
+       )
        when moment < 0 do
     case NIF.nif_moment_slot(cursor.db_ref, moment, true) do
       {:ok, tuple, resolved_moment} ->
-        %Cursor{Cursor.from_nif_tuple(cursor.db_ref, tuple, resolved_moment) | root: true}
+        %Cursor{} = resolved = Cursor.from_nif_tuple(cursor.db_ref, tuple, resolved_moment)
+        %Cursor{resolved | root: true}
 
       _ ->
         cursor
     end
+  end
+
+  defp pin_root_cursor_if_needed(%Cursor{tx_mode: false, moment: moment} = cursor)
+       when moment < 0 do
+    %{cursor | moment: resolve_pinned_moment(cursor.db_ref, moment)}
   end
 
   defp pin_root_cursor_if_needed(cursor), do: cursor
@@ -1276,6 +1415,16 @@ defmodule Xitdb do
     end
   end
 
+  def query(%Cursor{root: true, tx_mode: false, tag: :none, db_ref: db_ref}, query_str, opts)
+      when is_binary(query_str) do
+    with {:ok, validated} <- validate_opts(opts, @query_schema) do
+      case Keyword.get(validated, :moment) do
+        nil -> {:ok, %{vars: [], rows: []}}
+        moment -> do_query(db_ref, moment, query_str, validated)
+      end
+    end
+  end
+
   def query(%Cursor{db_ref: db_ref, moment: cursor_moment}, query_str, opts)
       when is_binary(query_str) do
     with {:ok, validated} <- validate_opts(opts, @query_schema) do
@@ -1285,6 +1434,7 @@ defmodule Xitdb do
   end
 
   defp do_query(db_ref, moment, query_str, validated) do
+    moment = resolve_pinned_moment(db_ref, moment)
     raw_tagged = Keyword.get(validated, :raw_tagged, false)
 
     max_bytes =
@@ -1441,11 +1591,8 @@ defmodule Xitdb do
   # ============================================================================
 
   @impl Access
-  def fetch(%__MODULE__{db_ref: db_ref}, key) do
-    Cursor.fetch(
-      %Cursor{db_ref: db_ref, tag: :hash_map, tag_id: -1, value: -1, moment: -1, root: true},
-      key
-    )
+  def fetch(%__MODULE__{} = db, key) do
+    Cursor.fetch(as_of(db, -1), key)
   end
 
   @impl Access

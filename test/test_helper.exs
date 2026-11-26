@@ -1,6 +1,6 @@
 Application.put_env(:ash, :default_string_length_count, :codepoints)
 Xitdb.Cursor.register_beam_tracer()
-ExUnit.start()
+ExUnit.start(exclude: if(match?({:unix, _}, :os.type()), do: [], else: [:unix]))
 
 if Code.ensure_loaded?(Ash.DataLayer) do
   Xitdb.Ash.TestSandbox.init()

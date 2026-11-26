@@ -106,6 +106,12 @@ defmodule Xitdb.Cursor do
   end
 
   @doc false
+  @spec empty_root(reference()) :: t()
+  def empty_root(db_ref) when is_reference(db_ref) do
+    %__MODULE__{db_ref: db_ref, tag: :none, tag_id: 0, value: 0, moment: -1, root: true}
+  end
+
+  @doc false
   def from_nif_tuple(db_ref, tuple, moment, path_steps \\ [])
 
   def from_nif_tuple(db_ref, {:cursor, tag_id, val}, moment, path_steps)
@@ -207,6 +213,8 @@ defmodule Xitdb.Cursor do
   def fetch(%__MODULE__{} = cursor, key) when is_atom(key) do
     fetch(cursor, Atom.to_string(key))
   end
+
+  def fetch(%__MODULE__{tx_mode: false, tag: :none}, _key), do: :error
 
   def fetch(%__MODULE__{tx_mode: false} = cursor, key) when is_binary(key) do
     cursor.db_ref
@@ -810,14 +818,28 @@ defmodule Xitdb.Cursor do
 
   @doc false
   def try_resolve(%__MODULE__{tag_id: -1, db_ref: db_ref, moment: moment} = cursor) do
-    case NIF.nif_moment_slot(db_ref, moment) do
-      {:ok, {:cursor, tag_id, val}} ->
+    case NIF.nif_moment_slot(db_ref, moment, true) do
+      {:ok, {:cursor, tag_id, val}, resolved_moment} ->
         {:ok,
-         %__MODULE__{cursor | tag: tag_atom_for(tag_id), tag_id: tag_id, value: val, full: false}}
+         %{
+           cursor
+           | tag: tag_atom_for(tag_id),
+             tag_id: tag_id,
+             value: val,
+             moment: resolved_moment,
+             full: false
+         }}
 
-      {:ok, {:cursor, tag_atom, tag_id, val, full_int}} ->
+      {:ok, {:cursor, tag_atom, tag_id, val, full_int}, resolved_moment} ->
         {:ok,
-         %__MODULE__{cursor | tag: tag_atom, tag_id: tag_id, value: val, full: full_int != 0}}
+         %{
+           cursor
+           | tag: tag_atom,
+             tag_id: tag_id,
+             value: val,
+             moment: resolved_moment,
+             full: full_int != 0
+         }}
 
       {:error, reason} ->
         {:error, reason}
@@ -2681,6 +2703,8 @@ defimpl Enumerable, for: Xitdb.Cursor do
   @chunk_size 256
 
   @impl Enumerable
+  def count(%Cursor{tx_mode: false, tag: :none}), do: {:ok, 0}
+
   def count(%Cursor{tx_mode: false, root: false, tag_id: tag_id, db_ref: db_ref, value: val})
       when tag_id > 0 do
     case NIF.nif_slot_count(db_ref, tag_id, val) do
@@ -2715,6 +2739,8 @@ defimpl Enumerable, for: Xitdb.Cursor do
   end
 
   @impl Enumerable
+  def member?(%Cursor{tx_mode: false, tag: :none}, _candidate), do: {:ok, false}
+
   def member?(
         %Cursor{tx_mode: false, root: false, tag_id: tag_id, db_ref: db_ref, value: val},
         candidate
@@ -2807,6 +2833,9 @@ defimpl Enumerable, for: Xitdb.Cursor do
   end
 
   @impl Enumerable
+  def slice(%Cursor{tx_mode: false, tag: :none}),
+    do: {:ok, 0, fn _start, _len, _step -> [] end}
+
   def slice(%Cursor{} = raw_cursor) do
     if raw_cursor.tx_mode and
          (map_size(raw_cursor.staged_overrides) > 0 or
@@ -2872,6 +2901,13 @@ defimpl Enumerable, for: Xitdb.Cursor do
   end
 
   @impl Enumerable
+  def reduce(%Cursor{tx_mode: false, tag: :none}, {:halt, acc}, _fun), do: {:halted, acc}
+
+  def reduce(%Cursor{tx_mode: false, tag: :none} = c, {:suspend, acc}, fun),
+    do: {:suspended, acc, &reduce(c, &1, fun)}
+
+  def reduce(%Cursor{tx_mode: false, tag: :none}, {:cont, acc}, _fun), do: {:done, acc}
+
   def reduce(%Cursor{} = raw_cursor, acc, fun) do
     if raw_cursor.tx_mode and
          (map_size(raw_cursor.staged_overrides) > 0 or

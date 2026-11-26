@@ -38,7 +38,6 @@ defmodule Xitdb.NIF do
     do: :erlang.nif_error(:nif_not_loaded)
 
   def nif_bump_write_epoch(_db_ref), do: :erlang.nif_error(:nif_not_loaded)
-  def nif_transact(_db_ref, _base_moment, _ops, _doc), do: :erlang.nif_error(:nif_not_loaded)
 
   def nif_transact(_db_ref, _base_moment, _ops, _doc, _expected_epoch),
     do: :erlang.nif_error(:nif_not_loaded)

@@ -220,8 +220,13 @@ defmodule Xitdb.ReadOnlyAndTxContextTest do
     end
   end
 
+  @tag :unix
   test "exclusive OS file lock holds across OS processes and recovers immediately after SIGKILL" do
-    elixir_exe = System.find_executable("elixir")
+    local_elixir = Path.expand("../../bin/elixir", Application.app_dir(:elixir))
+
+    elixir_exe =
+      if File.regular?(local_elixir), do: local_elixir, else: System.find_executable("elixir")
+
     assert is_binary(elixir_exe)
 
     tmp_dir = Path.join(System.tmp_dir!(), "xitdb_sigkill_#{System.unique_integer([:positive])}")
@@ -302,6 +307,29 @@ defmodule Xitdb.ReadOnlyAndTxContextTest do
     assert :ok = Xitdb.close(rw)
   end
 
+  @tag :unix
+  test "writable file handle sets O_CLOEXEC so long-lived Ports do not inherit flock" do
+    path =
+      Path.join(
+        System.tmp_dir!(),
+        "xitdb_cloexec_#{System.unique_integer([:positive])}.xit"
+      )
+
+    on_exit(fn -> File.rm_rf(path) end)
+    assert {:ok, db} = Xitdb.open(backend: :buffered_file, path: path)
+    assert {:ok, db} = Xitdb.transact(db, %{"k" => "v1"})
+
+    port = Port.open({:spawn_executable, System.find_executable("cat")}, [:binary])
+    on_exit(fn -> if Port.info(port) != nil, do: Port.close(port) end)
+
+    assert :ok = Xitdb.close(db)
+
+    assert {:ok, db2} = Xitdb.open(backend: :buffered_file, path: path)
+    assert Xitdb.db(db2)["k"] == "v1"
+    assert :ok = Xitdb.close(db2)
+    Port.close(port)
+  end
+
   defp await_port_locked!(port, acc) do
     receive do
       {^port, {:data, chunk}} ->
@@ -315,7 +343,7 @@ defmodule Xitdb.ReadOnlyAndTxContextTest do
       {^port, {:exit_status, status}} ->
         flunk("Child elixir process exited (#{status}) before locking file. Output:\n#{acc}")
     after
-      5_000 ->
+      15_000 ->
         flunk("Timed out waiting for child elixir process to lock file. Output:\n#{acc}")
     end
   end

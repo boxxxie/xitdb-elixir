@@ -98,6 +98,7 @@ ATOM_ERROR:            ERL_NIF_TERM
 ATOM_NIL:              ERL_NIF_TERM
 ATOM_TRUE:             ERL_NIF_TERM
 ATOM_FALSE:            ERL_NIF_TERM
+ATOM_STRICT:           ERL_NIF_TERM
 ATOM_CURSOR:           ERL_NIF_TERM
 ATOM_TAGGED:           ERL_NIF_TERM
 ATOM_XITDB_SET:        ERL_NIF_TERM
@@ -179,6 +180,7 @@ odin_nif_init_atoms :: proc "c" (env: ErlNifEnv) {
 	ATOM_NIL          = make_atom(env, "nil")
 	ATOM_TRUE         = make_atom(env, "true")
 	ATOM_FALSE        = make_atom(env, "false")
+	ATOM_STRICT       = make_atom(env, "strict")
 	ATOM_CURSOR       = make_atom(env, "cursor")
 	ATOM_TAGGED       = make_atom(env, "tagged")
 	ATOM_XITDB_SET    = make_atom(env, "__xitdb_set__")
@@ -5864,12 +5866,12 @@ rollback_failed_tx :: proc(
 		cur_len, cur_len_err := xitdb.core_length(db.core)
 		if cur_len_err != nil || cur_len != target_len {
 			xitdb.core_set_length(db.core, target_len) or_return
+			xitdb.core_flush(db.core) or_return
+			xitdb.core_sync(db.core) or_return
 			after_len := xitdb.core_length(db.core) or_return
 			if after_len != target_len {
 				return .Truncated_Database
 			}
-			xitdb.core_flush(db.core) or_return
-			xitdb.core_sync(db.core) or_return
 		}
 	}
 	return nil
@@ -6607,8 +6609,19 @@ odin_nif_transact :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TER
 	}
 
 	base_moment: i64 = -1
+	has_strict_tip := false
+	strict_tip: i64 = -1
 	if nif_get_int64(env, argv[1], &base_moment) == 0 {
-		return make_err(env, "badarg")
+		arity: c.int = 0
+		elems: [^]ERL_NIF_TERM = nil
+		if nif_get_tuple(env, argv[1], &arity, &elems) != 0 && arity == 2 && elems[0] == ATOM_STRICT {
+			if nif_get_int64(env, elems[1], &strict_tip) == 0 {
+				return make_err(env, "badarg")
+			}
+			has_strict_tip = true
+		} else {
+			return make_err(env, "badarg")
+		}
 	}
 	doc_str := ""
 	if argv[3] != ATOM_NIL {
@@ -6634,6 +6647,29 @@ odin_nif_transact :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TER
 
 	if has_expected_epoch && handle.write_epoch != expected_epoch {
 		return make_err(env, "stale_write_epoch")
+	}
+
+	if has_strict_tip {
+		rc := xitdb.database_root_cursor(&handle.db).read_cursor
+		moment_count: i64 = 0
+		if hist, err := xitdb.read_array_list_init(rc); err == nil {
+			if cnt, c_err := xitdb.array_list_count(hist); c_err == nil {
+				moment_count = cnt
+			}
+		}
+		if strict_tip == -1 {
+			if moment_count != 0 {
+				return make_err(env, "stale_base_moment")
+			}
+			base_moment = -1
+		} else if strict_tip >= 0 {
+			if moment_count - 1 != strict_tip {
+				return make_err(env, "stale_base_moment")
+			}
+			base_moment = strict_tip
+		} else {
+			return make_err(env, "badarg")
+		}
 	}
 
 	tx := xitdb.tx_init(&handle.db, base_moment = base_moment, track_changes = false, allocator = context.temp_allocator)
