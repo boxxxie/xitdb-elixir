@@ -539,7 +539,7 @@ defmodule Xitdb.Columnar do
   # ============================================================================
 
   defp fetch_or_decode_page(col, field, page_id, db_ref, moment, opts) do
-    CacheOwner.ensure_started()
+    CacheOwner.ensure_tables_ready()
 
     max_bytes =
       Keyword.get(opts, :max_decompressed_bytes, Compression.default_max_decompressed_bytes())

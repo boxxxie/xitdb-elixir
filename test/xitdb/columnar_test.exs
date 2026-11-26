@@ -517,6 +517,84 @@ defmodule Xitdb.CacheOwnerResilienceTest do
     assert %{page_cache_hits: 1, page_reads: 0} = Columnar.stats()
   end
 
+  test "top-level cursor, pull, and query pin moment -1 so reads do not tear across commits" do
+    db =
+      Xitdb.open!(backend: :memory)
+      |> Columnar.put_rows!(
+        "items",
+        [{"1", %{"a" => "a0", "b" => "b0"}}],
+        columns: [:a, :b],
+        codec: :none
+      )
+
+    on_exit(fn -> Xitdb.close(db) end)
+
+    # Access on %Xitdb{} pins the cursor moment to 0 instead of keeping -1
+    items_cursor = db["items"]
+    assert items_cursor.moment == 0
+
+    # Commit moment 1 with new values
+    {:ok, db} =
+      Columnar.put_rows(
+        db,
+        "items",
+        [{"1", %{"a" => "a1", "b" => "b1"}}],
+        columns: [:a, :b],
+        codec: :none
+      )
+
+    # Reading from the cursor obtained before the commit still sees moment 0 for both columns
+    assert items_cursor["1"]["a"] == "a0"
+    assert items_cursor["1"]["b"] == "b0"
+
+    # Pull and Datalog query against %Xitdb{} see moment 1 consistently across both columns
+    assert {:ok, %{"items" => %{"1" => %{"a" => "a1", "b" => "b1"}}}} =
+             Xitdb.pull(db, "{items {\"1\" {a, b}}}")
+
+    assert {:ok, %{rows: [["a1", "b1"]]}} =
+             Xitdb.query(db, ~s(find ?a, ?b where .items["1"].a = ?a, .items["1"].b = ?b))
+
+    # Callback transact/2 pins root cursor moment and detects concurrent commits
+    assert {:error, %Xitdb.Error{reason: :stale_base_moment}} =
+             Xitdb.transact(db, fn root ->
+               assert root.moment == 1
+               assert {:ok, _} = Columnar.put_rows(db, "items", [{"2", %{"a" => "a2"}}])
+               put_in(root["items"]["1"]["a"], "from_m1")
+             end)
+
+    assert is_map(Xitdb.db(db)["items"])
+  end
+
+  test "concurrent Xitdb.transact/2 on an empty db detects stale_base_moment and avoids torn reads" do
+    {:ok, empty_db} = Xitdb.open(backend: :memory)
+
+    assert {:error, %Xitdb.Error{reason: :stale_base_moment}} =
+             Xitdb.transact(empty_db, fn root ->
+               assert root.moment == -1
+               assert root["seed"] == nil
+               assert {:ok, _} = Xitdb.transact(empty_db, %{"seed" => "winner"})
+               # Reads inside the callback remain pinned to the empty snapshot
+               assert root["seed"] == nil
+               put_in(root["seed"], "loser")
+             end)
+
+    assert Xitdb.db(empty_db)["seed"] == "winner"
+  end
+
+  test "CacheOwner :reattach_heir reclaims tables owned by CacheHeir and ensure_tables_ready/0 fast-paths" do
+    assert :ok = Xitdb.CacheOwner.ensure_tables_ready()
+    owner = Process.whereis(Xitdb.CacheOwner)
+    heir = Process.whereis(Xitdb.CacheHeir)
+    assert is_pid(owner) and is_pid(heir)
+
+    send(owner, :reattach_heir)
+    _ = :sys.get_state(owner)
+    assert :ets.info(:xitdb_page_cache, :owner) == owner
+    assert :ets.info(:xitdb_dict_cache, :owner) == owner
+    assert :ets.info(:xitdb_page_cache, :heir) == heir
+    assert :ets.info(:xitdb_dict_cache, :heir) == heir
+  end
+
   defp wait_for_registered_restart(name, _old_pid, 0),
     do: flunk("#{inspect(name)} did not restart")
 
