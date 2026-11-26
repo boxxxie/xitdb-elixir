@@ -187,4 +187,164 @@ defmodule Xitdb.ReadOnlyAndTxContextTest do
     assert m4["source_system"] == "steward_ui"
     refute Map.has_key?(m4, "reason")
   end
+
+  test "exclusive OS file lock prevents concurrent writable opens while allowing read_only readers" do
+    tmp_dir = Path.join(System.tmp_dir!(), "xitdb_flock_#{System.unique_integer([:positive])}")
+    File.mkdir_p!(tmp_dir)
+    on_exit(fn -> File.rm_rf!(tmp_dir) end)
+
+    for backend <- [:file, :buffered_file] do
+      path = Path.join(tmp_dir, "#{backend}.xit")
+
+      {:ok, rw1} = Xitdb.open(backend: backend, path: path)
+      {:ok, rw1} = Xitdb.transact(rw1, %{"k" => "committed"})
+      :ok = Xitdb.sync(rw1)
+
+      assert {:error, %Error{reason: :file_locked}} = Xitdb.open(backend: backend, path: path)
+
+      # Active handle's data remains completely intact
+      assert Xitdb.db(rw1)["k"] == "committed"
+
+      # Concurrent read-only open is allowed
+      {:ok, ro} = Xitdb.open(backend: backend, path: path, read_only: true)
+      assert Xitdb.db(ro)["k"] == "committed"
+      :ok = Xitdb.close(ro)
+
+      # Closing first writer releases the exclusive lock for subsequent writable open
+      :ok = Xitdb.close(rw1)
+      {:ok, rw2} = Xitdb.open(backend: backend, path: path)
+      assert Xitdb.db(rw2)["k"] == "committed"
+      {:ok, rw2} = Xitdb.transact(rw2, fn root -> put_in(root["k2"], "second") end)
+      assert Xitdb.db(rw2)["k2"] == "second"
+      :ok = Xitdb.close(rw2)
+    end
+  end
+
+  @tag :unix
+  test "exclusive OS file lock holds across OS processes and recovers immediately after SIGKILL" do
+    local_elixir = Path.expand("../../bin/elixir", Application.app_dir(:elixir))
+
+    elixir_exe =
+      if File.regular?(local_elixir), do: local_elixir, else: System.find_executable("elixir")
+
+    assert is_binary(elixir_exe)
+
+    tmp_dir = Path.join(System.tmp_dir!(), "xitdb_sigkill_#{System.unique_integer([:positive])}")
+    File.mkdir_p!(tmp_dir)
+    path = Path.join(tmp_dir, "cross_os.xit")
+
+    build_prefix = Mix.Project.build_path()
+
+    pa_args =
+      :code.get_path()
+      |> Enum.map(&List.to_string/1)
+      |> Enum.filter(&String.starts_with?(&1, build_prefix))
+      |> Enum.uniq()
+      |> Enum.flat_map(&["-pa", &1])
+
+    script = """
+    {:ok, _} = Application.ensure_all_started(:xitdb)
+    db = Xitdb.open!(backend: :buffered_file, path: #{inspect(path)})
+    db = Xitdb.transact!(db, %{"owner" => "child", "seq" => 1})
+    :ok = Xitdb.sync(db)
+    IO.puts("LOCKED:" <> System.pid())
+    Process.sleep(:infinity)
+    """
+
+    port =
+      Port.open(
+        {:spawn_executable, elixir_exe},
+        [:binary, :exit_status, :stderr_to_stdout, args: pa_args ++ ["-e", script]]
+      )
+
+    child_pid_ref = :atomics.new(1, signed: false)
+
+    case Port.info(port, :os_pid) do
+      {:os_pid, os_pid} -> :ok = :atomics.put(child_pid_ref, 1, os_pid)
+      nil -> :ok
+    end
+
+    on_exit(fn ->
+      pid = :atomics.get(child_pid_ref, 1)
+
+      if pid > 0 do
+        _ = System.cmd("kill", ["-9", Integer.to_string(pid)], stderr_to_stdout: true)
+      end
+
+      if Port.info(port) != nil do
+        Port.close(port)
+      end
+
+      File.rm_rf!(tmp_dir)
+    end)
+
+    child_os_pid = await_port_locked!(port, "")
+    :ok = :atomics.put(child_pid_ref, 1, String.to_integer(child_os_pid))
+
+    # Separate OS process holding writable FD blocks concurrent writable opens across both file backends
+    assert {:error, %Error{reason: :file_locked}} =
+             Xitdb.open(backend: :buffered_file, path: path)
+
+    assert {:error, %Error{reason: :file_locked}} = Xitdb.open(backend: :file, path: path)
+
+    # Read-only open from the second OS process still sees synced committed data
+    assert {:ok, ro} = Xitdb.open(backend: :buffered_file, path: path, read_only: true)
+    assert Xitdb.db(ro)["owner"] == "child"
+    assert Xitdb.db(ro)["seq"] == 1
+    assert :ok = Xitdb.close(ro)
+
+    # SIGKILL on child releases kernel flock immediately without corrupting data
+    {_out, 0} = System.cmd("kill", ["-9", child_os_pid])
+    assert_receive {^port, {:exit_status, status}}, 5_000
+    assert status != 0
+    :ok = :atomics.put(child_pid_ref, 1, 0)
+
+    assert {:ok, rw} = Xitdb.open(backend: :buffered_file, path: path)
+    assert Xitdb.db(rw)["owner"] == "child"
+    assert {:ok, rw} = Xitdb.transact(rw, %{"owner" => "parent", "seq" => 2})
+    assert Xitdb.db(rw)["owner"] == "parent"
+    assert Xitdb.db(rw)["seq"] == 2
+    assert :ok = Xitdb.close(rw)
+  end
+
+  @tag :unix
+  test "writable file handle sets O_CLOEXEC so long-lived Ports do not inherit flock" do
+    path =
+      Path.join(
+        System.tmp_dir!(),
+        "xitdb_cloexec_#{System.unique_integer([:positive])}.xit"
+      )
+
+    on_exit(fn -> File.rm_rf(path) end)
+    assert {:ok, db} = Xitdb.open(backend: :buffered_file, path: path)
+    assert {:ok, db} = Xitdb.transact(db, %{"k" => "v1"})
+
+    port = Port.open({:spawn_executable, System.find_executable("cat")}, [:binary])
+    on_exit(fn -> if Port.info(port) != nil, do: Port.close(port) end)
+
+    assert :ok = Xitdb.close(db)
+
+    assert {:ok, db2} = Xitdb.open(backend: :buffered_file, path: path)
+    assert Xitdb.db(db2)["k"] == "v1"
+    assert :ok = Xitdb.close(db2)
+    Port.close(port)
+  end
+
+  defp await_port_locked!(port, acc) do
+    receive do
+      {^port, {:data, chunk}} ->
+        next = acc <> chunk
+
+        case Regex.run(~r/LOCKED:(\d+)/, next) do
+          [_, os_pid] -> os_pid
+          nil -> await_port_locked!(port, next)
+        end
+
+      {^port, {:exit_status, status}} ->
+        flunk("Child elixir process exited (#{status}) before locking file. Output:\n#{acc}")
+    after
+      15_000 ->
+        flunk("Timed out waiting for child elixir process to lock file. Output:\n#{acc}")
+    end
+  end
 end

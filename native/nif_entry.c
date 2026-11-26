@@ -20,6 +20,7 @@ extern ERL_NIF_TERM odin_nif_slot_contains(ErlNifEnv* env, int argc, const ERL_N
 extern ERL_NIF_TERM odin_nif_slot_slice(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 extern ERL_NIF_TERM odin_nif_slot_entries(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 extern ERL_NIF_TERM odin_nif_slot_materialize(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+extern ERL_NIF_TERM odin_nif_bump_write_epoch(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 extern ERL_NIF_TERM odin_nif_transact(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 extern ERL_NIF_TERM odin_nif_select(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 extern ERL_NIF_TERM odin_nif_pull(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
@@ -411,7 +412,8 @@ static ErlNifFunc nif_funcs[] = {
     {"nif_slot_materialize", 4, odin_nif_slot_materialize, ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_slot_materialize", 5, odin_nif_slot_materialize, ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_slot_materialize", 6, odin_nif_slot_materialize, ERL_NIF_DIRTY_JOB_CPU_BOUND},
-    {"nif_transact",         4, odin_nif_transact,         ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"nif_bump_write_epoch", 1, odin_nif_bump_write_epoch, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"nif_transact",         5, odin_nif_transact,         ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"nif_select",           3, odin_nif_select,           0},
     {"nif_select",           4, odin_nif_select,           0},
     {"nif_select",           5, odin_nif_select,           0},

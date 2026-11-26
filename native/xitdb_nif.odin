@@ -80,12 +80,13 @@ foreign _ {
 }
 
 Db_Handle :: struct {
-	core:      xitdb.Core,
-	db:        xitdb.Database,
-	rwlock:    rawptr,
-	is_closed: bool,
-	read_only: bool,
-	backend:   u8, // 0 = memory, 1 = file, 2 = buffered_file
+	core:        xitdb.Core,
+	db:          xitdb.Database,
+	rwlock:      rawptr,
+	write_epoch: u64,
+	is_closed:   bool,
+	read_only:   bool,
+	backend:     u8, // 0 = memory, 1 = file, 2 = buffered_file
 }
 
 // ============================================================================
@@ -97,6 +98,7 @@ ATOM_ERROR:            ERL_NIF_TERM
 ATOM_NIL:              ERL_NIF_TERM
 ATOM_TRUE:             ERL_NIF_TERM
 ATOM_FALSE:            ERL_NIF_TERM
+ATOM_STRICT:           ERL_NIF_TERM
 ATOM_CURSOR:           ERL_NIF_TERM
 ATOM_TAGGED:           ERL_NIF_TERM
 ATOM_XITDB_SET:        ERL_NIF_TERM
@@ -178,6 +180,7 @@ odin_nif_init_atoms :: proc "c" (env: ErlNifEnv) {
 	ATOM_NIL          = make_atom(env, "nil")
 	ATOM_TRUE         = make_atom(env, "true")
 	ATOM_FALSE        = make_atom(env, "false")
+	ATOM_STRICT       = make_atom(env, "strict")
 	ATOM_CURSOR       = make_atom(env, "cursor")
 	ATOM_TAGGED       = make_atom(env, "tagged")
 	ATOM_XITDB_SET    = make_atom(env, "__xitdb_set__")
@@ -274,6 +277,9 @@ make_err :: proc(env: ErlNifEnv, reason: string) -> ERL_NIF_TERM {
 }
 
 make_xitdb_err :: proc(env: ErlNifEnv, err: xitdb.Error) -> ERL_NIF_TERM {
+	if xerr, ok := err.(xitdb.Xitdb_Error); ok && xerr == .File_Locked {
+		return make_err(env, "file_locked")
+	}
 	msg := fmt.tprintf("%v", err)
 	return nif_make_tuple2(env, ATOM_ERROR, make_binary(env, msg))
 }
@@ -5840,21 +5846,8 @@ rollback_failed_tx :: proc(
 	pre_fs_bytes: [8]u8,
 	pre_fs_err: xitdb.Error,
 ) -> xitdb.Error {
-	has_target_len := pre_hdr_err == nil || pre_len_err == nil
-	target_len := pre_header.file_size if pre_hdr_err == nil else pre_len
-	len_changed := false
-	if has_target_len {
-		cur_len, cur_len_err := xitdb.core_length(db.core)
-		if cur_len_err != nil || cur_len != target_len {
-			len_changed = true
-			xitdb.core_set_length(db.core, target_len) or_return
-			after_len := xitdb.core_length(db.core) or_return
-			if after_len != target_len {
-				return .Truncated_Database
-			}
-		}
-	}
-
+	// Restore the committed header pointer before truncating tail bytes so a
+	// crash mid-rollback never leaves the header pointing past EOF.
 	file_size_start := xitdb.database_file_size_start(db.header.version)
 	cur_fs_bytes: [8]u8 = ---
 	cur_fs_err := xitdb.core_read_exact_at(db.core, file_size_start, cur_fs_bytes[:])
@@ -5865,8 +5858,21 @@ rollback_failed_tx :: proc(
 		xitdb.core_write_all(db.core, fs_bytes[:]) or_return
 		xitdb.core_flush(db.core) or_return
 		xitdb.core_sync(db.core) or_return
-	} else if len_changed {
-		xitdb.core_flush(db.core) or_return
+	}
+
+	has_target_len := pre_hdr_err == nil || pre_len_err == nil
+	target_len := pre_header.file_size if pre_hdr_err == nil else pre_len
+	if has_target_len {
+		cur_len, cur_len_err := xitdb.core_length(db.core)
+		if cur_len_err != nil || cur_len != target_len {
+			xitdb.core_set_length(db.core, target_len) or_return
+			xitdb.core_flush(db.core) or_return
+			xitdb.core_sync(db.core) or_return
+			after_len := xitdb.core_length(db.core) or_return
+			if after_len != target_len {
+				return .Truncated_Database
+			}
+		}
 	}
 	return nil
 }
@@ -6563,17 +6569,59 @@ parse_tx_ops :: proc(
 }
 
 @(export)
+odin_nif_bump_write_epoch :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {
+	context = runtime.default_context()
+	defer free_all(context.temp_allocator)
+
+	if argc != 1 {
+		return make_err(env, "badarg")
+	}
+	handle, ok := acquire_wlock(env, argv[0])
+	if !ok {
+		return make_err(env, "closed")
+	}
+	defer nif_rwlock_rwunlock(handle.rwlock)
+
+	if handle.read_only {
+		return make_err(env, "read_only")
+	}
+
+	handle.write_epoch += 1
+	return make_ok(env, nif_make_uint64(env, handle.write_epoch))
+}
+
+@(export)
 odin_nif_transact :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM) -> ERL_NIF_TERM {
 	context = runtime.default_context()
 	defer free_all(context.temp_allocator)
 
-	if argc != 4 {
+	if argc != 4 && argc != 5 {
 		return make_err(env, "badarg")
 	}
 
+	expected_epoch: u64 = 0
+	has_expected_epoch := false
+	if argc == 5 && argv[4] != ATOM_NIL {
+		if nif_get_uint64(env, argv[4], &expected_epoch) == 0 {
+			return make_err(env, "badarg")
+		}
+		has_expected_epoch = true
+	}
+
 	base_moment: i64 = -1
+	has_strict_tip := false
+	strict_tip: i64 = -1
 	if nif_get_int64(env, argv[1], &base_moment) == 0 {
-		return make_err(env, "badarg")
+		arity: c.int = 0
+		elems: [^]ERL_NIF_TERM = nil
+		if nif_get_tuple(env, argv[1], &arity, &elems) != 0 && arity == 2 && elems[0] == ATOM_STRICT {
+			if nif_get_int64(env, elems[1], &strict_tip) == 0 {
+				return make_err(env, "badarg")
+			}
+			has_strict_tip = true
+		} else {
+			return make_err(env, "badarg")
+		}
 	}
 	doc_str := ""
 	if argv[3] != ATOM_NIL {
@@ -6595,6 +6643,33 @@ odin_nif_transact :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TER
 
 	if handle.read_only {
 		return make_err(env, "read_only")
+	}
+
+	if has_expected_epoch && handle.write_epoch != expected_epoch {
+		return make_err(env, "stale_write_epoch")
+	}
+
+	if has_strict_tip {
+		rc := xitdb.database_root_cursor(&handle.db).read_cursor
+		moment_count: i64 = 0
+		if hist, err := xitdb.read_array_list_init(rc); err == nil {
+			if cnt, c_err := xitdb.array_list_count(hist); c_err == nil {
+				moment_count = cnt
+			}
+		}
+		if strict_tip == -1 {
+			if moment_count != 0 {
+				return make_err(env, "stale_base_moment")
+			}
+			base_moment = -1
+		} else if strict_tip >= 0 {
+			if moment_count - 1 != strict_tip {
+				return make_err(env, "stale_base_moment")
+			}
+			base_moment = strict_tip
+		} else {
+			return make_err(env, "badarg")
+		}
 	}
 
 	tx := xitdb.tx_init(&handle.db, base_moment = base_moment, track_changes = false, allocator = context.temp_allocator)
@@ -10595,7 +10670,12 @@ odin_nif_compact :: proc "c" (env: ErlNifEnv, argc: c.int, argv: [^]ERL_NIF_TERM
 		return make_xitdb_err(env, comp_err)
 	}
 
-	_ = xitdb.core_sync(&comp_handle.core)
+	if sync_err := xitdb.core_sync(&comp_handle.core); sync_err != nil {
+		_ = xitdb.core_destroy(&comp_handle.core, close_file = true)
+		comp_handle.is_closed = true
+		_ = nif_make_db_resource(env, raw_res)
+		return make_xitdb_err(env, sync_err)
+	}
 	comp_handle.rwlock = nif_rwlock_create("xitdb_rwlock")
 	if comp_handle.rwlock == nil {
 		_ = xitdb.core_destroy(&comp_handle.core, close_file = true)

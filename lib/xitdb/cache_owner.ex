@@ -11,6 +11,16 @@ defmodule Xitdb.CacheOwner do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
   end
 
+  @spec ensure_tables_ready() :: :ok
+  def ensure_tables_ready do
+    if :ets.whereis(@page_cache_table) != :undefined and
+         :ets.whereis(@dict_cache_table) != :undefined do
+      :ok
+    else
+      ensure_started()
+    end
+  end
+
   @spec ensure_started() :: :ok
   def ensure_started do
     if Process.whereis(__MODULE__) != nil and
@@ -18,27 +28,65 @@ defmodule Xitdb.CacheOwner do
          :ets.whereis(@dict_cache_table) != :undefined do
       :ok
     else
+      do_ensure_started(25)
+    end
+  end
+
+  defp do_ensure_started(attempts) when attempts > 0 do
+    if Process.whereis(Xitdb.Supervisor) != nil do
+      ping_with_retry(attempts)
+    else
       case GenServer.start(__MODULE__, [], name: __MODULE__) do
         {:ok, _pid} -> :ok
-        {:error, {:already_started, _pid}} -> GenServer.call(__MODULE__, :ping)
+        {:error, {:already_started, _pid}} -> ping_with_retry(attempts)
       end
     end
   end
 
+  defp ping_with_retry(attempts) do
+    GenServer.call(__MODULE__, :ping, 500)
+  catch
+    :exit, {reason, _} when reason != :timeout and attempts > 1 ->
+      Process.sleep(10)
+      do_ensure_started(attempts - 1)
+
+    :exit, reason ->
+      if :ets.whereis(@page_cache_table) != :undefined and
+           :ets.whereis(@dict_cache_table) != :undefined do
+        :ok
+      else
+        exit(reason)
+      end
+  end
+
   @spec put_page(term(), term(), non_neg_integer(), pos_integer()) :: :ok
   def put_page(cache_key, page, raw_len, limit) do
-    ensure_started()
-    GenServer.call(__MODULE__, {:put_page, cache_key, page, raw_len, limit})
+    call_best_effort({:put_page, cache_key, page, raw_len, limit}, 2)
   end
 
   @spec put_dict(term(), term(), term(), pos_integer()) :: :ok
   def put_dict(key, cdict, ddict, limit) do
-    ensure_started()
-    GenServer.call(__MODULE__, {:put_dict, key, cdict, ddict, limit})
+    call_best_effort({:put_dict, key, cdict, ddict, limit}, 2)
+  end
+
+  defp call_best_effort(msg, attempts) when attempts > 0 do
+    if Process.whereis(__MODULE__) == nil and Process.whereis(Xitdb.Supervisor) == nil do
+      _ = GenServer.start(__MODULE__, [], name: __MODULE__)
+    end
+
+    GenServer.call(__MODULE__, msg, 100)
+  catch
+    :exit, {reason, _} when reason != :timeout and attempts > 1 ->
+      Process.sleep(10)
+      call_best_effort(msg, attempts - 1)
+
+    :exit, _ ->
+      :ok
   end
 
   @impl GenServer
   def init(_opts) do
+    Xitdb.CacheHeir.claim([@page_cache_table, @dict_cache_table])
     ensure_tables()
     {:ok, %{}}
   end
@@ -81,6 +129,20 @@ defmodule Xitdb.CacheOwner do
     {:reply, :ok, state}
   end
 
+  @impl GenServer
+  def handle_info({:"ETS-TRANSFER", table, _from, _data}, state) do
+    attach_heir(table)
+    {:noreply, state}
+  end
+
+  def handle_info(:reattach_heir, state) do
+    Xitdb.CacheHeir.claim([@page_cache_table, @dict_cache_table])
+    ensure_tables()
+    {:noreply, state}
+  end
+
+  def handle_info(_msg, state), do: {:noreply, state}
+
   defp ensure_tables do
     ensure_table(@page_cache_table)
     ensure_table(@dict_cache_table)
@@ -88,13 +150,44 @@ defmodule Xitdb.CacheOwner do
 
   defp ensure_table(name) do
     if :ets.whereis(name) == :undefined do
-      :ets.new(name, [
+      base_opts = [
         :named_table,
         :public,
         :set,
         read_concurrency: true,
-        write_concurrency: true
-      ])
+        write_concurrency: :auto
+      ]
+
+      table_opts =
+        case Process.whereis(Xitdb.CacheHeir) do
+          pid when is_pid(pid) -> [{:heir, pid, :xitdb_cache} | base_opts]
+          nil -> base_opts
+        end
+
+      try do
+        _ = :ets.new(name, table_opts)
+        :ok
+      rescue
+        ArgumentError -> :ok
+      end
+    else
+      attach_heir(name)
+    end
+  end
+
+  defp attach_heir(table) do
+    case Process.whereis(Xitdb.CacheHeir) do
+      pid when is_pid(pid) ->
+        try do
+          if :ets.info(table, :owner) == self() do
+            :ets.setopts(table, {:heir, pid, :xitdb_cache})
+          end
+        rescue
+          ArgumentError -> :ok
+        end
+
+      nil ->
+        :ok
     end
 
     :ok

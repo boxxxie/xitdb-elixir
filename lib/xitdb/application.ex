@@ -6,6 +6,7 @@ defmodule Xitdb.Application do
   @impl Application
   def start(_type, _args) do
     children = [
+      Xitdb.CacheHeir,
       Xitdb.CacheOwner
     ]
 

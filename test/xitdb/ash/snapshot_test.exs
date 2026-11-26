@@ -43,8 +43,8 @@ defmodule Xitdb.Ash.SnapshotTest do
   test "current_db resolves process dictionary transaction handle over committed db", %{db: db} do
     Snapshot.put_base(MockStore, db)
 
-    # By default, returns committed_db
-    assert Snapshot.current_db(MockStore) == db
+    # By default, returns inert empty_root cursor for uncommitted store
+    assert Snapshot.current_db(MockStore) == Xitdb.Cursor.empty_root(db.db_ref)
 
     # Process dict override simulates active transaction writer lease
     {:ok, tx_db} = Xitdb.open(backend: :memory)
@@ -53,7 +53,7 @@ defmodule Xitdb.Ash.SnapshotTest do
     assert Snapshot.current_db(MockStore) == tx_db
 
     Process.delete({:xitdb_tx_db, MockStore})
-    assert Snapshot.current_db(MockStore) == db
+    assert Snapshot.current_db(MockStore) == Xitdb.Cursor.empty_root(db.db_ref)
   end
 
   test "swap_compacted_base replaces base_db while preserving reverse_fks", %{db: db} do
@@ -65,5 +65,30 @@ defmodule Xitdb.Ash.SnapshotTest do
 
     assert Snapshot.current_moment(MockStore) == 5
     assert [%{on_delete: :nilify}] = Snapshot.reverse_fks(MockStore, MockResource)
+  end
+
+  test "as_of/2 isolates uncommitted moments on empty stores and positive offsets", %{db: db} do
+    # Empty store (visible_moment == -1) with an uncommitted moment 0 staged on disk
+    Snapshot.put_base(MockStore, db)
+    {:ok, _staged_db} = Xitdb.transact(db, %{"uncommitted" => true})
+
+    for bad_moment <- [-2, -1, 0, 1] do
+      assert_raise Xitdb.Error, fn ->
+        Snapshot.as_of(MockStore, bad_moment)
+      end
+    end
+
+    # Advance committed moment to 0, stage uncommitted moment 1
+    Snapshot.advance_moment(MockStore, 0)
+    {:ok, _staged_db2} = Xitdb.transact(db, %{"second_uncommitted" => true})
+
+    assert Snapshot.as_of(MockStore, 0)["uncommitted"] == true
+    assert Snapshot.as_of(MockStore, -1)["uncommitted"] == true
+
+    for bad_moment <- [-2, 1] do
+      assert_raise Xitdb.Error, fn ->
+        Snapshot.as_of(MockStore, bad_moment)
+      end
+    end
   end
 end

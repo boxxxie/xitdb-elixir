@@ -314,6 +314,17 @@ if Code.ensure_loaded?(Ash.DataLayer) do
                  assert Store.root(store_a)["nums"]["a"] == 1
                  assert Store.root(store_a)["nums"]["b"] == nil
 
+                 # Subsequent mutate without explicit base_moment (default -1) must not resurrect
+                 # rolled-back inner savepoint writes from the disk tip.
+                 {:ok, _} =
+                   Store.mutate(store_a, fn {db, _moment} ->
+                     {:ok, db2} = Xitdb.transact_ops(db, [{:put, "nums[\"c\"]", 2}])
+                     {:ok, {db2, Xitdb.moment_count(db2) - 1}, :c}
+                   end)
+
+                 assert Store.root(store_a)["nums"]["b"] == nil
+                 assert Store.root(store_a)["nums"]["c"] == 2
+
                  # Cross-store rollback of store_a from inside store_b cleans up store_b snapshot too
                  assert {:error, :cross_abort} =
                           Store.transact(store_a, fn ->
@@ -668,6 +679,601 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       assert down_meta["restored_moment"] == 1
       assert down_meta["rolled_back_from"] == 2
       assert down_meta["action_name"] == "rollback_tip"
+    end
+
+    test "fences zombie writers with :stale_write_epoch, un-clamps lease_timeout, swaps base atomically, isolates as_of(-1), and terminates safely on closed db" do
+      alias Xitdb.Ash.Store.Snapshot
+
+      # 1. Zombie writer trying Xitdb.transact_ops after lease_timeout expires is fenced
+      {store, pid} = start_ephemeral_store(lease_timeout: 25)
+
+      {:ok, :seed} =
+        Store.mutate(store, fn {db, moment} ->
+          {:ok, db2} =
+            Xitdb.transact_ops(db, [{:init_col, "k", "hash_map"}, {:put, "k[\"v\"]", "init"}],
+              base_moment: moment
+            )
+
+          {:ok, {db2, Xitdb.moment_count(db2) - 1}, :seed}
+        end)
+
+      assert {:error, %LeaseError{store: ^store, reason: :lease_expired}} =
+               Store.transact(
+                 store,
+                 fn ->
+                   wait_until(fn -> :sys.get_state(pid).queue.active == nil end)
+
+                   {db, moment} = Process.get({:xitdb_tx_state, store})
+
+                   assert {:error, %Xitdb.Error{reason: :stale_write_epoch}} =
+                            Xitdb.transact_ops(db, [{:put, "k[\"v\"]", "zombie"}],
+                              base_moment: moment
+                            )
+
+                   :zombie_done
+                 end,
+                 timeout: 500
+               )
+
+      assert Store.root(store)["k"]["v"] == "init"
+
+      assert {:error, %LeaseError{store: ^store, reason: :lease_expired}} =
+               Store.mutate(
+                 store,
+                 fn {db, moment} ->
+                   wait_until(fn -> :sys.get_state(pid).queue.active == nil end)
+
+                   with {:ok, db2} <-
+                          Xitdb.transact_ops(db, [{:put, "k[\"v\"]", "zombie_mutate"}],
+                            base_moment: moment
+                          ) do
+                     {:ok, {db2, Xitdb.moment_count(db2) - 1}, :zombie_mutate}
+                   end
+                 end,
+                 lease_timeout: 25,
+                 timeout: 500
+               )
+
+      assert Store.root(store)["k"]["v"] == "init"
+
+      # 2. Short opts[:timeout] does NOT clamp state.lease_timeout when :lease_timeout is omitted
+      {no_clamp_store, _} = start_ephemeral_store(lease_timeout: 200)
+
+      assert {:ok, :ok} =
+               Store.transact(
+                 no_clamp_store,
+                 fn ->
+                   Process.sleep(50)
+                   :ok
+                 end,
+                 timeout: 20
+               )
+
+      # 3. Store.as_of(store, -1) does not leak uncommitted staged moments to concurrent readers
+      staged_m =
+        Store.transact(
+          no_clamp_store,
+          fn ->
+            {:ok, :staged} =
+              Store.mutate(no_clamp_store, fn {db, moment} ->
+                {:ok, db2} =
+                  Xitdb.transact_ops(db, [{:put, "uncommitted", "leak"}], base_moment: moment)
+
+                {:ok, {db2, Xitdb.moment_count(db2) - 1}, :staged}
+              end)
+
+            # Check from a separate unlinked process without $callers or tx_db
+            parent = self()
+
+            {_pid, mref} =
+              spawn_monitor(fn ->
+                val = Store.as_of(no_clamp_store, -1)["uncommitted"]
+                send(parent, {:reader_saw, val})
+              end)
+
+            receive do
+              {:reader_saw, val} ->
+                Process.demonitor(mref, [:flush])
+                assert val == nil
+                Store.rollback(no_clamp_store, :checked)
+
+              {:DOWN, ^mref, :process, _pid, reason} ->
+                flunk("reader process exited unexpectedly: #{inspect(reason)}")
+            after
+              1_000 ->
+                flunk("timed out waiting for concurrent reader")
+            end
+          end
+        )
+
+      assert {:error, :checked} = staged_m
+
+      # 4. Store.swap_compacted_base/3 works standalone (with subsequent mutations) and inside Store.transact
+      compacted = Xitdb.open!(backend: :memory)
+      {:ok, compacted} = Xitdb.transact(compacted, %{"swapped" => "yes"})
+      assert :ok = Store.swap_compacted_base(no_clamp_store, compacted)
+      assert Store.root(no_clamp_store)["swapped"] == "yes"
+
+      assert {:ok, :ok} =
+               Store.mutate(no_clamp_store, fn {db, moment} ->
+                 {:ok, db2} =
+                   Xitdb.transact_ops(db, [{:put, "after_swap", "ok"}], base_moment: moment)
+
+                 {:ok, {db2, Xitdb.moment_count(db2) - 1}, :ok}
+               end)
+
+      assert Store.root(no_clamp_store)["after_swap"] == "ok"
+
+      compacted2 = Xitdb.open!(backend: :memory)
+      {:ok, compacted2} = Xitdb.transact(compacted2, %{"swapped_in_tx" => "yes"})
+
+      assert {:ok, {:error, :swap_inside_transaction}} =
+               Store.transact(no_clamp_store, fn ->
+                 Store.swap_compacted_base(no_clamp_store, compacted2)
+               end)
+
+      assert {:error, :stale_compaction_base} =
+               Store.swap_compacted_base(no_clamp_store, compacted2, nil, expected_moment: 999)
+
+      assert Store.root(no_clamp_store)["after_swap"] == "ok"
+
+      # Swapping an empty handle sets moment to -1 (not 0) and close_previous?: true closes old_db
+      empty_compacted = Xitdb.open!(backend: :memory)
+
+      assert :ok =
+               Store.swap_compacted_base(no_clamp_store, empty_compacted, nil,
+                 close_previous?: true
+               )
+
+      assert Snapshot.current_moment(no_clamp_store) == -1
+      assert {:error, %Xitdb.Error{reason: :closed}} = Xitdb.info(compacted)
+
+      # 5. Terminating or acquiring a lease on a Store whose db was closed does not crash the GenServer
+      {closed_store, closed_pid} = start_ephemeral_store()
+      raw_db = :sys.get_state(closed_pid).db
+      :ok = Xitdb.close(raw_db)
+      assert {:error, %Xitdb.Error{reason: :closed}} = Store.transact(closed_store, fn -> :ok end)
+      assert Process.alive?(closed_pid)
+      assert :ok = GenServer.stop(closed_pid, :normal, 1_000)
+      assert_raise ArgumentError, fn -> Snapshot.current_moment(closed_store) end
+    end
+
+    test "fences an expired zombie writer even while a new active writer is mid-transaction" do
+      {store, pid} = start_ephemeral_store(lease_timeout: 25)
+      parent = self()
+
+      {:ok, :seed} =
+        Store.mutate(store, fn {db, moment} ->
+          {:ok, db2} =
+            Xitdb.transact_ops(db, [{:init_col, "k", "hash_map"}, {:put, "k[\"v\"]", "init"}],
+              base_moment: moment
+            )
+
+          {:ok, {db2, Xitdb.moment_count(db2) - 1}, :seed}
+        end)
+
+      writer_a =
+        Task.async(fn ->
+          Store.transact(
+            store,
+            fn ->
+              send(parent, {:writer_a_acquired, self()})
+              receive do: (:writer_a_attempt_zombie -> :ok)
+
+              {db, moment} = Process.get({:xitdb_tx_state, store})
+
+              assert {:error, %Xitdb.Error{reason: :stale_write_epoch}} =
+                       Xitdb.transact_ops(db, [{:put, "k[\"zombie_raw\"]", "bad"}],
+                         base_moment: moment
+                       )
+
+              assert {:error, %LeaseError{store: ^store, reason: :lease_expired}} =
+                       Store.mutate(store, fn {cur_db, cur_moment} ->
+                         with {:ok, db2} <-
+                                Xitdb.transact_ops(
+                                  cur_db,
+                                  [{:put, "k[\"zombie_mutate\"]", "bad"}],
+                                  base_moment: cur_moment
+                                ) do
+                           {:ok, {db2, Xitdb.moment_count(db2) - 1}, :should_not_commit}
+                         end
+                       end)
+
+              send(parent, :writer_a_fenced)
+              :zombie_done
+            end,
+            timeout: 1_000
+          )
+        end)
+
+      assert_receive {:writer_a_acquired, _}, 1_000
+      wait_until(fn -> :sys.get_state(pid).queue.active == nil end)
+
+      writer_b =
+        Task.async(fn ->
+          Store.transact(
+            store,
+            fn ->
+              {:ok, :step1} =
+                Store.mutate(store, fn {db, moment} ->
+                  {:ok, db2} =
+                    Xitdb.transact_ops(db, [{:put, "k[\"step1\"]", "ok1"}], base_moment: moment)
+
+                  {:ok, {db2, Xitdb.moment_count(db2) - 1}, :step1}
+                end)
+
+              send(parent, :writer_b_mid_tx)
+              receive do: (:writer_b_finish -> :ok)
+
+              {:ok, :step2} =
+                Store.mutate(store, fn {db, moment} ->
+                  {:ok, db2} =
+                    Xitdb.transact_ops(db, [{:put, "k[\"step2\"]", "ok2"}], base_moment: moment)
+
+                  {:ok, {db2, Xitdb.moment_count(db2) - 1}, :step2}
+                end)
+
+              :writer_b_ok
+            end,
+            lease_timeout: 2_000
+          )
+        end)
+
+      assert_receive :writer_b_mid_tx, 1_000
+      send(writer_a.pid, :writer_a_attempt_zombie)
+      assert_receive :writer_a_fenced, 1_000
+
+      send(writer_b.pid, :writer_b_finish)
+      assert {:ok, :writer_b_ok} = Task.await(writer_b, 2_000)
+
+      assert {:error, %LeaseError{store: ^store, reason: :lease_expired}} =
+               Task.await(writer_a, 2_000)
+
+      k = Store.root(store)["k"]
+      assert k["v"] == "init"
+      assert k["step1"] == "ok1"
+      assert k["step2"] == "ok2"
+      assert k["zombie_raw"] == nil
+      assert k["zombie_mutate"] == nil
+    end
+
+    test "file-backed Xitdb.compact/2 + Store.swap_compacted_base/3 preserves in-flight cursors and persists post-swap writes" do
+      tmp_dir =
+        Path.join(System.tmp_dir!(), "xitdb_store_swap_#{System.unique_integer([:positive])}")
+
+      File.mkdir_p!(tmp_dir)
+      on_exit(fn -> File.rm_rf!(tmp_dir) end)
+
+      orig_path = Path.join(tmp_dir, "orig.xit")
+      compacted_path = Path.join(tmp_dir, "compacted.xit")
+      store_name = :"XitdbSwapFileStore_#{System.unique_integer([:positive])}"
+
+      {:ok, pid} = Store.start_link(name: store_name, path: orig_path)
+
+      on_exit(fn ->
+        if Process.alive?(pid) do
+          try do
+            GenServer.stop(pid, :normal, 1_000)
+          catch
+            :exit, _ -> :ok
+          end
+        end
+      end)
+
+      {:ok, :seeded} =
+        Store.mutate(store_name, fn {db, moment} ->
+          {:ok, db2} =
+            Xitdb.transact_ops(
+              db,
+              [{:init_col, "items", "hash_map"}, {:put, "items[\"a\"]", "v1"}],
+              base_moment: moment
+            )
+
+          {:ok, {db2, Xitdb.moment_count(db2) - 1}, :seeded}
+        end)
+
+      {:ok, :updated} =
+        Store.mutate(store_name, fn {db, moment} ->
+          {:ok, db2} =
+            Xitdb.transact_ops(db, [{:put, "items[\"a\"]", "v2"}, {:put, "items[\"b\"]", "keep"}],
+              base_moment: moment
+            )
+
+          {:ok, {db2, Xitdb.moment_count(db2) - 1}, :updated}
+        end)
+
+      old_db = :sys.get_state(pid).db
+      old_cursor = Store.root(store_name)
+
+      {:ok, compacted_db} = Xitdb.compact(old_db, path: compacted_path)
+      assert :ok = Store.swap_compacted_base(store_name, compacted_db)
+
+      # Pre-swap reader cursor remains valid without raising
+      assert old_cursor["items"]["a"] == "v2"
+      assert old_cursor["items"]["b"] == "keep"
+      assert :ok = Xitdb.close(old_db)
+
+      # Active store reads compacted data and accepts subsequent mutations
+      assert Store.root(store_name)["items"]["a"] == "v2"
+      assert Store.root(store_name)["items"]["b"] == "keep"
+
+      {:ok, :post_swap} =
+        Store.mutate(store_name, fn {db, moment} ->
+          {:ok, db2} =
+            Xitdb.transact_ops(db, [{:put, "items[\"c\"]", "after_swap"}], base_moment: moment)
+
+          {:ok, {db2, Xitdb.moment_count(db2) - 1}, :post_swap}
+        end)
+
+      assert Store.root(store_name)["items"]["c"] == "after_swap"
+
+      assert :ok = GenServer.stop(pid, :normal, 1_000)
+
+      # Reopening a fresh Store on compacted_path acquires flock and sees post-swap writes
+      restarted_name = :"XitdbSwapFileStoreRestarted_#{System.unique_integer([:positive])}"
+      {:ok, pid2} = Store.start_link(name: restarted_name, path: compacted_path)
+
+      on_exit(fn ->
+        if Process.alive?(pid2) do
+          try do
+            GenServer.stop(pid2, :normal, 1_000)
+          catch
+            :exit, _ -> :ok
+          end
+        end
+      end)
+
+      assert Store.root(restarted_name)["items"]["a"] == "v2"
+      assert Store.root(restarted_name)["items"]["c"] == "after_swap"
+    end
+
+    test "Store.as_of/2 raises :invalid_moment when negative offset precedes moment 0" do
+      {store, _pid} = start_ephemeral_store()
+
+      err =
+        assert_raise Xitdb.Error, fn ->
+          Store.as_of(store, -2)
+        end
+
+      assert err.reason == :invalid_moment
+    end
+
+    test "active-lease :cancel_waiter and late expired :abort_lease reconcile tip and fence stale writer" do
+      {store, pid} = start_ephemeral_store(lease_timeout: 25)
+      parent = self()
+
+      {:ok, :seed} =
+        Store.mutate(store, fn {db, moment} ->
+          {:ok, db2} =
+            Xitdb.transact_ops(db, [{:init_col, "k", "hash_map"}, {:put, "k[\"v\"]", "init"}],
+              base_moment: moment
+            )
+
+          {:ok, {db2, Xitdb.moment_count(db2) - 1}, :seed}
+        end)
+
+      writer_a =
+        Task.async(fn ->
+          Store.transact(
+            store,
+            fn ->
+              {:ok, :staged} =
+                Store.mutate(store, fn {db, moment} ->
+                  {:ok, db2} =
+                    Xitdb.transact_ops(db, [{:put, "k[\"cancelled\"]", "bad"}],
+                      base_moment: moment
+                    )
+
+                  {:ok, {db2, Xitdb.moment_count(db2) - 1}, :staged}
+                end)
+
+              send(parent, :writer_a_staged)
+              receive do: (:writer_a_check_fenced -> :ok)
+
+              {db, moment} = Process.get({:xitdb_tx_state, store})
+
+              assert {:error, %Xitdb.Error{reason: :stale_write_epoch}} =
+                       Xitdb.transact_ops(db, [{:put, "k[\"after_cancel\"]", "bad"}],
+                         base_moment: moment
+                       )
+
+              :writer_a_done
+            end,
+            lease_timeout: 5_000,
+            timeout: 5_000
+          )
+        end)
+
+      assert_receive :writer_a_staged, 1_000
+      active = :sys.get_state(pid).queue.active
+      assert active != nil
+
+      waiter =
+        Task.async(fn ->
+          Store.transact(
+            store,
+            fn ->
+              assert Store.root(store)["k"]["cancelled"] == nil
+              :waiter_ok
+            end,
+            timeout: 5_000
+          )
+        end)
+
+      wait_until(fn -> :queue.len(:sys.get_state(pid).queue.waiters) == 1 end)
+
+      GenServer.cast(pid, {:cancel_waiter, active.req_ref})
+      assert {:ok, :waiter_ok} = Task.await(waiter, 2_000)
+
+      send(writer_a.pid, :writer_a_check_fenced)
+
+      assert {:error, %LeaseError{store: ^store, reason: :lease_expired}} =
+               Task.await(writer_a, 2_000)
+
+      assert Store.root(store)["k"]["cancelled"] == nil
+
+      # Late expired :abort_lease when queue.active == nil is ignored cleanly without crashing
+      wait_until(fn -> :sys.get_state(pid).queue.active == nil end)
+      GenServer.cast(pid, {:abort_lease, make_ref(), self()})
+      _ = :sys.get_state(pid)
+      assert Store.root(store)["k"]["v"] == "init"
+    end
+
+    test "empty-store (moment == -1) rollback clears staged keys and as_of/2 validates bounds in tx" do
+      {store, _pid} = start_ephemeral_store()
+      empty_db = Xitdb.open!(backend: :memory)
+      assert :ok = Store.swap_compacted_base(store, empty_db, nil, close_previous?: true)
+      assert Xitdb.Ash.Store.Snapshot.current_moment(store) == -1
+
+      # Snapshot.as_of/2 inside Store.transact on an empty store raises :invalid_moment
+      assert {:ok, :checked} =
+               Store.transact(store, fn ->
+                 assert_raise Xitdb.Error, ~r/invalid_moment/, fn ->
+                   Store.as_of(store, -1)
+                 end
+
+                 assert_raise Xitdb.Error, ~r/invalid_moment/, fn ->
+                   Store.as_of(store, 0)
+                 end
+
+                 :checked
+               end)
+
+      # Stage a write on the empty store, then roll back; root must remain empty
+      assert {:error, :abort_empty} =
+               Store.transact(store, fn ->
+                 assert {:ok, _} =
+                          Store.mutate(store, fn {db, moment} ->
+                            {:ok, db2} =
+                              Xitdb.transact_ops(db, [{:put, "leaked", "bad"}],
+                                base_moment: moment
+                              )
+
+                            {:ok, {db2, Xitdb.moment_count(db2) - 1}, :staged}
+                          end)
+
+                 # Concurrent reader outside the transaction (no $callers) must not dirty-read staged moment 0
+                 parent = self()
+                 spawn(fn -> send(parent, {:outside_read, Store.root(store)["leaked"]}) end)
+                 assert_receive {:outside_read, nil}, 1_000
+
+                 Store.rollback(store, :abort_empty)
+               end)
+
+      assert Enum.to_list(Store.root(store)) == []
+      assert Xitdb.Ash.Store.Snapshot.current_moment(store) == -1
+
+      # Xitdb.query/2 on empty_root preserves projected vars and rejects invalid Datalog syntax
+      assert {:ok, %{vars: ["?a"], rows: []}} =
+               Xitdb.query(Store.root(store), "find ?a where .items[?a] = 1")
+
+      assert {:error, %Xitdb.Error{}} = Xitdb.query(Store.root(store), "not valid datalog")
+
+      # Repeated no-op transactions on an already-reconciled empty store do not append extra moments
+      moments_before_noop = Xitdb.moment_count(:sys.get_state(store).db)
+      assert {:ok, :noop} = Store.transact(store, fn -> :noop end)
+      assert Xitdb.moment_count(:sys.get_state(store).db) == moments_before_noop
+
+      assert_raise Xitdb.Error, ~r/invalid_moment/, fn ->
+        Store.as_of(store, -1)
+      end
+
+      assert_raise Xitdb.Error, ~r/invalid_moment/, fn ->
+        Store.as_of(store, 0)
+      end
+
+      # Savepoint rollback on an empty store keeps working snapshot and committed moment at -1
+      assert {:ok, :outer_ok} =
+               Store.transact(store, fn ->
+                 assert {:error, :inner_abort} =
+                          Store.transact(store, fn ->
+                            assert {:ok, _} =
+                                     Store.mutate(store, fn {db, moment} ->
+                                       {:ok, db2} =
+                                         Xitdb.transact_ops(db, [{:put, "inner", "bad"}],
+                                           base_moment: moment
+                                         )
+
+                                       {:ok, {db2, Xitdb.moment_count(db2) - 1}, :staged}
+                                     end)
+
+                            Store.rollback(store, :inner_abort)
+                          end)
+
+                 assert Store.root(store)["inner"] == nil
+                 :outer_ok
+               end)
+
+      assert Xitdb.Ash.Store.Snapshot.current_moment(store) == -1
+
+      # Returning -1 from Store.mutate/3 on a populated store is rejected without wiping data
+      assert {:ok, :seeded} =
+               Store.mutate(store, fn {db, moment} ->
+                 {:ok, db2} = Xitdb.transact_ops(db, [{:put, "keep", "yes"}], base_moment: moment)
+                 {:ok, {db2, Xitdb.moment_count(db2) - 1}, :seeded}
+               end)
+
+      assert {:error, :invalid_moment} =
+               Store.mutate(store, fn {db, _moment} ->
+                 {:ok, {db, -1}, :bad}
+               end)
+
+      assert {:error, :invalid_moment} =
+               Store.mutate(store, fn {db, _moment} ->
+                 {:ok, {db, Xitdb.moment_count(db) + 5}, :out_of_bounds}
+               end)
+
+      # Failed nested mutate after writing reconciles tip so subsequent default-tip writes don't resurrect it
+      assert {:ok, :outer_done} =
+               Store.transact(store, fn ->
+                 assert {:error, :failed_after_write} =
+                          Store.mutate(store, fn {db, moment} ->
+                            {:ok, _db2} =
+                              Xitdb.transact_ops(db, [{:put, "ghost", "bad"}],
+                                base_moment: moment
+                              )
+
+                            {:error, :failed_after_write}
+                          end)
+
+                 assert {:ok, :ok_write} =
+                          Store.mutate(store, fn {db, _moment} ->
+                            {:ok, db2} = Xitdb.transact_ops(db, [{:put, "clean", "yes"}])
+                            {:ok, {db2, Xitdb.moment_count(db2) - 1}, :ok_write}
+                          end)
+
+                 :outer_done
+               end)
+
+      assert Store.root(store)["ghost"] == nil
+      assert Store.root(store)["clean"] == "yes"
+      assert Store.root(store)["keep"] == "yes"
+    end
+
+    test "swap_compacted_base/4 validates handle state and moment bounds" do
+      {store, _pid} = start_ephemeral_store()
+
+      closed_db = Xitdb.open!(backend: :memory)
+      :ok = Xitdb.close(closed_db)
+      assert {:error, %Xitdb.Error{reason: :closed}} = Store.swap_compacted_base(store, closed_db)
+
+      path =
+        Path.join(System.tmp_dir!(), "xitdb_swap_ro_#{System.unique_integer([:positive])}.xit")
+
+      try do
+        rw = Xitdb.open!(backend: :file, path: path)
+        {:ok, rw} = Xitdb.transact(rw, %{"k" => "v"})
+        ro = Xitdb.open!(backend: :file, path: path, read_only: true)
+
+        assert {:error, :read_only} = Store.swap_compacted_base(store, ro)
+        assert {:error, :invalid_moment} = Store.swap_compacted_base(store, rw, 5)
+        assert {:error, :invalid_moment} = Store.swap_compacted_base(store, rw, -2)
+
+        :ok = Xitdb.close(ro)
+        :ok = Xitdb.close(rw)
+      after
+        File.rm_rf(path)
+      end
     end
   end
 end

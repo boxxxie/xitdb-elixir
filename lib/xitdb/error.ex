@@ -10,6 +10,22 @@ defmodule Xitdb.Error do
         }
 
   @impl true
+  def message(%__MODULE__{reason: :file_locked, details: nil}) do
+    "Xitdb database file is locked by another writable handle"
+  end
+
+  def message(%__MODULE__{reason: :file_locked, details: details}) do
+    "Xitdb database file is locked by another writable handle: #{inspect(details)}"
+  end
+
+  def message(%__MODULE__{reason: :stale_write_epoch, details: nil}) do
+    "Xitdb write rejected due to stale write epoch"
+  end
+
+  def message(%__MODULE__{reason: :stale_write_epoch, details: details}) do
+    "Xitdb write rejected due to stale write epoch: #{inspect(details)}"
+  end
+
   def message(%__MODULE__{reason: reason, details: nil}) do
     "Xitdb operation failed: #{inspect(reason)}"
   end

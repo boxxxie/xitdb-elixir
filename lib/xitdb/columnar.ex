@@ -539,12 +539,22 @@ defmodule Xitdb.Columnar do
   # ============================================================================
 
   defp fetch_or_decode_page(col, field, page_id, db_ref, moment, opts) do
-    CacheOwner.ensure_started()
+    CacheOwner.ensure_tables_ready()
 
     max_bytes =
       Keyword.get(opts, :max_decompressed_bytes, Compression.default_max_decompressed_bytes())
 
-    cache_key = {:erlang.ref_to_list(db_ref), moment, col, field, page_id}
+    resolved_moment =
+      if moment < 0 do
+        case NIF.nif_moment_slot(db_ref, moment, true) do
+          {:ok, _tuple, idx} when is_integer(idx) -> idx
+          _ -> moment
+        end
+      else
+        moment
+      end
+
+    cache_key = {:erlang.ref_to_list(db_ref), resolved_moment, col, field, page_id}
 
     case :ets.lookup(@page_cache_table, cache_key) do
       [{^cache_key, %Page{} = page, raw_len, _ts}] ->
@@ -568,12 +578,12 @@ defmodule Xitdb.Columnar do
       [] ->
         bump_stat(:page_reads)
 
-        case NIF.nif_select(db_ref, moment, ["__col_pages", col, field, page_id], true) do
+        case NIF.nif_select(db_ref, resolved_moment, ["__col_pages", col, field, page_id], true) do
           {:ok, page_bin} when is_binary(page_bin) ->
             decode_opts =
               opts
               |> Keyword.take([:dictionary_bytes, :max_decompressed_bytes])
-              |> Keyword.merge(db_ref: db_ref, moment: moment)
+              |> Keyword.merge(db_ref: db_ref, moment: resolved_moment)
 
             bump_stat(:page_decompressions)
 

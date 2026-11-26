@@ -121,33 +121,73 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       {base_db, atomics, _reverse_fks} = fetch_slot!(store)
 
       case :atomics.get(atomics, 1) do
-        @uncommitted_moment -> base_db
-        moment -> Xitdb.as_of(base_db, moment)
+        @uncommitted_moment ->
+          case base_db do
+            %Xitdb{db_ref: db_ref} -> Xitdb.Cursor.empty_root(db_ref)
+            other -> other
+          end
+
+        moment ->
+          Xitdb.as_of(base_db, moment)
       end
     end
 
     @doc """
     Returns a root `%Xitdb.Cursor{}` pinned to `moment` on the caller's active store handle
     (transaction, `TestSandbox`, or committed `Snapshot`).
+
+    Moment indices address the underlying append-only log up to `visible_moment`, including
+    reconciled/aborted moments.
     """
     @spec as_of(module(), integer()) :: Xitdb.Cursor.t()
     def as_of(store, moment) when is_atom(store) and is_integer(moment) do
       tx_key = {:xitdb_tx_db, store}
       callers = Process.get(:"$callers")
 
-      active_handle =
-        Process.get(tx_key) ||
-          caller_dict_lookup(callers, tx_key, tx_key) ||
-          sandbox_or_committed_db(store)
+      {base_db, visible_moment} =
+        case Process.get(tx_key) || caller_dict_lookup(callers, tx_key, tx_key) do
+          %Xitdb{} = db ->
+            {db, @uncommitted_moment}
 
-      base_db =
-        case active_handle do
-          %Xitdb{} = db -> db
-          %Xitdb.Cursor{db_ref: db_ref} -> struct(Xitdb, db_ref: db_ref)
-          {%Xitdb{} = db, _moment} -> db
+          %Xitdb.Cursor{db_ref: db_ref, moment: m} ->
+            {%Xitdb{db_ref: db_ref, backend: :memory}, m}
+
+          {%Xitdb{} = db, m} ->
+            {db, m}
+
+          nil ->
+            case sandbox_db(store) do
+              {:ok, %Xitdb.Cursor{db_ref: db_ref, moment: m}} ->
+                {%Xitdb{db_ref: db_ref, backend: :memory}, m}
+
+              {:ok, %Xitdb{} = db} ->
+                {db, @uncommitted_moment}
+
+              :none ->
+                {slot_db, atomics, _reverse_fks} = fetch_slot!(store)
+                {slot_db, :atomics.get(atomics, 1)}
+            end
         end
 
-      Xitdb.as_of(base_db, moment)
+      cond do
+        not is_integer(visible_moment) ->
+          Xitdb.as_of(base_db, moment)
+
+        moment < 0 ->
+          resolved = visible_moment + 1 + moment
+
+          if resolved >= 0 do
+            Xitdb.as_of(base_db, resolved)
+          else
+            raise Xitdb.Error, reason: :invalid_moment, details: %{moment_index: moment}
+          end
+
+        moment > visible_moment ->
+          raise Xitdb.Error, reason: :invalid_moment, details: %{moment_index: moment}
+
+        true ->
+          Xitdb.as_of(base_db, moment)
+      end
     end
 
     @doc """
@@ -194,13 +234,17 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     defp caller_dict_lookup(_callers, _as_of_key, _tx_key), do: nil
 
     defp sandbox_or_committed_db(store) do
+      case sandbox_db(store) do
+        {:ok, sandbox_db} -> sandbox_db
+        :none -> committed_db(store)
+      end
+    end
+
+    defp sandbox_db(store) do
       if Code.ensure_loaded?(TestSandbox) and function_exported?(TestSandbox, :checkout_db, 1) do
-        case apply(TestSandbox, :checkout_db, [store]) do
-          {:ok, sandbox_db} -> sandbox_db
-          :none -> committed_db(store)
-        end
+        apply(TestSandbox, :checkout_db, [store])
       else
-        committed_db(store)
+        :none
       end
     end
 
