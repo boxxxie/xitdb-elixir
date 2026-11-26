@@ -1163,6 +1163,17 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       assert Enum.to_list(Store.root(store)) == []
       assert Xitdb.Ash.Store.Snapshot.current_moment(store) == -1
 
+      # Xitdb.query/2 on empty_root preserves projected vars and rejects invalid Datalog syntax
+      assert {:ok, %{vars: ["?a"], rows: []}} =
+               Xitdb.query(Store.root(store), "find ?a where .items[?a] = 1")
+
+      assert {:error, %Xitdb.Error{}} = Xitdb.query(Store.root(store), "not valid datalog")
+
+      # Repeated no-op transactions on an already-reconciled empty store do not append extra moments
+      moments_before_noop = Xitdb.moment_count(:sys.get_state(store).db)
+      assert {:ok, :noop} = Store.transact(store, fn -> :noop end)
+      assert Xitdb.moment_count(:sys.get_state(store).db) == moments_before_noop
+
       assert_raise Xitdb.Error, ~r/invalid_moment/, fn ->
         Store.as_of(store, -1)
       end
@@ -1207,6 +1218,35 @@ if Code.ensure_loaded?(Ash.DataLayer) do
                  {:ok, {db, -1}, :bad}
                end)
 
+      assert {:error, :invalid_moment} =
+               Store.mutate(store, fn {db, _moment} ->
+                 {:ok, {db, Xitdb.moment_count(db) + 5}, :out_of_bounds}
+               end)
+
+      # Failed nested mutate after writing reconciles tip so subsequent default-tip writes don't resurrect it
+      assert {:ok, :outer_done} =
+               Store.transact(store, fn ->
+                 assert {:error, :failed_after_write} =
+                          Store.mutate(store, fn {db, moment} ->
+                            {:ok, _db2} =
+                              Xitdb.transact_ops(db, [{:put, "ghost", "bad"}],
+                                base_moment: moment
+                              )
+
+                            {:error, :failed_after_write}
+                          end)
+
+                 assert {:ok, :ok_write} =
+                          Store.mutate(store, fn {db, _moment} ->
+                            {:ok, db2} = Xitdb.transact_ops(db, [{:put, "clean", "yes"}])
+                            {:ok, {db2, Xitdb.moment_count(db2) - 1}, :ok_write}
+                          end)
+
+                 :outer_done
+               end)
+
+      assert Store.root(store)["ghost"] == nil
+      assert Store.root(store)["clean"] == "yes"
       assert Store.root(store)["keep"] == "yes"
     end
 

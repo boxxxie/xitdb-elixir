@@ -263,6 +263,10 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         case fun.(snapshot) do
           {:ok, {new_db, new_moment} = next_snapshot, result} ->
             if Backend.invalid_mutate_moment?(old_db, old_moment, prev_tail, new_db, new_moment) do
+              if Backend.latest_moment(old_db) > prev_tail do
+                restore_savepoint_snapshot(store, snapshot)
+              end
+
               {:error, :invalid_moment}
             else
               put_working_snapshot(store, next_snapshot)
@@ -270,6 +274,10 @@ if Code.ensure_loaded?(Ash.DataLayer) do
             end
 
           {:error, reason} ->
+            if Backend.latest_moment(old_db) > prev_tail do
+              restore_savepoint_snapshot(store, snapshot)
+            end
+
             {:error, normalize_lease_error(store, reason)}
         end
       else
@@ -1138,7 +1146,10 @@ if Code.ensure_loaded?(Ash.DataLayer) do
               (new_db.db_ref != old_db.db_ref and latest_moment(new_db) >= 0)
 
           true ->
-            false
+            case Xitdb.info(new_db) do
+              {:ok, %{moment_count: count}} -> new_moment >= count
+              {:error, _} -> false
+            end
         end
       end
 
@@ -1168,12 +1179,26 @@ if Code.ensure_loaded?(Ash.DataLayer) do
             ops_and_base =
               if target_moment < 0 do
                 try do
-                  delete_ops =
-                    db
-                    |> Xitdb.as_of(tail_moment)
-                    |> Enum.map(fn {key, _val} -> {:rm_if_exists, [key]} end)
+                  tail_cursor = Xitdb.as_of(db, tail_moment)
 
-                  {:ok, delete_ops ++ [{:meta, "restored_moment", target_moment}], tail_moment}
+                  delete_ops =
+                    for {key, _val} <- tail_cursor, key != "__tx" do
+                      {:rm_if_exists, [key]}
+                    end
+
+                  if delete_ops == [] and
+                       match?(
+                         {:ok,
+                          %{
+                            "action_name" => "rollback_tip",
+                            "restored_moment" => ^target_moment
+                          }},
+                         Xitdb.tx_meta(tail_cursor)
+                       ) do
+                    :already_reconciled
+                  else
+                    {:ok, delete_ops ++ [{:meta, "restored_moment", target_moment}], tail_moment}
+                  end
                 rescue
                   _ in Xitdb.Error -> :error
                 end
@@ -1211,7 +1236,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
                     {db, target_moment}
                 end
 
-              :error ->
+              status when status in [:already_reconciled, :error] ->
                 {db, target_moment}
             end
 
