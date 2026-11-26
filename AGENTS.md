@@ -19,6 +19,7 @@ This document provides the architecture, build/test/benchmark commands, and deve
   - [`lib/xitdb/tx_compiler.ex`](lib/xitdb/tx_compiler.ex): Compiles nested Elixir maps, collections, and staged `put_in`/`update_in`/`pop_in` cursor edits into coarse-grained NIF transaction operations.
   - [`lib/xitdb/sigils.ex`](lib/xitdb/sigils.ex): Compile-time validated `~x` (selector) and `~q` (Datalog) sigils.
   - [`lib/xitdb/nif.ex`](lib/xitdb/nif.ex): `@on_load` loader for `priv/xitdb_nif.so`.
+  - [`lib/xitdb/fallback.ex`](lib/xitdb/fallback.ex): Standardized observable read-only fallback helper (`Xitdb.Fallback.run/2,3`, `Xitdb.Fallback.try_run/3,4`) emitting `[:xitdb, :fallback, :used]` telemetry and warnings.
 - **`docs/`** — Dedicated reference guides:
   - Core concepts: [`docs/access-and-enumerable.md`](docs/access-and-enumerable.md), [`docs/collections-and-indexing.md`](docs/collections-and-indexing.md), [`docs/time-travel-and-storage.md`](docs/time-travel-and-storage.md).
   - DSLs, queries & Ash: [`docs/transaction-dsl.md`](docs/transaction-dsl.md), [`docs/path-and-pull-dsl.md`](docs/path-and-pull-dsl.md), [`docs/datalog-dsl.md`](docs/datalog-dsl.md), [`docs/ash-and-spark.md`](docs/ash-and-spark.md).
@@ -59,6 +60,11 @@ mix test --trace
 # 5. Run ExFuzz regression corpus & bounded coverage-guided fuzzing
 mix test --only fuzz
 mix fuzz test/fuzz/parsers_and_codecs_fuzz_test.exs:90 --max-runs 50000
+
+# 6. Run Credo strict & diff-scoped mutation testing (muex)
+mix credo --strict
+mix muex --since master --mirror native
+mix muex --files "lib/xitdb/fallback.ex" --test-paths "test/xitdb/fallback_test.exs" --mirror native --no-filter
 ```
 
 ---
@@ -69,3 +75,4 @@ mix fuzz test/fuzz/parsers_and_codecs_fuzz_test.exs:90 --max-runs 50000
 - **Zero Warnings & Clean Formatting**: Always ensure `mix precommit` passes with zero warnings.
 - **Odin NIF Memory Hygiene**: Every NIF entrypoint in [`native/xitdb_nif.odin`](native/xitdb_nif.odin) that uses `context.temp_allocator` must call `defer free_all(context.temp_allocator)` before returning to the BEAM scheduler.
 - **4-Layer Client ATDD Architecture**: Add new behavioral tests as scenarios in `test/features/*_spec.exs` using `@given`, `@upon`, and `@then` steps wired through `Xitdb.TestDSL.ClientDSL` and `Xitdb.TestDrivers.ClientDriver`.
+- **No Success-Shaped Fallbacks (`Xitdb.Fallback`)**: Never write ad-hoc `rescue` blocks returning `:ok`/defaults, `_ -> :ok` catch-alls, early `:ok` on missing required slots/records, or silent config defaults. Route legitimate read-only/planner/cache fallbacks that pass the 3-question gate through `Xitdb.Fallback.run/2,3` or `Xitdb.Fallback.try_run/3,4`. Never use fallbacks on write, transaction, NIF, lease-fencing, compaction, or Ash mutator paths (fail fast with `{:error, ...}` or raise). Enforced via `Credo.Check.Warning.NoBusinessLogicRescue` ([`credo/checks/no_business_logic_rescue.ex`](credo/checks/no_business_logic_rescue.ex)). For diff-scoped mutation testing on PRs, run `mix muex --since master --mirror native` (or use the zero-dependency agent diff-mutation fallback: delete each newly added `rescue`, catch-all, or default one at a time, re-run targeted tests, and either add the missing test or delete the dead fallback).

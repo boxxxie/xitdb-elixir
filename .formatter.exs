@@ -75,7 +75,7 @@ spark_locals_without_parens = [
 exported_locals = dsl_locals_without_parens ++ spark_locals_without_parens
 
 [
-  inputs: ["{mix,.formatter}.exs", "{config,lib,test,benchmarks}/**/*.{ex,exs}"],
+  inputs: ["{mix,.formatter,.credo}.exs", "{config,lib,test,benchmarks,credo}/**/*.{ex,exs}"],
   locals_without_parens: exported_locals ++ [scenario: 2, fuzz: 3, fuzz: 4, fuzz: 5],
   export: [locals_without_parens: exported_locals]
 ]

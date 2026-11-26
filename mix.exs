@@ -57,6 +57,8 @@ defmodule Xitdb.MixProject do
       {:simple_sat, "~> 0.1", only: :test},
       {:stream_data, "~> 1.1", optional: true},
       {:ex_fuzz, "~> 0.1.0", only: [:dev, :test]},
+      {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
+      {:muex, "~> 0.13.1", only: [:dev, :test], runtime: false},
       {:ex_doc, "~> 0.35", only: :dev, runtime: false}
     ]
   end
@@ -116,7 +118,8 @@ defmodule Xitdb.MixProject do
           Xitdb.Collection,
           Xitdb.Key,
           Xitdb.Encoder,
-          Xitdb.Error
+          Xitdb.Error,
+          Xitdb.Fallback
         ],
         "Compression & Columnar Storage": [
           Xitdb.Compression,
@@ -172,6 +175,7 @@ defmodule Xitdb.MixProject do
       precommit: [
         "format --check-formatted",
         "compile --warnings-as-errors",
+        "credo --strict",
         "test"
       ]
     ]
