@@ -1,0 +1,8 @@
+{
+  "track_id": "concurrency_locking_and_lease_fencing_20261125",
+  "type": "bug",
+  "status": "in_progress",
+  "created_at": "2026-11-25T16:51:36+08:00",
+  "updated_at": "2026-11-26T16:15:00+08:00",
+  "description": "Enforce cross-process flock, NIF write_epoch lease fencing, ordered rollback, and ETS cache/sandbox safety"
+}

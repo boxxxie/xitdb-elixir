@@ -6,4 +6,5 @@ Completed tracks (**Waves 0–5**, benchmark/optimization tracks, **bugfix slice
 
 ---
 
-*No open tracks remaining.*
+- [~] **Track: Concurrency Locking, Write-Epoch Lease Fencing & Crash-Safe Rollback** *(PR #15 — `fix/concurrency-locking-and-lease-fencing`)*
+  *Link: [./tracks/concurrency_locking_and_lease_fencing_20261125/](./tracks/concurrency_locking_and_lease_fencing_20261125/)*
