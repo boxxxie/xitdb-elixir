@@ -562,7 +562,9 @@ defmodule Xitdb.CacheOwnerResilienceTest do
                put_in(root["items"]["1"]["a"], "from_m1")
              end)
 
-    assert is_map(Xitdb.db(db)["items"])
+    items = Xitdb.db(db)["items"]
+    assert items["1"]["a"] == "a1"
+    assert items["2"]["a"] == "a2"
   end
 
   test "concurrent Xitdb.transact/2 on an empty db detects stale_base_moment and avoids torn reads" do

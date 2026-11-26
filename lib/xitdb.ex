@@ -446,36 +446,33 @@ defmodule Xitdb do
 
               {cursor, opts}
 
+            {:ok, _tuple, -1} ->
+              opts = put_base_moment_opt(validated_or_default, {:strict, -1})
+
+              cursor = %Cursor{
+                db_ref: db_ref,
+                tag: :hash_map,
+                tag_id: 4,
+                value: 0,
+                moment: -1,
+                root: true,
+                tx_mode: true
+              }
+
+              {cursor, opts}
+
             _ ->
-              case NIF.nif_info(db_ref) do
-                {:ok, %{moment_count: 0}} ->
-                  opts = put_base_moment_opt(validated_or_default, {:strict, -1})
+              cursor = %Cursor{
+                db_ref: db_ref,
+                tag: :hash_map,
+                tag_id: -1,
+                value: base_moment,
+                moment: base_moment,
+                root: true,
+                tx_mode: true
+              }
 
-                  cursor = %Cursor{
-                    db_ref: db_ref,
-                    tag: :hash_map,
-                    tag_id: 4,
-                    value: 0,
-                    moment: -1,
-                    root: true,
-                    tx_mode: true
-                  }
-
-                  {cursor, opts}
-
-                _ ->
-                  cursor = %Cursor{
-                    db_ref: db_ref,
-                    tag: :hash_map,
-                    tag_id: -1,
-                    value: base_moment,
-                    moment: base_moment,
-                    root: true,
-                    tx_mode: true
-                  }
-
-                  {cursor, validated_or_default}
-              end
+              {cursor, validated_or_default}
           end
 
         base_moment < -1 ->
@@ -1419,8 +1416,21 @@ defmodule Xitdb do
       when is_binary(query_str) do
     with {:ok, validated} <- validate_opts(opts, @query_schema) do
       case Keyword.get(validated, :moment) do
-        nil -> {:ok, %{vars: [], rows: []}}
-        moment -> do_query(db_ref, moment, query_str, validated)
+        nil ->
+          case NIF.nif_open(:memory, "", :sha1, false) do
+            {:ok, empty_ref} ->
+              try do
+                do_query(empty_ref, -1, query_str, validated)
+              after
+                NIF.nif_close(empty_ref)
+              end
+
+            {:error, reason} ->
+              {:error, %Error{reason: reason}}
+          end
+
+        moment ->
+          do_query(db_ref, moment, query_str, validated)
       end
     end
   end
