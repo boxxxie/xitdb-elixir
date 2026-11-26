@@ -452,6 +452,101 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       assert {:error, :sandbox_checked_in} = Task.await(waiter, 1_000)
     end
 
+    test "active-lease :cancel_waiter and late expired :abort reconcile sandbox tip and fence stale writer" do
+      store = start_sandboxed_store()
+      :ok = TestSandbox.checkout([store], lease_timeout: 5_000)
+      owner = self()
+      [{_, coord_pid}] = :ets.lookup(:xitdb_ash_sandbox_checkouts, {:coord, store, owner})
+
+      writer_a =
+        Task.async(fn ->
+          TestSandbox.allow([store], owner, self())
+
+          Store.transact(
+            store,
+            fn ->
+              {:ok, :staged} =
+                Store.mutate(store, fn {db, moment} ->
+                  {:ok, db2} =
+                    Xitdb.transact_ops(db, [{:put, "entries[\"cancelled\"]", "bad"}],
+                      base_moment: moment
+                    )
+
+                  {:ok, {db2, Xitdb.moment_count(db2) - 1}, :staged}
+                end)
+
+              send(owner, :sandbox_writer_a_staged)
+              receive do: (:sandbox_writer_a_check_fenced -> :ok)
+
+              {db, moment} = Process.get({:xitdb_tx_state, store})
+
+              assert {:error, %Xitdb.Error{reason: :stale_write_epoch}} =
+                       Xitdb.transact_ops(db, [{:put, "entries[\"after_cancel\"]", "bad"}],
+                         base_moment: moment
+                       )
+
+              :writer_a_done
+            end,
+            lease_timeout: 5_000,
+            timeout: 5_000
+          )
+        end)
+
+      assert_receive :sandbox_writer_a_staged, 1_000
+      active = :sys.get_state(coord_pid).queues[store].active
+      assert active != nil
+
+      waiter =
+        Task.async(fn ->
+          TestSandbox.allow([store], owner, self())
+
+          Store.transact(
+            store,
+            fn ->
+              assert Store.root(store)["entries"]["cancelled"] == nil
+              :waiter_ok
+            end,
+            timeout: 5_000
+          )
+        end)
+
+      wait_until_sandbox(fn ->
+        :queue.len(:sys.get_state(coord_pid).queues[store].waiters) == 1
+      end)
+
+      GenServer.cast(coord_pid, {:cancel_waiter, store, active.req_ref})
+      assert {:ok, :waiter_ok} = Task.await(waiter, 2_000)
+
+      send(writer_a.pid, :sandbox_writer_a_check_fenced)
+
+      assert {:error, %LeaseError{store: ^store, reason: :lease_expired}} =
+               Task.await(writer_a, 2_000)
+
+      assert Store.root(store)["entries"]["cancelled"] == nil
+
+      # Late expired :abort when queue.active == nil keeps the sandbox healthy
+      wait_until_sandbox(fn -> :sys.get_state(coord_pid).queues[store].active == nil end)
+      GenServer.cast(coord_pid, {:abort, store, make_ref(), self()})
+      _ = :sys.get_state(coord_pid)
+      assert Store.root(store)["entries"]["seed"] == "from_template"
+    end
+
+    test "swap_compacted_base with close_previous?: false keeps pre-swap sandbox cursors readable" do
+      store = start_sandboxed_store()
+      assert :ok = TestSandbox.checkout([store])
+      on_exit(fn -> TestSandbox.checkin([store]) end)
+
+      pre_cursor = Store.root(store)
+      assert pre_cursor["entries"]["seed"] == "from_template"
+
+      compacted = Xitdb.open!(backend: :memory)
+      {:ok, compacted} = Xitdb.transact(compacted, %{"entries" => %{"seed" => "compacted"}})
+
+      assert :ok = Store.swap_compacted_base(store, compacted, nil, close_previous?: false)
+      assert Store.root(store)["entries"]["seed"] == "compacted"
+      assert pre_cursor["entries"]["seed"] == "from_template"
+    end
+
     defp wait_until_sandbox(pred, attempts \\ 200)
     defp wait_until_sandbox(_pred, 0), do: flunk("Sandbox condition not met")
 
