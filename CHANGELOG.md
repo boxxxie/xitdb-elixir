@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.5.0] - 2026-11-26
+
+### Added
+- **Standardized Observable Fallback Helper (`Xitdb.Fallback`):**
+  - Added `Xitdb.Fallback.run/2,3` and `Xitdb.Fallback.try_run/3,4` emitting `[:xitdb, :fallback, :used]` telemetry and structured warning logs for legitimate read-only, query-planner, cache-miss, and display-only fallbacks.
+  - Replaced ad-hoc `rescue` blocks and silent catch-all defaults across `Xitdb.Ash.DataLayer`, `Xitdb.Ash.Query`, `Xitdb.Ash.Store`, `Xitdb.Ash.Store.Snapshot`, `Xitdb.Ash.Types.FixedDecimal64`, `Xitdb.Compression`, and `Xitdb.Key` with `Xitdb.Fallback` or explicit error paths.
+- **Fallback & Mutation Guardrails (`Credo.Check.Warning.NoBusinessLogicRescue`, `muex`):**
+  - Added custom Credo check `Credo.Check.Warning.NoBusinessLogicRescue` (`credo/checks/no_business_logic_rescue.ex`) wired into `.credo.exs` and `mix precommit`.
+  - Added `muex` (`~> 0.3.2`) for diff-scoped and coverage-guided mutation testing.
+
+### Changed
+- **Dependencies:**
+  - Updated `ash` (`3.37.7` -> `3.38.1`) in `mix.lock` and `native/xitdb-odin` submodule to `v2.2.2` (`cf7e585`).
+
 ## [2.4.2] - 2026-11-23
 
 ### Fixed
