@@ -25,6 +25,12 @@ if Code.ensure_loaded?(Ash.DataLayer) do
             waiters: :queue.queue(waiter())
           }
 
+    @type snapshot_source ::
+            Xitdb.Ash.Store.working_snapshot()
+            | (-> Xitdb.Ash.Store.working_snapshot()
+                  | {:ok, Xitdb.Ash.Store.working_snapshot()}
+                  | {:error, term()})
+
     @spec new() :: t()
     def new, do: %__MODULE__{}
 
@@ -64,7 +70,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       {:queued, %__MODULE__{queue | waiters: :queue.in(waiter, queue.waiters)}}
     end
 
-    @spec cancel_waiter(t(), reference(), term(), term()) :: t()
+    @spec cancel_waiter(t(), reference(), term(), snapshot_source()) :: t()
     def cancel_waiter(
           %__MODULE__{active: %{req_ref: req_ref} = active} = queue,
           req_ref,
@@ -86,13 +92,13 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     def verify_holder(%__MODULE__{active: %{ref: ref, holder: pid}}, ref, pid), do: :ok
     def verify_holder(%__MODULE__{}, _ref, _pid), do: {:error, :lease_expired}
 
-    @spec release_and_grant_next(t(), term(), term()) :: t()
+    @spec release_and_grant_next(t(), term(), snapshot_source()) :: t()
     def release_and_grant_next(%__MODULE__{active: active} = queue, owner_key, latest_snapshot) do
       cleanup_active(active)
       grant_next_waiter(%__MODULE__{queue | active: nil}, owner_key, latest_snapshot)
     end
 
-    @spec handle_down(t(), reference(), term(), term()) :: {:matched, t()} | :unmatched
+    @spec handle_down(t(), reference(), term(), snapshot_source()) :: {:matched, t()} | :unmatched
     def handle_down(
           %__MODULE__{active: %{monitor_ref: mref} = active} = queue,
           mref,
@@ -105,7 +111,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
     def handle_down(%__MODULE__{}, _mref, _owner_key, _latest_snapshot), do: :unmatched
 
-    @spec handle_expired(t(), reference(), term(), term()) :: {:matched, t()} | :unmatched
+    @spec handle_expired(t(), reference(), term(), snapshot_source()) ::
+            {:matched, t()} | :unmatched
     def handle_expired(
           %__MODULE__{active: %{ref: ref} = active} = queue,
           ref,
@@ -136,21 +143,35 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
       case :queue.out(queue.waiters) do
         {:empty, _} ->
-          %__MODULE__{queue | active: nil}
+          %{queue | active: nil}
 
         {{:value, waiter}, rest} ->
-          next_queue = %__MODULE__{queue | waiters: rest}
+          next_queue = %{queue | waiters: rest}
           {caller_pid, _tag} = waiter.from
 
           if waiter_alive_and_valid?(caller_pid, waiter, now_ms) do
-            {lease_ref, active} =
-              build_active_lease(owner_key, waiter.req_ref, caller_pid, waiter.lease_timeout)
-
-            granted_snapshot =
+            resolved =
               if is_function(latest_snapshot, 0), do: latest_snapshot.(), else: latest_snapshot
 
-            GenServer.reply(waiter.from, {:ok, lease_ref, granted_snapshot})
-            %__MODULE__{next_queue | active: active}
+            case resolved do
+              {:error, _} = err ->
+                GenServer.reply(waiter.from, err)
+                cancel_all(%{next_queue | active: nil}, err)
+
+              {:ok, granted_snapshot} ->
+                {lease_ref, active} =
+                  build_active_lease(owner_key, waiter.req_ref, caller_pid, waiter.lease_timeout)
+
+                GenServer.reply(waiter.from, {:ok, lease_ref, granted_snapshot})
+                %{next_queue | active: active}
+
+              granted_snapshot ->
+                {lease_ref, active} =
+                  build_active_lease(owner_key, waiter.req_ref, caller_pid, waiter.lease_timeout)
+
+                GenServer.reply(waiter.from, {:ok, lease_ref, granted_snapshot})
+                %{next_queue | active: active}
+            end
           else
             grant_next_waiter(next_queue, owner_key, latest_snapshot)
           end

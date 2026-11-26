@@ -35,7 +35,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     alias Xitdb.Ash.{Info, LeaseError, TestSandbox}
     alias Xitdb.Ash.Store.{Backend, LeaseQueue, Snapshot}
 
-    @type working_snapshot :: {Xitdb.t(), non_neg_integer()}
+    @type working_snapshot :: {Xitdb.t(), integer()}
     @type reverse_fk :: %{
             :source_resource => module(),
             :source_collection => atom() | nil,
@@ -81,15 +81,16 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
     defmodule State do
       @moduledoc false
-      defstruct [:name, :path, :db, :moment, :lease_timeout, :queue]
+      defstruct [:name, :path, :db, :moment, :lease_timeout, :queue, next_write_epoch: nil]
 
       @type t :: %__MODULE__{
               name: module(),
               path: String.t() | :memory,
               db: Xitdb.t(),
-              moment: non_neg_integer(),
+              moment: integer(),
               lease_timeout: timeout(),
-              queue: LeaseQueue.t()
+              queue: LeaseQueue.t(),
+              next_write_epoch: {reference(), pos_integer()} | nil
             }
     end
 
@@ -139,7 +140,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         @spec rollback(term()) :: no_return()
         def rollback(reason), do: Xitdb.Ash.Store.rollback(__MODULE__, reason)
 
-        @spec swap_compacted_base(Xitdb.t(), non_neg_integer() | nil, keyword()) ::
+        @spec swap_compacted_base(Xitdb.t(), integer() | nil, keyword()) ::
                 :ok | {:error, term()}
         def swap_compacted_base(compacted_db, moment \\ nil, opts \\ []),
           do: Xitdb.Ash.Store.swap_compacted_base(__MODULE__, compacted_db, moment, opts)
@@ -256,12 +257,17 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           ) :: {:ok, term()} | {:error, term()}
     def mutate(store, fun, opts \\ []) when is_atom(store) and is_function(fun, 1) do
       if in_transaction?(store) do
-        snapshot = Process.get(tx_state_key(store))
+        {old_db, old_moment} = snapshot = Process.get(tx_state_key(store))
+        prev_tail = Backend.latest_moment(old_db)
 
         case fun.(snapshot) do
-          {:ok, {_new_db, _new_moment} = next_snapshot, result} ->
-            put_working_snapshot(store, next_snapshot)
-            {:ok, result}
+          {:ok, {new_db, new_moment} = next_snapshot, result} ->
+            if Backend.invalid_mutate_moment?(old_db, old_moment, prev_tail, new_db, new_moment) do
+              {:error, :invalid_moment}
+            else
+              put_working_snapshot(store, next_snapshot)
+              {:ok, result}
+            end
 
           {:error, reason} ->
             {:error, normalize_lease_error(store, reason)}
@@ -270,12 +276,23 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         transact(
           store,
           fn ->
-            snapshot = Process.get(tx_state_key(store))
+            {old_db, old_moment} = snapshot = Process.get(tx_state_key(store))
+            prev_tail = Backend.latest_moment(old_db)
 
             case fun.(snapshot) do
-              {:ok, {_new_db, _new_moment} = next_snapshot, result} ->
-                put_working_snapshot(store, next_snapshot)
-                result
+              {:ok, {new_db, new_moment} = next_snapshot, result} ->
+                if Backend.invalid_mutate_moment?(
+                     old_db,
+                     old_moment,
+                     prev_tail,
+                     new_db,
+                     new_moment
+                   ) do
+                  rollback(store, :invalid_moment)
+                else
+                  put_working_snapshot(store, next_snapshot)
+                  result
+                end
 
               {:error, reason} ->
                 rollback(store, normalize_lease_error(store, reason))
@@ -340,20 +357,76 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     end
 
     @doc """
-    Atomically replaces the active `%Xitdb{}` handle inside an exclusive transaction on `store`.
+    Atomically replaces the active `%Xitdb{}` handle on `store` outside an open transaction.
+
+    Note: Supervisor restarts reopen the original configured `:path` unless the underlying file
+    is atomically replaced on disk.
+
+    Options:
+    - `:close_previous?` — when `true`, closes the previous `%Xitdb{}` handle after a successful
+      swap (default `false`).
+    - `:expected_moment` — if provided, verifies that the store's current committed moment matches
+      before swapping, returning `{:error, :stale_compaction_base}` if another commit landed.
+    - `:expected_db_ref` — if provided, verifies that the store's current `db.db_ref` matches
+      before swapping, returning `{:error, :stale_compaction_base}` on mismatch.
     """
-    @spec swap_compacted_base(module(), Xitdb.t(), non_neg_integer() | nil, keyword()) ::
+    @spec swap_compacted_base(module(), Xitdb.t(), integer() | nil, keyword()) ::
             :ok | {:error, term()}
     def swap_compacted_base(store, %Xitdb{} = compacted_db, moment \\ nil, opts \\ [])
         when is_atom(store) and is_list(opts) do
-      target_moment =
-        if is_integer(moment), do: moment, else: max(Xitdb.moment_count(compacted_db) - 1, 0)
+      cond do
+        in_transaction?(store) ->
+          {:error, :swap_inside_transaction}
 
-      case mutate(store, fn _snapshot -> {:ok, {compacted_db, target_moment}, :ok} end, opts) do
-        {:ok, :ok} -> :ok
-        {:error, _} = err -> err
+        compacted_db.read_only ->
+          {:error, :read_only}
+
+        true ->
+          with {:ok, %{moment_count: count}} <- Xitdb.info(compacted_db),
+               {:ok, target_moment} <- validate_swap_moment(moment, count) do
+            close_previous? = Keyword.get(opts, :close_previous?, false)
+            expected_moment = Keyword.get(opts, :expected_moment)
+            expected_db_ref = Keyword.get(opts, :expected_db_ref)
+
+            case mutate(
+                   store,
+                   fn {old_db, old_moment} ->
+                     cond do
+                       expected_moment != nil and old_moment != expected_moment ->
+                         {:error, :stale_compaction_base}
+
+                       expected_db_ref != nil and old_db.db_ref != expected_db_ref ->
+                         {:error, :stale_compaction_base}
+
+                       true ->
+                         {:ok, {compacted_db, target_moment}, old_db}
+                     end
+                   end,
+                   Keyword.drop(opts, [:close_previous?, :expected_moment, :expected_db_ref])
+                 ) do
+              {:ok, old_db} ->
+                if close_previous? and old_db.db_ref != compacted_db.db_ref do
+                  _ = Backend.close_db(old_db)
+                end
+
+                :ok
+
+              {:error, _} = err ->
+                err
+            end
+          end
       end
     end
+
+    defp validate_swap_moment(nil, count), do: {:ok, count - 1}
+    defp validate_swap_moment(-1, count), do: {:ok, count - 1}
+
+    defp validate_swap_moment(moment, count)
+         when is_integer(moment) and moment >= 0 and moment < count do
+      {:ok, moment}
+    end
+
+    defp validate_swap_moment(_moment, _count), do: {:error, :invalid_moment}
 
     # -- GenServer Callbacks --
 
@@ -399,21 +472,47 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
       snapshot = {state.db, state.moment}
 
-      case LeaseQueue.acquire(
-             state.queue,
-             state.name,
-             req_ref,
-             from,
-             lease_timeout,
-             call_timeout,
-             snapshot
-           ) do
-        {:granted, lease_ref, next_queue} ->
-          {:reply, {:ok, lease_ref, Backend.fence_snapshot(snapshot)},
-           %State{state | queue: next_queue}}
+      if state.queue.active == nil do
+        db_ref = state.db.db_ref
 
-        {:queued, next_queue} ->
-          {:noreply, %State{state | queue: next_queue}}
+        fenced_result =
+          case state.next_write_epoch do
+            {^db_ref, epoch} -> {:ok, {%{state.db | write_epoch: epoch}, state.moment}}
+            _ -> Backend.fence_snapshot(snapshot)
+          end
+
+        case fenced_result do
+          {:ok, fenced_snapshot} ->
+            {:granted, lease_ref, next_queue} =
+              LeaseQueue.acquire(
+                state.queue,
+                state.name,
+                req_ref,
+                from,
+                lease_timeout,
+                call_timeout,
+                snapshot
+              )
+
+            {:reply, {:ok, lease_ref, fenced_snapshot},
+             %{state | queue: next_queue, next_write_epoch: nil}}
+
+          {:error, _} = err ->
+            {:reply, err, %{state | next_write_epoch: nil}}
+        end
+      else
+        {:queued, next_queue} =
+          LeaseQueue.acquire(
+            state.queue,
+            state.name,
+            req_ref,
+            from,
+            lease_timeout,
+            call_timeout,
+            snapshot
+          )
+
+        {:noreply, %{state | queue: next_queue}}
       end
     end
 
@@ -424,40 +523,67 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         ) do
       case LeaseQueue.verify_holder(state.queue, lease_ref, caller_pid) do
         :ok ->
-          Backend.bump_write_epoch(state.db)
-          base_db = %Xitdb{new_db | write_epoch: nil}
-
-          {committed_db, committed_moment} =
-            Backend.reconcile_tip(base_db, new_moment, :reconcile_commit)
-
-          if committed_db.db_ref != state.db.db_ref do
-            :ok = Snapshot.swap_compacted_base(state.name, committed_db, committed_moment)
+          if Backend.invalid_commit_moment?(state.db, state.moment, new_db, new_moment) do
+            {:reply, {:error, :invalid_moment},
+             release_aborted_lease(state, lease_ref, caller_pid)}
           else
-            :ok = Backend.publish_commit(state.name, state.moment, committed_moment)
+            bump_result = Backend.bump_write_epoch(state.db)
+            base_db = %{new_db | write_epoch: nil}
+
+            {committed_db, committed_moment} =
+              Backend.reconcile_tip(base_db, new_moment, :reconcile_commit)
+
+            {next_db, bump_for_next} =
+              if committed_db.db_ref != state.db.db_ref do
+                if is_integer(state.moment) do
+                  _ = Backend.reconcile_tip(state.db, state.moment, :aborted)
+                end
+
+                :ok = Snapshot.swap_compacted_base(state.name, committed_db, committed_moment)
+                {committed_db, Backend.bump_write_epoch(committed_db)}
+              else
+                :ok = Backend.publish_commit(state.name, state.moment, committed_moment)
+                {state.db, bump_result}
+              end
+
+            next_snapshot = {committed_db, committed_moment}
+
+            next_queue =
+              LeaseQueue.release_and_grant_next(
+                state.queue,
+                state.name,
+                fn -> Backend.fence_snapshot_with_epoch(next_snapshot, next_db, bump_for_next) end
+              )
+
+            next_epoch = next_cached_epoch(next_queue, committed_db, next_db, bump_for_next)
+
+            {:reply, :ok,
+             %{
+               state
+               | db: committed_db,
+                 moment: committed_moment,
+                 queue: next_queue,
+                 next_write_epoch: next_epoch
+             }}
           end
-
-          next_snapshot = {committed_db, committed_moment}
-
-          next_queue =
-            LeaseQueue.release_and_grant_next(
-              state.queue,
-              state.name,
-              fn -> Backend.fence_snapshot(next_snapshot) end
-            )
-
-          {:reply, :ok,
-           %State{state | db: committed_db, moment: committed_moment, queue: next_queue}}
 
         {:error, :lease_expired} = err ->
           next_state =
             if is_nil(state.queue.active) do
-              Backend.bump_write_epoch(state.db)
+              bump_result = Backend.bump_write_epoch(state.db)
 
               {restored_db, restored_moment} =
                 Backend.reconcile_tip(state.db, state.moment, :lease_expired)
 
               :ok = Backend.publish_commit(state.name, state.moment, restored_moment)
-              %State{state | db: restored_db, moment: restored_moment}
+              next_epoch = next_cached_epoch(state.queue, restored_db, state.db, bump_result)
+
+              %{
+                state
+                | db: restored_db,
+                  moment: restored_moment,
+                  next_write_epoch: next_epoch
+              }
             else
               state
             end
@@ -477,7 +603,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
     def handle_cast({:cancel_waiter, req_ref}, %State{} = state) do
       if match?(%{req_ref: ^req_ref}, state.queue.active) do
-        Backend.bump_write_epoch(state.db)
+        bump_result = Backend.bump_write_epoch(state.db)
 
         {restored_db, restored_moment} =
           Backend.reconcile_tip(state.db, state.moment, :lease_timeout)
@@ -490,10 +616,19 @@ if Code.ensure_loaded?(Ash.DataLayer) do
             state.queue,
             req_ref,
             state.name,
-            fn -> Backend.fence_snapshot(snapshot) end
+            fn -> Backend.fence_snapshot_with_epoch(snapshot, state.db, bump_result) end
           )
 
-        {:noreply, %State{state | db: restored_db, moment: restored_moment, queue: next_queue}}
+        next_epoch = next_cached_epoch(next_queue, restored_db, state.db, bump_result)
+
+        {:noreply,
+         %{
+           state
+           | db: restored_db,
+             moment: restored_moment,
+             queue: next_queue,
+             next_write_epoch: next_epoch
+         }}
       else
         snapshot = {state.db, state.moment}
 
@@ -505,14 +640,14 @@ if Code.ensure_loaded?(Ash.DataLayer) do
             fn -> Backend.fence_snapshot(snapshot) end
           )
 
-        {:noreply, %State{state | queue: next_queue}}
+        {:noreply, %{state | queue: next_queue}}
       end
     end
 
     @impl GenServer
     def handle_info({:DOWN, mref, :process, _pid, _reason}, %State{} = state) do
       if match?(%{monitor_ref: ^mref}, state.queue.active) do
-        Backend.bump_write_epoch(state.db)
+        bump_result = Backend.bump_write_epoch(state.db)
 
         {restored_db, restored_moment} =
           Backend.reconcile_tip(state.db, state.moment, :process_down)
@@ -525,10 +660,19 @@ if Code.ensure_loaded?(Ash.DataLayer) do
             state.queue,
             mref,
             state.name,
-            fn -> Backend.fence_snapshot(snapshot) end
+            fn -> Backend.fence_snapshot_with_epoch(snapshot, state.db, bump_result) end
           )
 
-        {:noreply, %State{state | db: restored_db, moment: restored_moment, queue: next_queue}}
+        next_epoch = next_cached_epoch(next_queue, restored_db, state.db, bump_result)
+
+        {:noreply,
+         %{
+           state
+           | db: restored_db,
+             moment: restored_moment,
+             queue: next_queue,
+             next_write_epoch: next_epoch
+         }}
       else
         {:noreply, state}
       end
@@ -536,7 +680,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
     def handle_info({:xitdb_lease_expired, name, lease_ref}, %State{name: name} = state) do
       if match?(%{ref: ^lease_ref}, state.queue.active) do
-        Backend.bump_write_epoch(state.db)
+        bump_result = Backend.bump_write_epoch(state.db)
 
         {restored_db, restored_moment} =
           Backend.reconcile_tip(state.db, state.moment, :lease_expired)
@@ -549,10 +693,19 @@ if Code.ensure_loaded?(Ash.DataLayer) do
             state.queue,
             lease_ref,
             state.name,
-            fn -> Backend.fence_snapshot(snapshot) end
+            fn -> Backend.fence_snapshot_with_epoch(snapshot, state.db, bump_result) end
           )
 
-        {:noreply, %State{state | db: restored_db, moment: restored_moment, queue: next_queue}}
+        next_epoch = next_cached_epoch(next_queue, restored_db, state.db, bump_result)
+
+        {:noreply,
+         %{
+           state
+           | db: restored_db,
+             moment: restored_moment,
+             queue: next_queue,
+             next_write_epoch: next_epoch
+         }}
       else
         {:noreply, state}
       end
@@ -567,7 +720,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
       try do
         case state.db do
-          %Xitdb{} = db when is_integer(state.moment) and state.moment >= 0 ->
+          %Xitdb{} = db when is_integer(state.moment) ->
             _ = Backend.reconcile_tip(db, state.moment, :terminate)
             :ok
 
@@ -585,7 +738,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     defp release_aborted_lease(%State{} = state, lease_ref, caller_pid) do
       case LeaseQueue.verify_holder(state.queue, lease_ref, caller_pid) do
         :ok ->
-          Backend.bump_write_epoch(state.db)
+          bump_result = Backend.bump_write_epoch(state.db)
 
           {restored_db, restored_moment} =
             Backend.reconcile_tip(state.db, state.moment, :aborted)
@@ -597,25 +750,33 @@ if Code.ensure_loaded?(Ash.DataLayer) do
             LeaseQueue.release_and_grant_next(
               state.queue,
               state.name,
-              fn -> Backend.fence_snapshot(snapshot) end
+              fn -> Backend.fence_snapshot_with_epoch(snapshot, state.db, bump_result) end
             )
 
-          %State{state | db: restored_db, moment: restored_moment, queue: next_queue}
+          next_epoch = next_cached_epoch(next_queue, restored_db, state.db, bump_result)
+
+          %{
+            state
+            | db: restored_db,
+              moment: restored_moment,
+              queue: next_queue,
+              next_write_epoch: next_epoch
+          }
 
         {:error, :lease_expired} ->
-          if is_nil(state.queue.active) do
-            Backend.bump_write_epoch(state.db)
-
-            {restored_db, restored_moment} =
-              Backend.reconcile_tip(state.db, state.moment, :lease_expired)
-
-            :ok = Backend.publish_commit(state.name, state.moment, restored_moment)
-            %State{state | db: restored_db, moment: restored_moment}
-          else
-            state
-          end
+          state
       end
     end
+
+    defp next_cached_epoch(
+           %LeaseQueue{active: nil},
+           %Xitdb{db_ref: db_ref},
+           %Xitdb{db_ref: db_ref},
+           {:ok, epoch}
+         ),
+         do: {db_ref, epoch}
+
+    defp next_cached_epoch(_queue, _db, _prev_db, _bump_result), do: nil
 
     # -- Internal Savepoint & Lease Execution --
 
@@ -657,6 +818,9 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
             {:error, :lease_expired} ->
               {:error, %LeaseError{store: store, reason: :lease_expired}}
+
+            {:error, reason} ->
+              {:error, reason}
           end
 
         {:error, _reason} = err ->
@@ -671,14 +835,24 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         {:ok, fun.()}
       catch
         :throw, {:xitdb_ash_rollback, ^store, reason} ->
-          put_working_snapshot(store, prev_snapshot)
+          restore_savepoint_snapshot(store, prev_snapshot)
           {:error, normalize_lease_error(store, reason)}
 
         kind, payload ->
           stacktrace = __STACKTRACE__
-          put_working_snapshot(store, prev_snapshot)
+          restore_savepoint_snapshot(store, prev_snapshot)
           :erlang.raise(kind, payload, stacktrace)
       end
+    end
+
+    defp restore_savepoint_snapshot(store, {%Xitdb{} = prev_db, prev_moment})
+         when is_integer(prev_moment) do
+      restored_snapshot = Backend.reconcile_tip(prev_db, prev_moment, :savepoint_rollback)
+      put_working_snapshot(store, restored_snapshot)
+    end
+
+    defp restore_savepoint_snapshot(store, prev_snapshot) do
+      put_working_snapshot(store, prev_snapshot)
     end
 
     defp normalize_lease_error(store, %Xitdb.Error{reason: :stale_write_epoch}),
@@ -725,9 +899,17 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         {:error, %LeaseError{store: store, reason: :lease_timeout}}
     end
 
-    defp put_working_snapshot(store, {db, moment} = snapshot) do
+    defp put_working_snapshot(store, {%Xitdb{} = db, moment} = snapshot) do
       Process.put(tx_state_key(store), snapshot)
-      Process.put(tx_db_key(store), Xitdb.as_of(db, moment))
+
+      cursor =
+        if is_integer(moment) and moment >= 0 do
+          Xitdb.as_of(db, moment)
+        else
+          Xitdb.Cursor.empty_root(db.db_ref)
+        end
+
+      Process.put(tx_db_key(store), cursor)
       :ok
     end
 
@@ -886,9 +1068,10 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     defp normalize_optional_timeout(nil), do: nil
     defp normalize_optional_timeout(t), do: normalize_timeout(t)
 
-    defp normalize_timeout(nil), do: 15_000
-    defp normalize_timeout(:infinity), do: :infinity
-    defp normalize_timeout(ms) when is_integer(ms) and ms >= 0, do: ms
+    @doc false
+    def normalize_timeout(nil), do: 15_000
+    def normalize_timeout(:infinity), do: :infinity
+    def normalize_timeout(ms) when is_integer(ms) and ms >= 0, do: ms
 
     defp max_timeout(a, nil), do: a
     defp max_timeout(_a, :infinity), do: :infinity
@@ -937,57 +1120,145 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       end
 
       @spec latest_moment(Xitdb.t()) :: integer()
-      def latest_moment(%Xitdb{} = db), do: Xitdb.moment_count(db) - 1
-
-      @spec reconcile_tip(Xitdb.t(), non_neg_integer(), atom() | String.t()) ::
-              {Xitdb.t(), non_neg_integer()}
-      def reconcile_tip(%Xitdb{} = db, target_moment, reason \\ :rollback)
-          when is_integer(target_moment) do
-        tail_moment = latest_moment(db)
-
-        if tail_moment > target_moment do
-          reason_str = to_string(reason)
-
-          {:ok, restored_db, restored_moment} =
-            Xitdb.transact_ops_with_moment(
-              db,
-              [{:meta, "restored_moment", target_moment}],
-              base_moment: target_moment,
-              doc: "rollback tip from moment #{tail_moment} to #{target_moment} (#{reason_str})",
-              instant: System.os_time(:millisecond),
-              meta: %{
-                "restored_moment" => target_moment,
-                "rolled_back_from" => tail_moment,
-                "rollback_reason" => reason_str,
-                "source_system" => "xitdb_store",
-                "action_name" => "rollback_tip",
-                "actor_id" => "system"
-              }
-            )
-
-          {restored_db, restored_moment}
-        else
-          {db, target_moment}
+      def latest_moment(%Xitdb{} = db) do
+        case Xitdb.info(db) do
+          {:ok, %{moment_count: count}} -> count - 1
+          {:error, _} -> -1
         end
       end
 
-      @spec bump_write_epoch(term()) :: :ok
-      def bump_write_epoch(%Xitdb{} = db) do
-        _ = Xitdb.bump_write_epoch(db)
-        :ok
+      @spec invalid_commit_moment?(Xitdb.t(), integer(), Xitdb.t(), term()) :: boolean()
+      def invalid_commit_moment?(%Xitdb{} = old_db, old_moment, %Xitdb{} = new_db, new_moment) do
+        cond do
+          not is_integer(new_moment) or new_moment < -1 ->
+            true
+
+          new_moment == -1 ->
+            (new_db.db_ref == old_db.db_ref and old_moment >= 0) or
+              (new_db.db_ref != old_db.db_ref and latest_moment(new_db) >= 0)
+
+          true ->
+            false
+        end
       end
 
-      def bump_write_epoch(_other), do: :ok
+      @spec invalid_mutate_moment?(Xitdb.t(), integer(), integer(), Xitdb.t(), term()) ::
+              boolean()
+      def invalid_mutate_moment?(
+            %Xitdb{} = old_db,
+            old_moment,
+            prev_tail,
+            %Xitdb{} = new_db,
+            new_moment
+          ) do
+        invalid_commit_moment?(old_db, old_moment, new_db, new_moment) or
+          (new_moment == -1 and new_db.db_ref == old_db.db_ref and
+             latest_moment(new_db) > prev_tail)
+      end
+
+      @spec reconcile_tip(Xitdb.t(), integer(), atom() | String.t()) ::
+              {Xitdb.t(), integer()}
+      def reconcile_tip(%Xitdb{} = db, target_moment, reason \\ :rollback)
+          when is_integer(target_moment) do
+        case Xitdb.info(db) do
+          {:ok, %{moment_count: count}} when count - 1 > target_moment ->
+            tail_moment = count - 1
+            reason_str = to_string(reason)
+
+            ops_and_base =
+              if target_moment < 0 do
+                try do
+                  delete_ops =
+                    db
+                    |> Xitdb.as_of(tail_moment)
+                    |> Enum.map(fn {key, _val} -> {:rm_if_exists, [key]} end)
+
+                  {:ok, delete_ops ++ [{:meta, "restored_moment", target_moment}], tail_moment}
+                rescue
+                  _ in Xitdb.Error -> :error
+                end
+              else
+                {:ok, [{:meta, "restored_moment", target_moment}], target_moment}
+              end
+
+            case ops_and_base do
+              {:ok, ops, tx_base_moment} ->
+                case Xitdb.transact_ops_with_moment(
+                       db,
+                       ops,
+                       base_moment: tx_base_moment,
+                       doc:
+                         "rollback tip from moment #{tail_moment} to #{target_moment} (#{reason_str})",
+                       instant: System.os_time(:millisecond),
+                       meta: %{
+                         "restored_moment" => target_moment,
+                         "rolled_back_from" => tail_moment,
+                         "rollback_reason" => reason_str,
+                         "source_system" => "xitdb_store",
+                         "action_name" => "rollback_tip",
+                         "actor_id" => "system"
+                       }
+                     ) do
+                  {:ok, restored_db, restored_moment} ->
+                    Xitdb.Columnar.clear_cache(restored_db)
+
+                    returned_moment =
+                      if target_moment < 0, do: target_moment, else: restored_moment
+
+                    {restored_db, returned_moment}
+
+                  {:error, _} ->
+                    {db, target_moment}
+                end
+
+              :error ->
+                {db, target_moment}
+            end
+
+          _ ->
+            {db, target_moment}
+        end
+      end
+
+      @spec bump_write_epoch(term()) :: {:ok, pos_integer()} | {:error, term()}
+      def bump_write_epoch(%Xitdb{} = db), do: Xitdb.bump_write_epoch(db)
+      def bump_write_epoch(_other), do: {:error, :invalid_db}
 
       @spec fence_snapshot(Xitdb.Ash.Store.working_snapshot()) ::
-              Xitdb.Ash.Store.working_snapshot()
+              {:ok, Xitdb.Ash.Store.working_snapshot()} | {:error, term()}
       def fence_snapshot({%Xitdb{} = db, moment}) do
-        epoch = Xitdb.bump_write_epoch!(db)
-        {%Xitdb{db | write_epoch: epoch}, moment}
+        apply_epoch_to_snapshot({db, moment}, Xitdb.bump_write_epoch(db))
       end
 
-      @spec publish_commit(module(), non_neg_integer(), non_neg_integer()) :: :ok
+      @spec fence_snapshot_with_epoch(
+              Xitdb.Ash.Store.working_snapshot(),
+              Xitdb.t(),
+              {:ok, pos_integer()} | {:error, term()}
+            ) :: {:ok, Xitdb.Ash.Store.working_snapshot()} | {:error, term()}
+      def fence_snapshot_with_epoch({%Xitdb{} = db, moment}, %Xitdb{} = prev_db, bump_result) do
+        if db.db_ref == prev_db.db_ref do
+          apply_epoch_to_snapshot({db, moment}, bump_result)
+        else
+          fence_snapshot({db, moment})
+        end
+      end
+
+      defp apply_epoch_to_snapshot({%Xitdb{} = db, moment}, {:ok, epoch}) do
+        {:ok, {%{db | write_epoch: epoch}, moment}}
+      end
+
+      defp apply_epoch_to_snapshot(
+             {%Xitdb{} = db, moment},
+             {:error, %Xitdb.Error{reason: :read_only}}
+           ) do
+        {:ok, {db, moment}}
+      end
+
+      defp apply_epoch_to_snapshot({_db, _moment}, {:error, _} = err), do: err
+
+      @spec publish_commit(module(), integer(), integer()) :: :ok
       def publish_commit(_store, prev_moment, prev_moment), do: :ok
+      def publish_commit(_store, _prev_moment, new_moment) when new_moment < 0, do: :ok
 
       def publish_commit(store, _prev_moment, new_moment) when new_moment >= 0 do
         Snapshot.advance_moment(store, new_moment)
