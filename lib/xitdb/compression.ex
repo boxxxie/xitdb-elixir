@@ -1257,7 +1257,7 @@ defmodule Xitdb.Compression do
       _ -> false
     end
   rescue
-    _ -> false
+    ArgumentError -> false
   end
 
   defp skip_auto_for_path?([{:at_moment, _}, step | _]), do: step_is_internal?(step)
@@ -1335,12 +1335,11 @@ defmodule Xitdb.Compression do
       case target do
         %Xitdb{} = db -> Xitdb.db(db)["__blobs"]
         %Xitdb.Cursor{} = c -> c["__blobs"]
+        {%Xitdb{}, moment} when is_integer(moment) and moment < 0 -> nil
         {%Xitdb{} = db, moment} -> Xitdb.as_of(db, moment)["__blobs"]
       end
 
     {cur, %{state | existing_blobs: cur}}
-  rescue
-    _ -> {nil, %{state | existing_blobs: nil}}
   end
 
   defp prepend_blob_ops(state, []), do: state

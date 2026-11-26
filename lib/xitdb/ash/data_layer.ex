@@ -464,63 +464,62 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       case {Info.fetch_store(resource), override} do
         {{:ok, store}, {:override, moment_or_db}} ->
           Store.with_as_of(store, moment_or_db, fn ->
-            fun.(safe_current_db(store))
+            fun.(Store.current_db_or_nil(store))
           end)
 
         {{:ok, store}, :none} ->
-          fun.(safe_current_db(store))
+          fun.(Store.current_db_or_nil(store))
 
         {:error, _} ->
           fun.(nil)
       end
     end
 
-    defp safe_current_db(store) do
-      Store.current_db(store)
-    rescue
-      _ -> nil
-    end
-
     defp eval_relational_fallback(expr, record, eval_opts, domain, actor, tenant)
          when is_map(record) do
-      if boolean_filter_expr?(expr) do
-        case Ash.Filter.Runtime.filter_matches(domain, [record], expr,
-               actor: actor,
-               tenant: tenant,
-               authorize?: false
-             ) do
-          {:ok, [_ | _]} -> {:ok, true}
-          {:ok, []} -> {:ok, false}
-          {:error, _} = err -> err
-        end
-      else
-        case collect_refs_to_load(expr) do
-          [] ->
-            :unknown
-
-          refs ->
-            load_ctx = Keyword.get(eval_opts, :context, %{})
-
-            with {:ok, [loaded]} <-
-                   Ash.load([record], refs,
-                     domain: domain,
-                     actor: actor,
-                     tenant: tenant,
-                     context: load_ctx,
-                     authorize?: false
-                   ),
-                 {:ok, val} <-
-                   Ash.Expr.eval_hydrated(expr, Keyword.put(eval_opts, :record, loaded)) do
-              {:ok, val}
-            else
-              :unknown -> :unknown
+      Xitdb.Fallback.try_run(
+        :ash_relational_expr_eval,
+        %{domain: domain},
+        fn ->
+          if boolean_filter_expr?(expr) do
+            case Ash.Filter.Runtime.filter_matches(domain, [record], expr,
+                   actor: actor,
+                   tenant: tenant,
+                   authorize?: false
+                 ) do
+              {:ok, [_ | _]} -> {:ok, true}
+              {:ok, []} -> {:ok, false}
               {:error, _} = err -> err
-              _ -> :unknown
             end
-        end
-      end
-    rescue
-      _ -> :unknown
+          else
+            case collect_refs_to_load(expr) do
+              [] ->
+                :unknown
+
+              refs ->
+                load_ctx = Keyword.get(eval_opts, :context, %{})
+
+                with {:ok, [loaded]} <-
+                       Ash.load([record], refs,
+                         domain: domain,
+                         actor: actor,
+                         tenant: tenant,
+                         context: load_ctx,
+                         authorize?: false
+                       ),
+                     {:ok, val} <-
+                       Ash.Expr.eval_hydrated(expr, Keyword.put(eval_opts, :record, loaded)) do
+                  {:ok, val}
+                else
+                  :unknown -> :unknown
+                  {:error, _} = err -> err
+                  _ -> :unknown
+                end
+            end
+          end
+        end,
+        fn -> :unknown end
+      )
     end
 
     @boolean_filter_structs [

@@ -46,12 +46,7 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
     @doc false
     @spec validate_scale(term()) :: {:ok, pos_integer()} | {:error, String.t()}
-    def validate_scale(scale) do
-      {valid_scale, _exp} = Key.validate_scale!(scale)
-      {:ok, valid_scale}
-    rescue
-      e in ArgumentError -> {:error, e.message}
-    end
+    def validate_scale(scale), do: Key.validate_scale(scale)
 
     @impl true
     def constraints, do: @constraints

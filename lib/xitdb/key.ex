@@ -318,6 +318,26 @@ defmodule Xitdb.Key do
     end
   end
 
+  @doc """
+  Non-raising variant of `validate_scale!/1` returning `{:ok, scale}` or `{:error, message}`.
+  """
+  @spec validate_scale(term()) :: {:ok, pos_integer()} | {:error, String.t()}
+  def validate_scale(scale) when is_integer(scale) and scale > 0 do
+    case power_of_ten_exp(scale, 0) do
+      {:ok, _exp} ->
+        {:ok, scale}
+
+      :error ->
+        {:error,
+         "FixedDecimal64 :scale must be a positive integer power of 10, got: #{inspect(scale)}"}
+    end
+  end
+
+  def validate_scale(scale) do
+    {:error,
+     "FixedDecimal64 :scale must be a positive integer power of 10, got: #{inspect(scale)}"}
+  end
+
   @doc false
   @spec validate_scale!(term()) :: {pos_integer(), non_neg_integer()}
   def validate_scale!(scale) when is_integer(scale) and scale > 0 do

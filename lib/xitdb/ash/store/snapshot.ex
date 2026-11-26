@@ -82,6 +82,38 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     end
 
     @doc """
+    Non-raising variant of `current_db/1` returning `nil` when `store` has not been started.
+    """
+    @spec current_db_or_nil(module()) :: term() | nil
+    def current_db_or_nil(store) when is_atom(store) do
+      as_of_key = {:xitdb_as_of_db, store}
+      tx_key = {:xitdb_tx_db, store}
+
+      cond do
+        as_of_db = Process.get(as_of_key) ->
+          as_of_db
+
+        tx_db = Process.get(tx_key) ->
+          tx_db
+
+        inherited = caller_dict_lookup(Process.get(:"$callers"), as_of_key, tx_key) ->
+          inherited
+
+        :persistent_term.get(pt_key(store), nil) != nil ->
+          sandbox_or_committed_db(store)
+
+        Code.ensure_loaded?(TestSandbox) and function_exported?(TestSandbox, :checkout_db, 1) ->
+          case apply(TestSandbox, :checkout_db, [store]) do
+            {:ok, sandbox_db} -> sandbox_db
+            :none -> nil
+          end
+
+        true ->
+          nil
+      end
+    end
+
+    @doc """
     Returns the latest committed `%Xitdb{}` snapshot directly, bypassing tx/sandbox overrides.
     """
     @spec committed_db(module()) :: term()

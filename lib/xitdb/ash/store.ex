@@ -172,6 +172,12 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     def current_db(store) when is_atom(store), do: Snapshot.current_db(store)
 
     @doc """
+    Non-raising variant of `current_db/1` returning `nil` when `store` has not been started.
+    """
+    @spec current_db_or_nil(module()) :: term() | nil
+    def current_db_or_nil(store) when is_atom(store), do: Snapshot.current_db_or_nil(store)
+
+    @doc """
     Returns the active root `%Xitdb.Cursor{}` for `store` pinned to the caller's visible moment.
     """
     @spec root(module()) :: Xitdb.Cursor.t()

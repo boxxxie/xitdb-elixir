@@ -878,12 +878,15 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         end
 
       if kind_compatible? do
-        try do
-          _ = Codec.encode_scalar_key(attr, val)
-          true
-        rescue
-          _ -> false
-        end
+        Xitdb.Fallback.try_run(
+          :ash_index_key_encode,
+          %{attribute: attr.name},
+          fn ->
+            _ = Codec.encode_scalar_key(attr, val)
+            true
+          end,
+          fn -> false end
+        )
       else
         false
       end
@@ -1247,24 +1250,28 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
         loads =
           if function_exported?(mod, :load, 3) do
-            try do
-              mod
-              |> Ash.Resource.Calculation.load(ash_query, calc.opts, calc.context)
-              |> List.wrap()
-            rescue
-              _ -> []
-            end
+            Xitdb.Fallback.try_run(
+              :ash_calculation_load,
+              %{resource: resource, calculation: mod},
+              fn ->
+                mod
+                |> Ash.Resource.Calculation.load(ash_query, calc.opts, calc.context)
+                |> List.wrap()
+              end,
+              fn -> [] end
+            )
           else
             []
           end
 
         selects =
           if function_exported?(mod, :select, 3) do
-            try do
-              mod.select(ash_query, calc.opts, calc.context) |> List.wrap()
-            rescue
-              _ -> []
-            end
+            Xitdb.Fallback.try_run(
+              :ash_calculation_select,
+              %{resource: resource, calculation: mod},
+              fn -> mod.select(ash_query, calc.opts, calc.context) |> List.wrap() end,
+              fn -> [] end
+            )
           else
             []
           end
@@ -3797,17 +3804,11 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           current_db
 
         target_store != nil ->
-          safe_store_current_db(target_store)
+          Store.current_db_or_nil(target_store)
 
         true ->
           current_db
       end
-    end
-
-    defp safe_store_current_db(store) do
-      Store.current_db(store)
-    rescue
-      ArgumentError -> nil
     end
 
     defp apply_optional_filter(_domain, records, nil, _tenant, _actor, _parent),
