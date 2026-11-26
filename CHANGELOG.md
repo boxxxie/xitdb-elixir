@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.5.1] - 2026-11-26
+
+### Fixed
+- **Concurrency Locking, Write-Epoch Lease Fencing & Crash-Safe Rollback (`native/xitdb_nif.odin`, `Xitdb`, `Xitdb.Ash.Store`, `Xitdb.Ash.TestSandbox`):**
+  - Enforced strict-tip concurrency, `flock` + `write_epoch` lease fencing, ordered rollback sync recovery, and empty-db `transact` TOCTOU race removal (`Xitdb.Error` + `Xitdb.NIF`).
+  - Hardened `Xitdb.Ash.Store`, `Xitdb.Ash.Store.LeaseQueue`, `Xitdb.Ash.Store.Snapshot`, and `Xitdb.Ash.TestSandbox` checkout isolation, failed nested mutate reconciliation, bounded commit moments, and empty rollback deduplication.
+  - Added `Xitdb.CacheHeir` and hardened `Xitdb.CacheOwner` with `Xitdb.Fallback.try_exit/3,4` and `try_run/3,4` for ETS heir/retry safety.
+
 ## [2.5.0] - 2026-11-26
 
 ### Added
