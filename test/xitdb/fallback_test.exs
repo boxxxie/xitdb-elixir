@@ -47,7 +47,19 @@ defmodule Xitdb.FallbackTest do
                       %{dict: "users", reason: :dict_miss}}
 
       assert log =~ "dict_miss"
-      assert log =~ "users"
+      assert log =~ "metadata=%{dict: \"users\"}"
+    end
+
+    test "accepts binary reason" do
+      log =
+        capture_log(fn ->
+          assert :ok == Xitdb.Fallback.run("string_reason", fn -> :ok end)
+        end)
+
+      assert_receive {:fallback_telemetry, [:xitdb, :fallback, :used], %{count: 1},
+                      %{reason: "string_reason"}}
+
+      assert log =~ "string_reason"
     end
 
     test "rejects invalid reason or non-map metadata" do
@@ -120,6 +132,54 @@ defmodule Xitdb.FallbackTest do
                       }}
 
       assert log =~ "calc_select"
+    end
+
+    test "overwrites existing :exception and :exception_module metadata and accepts binary reason" do
+      log =
+        capture_log(fn ->
+          assert :fallback ==
+                   Xitdb.Fallback.try_run(
+                     "calc_err",
+                     %{exception: :stale, exception_module: Stale},
+                     fn -> raise ArgumentError, "fresh" end,
+                     fn -> :fallback end
+                   )
+        end)
+
+      assert_receive {:fallback_telemetry, [:xitdb, :fallback, :used], %{count: 1},
+                      %{
+                        reason: "calc_err",
+                        exception: "fresh",
+                        exception_module: ArgumentError
+                      }}
+
+      assert log =~ "calc_err"
+    end
+
+    test "rejects invalid arguments on try_run/3 and try_run/4" do
+      assert_raise FunctionClauseError, fn ->
+        apply(Xitdb.Fallback, :try_run, [:r, :not_a_fun, fn -> :ok end])
+      end
+
+      assert_raise FunctionClauseError, fn ->
+        apply(Xitdb.Fallback, :try_run, [:r, fn -> :ok end, fn _a, _b -> :ok end])
+      end
+
+      assert_raise FunctionClauseError, fn ->
+        apply(Xitdb.Fallback, :try_run, [123, %{}, fn -> :ok end, fn -> :ok end])
+      end
+
+      assert_raise FunctionClauseError, fn ->
+        apply(Xitdb.Fallback, :try_run, [:r, [:not_a_map], fn -> :ok end, fn -> :ok end])
+      end
+
+      assert_raise FunctionClauseError, fn ->
+        apply(Xitdb.Fallback, :try_run, [:r, %{}, :not_a_fun, fn -> :ok end])
+      end
+
+      assert_raise FunctionClauseError, fn ->
+        apply(Xitdb.Fallback, :try_run, [:r, %{}, fn -> :ok end, fn _a, _b -> :ok end])
+      end
     end
   end
 end
