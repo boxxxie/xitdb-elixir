@@ -6,6 +6,9 @@ Completed tracks (**Waves 0–5**, benchmark/optimization tracks, **bugfix slice
 
 ---
 
+- [ ] **Track: Mutation Testing Hardening (`v2.5.1` Baseline -> >= 75% Score)**
+  *Link: [./tracks/mutation_hardening_v2_5_1_20261127/](./tracks/mutation_hardening_v2_5_1_20261127/)*
+
 - [x] **Track: Standardized Fallback Helper & Anti-Success-Shaped-Fallback Guardrails**
   *Link: [./tracks/standardized_fallback_helper_20261126/](./tracks/standardized_fallback_helper_20261126/)*
 
