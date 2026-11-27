@@ -13,7 +13,11 @@ defmodule Xitdb.CacheHeir do
     case Process.whereis(__MODULE__) do
       pid when is_pid(pid) ->
         if pid != self() do
-          GenServer.call(pid, {:claim, tables, self()})
+          Xitdb.Fallback.try_exit(
+            :cache_heir_claim_exit,
+            fn -> GenServer.call(pid, {:claim, tables, self()}) end,
+            fn _reason -> :ok end
+          )
         else
           :ok
         end
@@ -21,8 +25,6 @@ defmodule Xitdb.CacheHeir do
       nil ->
         :ok
     end
-  catch
-    :exit, _ -> :ok
   end
 
   @impl GenServer
@@ -37,13 +39,19 @@ defmodule Xitdb.CacheHeir do
   @impl GenServer
   def handle_call({:claim, tables, owner_pid}, _from, state) do
     Enum.each(tables, fn table ->
-      try do
-        if :ets.whereis(table) != :undefined and :ets.info(table, :owner) == self() do
-          :ets.give_away(table, owner_pid, :xitdb_cache)
+      Xitdb.Fallback.try_run(
+        :cache_heir_give_away_race,
+        %{table: table},
+        fn ->
+          if :ets.whereis(table) != :undefined and :ets.info(table, :owner) == self() do
+            :ets.give_away(table, owner_pid, :xitdb_cache)
+          end
+        end,
+        fn
+          %ArgumentError{} -> :ok
+          e -> raise e
         end
-      rescue
-        ArgumentError -> :ok
-      end
+      )
     end)
 
     {:reply, :ok, state}

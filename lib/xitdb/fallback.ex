@@ -70,4 +70,36 @@ defmodule Xitdb.Fallback do
         end
       end)
   end
+
+  @doc """
+  Executes `try_fun.()` and, if an `:exit` is caught, records exit metadata and
+  delegates to `run/3` with `fallback_fun` (0-arity or 1-arity receiving the exit reason).
+  """
+  @spec try_exit(reason(), (-> result), (-> result) | (term() -> result)) :: result
+        when result: var
+  def try_exit(reason, try_fun, fallback_fun)
+      when is_function(try_fun, 0) and
+             (is_function(fallback_fun, 0) or is_function(fallback_fun, 1)) do
+    try_exit(reason, %{}, try_fun, fallback_fun)
+  end
+
+  @spec try_exit(reason(), map(), (-> result), (-> result) | (term() -> result)) :: result
+        when result: var
+  def try_exit(reason, metadata, try_fun, fallback_fun)
+      when (is_atom(reason) or is_binary(reason)) and is_map(metadata) and
+             is_function(try_fun, 0) and
+             (is_function(fallback_fun, 0) or is_function(fallback_fun, 1)) do
+    try_fun.()
+  catch
+    :exit, exit_reason ->
+      enriched_meta = Map.put(metadata, :exit_reason, inspect(exit_reason))
+
+      run(reason, enriched_meta, fn ->
+        if is_function(fallback_fun, 1) do
+          fallback_fun.(exit_reason)
+        else
+          fallback_fun.()
+        end
+      end)
+  end
 end

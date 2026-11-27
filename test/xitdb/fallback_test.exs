@@ -182,4 +182,29 @@ defmodule Xitdb.FallbackTest do
       end
     end
   end
+
+  describe "try_exit/3,4" do
+    test "returns try_fun result without telemetry when no exit occurs" do
+      assert :ok == Xitdb.Fallback.try_exit(:cache_exit, fn -> :ok end, fn -> :fallback end)
+      refute_receive {:fallback_telemetry, _, _, _}
+    end
+
+    test "invokes fallback_fun with exit reason and emits telemetry on :exit" do
+      log =
+        capture_log(fn ->
+          assert {:caught, :noproc} ==
+                   Xitdb.Fallback.try_exit(
+                     :cache_exit,
+                     %{table: :page_cache},
+                     fn -> exit(:noproc) end,
+                     fn reason -> {:caught, reason} end
+                   )
+        end)
+
+      assert_receive {:fallback_telemetry, [:xitdb, :fallback, :used], %{count: 1},
+                      %{reason: :cache_exit, table: :page_cache, exit_reason: ":noproc"}}
+
+      assert log =~ "cache_exit"
+    end
+  end
 end

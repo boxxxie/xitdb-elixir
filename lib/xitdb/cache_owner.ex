@@ -44,19 +44,24 @@ defmodule Xitdb.CacheOwner do
   end
 
   defp ping_with_retry(attempts) do
-    GenServer.call(__MODULE__, :ping, 500)
-  catch
-    :exit, {reason, _} when reason != :timeout and attempts > 1 ->
-      Process.sleep(10)
-      do_ensure_started(attempts - 1)
+    Xitdb.Fallback.try_exit(
+      :cache_owner_ping_exit,
+      %{attempts: attempts},
+      fn -> GenServer.call(__MODULE__, :ping, 500) end,
+      fn
+        {reason, _} when reason != :timeout and attempts > 1 ->
+          Process.sleep(10)
+          do_ensure_started(attempts - 1)
 
-    :exit, reason ->
-      if :ets.whereis(@page_cache_table) != :undefined and
-           :ets.whereis(@dict_cache_table) != :undefined do
-        :ok
-      else
-        exit(reason)
+        reason ->
+          if :ets.whereis(@page_cache_table) != :undefined and
+               :ets.whereis(@dict_cache_table) != :undefined do
+            :ok
+          else
+            exit(reason)
+          end
       end
+    )
   end
 
   @spec put_page(term(), term(), non_neg_integer(), pos_integer()) :: :ok
@@ -74,14 +79,19 @@ defmodule Xitdb.CacheOwner do
       _ = GenServer.start(__MODULE__, [], name: __MODULE__)
     end
 
-    GenServer.call(__MODULE__, msg, 100)
-  catch
-    :exit, {reason, _} when reason != :timeout and attempts > 1 ->
-      Process.sleep(10)
-      call_best_effort(msg, attempts - 1)
+    Xitdb.Fallback.try_exit(
+      :cache_owner_best_effort_exit,
+      %{attempts: attempts},
+      fn -> GenServer.call(__MODULE__, msg, 100) end,
+      fn
+        {reason, _} when reason != :timeout and attempts > 1 ->
+          Process.sleep(10)
+          call_best_effort(msg, attempts - 1)
 
-    :exit, _ ->
-      :ok
+        _reason ->
+          :ok
+      end
+    )
   end
 
   @impl GenServer
@@ -164,12 +174,18 @@ defmodule Xitdb.CacheOwner do
           nil -> base_opts
         end
 
-      try do
-        _ = :ets.new(name, table_opts)
-        :ok
-      rescue
-        ArgumentError -> :ok
-      end
+      Xitdb.Fallback.try_run(
+        :cache_owner_table_race,
+        %{table: name},
+        fn ->
+          _ = :ets.new(name, table_opts)
+          :ok
+        end,
+        fn
+          %ArgumentError{} -> :ok
+          e -> raise e
+        end
+      )
     else
       attach_heir(name)
     end
@@ -178,13 +194,19 @@ defmodule Xitdb.CacheOwner do
   defp attach_heir(table) do
     case Process.whereis(Xitdb.CacheHeir) do
       pid when is_pid(pid) ->
-        try do
-          if :ets.info(table, :owner) == self() do
-            :ets.setopts(table, {:heir, pid, :xitdb_cache})
+        Xitdb.Fallback.try_run(
+          :cache_owner_heir_race,
+          %{table: table},
+          fn ->
+            if :ets.info(table, :owner) == self() do
+              :ets.setopts(table, {:heir, pid, :xitdb_cache})
+            end
+          end,
+          fn
+            %ArgumentError{} -> :ok
+            e -> raise e
           end
-        rescue
-          ArgumentError -> :ok
-        end
+        )
 
       nil ->
         :ok
