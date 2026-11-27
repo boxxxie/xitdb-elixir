@@ -967,6 +967,30 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         assert Xitdb.db(db)["idx"]["search"]["articles"]["terms"]["sovereign"] == nil
         assert Search.ids(Article, "sovereign", db: db) == []
       end
+
+      test "plan_put_ops/5, index_slot_name/1 string names, and reindex_tx_opts with active tx context",
+           %{db: db} do
+        a1 = %Article{id: 99, slug: Ash.CiString.new("plan-99"), status: :draft, title: "Plan"}
+        assert {:ok, ops} = Indexer.plan_put_ops(db, Article, nil, a1)
+        assert is_list(ops) and ops != []
+
+        assert Indexer.index_slot_name(%{name: "custom_slot", fields: [:a]}) == "custom_slot"
+        assert Indexer.index_slot_name(%{name: "", fields: [:a]}) == "attr_a"
+        assert Indexer.index_slot_name(%{name: nil, fields: [:a, :b]}) == "idx_a_b"
+
+        # Active tx context custom doc is preserved in delete_record / put_record
+        {:ok, db} =
+          Xitdb.with_tx_context(
+            [doc: "custom reindex doc", meta: %{"actor_id" => "tester"}],
+            fn ->
+              Indexer.put_record(db, Article, nil, a1)
+            end
+          )
+
+        meta = Xitdb.tx_meta!(db)
+        assert meta["doc"] == "custom reindex doc"
+        assert meta["actor_id"] == "tester"
+      end
     end
   end
 end

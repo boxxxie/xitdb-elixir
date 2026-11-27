@@ -908,6 +908,195 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         assert byte_size(comp_pos) == 18
         assert comp_neg < comp_pos
       end
+
+      test "covers scoped_collection, encode_doc_id atoms, temporal PKs, UnsignedInteger PK bounds, matches_attribute_tenant?, and unwrap_type/1" do
+        # scoped_collection/2
+        assert Codec.scoped_collection(TypedRecord, nil) == "typed_records"
+        assert Codec.scoped_collection(ContextTenantRecord, "acme") == "t:acme:context_docs"
+
+        # encode_doc_id/1 atom vs nil
+        assert Codec.encode_doc_id(:my_atom) == "my_atom"
+        assert Codec.encode_doc_id(nil) == ""
+
+        # encode_pk_doc_id/2 with temporal attribute
+        date_attr = Ash.Resource.Info.attribute(TypedRecord, :published_on)
+        assert Codec.encode_pk_doc_id(date_attr, ~D[2026-11-11]) == "2026-11-11"
+        dt_attr = Ash.Resource.Info.attribute(TypedRecord, :published_at)
+        assert is_binary(Codec.encode_pk_doc_id(dt_attr, ~U[2026-11-11 10:00:00Z]))
+
+        # UnsignedInteger PK exact boundaries (0, @max_u64, -1, @max_u64 + 1)
+        defmodule UintPkRecord do
+          use Ash.Resource,
+            domain: nil,
+            validate_domain_inclusion?: false,
+            extensions: [Xitdb.Ash.Dsl]
+
+          xitdb do
+            store DummyStore
+            collection :uint_pks
+          end
+
+          attributes do
+            attribute(:id, Xitdb.Ash.Types.UnsignedInteger,
+              primary_key?: true,
+              allow_nil?: false,
+              public?: true
+            )
+          end
+        end
+
+        assert {:ok, 0} = Codec.decode_doc_id(UintPkRecord, "0")
+        assert {:ok, @max_u64} = Codec.decode_doc_id(UintPkRecord, Integer.to_string(@max_u64))
+
+        assert {:error, {:invalid_integer_pk, "-1"}} = Codec.decode_doc_id(UintPkRecord, "-1")
+
+        assert {:error, {:invalid_integer_pk, _}} =
+                 Codec.decode_doc_id(UintPkRecord, Integer.to_string(@max_u64 + 1))
+
+        # matches_attribute_tenant? all branches
+        assert Codec.matches_attribute_tenant?(%{org_id: 1}, :attribute, :org_id, false, nil) ==
+                 false
+
+        assert Codec.matches_attribute_tenant?(%{org_id: 1}, :attribute, :org_id, true, nil) ==
+                 true
+
+        assert Codec.matches_attribute_tenant?(%{org_id: 1}, :attribute, :org_id, false, 1) ==
+                 true
+
+        assert Codec.matches_attribute_tenant?(%{org_id: 1}, :attribute, :org_id, false, 2) ==
+                 false
+
+        assert Codec.matches_attribute_tenant?(%{}, nil, nil, false, nil) == true
+
+        # unwrap_type/1 default constraints
+        assert {:integer, []} == Codec.unwrap_type(:integer)
+        assert {:datetime, []} == Codec.unwrap_type(Ash.Type.DateTime)
+
+        # :datetime scalar key encoding
+        datetime_attr = %Ash.Resource.Attribute{
+          name: :dt,
+          type: Ash.Type.DateTime,
+          constraints: []
+        }
+
+        assert byte_size(Codec.encode_scalar_key(datetime_attr, ~U[2026-11-11 10:15:30Z])) == 8
+
+        # to_cursor_map_fast / compile_read_plan / from_cursor_fast boundaries & guards
+        write_plan = Codec.compile_attr_plan(TypedRecord)
+
+        assert {:ok, %{"id" => -9_223_372_036_854_775_808}} =
+                 Codec.to_cursor_map_fast(write_plan, %{id: -9_223_372_036_854_775_808})
+
+        assert {:ok, %{"id" => 9_223_372_036_854_775_807}} =
+                 Codec.to_cursor_map_fast(write_plan, %{id: 9_223_372_036_854_775_807})
+
+        assert {:error, _} =
+                 Codec.to_cursor_map_fast(write_plan, %{id: -9_223_372_036_854_775_809})
+
+        assert_raise FunctionClauseError, fn ->
+          apply(Codec, :to_cursor_map_fast, [:bad, %{}])
+        end
+
+        assert_raise FunctionClauseError, fn ->
+          apply(Codec, :to_cursor_map_fast, [write_plan, :bad])
+        end
+
+        assert_raise FunctionClauseError, fn ->
+          apply(Codec, :to_cursor_map, ["bad", %{}])
+        end
+
+        assert_raise FunctionClauseError, fn ->
+          apply(Codec, :to_cursor_map, [TypedRecord, :bad])
+        end
+
+        assert_raise FunctionClauseError, fn ->
+          apply(Codec, :decode_doc_id, ["bad", "1"])
+        end
+
+        assert_raise FunctionClauseError, fn ->
+          apply(Codec, :decode_doc_id, [TypedRecord, 123])
+        end
+
+        # from_cursor_fast with tenant override, empty keys, resolved/unresolved cursor, and tx_mode cursor
+        plan_t1 = Codec.compile_read_plan(TypedRecord, :all, "t1")
+        assert {:ok, rec_t2} = Codec.from_cursor_fast(plan_t1, %{"id" => 1}, "t2")
+        assert rec_t2.__metadata__.tenant == "t2"
+
+        assert {:ok, rec_nil_t} = Codec.from_cursor_fast(plan_t1, %{"id" => 1}, nil)
+        assert rec_nil_t.__metadata__.tenant == "t1"
+
+        plan_empty = Codec.compile_read_plan(TypedRecord, [], nil)
+        {:ok, db} = Xitdb.open(backend: :memory)
+        on_exit(fn -> Xitdb.close(db) end)
+
+        {:ok, db} =
+          Xitdb.transact(db, %{
+            "recs" => %{"1" => %{"id" => 1, "name" => "Ada", "tags" => Xitdb.counted_set(["a"])}}
+          })
+
+        cur = Xitdb.db(db)["recs"]["1"]
+
+        assert {:ok, empty_rec} = Codec.from_cursor_fast(plan_empty, cur)
+        assert %Ash.NotLoaded{} = empty_rec.id
+
+        # tx_mode cursor hits hydrate_from_plan_source {:cursor, cursor} branch
+        tx_cur = %{cur | tx_mode: true}
+        assert {:ok, from_tx} = Codec.from_cursor_fast(plan_t1, tx_cur)
+        assert from_tx.id == 1
+        assert from_tx.name == "Ada"
+        assert from_tx.tags == ["a"]
+
+        # encode_index_key & encode_index_prefix exact length boundaries & guards
+        id_attr = Ash.Resource.Info.attribute(TypedRecord, :id)
+        name_attr = Ash.Resource.Info.attribute(TypedRecord, :name)
+
+        assert Codec.encode_index_prefix([id_attr], [1]) == Codec.encode_index_key([id_attr], [1])
+
+        assert Codec.encode_index_prefix([id_attr, name_attr], [1, "a"]) ==
+                 Codec.encode_index_key([id_attr, name_attr], [1, "a"])
+
+        assert_raise FunctionClauseError, fn ->
+          apply(Codec, :encode_index_key, [:bad, [1]])
+        end
+
+        assert_raise FunctionClauseError, fn ->
+          apply(Codec, :encode_index_key, [[id_attr], [1, 2]])
+        end
+
+        assert_raise FunctionClauseError, fn ->
+          apply(Codec, :encode_index_prefix, [[id_attr], [1, 2]])
+        end
+
+        assert_raise FunctionClauseError, fn ->
+          apply(Codec, :encode_index_prefix, [:bad, [1]])
+        end
+
+        # Exact @max_i64 boundary for UnsignedInteger dump (raw int at @max_i64 vs tagged at @max_i64 + 1)
+        u_attr = Ash.Resource.Info.attribute(UnsignedAndTaggedRecord, :big_uint)
+        assert {:ok, @max_i64} == Codec.dump_attribute(u_attr, @max_i64)
+        assert {:ok, {:tagged, "u8", _}} = Codec.dump_attribute(u_attr, @max_i64 + 1)
+        assert {:ok, 0} == Codec.load_attribute(u_attr, 0)
+        assert {:ok, 42} == Codec.load_attribute(u_attr, 42)
+        assert {:error, _} = Codec.load_attribute(u_attr, -1)
+
+        # Nil constraints fallback (constraints || []) in temporal dump/encode
+        nil_dt_attr = %Ash.Resource.Attribute{
+          name: :dt,
+          type: Ash.Type.UtcDatetime,
+          constraints: nil
+        }
+
+        assert {:ok, ts} = Codec.dump_attribute(nil_dt_attr, ~U[2026-11-11 10:15:30Z])
+        assert is_integer(ts)
+
+        nil_time_attr = %Ash.Resource.Attribute{
+          name: :t,
+          type: Ash.Type.Time,
+          constraints: nil
+        }
+
+        assert {:ok, "10:15:30"} = Codec.dump_attribute(nil_time_attr, ~T[10:15:30])
+      end
     end
   end
 end

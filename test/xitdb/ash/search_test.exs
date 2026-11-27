@@ -791,5 +791,55 @@ defmodule Xitdb.Ash.SearchTest do
         Xitdb.close(ro_db)
       end
     end
+
+    test "covers query/2 defaults, empty query_text, sort_by_rank empty list, lookup_field resource & nil id, and parallel reindex with existing docs",
+         %{db: db} do
+      # Empty / punctuation-only query returns []
+      assert Search.query(SearchProfile, "", db: db) == []
+      assert Search.query(SearchProfile, "   !!!   ", db: db) == []
+      assert Search.query(SearchProfile, nil, db: db) == []
+
+      # sort_by_rank with empty list returns query unchanged
+      q = Ash.Query.new(SearchProfile)
+      assert Search.sort_by_rank(q, []) == q
+
+      # lookup_field with nil id returns nil; with resource module resolves PK/collection
+      assert Search.lookup_field(db, :organizations, nil, "name") == nil
+
+      assert Search.lookup_field(db, :organizations, "org_1", "name") ==
+               "Northleaf Capital Partners"
+
+      assert Search.lookup_field(db, :organizations, "org_1", :name) ==
+               "Northleaf Capital Partners"
+
+      {:ok, db} =
+        Xitdb.transact_ops(db, [
+          {:put, ".search_profiles.p99.full_name", "Resource Lookup Test"}
+        ])
+
+      assert Search.lookup_field(db, SearchProfile, "p99", "full_name") == "Resource Lookup Test"
+
+      # Parallel reindex (>= 128 records) with existing indexed docs (covers old_docs_map slice path)
+      records =
+        for i <- 1..130 do
+          %SearchProfile{
+            id: "par_#{i}",
+            full_name: "Parallel Person #{i}",
+            headline: "Analyst #{rem(i, 5)}",
+            organization_id: nil
+          }
+        end
+
+      db = Search.index_records!(db, SearchProfile, records, parallel: true)
+      assert length(Search.ids(SearchProfile, "parallel", db: db, limit: 200)) == 130
+
+      # Re-index same 130 records in parallel with updated headlines (old_docs_map non-empty)
+      updated_records =
+        Enum.map(records, fn r -> %{r | headline: "Director #{r.id}"} end)
+
+      db = Search.index_records!(db, SearchProfile, updated_records, parallel: true)
+      assert Search.ids(SearchProfile, "analyst", db: db) == []
+      assert length(Search.ids(SearchProfile, "director", db: db, limit: 200)) == 130
+    end
   end
 end

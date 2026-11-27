@@ -412,6 +412,143 @@ defmodule Xitdb.ColumnarTest do
       assert Xitdb.select!(db, ~s(.items["1"].body)) == payload
       assert %{page_reads: 1, page_cache_hits: 2} = Columnar.stats()
     end
+
+    test "validates put_rows, build_put_ops, build_columnar_ops_for_groups, encode_pointer, parse_pointer, and read_pointer edge cases" do
+      assert {:error, %Error{reason: :invalid_options}} = Columnar.put_rows(:not_db, "c", [])
+      assert {:error, %Error{reason: :invalid_options}} = Columnar.build_put_ops(nil, 123, [])
+
+      assert {:error, %Error{reason: :invalid_options}} =
+               Columnar.build_put_ops(nil, "c", [], :bad)
+
+      # build_columnar_ops_for_groups invalid args and exact boundaries
+      assert {:error, %Error{reason: :invalid_options}} =
+               Columnar.build_columnar_ops_for_groups("", [{"1", %{"a" => "x"}}], [:a])
+
+      assert {:error, %Error{reason: :invalid_options}} =
+               Columnar.build_columnar_ops_for_groups(String.duplicate("a", 65_536), [], [:a])
+
+      assert {:ok, [], []} =
+               Columnar.build_columnar_ops_for_groups(String.duplicate("a", 65_535), [], [:a])
+
+      assert {:error, %Error{reason: :invalid_options}} =
+               Columnar.build_columnar_ops_for_groups("c", :not_list, [:a])
+
+      assert {:error, %Error{reason: :invalid_options}} =
+               Columnar.build_columnar_ops_for_groups("c", [], :not_list)
+
+      assert {:error, %Error{reason: :invalid_options}} =
+               Columnar.build_columnar_ops_for_groups("c", [], [:a], :not_list)
+
+      assert {:error, %Error{reason: :invalid_options}} =
+               Columnar.build_columnar_ops_for_groups("c", [{"1", %{"a" => "x"}}], [:a],
+                 row_group_size: 0
+               )
+
+      assert {:error, %Error{reason: :invalid_options}} =
+               Columnar.build_columnar_ops_for_groups("c", [{"1", %{"a" => "x"}}], [:a],
+                 row_group_size: 65_537
+               )
+
+      # Map rows, atom row keys, struct rejection, invalid list rows, map col_opts, string column missing key, mixed nil
+      assert {:ok, ops} =
+               Columnar.build_put_ops(
+                 nil,
+                 "items",
+                 %{r1: %{"body" => "hello", "other" => "ok"}, r2: %{"other" => "only"}},
+                 columns: [{"body", %{codec: :none}}, {"missing_str", []}]
+               )
+
+      assert Enum.any?(ops, fn
+               {:put, ["items", "r1"], %{"body" => {:tagged, "pg", _}}} -> true
+               _ -> false
+             end)
+
+      assert Enum.any?(ops, fn
+               {:put, ["items", "r2"], %{"other" => "only"}} -> true
+               _ -> false
+             end)
+
+      assert {:error, %Error{reason: :invalid_options}} =
+               Columnar.build_put_ops(nil, "items", [:not_a_tuple], columns: [:a])
+
+      assert {:error, %Error{reason: :invalid_options}} =
+               Columnar.build_put_ops(nil, "items", Decimal.new("1"), columns: [:a])
+
+      assert {:error, %Error{reason: :invalid_options}} =
+               Columnar.build_put_ops(nil, "items", [{"1", %{"a" => "x"}}], columns: [{123, []}])
+
+      assert {:error, %Error{reason: :invalid_options}} =
+               Columnar.build_put_ops(nil, "items", [{"1", %{"a" => "x"}}],
+                 columns: [{:a, :not_opts}]
+               )
+
+      # encode_pointer / parse_pointer / read_pointer boundaries
+      assert {:error, %Error{reason: :invalid_column_page}} =
+               Columnar.encode_pointer("", "f", "p", 0)
+
+      assert {:error, %Error{reason: :invalid_column_page}} =
+               Columnar.encode_pointer("c", "", "p", 0)
+
+      assert {:error, %Error{reason: :invalid_column_page}} =
+               Columnar.encode_pointer("c", "f", "", 0)
+
+      assert {:error, %Error{reason: :invalid_column_page}} =
+               Columnar.encode_pointer("c", "f", "p", -1)
+
+      # Zero-length fields in binary rejected by parse_pointer
+      assert {:error, %Error{reason: :corrupt_column_page}} =
+               Columnar.parse_pointer(
+                 <<0x10, 0::16-little, 1::16-little, "f", 1, "p", 0::32-little>>
+               )
+
+      assert {:error, %Error{reason: :corrupt_column_page}} =
+               Columnar.parse_pointer(
+                 <<0x10, 1::16-little, "c", 0::16-little, 1, "p", 0::32-little>>
+               )
+
+      assert {:error, %Error{reason: :corrupt_column_page}} =
+               Columnar.parse_pointer(
+                 <<0x10, 1::16-little, "c", 1::16-little, "f", 0, 0::32-little>>
+               )
+
+      ref = make_ref()
+
+      assert {:error, %Error{reason: :missing_database_handle}} =
+               Columnar.read_pointer(<<>>, nil, 0)
+
+      assert {:error, %Error{reason: :corrupt_column_page}} = Columnar.read_pointer(:bad, ref, 0)
+      assert {:error, %Error{reason: :corrupt_column_page}} = Columnar.read_pointer(<<>>, :bad, 0)
+
+      assert {:error, %Error{reason: :corrupt_column_page}} =
+               Columnar.read_pointer(<<>>, ref, :bad)
+
+      assert {:error, %Error{reason: :corrupt_column_page}} =
+               Columnar.read_pointer(<<>>, ref, 0, :bad)
+
+      # Exact raw_len == max_decompressed_bytes boundary succeeds on cache hit
+      db =
+        Xitdb.open!(backend: :memory)
+        |> Columnar.put_rows!("items", [{"1", %{"body" => "exact-limit"}}],
+          columns: [:body],
+          codec: :none
+        )
+
+      on_exit(fn -> Xitdb.close(db) end)
+      [{_pid, page_bin}] = Enum.to_list(db["__col_pages"]["items"]["body"])
+      <<_::binary-size(11), raw_len::unsigned-little-32, _::binary>> = page_bin
+      {:tagged, "pg", ptr_bin} = Xitdb.select!(db, ~s(.items["1"].body), raw_tagged: true)
+
+      assert {:ok, "exact-limit"} =
+               Columnar.read_pointer(ptr_bin, db.db_ref, 0, max_decompressed_bytes: raw_len)
+
+      assert {:ok, "exact-limit"} =
+               Columnar.read_pointer(ptr_bin, db.db_ref, 0, max_decompressed_bytes: raw_len)
+
+      assert {:error, %Error{reason: :decompressed_size_exceeded}} =
+               Columnar.read_pointer(ptr_bin, db.db_ref, 0, max_decompressed_bytes: raw_len - 1)
+
+      assert :ok == Columnar.clear_cache(:all)
+    end
   end
 end
 

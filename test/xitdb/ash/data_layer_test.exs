@@ -2482,6 +2482,108 @@ if Code.ensure_loaded?(Ash.DataLayer) do
                    }
                  )
       end
+
+      test "DataLayer.calculate/3 relational fallback evaluates exists/boolean filters and loads 1-hop, 2-hop, and calculation refs" do
+        user =
+          User
+          |> Ash.Changeset.for_create(:create, %{email: "calc@acme.io", role: :admin})
+          |> Ash.create!(authorize?: false)
+
+        org =
+          Organization
+          |> Ash.Changeset.for_create(:create, %{name: "CalcOrg", slug: "calc-org"})
+          |> Ash.create!(authorize?: false)
+
+        profile =
+          Profile
+          |> Ash.Changeset.for_create(:create, %{
+            user_id: user.id,
+            organization_id: org.id,
+            first_name: "Alice"
+          })
+          |> Ash.create!(authorize?: false)
+
+        event =
+          Event
+          |> Ash.Changeset.for_create(:create, %{
+            title: "Calc Summit",
+            start_time: ~U[2026-11-11 10:00:00Z]
+          })
+          |> Ash.create!(authorize?: false)
+
+        conf =
+          Conference
+          |> Ash.Changeset.for_create(:create, %{
+            event_id: event.id,
+            organizer_id: user.id,
+            title: "Main Conf",
+            location_name: "Hall"
+          })
+          |> Ash.create!(authorize?: false)
+
+        seat =
+          TableTalkSeat
+          |> Ash.Changeset.for_create(:create, %{
+            conference_id: conf.id,
+            table_talk_id: 1,
+            user_id: user.id
+          })
+          |> Ash.create!(authorize?: false)
+
+        session =
+          AgendaSession
+          |> Ash.Changeset.for_create(:create, %{
+            event_id: event.id,
+            title: "Keynote",
+            room: "A"
+          })
+          |> Ash.create!(authorize?: false)
+
+        # 1. Boolean relational filter fallback (true and false branches)
+        assert {:ok, [true, false]} =
+                 Xitdb.Ash.DataLayer.calculate(
+                   Organization,
+                   [
+                     expr(exists(profiles, first_name == "Alice")),
+                     expr(exists(profiles, first_name == "Nobody"))
+                   ],
+                   %{record: org, domain: TestDomain}
+                 )
+
+        # 2. 1-hop unloaded relationship ref (nest_load_path [last], [])
+        assert {:ok, [email]} =
+                 Xitdb.Ash.DataLayer.calculate(
+                   Profile,
+                   [expr(user.email)],
+                   %{record: profile, domain: TestDomain}
+                 )
+
+        assert Ash.CiString.value(email) == "calc@acme.io"
+
+        # 3. 2-hop unloaded relationship ref (nest_load_path [head | rest], leaf)
+        assert {:ok, ["Calc Summit"]} =
+                 Xitdb.Ash.DataLayer.calculate(
+                   TableTalkSeat,
+                   [expr(conference.event.title)],
+                   %{record: seat, domain: TestDomain}
+                 )
+
+        # 4. 1-hop relationship + calculation leaf (nest_load_path [last], [calc])
+        assert {:ok, [~D[2026-11-11]]} =
+                 Xitdb.Ash.DataLayer.calculate(
+                   AgendaSession,
+                   [expr(event.start_date)],
+                   %{record: session, domain: TestDomain}
+                 )
+
+        # 5. 0-hop calculation ref (do_collect_refs_to_load relationship_path: [])
+        assert {:ok, [~D[2026-11-11]]} =
+                 Xitdb.Ash.DataLayer.calculate(
+                   Event,
+                   [expr(start_date)],
+                   %{record: event, domain: TestDomain}
+                 )
+      end
     end
   end
 end
