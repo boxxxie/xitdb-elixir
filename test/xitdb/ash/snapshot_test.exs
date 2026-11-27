@@ -91,4 +91,106 @@ defmodule Xitdb.Ash.SnapshotTest do
       end
     end
   end
+
+  test "guards reject invalid argument types on Snapshot API functions", %{db: db} do
+    Snapshot.put_base(MockStore, db)
+
+    assert_raise FunctionClauseError, fn -> apply(Snapshot, :put_base, ["not_atom", db, []]) end
+    assert_raise FunctionClauseError, fn -> apply(Snapshot, :put_base, [MockStore, db, :bad]) end
+
+    assert_raise FunctionClauseError, fn ->
+      apply(Snapshot, :swap_compacted_base, ["not_atom", db, 0])
+    end
+
+    assert_raise FunctionClauseError, fn ->
+      apply(Snapshot, :swap_compacted_base, [MockStore, db, :bad])
+    end
+
+    assert_raise FunctionClauseError, fn ->
+      apply(Snapshot, :swap_compacted_base, [MockStore, db, -2])
+    end
+
+    assert_raise FunctionClauseError, fn -> apply(Snapshot, :advance_moment, ["not_atom", 0]) end
+
+    assert_raise FunctionClauseError, fn ->
+      apply(Snapshot, :advance_moment, [MockStore, :bad])
+    end
+
+    assert_raise FunctionClauseError, fn -> apply(Snapshot, :advance_moment, [MockStore, -1]) end
+
+    assert_raise FunctionClauseError, fn -> apply(Snapshot, :as_of, ["not_atom", 0]) end
+    assert_raise FunctionClauseError, fn -> apply(Snapshot, :as_of, [MockStore, "0"]) end
+
+    assert_raise FunctionClauseError, fn ->
+      apply(Snapshot, :reverse_fks, ["not_atom", MockResource])
+    end
+
+    assert_raise FunctionClauseError, fn ->
+      apply(Snapshot, :reverse_fks, [MockStore, "not_atom"])
+    end
+  end
+
+  test "current_db_or_nil/1 returns nil for unstarted store, committed db for started store, and sandbox db when checked out",
+       %{db: db} do
+    assert Snapshot.current_db_or_nil(MockStore) == nil
+
+    # Sandbox checkout on a store whose :persistent_term entry is absent
+    Snapshot.put_base(MockStore, db)
+    Xitdb.Ash.TestSandbox.checkout([MockStore])
+    Snapshot.erase(MockStore)
+
+    try do
+      assert %Xitdb.Cursor{} = Snapshot.current_db_or_nil(MockStore)
+    after
+      Xitdb.Ash.TestSandbox.checkin([MockStore])
+    end
+
+    assert Snapshot.current_db_or_nil(MockStore) == nil
+
+    # Started store resolves committed db
+    Snapshot.put_base(MockStore, db)
+    assert Snapshot.current_db_or_nil(MockStore) == Xitdb.Cursor.empty_root(db.db_ref)
+  end
+
+  test "caller_dict_lookup inherits :xitdb_as_of_db and :xitdb_tx_db from pid and registered atom $callers",
+       %{db: db} do
+    Snapshot.put_base(MockStore, db)
+    {:ok, db1} = Xitdb.open(backend: :memory)
+    {:ok, db2} = Xitdb.open(backend: :memory)
+
+    reg_name = :"xitdb_snapshot_caller_#{System.unique_integer([:positive])}"
+    Process.register(self(), reg_name)
+
+    on_exit(fn ->
+      if Process.whereis(reg_name) == self(), do: Process.unregister(reg_name)
+    end)
+
+    # 1. Inherits :xitdb_as_of_db via registered atom name, skipping nil and unregistered atoms
+    Process.put({:xitdb_as_of_db, MockStore}, db1)
+
+    child_res =
+      Task.async(fn ->
+        Process.put(:"$callers", [nil, :unregistered_xitdb_caller_xyz, reg_name])
+        {Snapshot.current_db(MockStore), Snapshot.current_db_or_nil(MockStore)}
+      end)
+      |> Task.await()
+
+    assert child_res == {db1, db1}
+
+    # 2. Falls back to :xitdb_tx_db when :xitdb_as_of_db is nil
+    Process.put({:xitdb_as_of_db, MockStore}, nil)
+    Process.put({:xitdb_tx_db, MockStore}, db2)
+
+    child_tx_res =
+      Task.async(fn ->
+        Process.put(:"$callers", [reg_name])
+        Snapshot.current_db(MockStore)
+      end)
+      |> Task.await()
+
+    assert child_tx_res == db2
+
+    Process.delete({:xitdb_as_of_db, MockStore})
+    Process.delete({:xitdb_tx_db, MockStore})
+  end
 end

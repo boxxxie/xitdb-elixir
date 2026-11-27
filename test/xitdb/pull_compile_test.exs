@@ -99,4 +99,64 @@ defmodule Xitdb.PullCompileTest do
       )
     end
   end
+
+  test "compile/1 and compile!/1 handle binary patterns, string wildcard, and invalid inputs" do
+    assert {:ok, "{name}"} = Pull.compile("  {name}  ")
+    assert "{name}" == Pull.compile!("  {name}  ")
+
+    assert {:error, %Error{reason: :invalid_pull_pattern}} = Pull.compile("")
+    assert {:error, %Error{reason: :invalid_pull_pattern}} = Pull.compile("   ")
+    assert_raise ArgumentError, fn -> Pull.compile!("") end
+    assert_raise ArgumentError, fn -> Pull.compile!("   ") end
+
+    assert {:ok, "*"} = Pull.compile(["*"])
+    assert "*" == Pull.compile!(["*"])
+    assert "{*, name}" == Pull.compile!(["*", "name"])
+
+    for invalid <- [
+          123,
+          nil,
+          :atom,
+          [""],
+          [nil],
+          [true],
+          [false],
+          [{:a, {:not_slice, 1, 2}}],
+          [{:a, {:slice, 1}}],
+          [{:a, {{:not_slice, 1, 2}, [:b]}}],
+          [{:a, {0..1, :not_list}}],
+          [{123, [:b]}]
+        ] do
+      assert {:error, %Error{reason: :invalid_pull_pattern}} = Pull.compile(invalid)
+      assert_raise ArgumentError, fn -> Pull.compile!(invalid) end
+    end
+
+    # Boundary: first == 0 and last == first == 0
+    assert "{a[0..1]}" == Pull.compile!(a: 0..0//1)
+    assert "{a[0..0]}" == Pull.compile!(a: {:slice, 0, 0})
+    assert "{a[0..2]{b}}" == Pull.compile!(a: {0..1, [:b]})
+  end
+
+  test "split_wildcard_plan/1 and merge_wildcard_results/2 handle braces, quotes, escapes, and empty items" do
+    assert {:single, "*"} == Pull.split_wildcard_plan("*")
+    assert {:single, "*"} == Pull.split_wildcard_plan("  { * }  ")
+    assert {:single, "{name, age}"} == Pull.split_wildcard_plan("{name, age}")
+    assert {:single, "{unclosed"} == Pull.split_wildcard_plan("{unclosed")
+    assert {:single, "{"} == Pull.split_wildcard_plan("{")
+    assert {:single, "{}"} == Pull.split_wildcard_plan("{}")
+
+    assert {:merge_top, "*", "{name, profile{city, zip}}"} ==
+             Pull.split_wildcard_plan("{*, name, profile{city, zip}}")
+
+    # Quoted strings with commas, escaped quotes, brackets, braces, and trailing/empty commas
+    complex = ~s({*, "a,b", 'c,d', "e\\"f", 'g\\'h', items[0..2]{x, y}, , })
+
+    assert {:merge_top, "*",
+            ~s("a,b", 'c,d', "e\\"f", 'g\\'h', items[0..2]{x, y}) |> then(&"{#{&1}}")} ==
+             Pull.split_wildcard_plan(complex)
+
+    assert %{"a" => 1, "b" => 2} == Pull.merge_wildcard_results(%{"a" => 1}, %{"b" => 2})
+    assert :fallback == Pull.merge_wildcard_results(:not_a_map, :fallback)
+    assert :fallback == Pull.merge_wildcard_results(%{"a" => 1}, :fallback)
+  end
 end

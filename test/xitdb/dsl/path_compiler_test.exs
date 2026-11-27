@@ -450,4 +450,78 @@ defmodule Xitdb.DSL.PathCompilerTest do
     assert {:ok, %{moment_count: 1, file_size: ^size_after}} = Xitdb.info(reopened)
     assert {:ok, "v2"} = Xitdb.select(reopened, steps_18)
   end
+
+  test "PathCompiler handles negative array/linked modifiers, bare atoms, lists, root/_, standalone map modifiers, and fold_and_quote edge cases" do
+    # linked(-1), array(0), array(-1) in both :selector and :steps modes
+    assert PathCompiler.typed_modifier_segment(:linked, quote(do: -1), :selector) ==
+             {:static, "[[-1]]"}
+
+    assert PathCompiler.typed_modifier_segment(:linked, quote(do: -1), :steps) ==
+             {:static_step, [-1]}
+
+    assert PathCompiler.typed_modifier_segment(:array, 0, :selector) == {:static, "[0]"}
+    assert PathCompiler.typed_modifier_segment(:array, 0, :steps) == {:static_step, 0}
+
+    assert PathCompiler.typed_modifier_segment(:array, quote(do: -1), :selector) ==
+             {:static, "[-1]"}
+
+    assert PathCompiler.typed_modifier_segment(:array, quote(do: -1), :steps) ==
+             {:static_step, -1}
+
+    # Invalid literal types for index modifiers, key modifiers, moment, and unknown modifier
+    for bad <- ["str", :atom, 1.5] do
+      assert_raise ArgumentError, fn ->
+        PathCompiler.typed_modifier_segment(:array, bad, :selector)
+      end
+
+      assert_raise ArgumentError, fn ->
+        PathCompiler.typed_modifier_segment(:at_moment, bad, :selector)
+      end
+    end
+
+    assert_raise ArgumentError, fn ->
+      PathCompiler.typed_modifier_segment(:bogus_mod, :x, :selector)
+    end
+
+    # Bare atom AST in :selector and :steps
+    assert PathCompiler.compile(:users) == ".users"
+    assert PathCompiler.compile_steps(:users) == ["users"]
+
+    # List AST in :selector and :steps
+    assert PathCompiler.compile([:users, [0], {:counted, :a}]) == ".users[[0]]#a"
+
+    assert PathCompiler.compile_steps([:users, [0], {:counted, :a}]) == [
+             "users",
+             [0],
+             {:counted_hash_map, "a"}
+           ]
+
+    # root and _ prefixes
+    assert PathCompiler.compile(quote(do: root.users)) == ".users"
+    assert PathCompiler.compile(quote(do: _.users)) == ".users"
+    assert PathCompiler.compile_steps(quote(do: root.users)) == ["users"]
+    assert PathCompiler.compile_steps(quote(do: _.users)) == ["users"]
+
+    # Standalone map modifier at root: counted(:departments)["eng"]
+    assert PathCompiler.compile(quote(do: counted(:departments)["eng"])) == ".departments#eng"
+
+    assert PathCompiler.compile_steps(quote(do: counted(:departments)["eng"])) == [
+             "departments",
+             {:counted_hash_map, "eng"}
+           ]
+
+    # Bracketed typed modifier, pin, negative int, and atom key
+    assert PathCompiler.compile(quote(do: users[sorted("a")])) == ".users$a"
+    assert PathCompiler.compile(quote(do: users[-1])) == ".users[-1]"
+    assert PathCompiler.compile_steps(quote(do: users[-1])) == ["users", -1]
+    assert PathCompiler.compile(quote(do: users[:alice])) == ".users.alice"
+    assert PathCompiler.compile_steps(quote(do: users[:alice])) == ["users", "alice"]
+    assert PathCompiler.compile(quote(do: users[^:alice])) == ".users.alice"
+
+    # fold_and_quote edge cases: empty, single static, single dynamic
+    assert PathCompiler.fold_and_quote([]) == ""
+    assert PathCompiler.fold_and_quote([{:static, ".a"}]) == ".a"
+    dyn = quote(do: my_var)
+    assert PathCompiler.fold_and_quote([{:dynamic, dyn}]) == dyn
+  end
 end

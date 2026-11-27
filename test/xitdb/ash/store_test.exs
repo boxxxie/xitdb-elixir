@@ -1275,5 +1275,230 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         File.rm_rf(path)
       end
     end
+
+    test "guards reject invalid argument types on Store API functions" do
+      {store, _pid} = start_ephemeral_store()
+
+      assert_raise FunctionClauseError, fn -> apply(Store, :as_of, ["bad", 0]) end
+      assert_raise FunctionClauseError, fn -> apply(Store, :as_of, [store, "0"]) end
+
+      assert_raise FunctionClauseError, fn ->
+        apply(Store, :with_as_of, ["bad", 0, fn -> :ok end])
+      end
+
+      assert_raise FunctionClauseError, fn -> apply(Store, :with_as_of, [store, 0, :not_fun]) end
+
+      assert_raise FunctionClauseError, fn -> apply(Store, :reverse_fks, ["bad", ParentOrg]) end
+      assert_raise FunctionClauseError, fn -> apply(Store, :reverse_fks, [store, "bad"]) end
+
+      assert_raise FunctionClauseError, fn ->
+        apply(Store, :mutate, ["bad", fn s -> {:ok, s, :ok} end])
+      end
+
+      assert_raise FunctionClauseError, fn -> apply(Store, :mutate, [store, :not_fun]) end
+
+      assert_raise FunctionClauseError, fn ->
+        apply(Store, :transact, ["bad", fn -> :ok end, []])
+      end
+
+      assert_raise FunctionClauseError, fn -> apply(Store, :transact, [store, :not_fun, []]) end
+
+      assert_raise FunctionClauseError, fn ->
+        apply(Store, :transact, [store, fn -> :ok end, :not_list])
+      end
+
+      db = Xitdb.open!(backend: :memory)
+
+      assert_raise FunctionClauseError, fn ->
+        apply(Store, :swap_compacted_base, ["bad", db, nil, []])
+      end
+
+      assert_raise FunctionClauseError, fn ->
+        apply(Store, :swap_compacted_base, [store, db, nil, :bad])
+      end
+
+      assert Store.normalize_timeout(0) == 0
+      assert Store.normalize_timeout(:infinity) == :infinity
+      assert Store.normalize_timeout(nil) == 15_000
+      assert_raise FunctionClauseError, fn -> apply(Store, :normalize_timeout, [-1]) end
+      assert_raise FunctionClauseError, fn -> apply(Store, :normalize_timeout, [:bad]) end
+    end
+
+    test "nested with_as_of/3 and transact/3 inside with_as_of/3 preserve and restore process dictionary pins" do
+      {store, _pid} = start_ephemeral_store()
+
+      {:ok, m0} =
+        Store.mutate(store, fn {db, m} ->
+          {:ok, db2} = Xitdb.transact(db, %{"v" => 1}, base_moment: m)
+          m0 = Xitdb.moment_count(db2) - 1
+          {:ok, {db2, m0}, m0}
+        end)
+
+      {:ok, m1} =
+        Store.mutate(store, fn {db, m} ->
+          {:ok, db2} = Xitdb.transact(db, %{"v" => 2}, base_moment: m)
+          m1 = Xitdb.moment_count(db2) - 1
+          {:ok, {db2, m1}, m1}
+        end)
+
+      {:ok, _m2} =
+        Store.mutate(store, fn {db, m} ->
+          {:ok, db2} = Xitdb.transact(db, %{"v" => 3}, base_moment: m)
+          m2 = Xitdb.moment_count(db2) - 1
+          {:ok, {db2, m2}, m2}
+        end)
+
+      assert Process.get({:xitdb_as_of_db, store}) == nil
+
+      Store.with_as_of(store, m0, fn ->
+        assert Store.root(store)["v"] == 1
+
+        # Nested with_as_of pins m1, then restores m0 on exit
+        Store.with_as_of(store, m1, fn ->
+          assert Store.root(store)["v"] == 2
+        end)
+
+        assert Store.root(store)["v"] == 1
+
+        # transact inside with_as_of clears pin during tx, then restores m0 after tx
+        assert {:ok, 3} =
+                 Store.transact(store, fn ->
+                   assert Process.get({:xitdb_as_of_db, store}) == nil
+                   Store.root(store)["v"]
+                 end)
+
+        assert Store.root(store)["v"] == 1
+      end)
+
+      assert Process.get({:xitdb_as_of_db, store}) == nil
+      assert Store.root(store)["v"] == 3
+    end
+
+    test "nested mutate invalid_moment reconciles staged writes, swap_compacted_base supports explicit moments -1 and 0, and unknown messages are ignored" do
+      {store, pid} = start_ephemeral_store()
+
+      # Unknown handle_info message is ignored without crashing
+      send(pid, :unexpected_info_message)
+      assert Process.alive?(pid)
+      assert :sys.get_state(pid).name == store
+
+      # Swap with explicit moment 0 and -1 on a 2-moment compacted db
+      compacted = Xitdb.open!(backend: :memory)
+      {:ok, compacted} = Xitdb.transact(compacted, %{"stage" => "m0"})
+      {:ok, compacted} = Xitdb.transact(compacted, %{"stage" => "m1"})
+
+      assert :ok = Store.swap_compacted_base(store, compacted, 0)
+      assert Xitdb.Ash.Store.Snapshot.current_moment(store) == 2
+      assert Store.root(store)["stage"] == "m0"
+
+      # Swap with explicit moment 0 on a 1-moment compacted db stays at moment 0
+      compacted_one = Xitdb.open!(backend: :memory)
+      {:ok, compacted_one} = Xitdb.transact(compacted_one, %{"stage" => "only_m0"})
+      assert :ok = Store.swap_compacted_base(store, compacted_one, 0)
+      assert Xitdb.Ash.Store.Snapshot.current_moment(store) == 0
+
+      # Transaction starting at moment 0 sees moment 0 cursor (not empty_root)
+      assert {:ok, "only_m0"} = Store.transact(store, fn -> Store.root(store)["stage"] end)
+
+      # Swap with explicit -1 selects latest moment (1)
+      compacted2 = Xitdb.open!(backend: :memory)
+      {:ok, compacted2} = Xitdb.transact(compacted2, %{"stage" => "a"})
+      {:ok, compacted2} = Xitdb.transact(compacted2, %{"stage" => "b"})
+      assert :ok = Store.swap_compacted_base(store, compacted2, -1)
+      assert Xitdb.Ash.Store.Snapshot.current_moment(store) == 1
+      assert Store.root(store)["stage"] == "b"
+
+      # Inside Store.transact, invalid_mutate_moment? with staged write reconciles tip; without staged write does not
+      assert {:ok, :done} =
+               Store.transact(store, fn ->
+                 moments_before = Xitdb.moment_count(:sys.get_state(pid).db)
+
+                 assert {:error, :invalid_moment} =
+                          Store.mutate(store, fn {db, _m} ->
+                            {:ok, {db, 999}, :bad_no_write}
+                          end)
+
+                 assert Xitdb.moment_count(:sys.get_state(pid).db) == moments_before
+
+                 assert {:error, :invalid_moment} =
+                          Store.mutate(store, fn {db, m} ->
+                            {:ok, db2} =
+                              Xitdb.transact_ops(db, [{:put, "ghost2", "bad"}], base_moment: m)
+
+                            {:ok, {db2, 999}, :bad_after_write}
+                          end)
+
+                 assert {:ok, :clean} =
+                          Store.mutate(store, fn {db, _m} ->
+                            {:ok, db2} = Xitdb.transact_ops(db, [{:put, "ok2", "yes"}])
+                            {:ok, {db2, Xitdb.moment_count(db2) - 1}, :clean}
+                          end)
+
+                 :done
+               end)
+
+      assert Store.root(store)["ghost2"] == nil
+      assert Store.root(store)["ok2"] == "yes"
+
+      # Direct :commit_lease with invalid moment returns {:error, :invalid_moment} and releases lease
+      req_ref = make_ref()
+      {:ok, lease_ref, {fenced_db, _m}} = GenServer.call(pid, {:acquire_lease, req_ref, 500, nil})
+
+      assert {:error, :invalid_moment} =
+               GenServer.call(pid, {:commit_lease, lease_ref, {fenced_db, 999}})
+
+      assert :sys.get_state(pid).queue.active == nil
+    end
+
+    test "Store.Backend helpers handle boundary conditions, invalid moments, tip reconciliation, and epoch fencing" do
+      alias Xitdb.Ash.Store.Backend
+
+      db = Xitdb.open!(backend: :memory)
+      assert Backend.latest_moment(db) == -1
+      {:ok, db} = Xitdb.transact(db, %{"k" => "v0"})
+      assert Backend.latest_moment(db) == 0
+
+      other_db = Xitdb.open!(backend: :memory)
+      {:ok, other_populated} = Xitdb.transact(Xitdb.open!(backend: :memory), %{"k" => "x"})
+
+      # invalid_commit_moment?
+      assert Backend.invalid_commit_moment?(db, 0, db, :not_int) == true
+      assert Backend.invalid_commit_moment?(db, 0, db, -2) == true
+      assert Backend.invalid_commit_moment?(db, 0, db, -1) == true
+      assert Backend.invalid_commit_moment?(db, -1, db, -1) == false
+      assert Backend.invalid_commit_moment?(db, 0, other_db, -1) == false
+      assert Backend.invalid_commit_moment?(db, 0, other_populated, -1) == true
+      assert Backend.invalid_commit_moment?(db, 0, db, 1) == true
+      assert Backend.invalid_commit_moment?(db, 0, db, 0) == false
+
+      # invalid_mutate_moment?
+      assert Backend.invalid_mutate_moment?(db, -1, -1, db, -1) == true
+      assert Backend.invalid_mutate_moment?(db, -1, 0, db, -1) == false
+
+      # reconcile_tip at target_moment == 0 returns restored_moment (not 0) and clears columnar cache
+      {:ok, db} = Xitdb.transact(db, %{"k" => "v1"})
+      cache_key = {:erlang.ref_to_list(db.db_ref), :c, :g, :p, :k}
+      :ets.insert(:xitdb_page_cache, {cache_key, :page, 1, 0})
+      {restored_db, restored_moment} = Backend.reconcile_tip(db, 0, :test_rb)
+      assert restored_moment == 2
+      assert Xitdb.as_of(restored_db, restored_moment)["k"] == "v0"
+      assert :ets.lookup(:xitdb_page_cache, cache_key) == []
+
+      # fence_snapshot_with_epoch reuses bump_result for same db_ref and re-fences for different db_ref
+      {:ok, {same_fenced, 2}} =
+        Backend.fence_snapshot_with_epoch({restored_db, 2}, restored_db, {:ok, 777})
+
+      assert same_fenced.write_epoch == 777
+
+      {:ok, {diff_fenced, -1}} =
+        Backend.fence_snapshot_with_epoch({other_db, -1}, restored_db, {:ok, 777})
+
+      assert diff_fenced.write_epoch != 777
+      assert is_integer(diff_fenced.write_epoch)
+
+      # Closed db returns -1 from latest_moment
+      :ok = Xitdb.close(other_db)
+      assert Backend.latest_moment(other_db) == -1
+    end
   end
 end
