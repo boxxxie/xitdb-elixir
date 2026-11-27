@@ -468,10 +468,6 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     end
 
     @impl GenServer
-    def handle_call({:acquire_lease, req_ref, call_timeout}, from, %State{} = state) do
-      handle_call({:acquire_lease, req_ref, call_timeout, nil}, from, state)
-    end
-
     def handle_call(
           {:acquire_lease, req_ref, call_timeout, explicit_lease_timeout},
           from,
@@ -1004,11 +1000,6 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       end
     end
 
-    defp normalize_nested_parent(_child, %{parent: parent, parent_key: fk_attr}, _by_collection)
-         when is_atom(parent) and not is_nil(parent) do
-      [{parent, fk_attr}]
-    end
-
     defp normalize_nested_parent(
            child,
            %{parent_collection: parent_col, foreign_key: fk_attr},
@@ -1054,25 +1045,16 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     end
 
     defp resource_store_matches?(resource, store_mod) do
-      case Info.store(resource) do
-        {:ok, ^store_mod} -> true
-        ^store_mod -> true
-        _ -> false
-      end
+      Info.store(resource) == store_mod
     end
 
     defp resolve_collection(resource) do
-      case Info.collection(resource) do
-        {:ok, col} -> col
-        col when is_atom(col) -> col
-        _ -> nil
-      end
+      Info.collection(resource)
     end
 
     defp resolve_nested_specs(resource) do
       case Info.nested_in(resource) do
         nil -> []
-        list when is_list(list) -> list
         spec -> [spec]
       end
     end

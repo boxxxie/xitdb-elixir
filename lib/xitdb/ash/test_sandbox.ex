@@ -561,10 +561,6 @@ if Code.ensure_loaded?(Ash.DataLayer) do
       end
     end
 
-    def handle_call({:acquire, store, req_ref, call_timeout}, from, %__MODULE__{} = state) do
-      handle_call({:acquire, store, req_ref, call_timeout, nil}, from, state)
-    end
-
     def handle_call(
           {:acquire, store, req_ref, call_timeout, explicit_lease_timeout},
           from,
