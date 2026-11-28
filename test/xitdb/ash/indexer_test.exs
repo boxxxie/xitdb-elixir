@@ -991,6 +991,59 @@ if Code.ensure_loaded?(Ash.DataLayer) do
         assert meta["doc"] == "custom reindex doc"
         assert meta["actor_id"] == "tester"
       end
+
+      test "hardens compile_ops init_slot skipping, nested :one eviction/reparenting, and batch state tracking",
+           %{db: db} do
+        a1 = %Article{id: 101, slug: Ash.CiString.new("slug-101"), status: :draft, title: "A1"}
+        a2 = %Article{id: 102, slug: Ash.CiString.new("slug-102"), status: :draft, title: "A2"}
+
+        # Fresh DB emits :init_col for unique & set index slots
+        {:ok, ops1, batch1} = Indexer.plan_put_ops_batched(db, Article, nil, a1, nil, %{})
+        assert Enum.any?(ops1, &match?({:init_col, _, "sorted_map"}, &1))
+        assert Enum.any?(ops1, &match?({:init_col, _, "counted_hash_set"}, &1))
+
+        # Second op in the same batch skips redundant :init_col via b_acc init_key
+        {:ok, ops2, _batch2} = Indexer.plan_put_ops_batched(db, Article, nil, a2, nil, batch1)
+        refute Enum.any?(ops2, &match?({:init_col, _, "sorted_map"}, &1))
+
+        {:ok, db} = Xitdb.transact_ops(db, ops1)
+        {:ok, db} = Xitdb.transact_ops(db, ops2)
+
+        # Persisted DB with initialized slots must NOT re-emit :init_col sorted_map
+        a3 = %Article{
+          id: 103,
+          slug: Ash.CiString.new("slug-103"),
+          status: :published,
+          title: "A3"
+        }
+
+        {:ok, ops3, _} = Indexer.plan_put_ops_batched(db, Article, nil, a3, nil, %{})
+        refute Enum.any?(ops3, &match?({:init_col, _, "sorted_map"}, &1))
+
+        # Nested :one eviction when putting a DIFFERENT PK under same parent, vs same PK upsert, vs reparenting
+        ev1 = %NestedEvent{id: 1001, title: "Ev1"}
+        ev2 = %NestedEvent{id: 1002, title: "Ev2"}
+        {:ok, db} = Indexer.put_record(db, NestedEvent, nil, ev1)
+        {:ok, db} = Indexer.put_record(db, NestedEvent, nil, ev2)
+
+        b1 = %NestedBanner{id: 2001, event_id: 1001, headline: "Banner 1"}
+        {:ok, db} = Indexer.put_record(db, NestedBanner, nil, b1)
+
+        # Upserting same PK with old_record == nil preserves existing_old path
+        b1_same = %NestedBanner{id: 2001, event_id: 1001, headline: "Banner 1 Updated"}
+        {:ok, db} = Indexer.put_record(db, NestedBanner, nil, b1_same)
+        assert Xitdb.select!(db, ".nested_events.1001.banner.headline") == "Banner 1 Updated"
+
+        # Inserting different PK with old_record == nil on same parent evicts b1_same
+        b2 = %NestedBanner{id: 2002, event_id: 1001, headline: "Banner 2"}
+        {:ok, db} = Indexer.put_record(db, NestedBanner, nil, b2)
+        assert Xitdb.select!(db, ".nested_events.1001.banner.id") == 2002
+
+        # Reparenting b2 from ev1 (1001) to ev2 (1002) with old_record != nil
+        {:ok, db} = Indexer.put_record(db, NestedBanner, b2, %{b2 | event_id: 1002})
+        assert Xitdb.select!(db, ".nested_events.1001.banner") == nil
+        assert Xitdb.select!(db, ".nested_events.1002.banner.id") == 2002
+      end
     end
   end
 end

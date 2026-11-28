@@ -1791,6 +1791,134 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
         assert Enum.map(rows, & &1.org_label) == ["Lead:Northleaf", "Solo:none"]
       end
+
+      @tag timeout: 5_000
+      test "hardens tighter index range bounds, reversed literal comparisons, contradictions, select masking, and nested as_of" do
+        org = seed!(PrimaryStore, Org, id: 901, name: "BoundOrg", slug: "bound-org", tier: :gold)
+
+        for {{name, score}, idx} <-
+              Enum.with_index(
+                [{"m10", 10}, {"m20", 20}, {"m30", 30}, {"m40", 40}, {"m50", 50}],
+                1
+              ) do
+          seed!(PrimaryStore, Member,
+            id: 900 + idx,
+            name: name,
+            score: score,
+            org_id: org.id
+          )
+        end
+
+        # Tighter lower & upper bounds (kills tighter_min / tighter_max / key1 > key2)
+        assert ["m30", "m40"] ==
+                 Member
+                 |> Ash.Query.filter(score > 10 and score > 25 and score < 100 and score < 45)
+                 |> Ash.Query.sort(score: :asc)
+                 |> Ash.read!(domain: Domain)
+                 |> Enum.map(& &1.name)
+
+        # >= vs > on same bound value, <= vs < on same bound value
+        assert ["m30", "m40"] ==
+                 Member
+                 |> Ash.Query.filter(score >= 20 and score > 20 and score <= 50 and score < 50)
+                 |> Ash.Query.sort(score: :asc)
+                 |> Ash.read!(domain: Domain)
+                 |> Enum.map(& &1.name)
+
+        # Reversed literal comparisons (literal on left, attr on right)
+        assert ["m30", "m40"] ==
+                 Member
+                 |> Ash.Query.filter(20 < score and 50 > score)
+                 |> Ash.Query.sort(score: :asc)
+                 |> Ash.read!(domain: Domain)
+                 |> Enum.map(& &1.name)
+
+        # Disjoint IN contradiction and false conjunct
+        assert [] ==
+                 Member
+                 |> Ash.Query.filter(score in [10, 20] and score in [30, 40])
+                 |> Ash.read!(domain: Domain)
+
+        assert [] ==
+                 Member
+                 |> Ash.Query.filter(score > 0 and false)
+                 |> Ash.read!(domain: Domain)
+
+        # select masking (to_mask != []) hides unselected attributes as %Ash.NotLoaded{}
+        [masked] =
+          Member
+          |> Ash.Query.filter(name == "m30")
+          |> Ash.Query.select([:name])
+          |> Ash.read!(domain: Domain)
+
+        assert masked.name == "m30"
+        assert match?(%Ash.NotLoaded{}, masked.score)
+
+        # Nested Store.with_as_of reuses handle (Process.get({:xitdb_as_of_db, store}) == handle)
+        m_now = Xitdb.Ash.Store.root(PrimaryStore).moment
+
+        Xitdb.Ash.Store.with_as_of(PrimaryStore, m_now, fn ->
+          Xitdb.Ash.Store.with_as_of(PrimaryStore, m_now, fn ->
+            assert length(Ash.read!(Member, domain: Domain)) == 5
+          end)
+        end)
+      end
+
+      @tag timeout: 5_000
+      test "hardens unrelated exists with parent(), step join_filter without parent(), and composite/leading index hops" do
+        org1 = seed!(PrimaryStore, Org, id: 911, name: "RelOrg1", slug: "rel-org-1", tier: :gold)
+
+        org2 =
+          seed!(PrimaryStore, Org, id: 912, name: "RelOrg2", slug: "rel-org-2", tier: :silver)
+
+        seed!(PrimaryStore, Member, id: 911, name: "R1", score: 80, role: :lead, org_id: org1.id)
+
+        seed!(PrimaryStore, Member,
+          id: 912,
+          name: "R2",
+          score: 20,
+          role: :analyst,
+          org_id: org2.id
+        )
+
+        # Unrelated exists(ExternalAlert, org_id == parent(org_id)) -> exercises L1635
+        seed!(SecondaryStore, ExternalAlert, id: 9901, org_id: org1.id, severity: "high")
+
+        assert ["R1"] ==
+                 Member
+                 |> Ash.Query.filter(exists(ExternalAlert, org_id == parent(org_id)))
+                 |> Ash.read!(domain: Domain)
+                 |> Enum.map(& &1.name)
+
+        # Filtered relationship load without parent() -> exercises apply_step_join_filter (L2733, L2741)
+        loaded =
+          [org1, org2]
+          |> Ash.load!([members: Ash.Query.filter(Member, score >= 50)], domain: Domain)
+
+        assert Enum.map(Enum.at(loaded, 0).members, & &1.name) == ["R1"]
+        assert Enum.at(loaded, 1).members == []
+
+        # Filter on expression calc (:tier_score) and module calc (:bonus) (kills L1417, L3226, L1350)
+        assert ["R1"] ==
+                 Member
+                 |> Ash.Query.filter(tier_score >= 100)
+                 |> Ash.read!(domain: Domain)
+                 |> Enum.map(& &1.name)
+
+        assert ["R1"] ==
+                 Member
+                 |> Ash.Query.filter(bonus > 50)
+                 |> Ash.read!(domain: Domain)
+                 |> Enum.map(& &1.name)
+
+        # No select (to_mask == []) keeps all attributes loaded (kills L3777)
+        [full_m] =
+          Member
+          |> Ash.Query.filter(name == "R1")
+          |> Ash.read!(domain: Domain)
+
+        assert full_m.score == 80
+      end
     end
   end
 end

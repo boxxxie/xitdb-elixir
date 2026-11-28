@@ -2879,6 +2879,208 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
         assert Search.query(BulkParent, "enterprise paralleltoken5", limit: 40) == hits_eager
       end
+
+      test "hardens tenant fallback in bulk_create/bulk_update/bulk_destroy, finalize_loaded_record, upsert_skipped telemetry, and exception cleanup" do
+        # 1. ContextTenantDoc: fallback_tenant in options vs changeset.tenant
+        cs1 = Ash.Changeset.for_create(ContextTenantDoc, :create, %{slug: "t1", body: "B1"})
+
+        cs2 =
+          ContextTenantDoc
+          |> Ash.Changeset.for_create(:create, %{slug: "t2", body: "B2"})
+          |> Ash.Changeset.set_tenant("tenant_b")
+
+        {:ok, [d1, d2]} =
+          Xitdb.Ash.Mutator.bulk_create(ContextTenantDoc, [cs1, cs2],
+            tenant: "tenant_a",
+            return_records?: true
+          )
+
+        assert Ash.Resource.get_metadata(d1, :tenant) == "tenant_a"
+        assert Ash.Resource.get_metadata(d2, :tenant) == "tenant_b"
+        assert d1.__meta__.state == :loaded
+
+        # 2. Ash.bulk_destroy! with tenant option (exercises bulk_destroy fallback_tenant)
+        assert %Ash.BulkResult{status: :success} =
+                 Ash.bulk_destroy!(
+                   [d1],
+                   :destroy,
+                   %{},
+                   domain: Domain,
+                   tenant: "tenant_a"
+                 )
+
+        assert Ash.read!(ContextTenantDoc, domain: Domain, tenant: "tenant_a") == []
+
+        # Re-create d1 for upsert_skipped test below
+        d1 =
+          Ash.create!(ContextTenantDoc, %{slug: "t1", body: "B1"},
+            domain: Domain,
+            tenant: "tenant_a"
+          )
+
+        # 3. AttrTenantSeat: :attribute multitenancy populates org_id and metadata :tenant, plus partial where: identity
+        s1 =
+          Ash.create!(AttrTenantSeat, %{seat_no: 1, status: :cancelled},
+            domain: Domain,
+            tenant: 42
+          )
+
+        assert s1.org_id == 42
+        assert Ash.Resource.get_metadata(s1, :tenant) == 42
+        assert s1.__meta__.state == :loaded
+
+        # Cancelled seat does not block confirmed seat with same seat_no
+        s2 =
+          Ash.create!(AttrTenantSeat, %{seat_no: 1, status: :confirmed},
+            domain: Domain,
+            tenant: 42
+          )
+
+        assert s2.status == :confirmed
+
+        # 4. upsert_skipped telemetry (record_count == 0 when upsert condition skips, kills L163)
+        _locked_badge =
+          Ash.create!(Badge, %{code: "LOCKED-TEL", label: "Locked", locked: true}, domain: Domain)
+
+        test_pid = self()
+        hid = "mut-skip-tel-#{System.unique_integer([:positive])}"
+
+        :telemetry.attach(
+          hid,
+          [:xitdb, :ash, :mutation, :stop],
+          fn _ev, meas, meta, _ ->
+            send(test_pid, {:mut_tel, meta.action, meas.record_count})
+          end,
+          nil
+        )
+
+        on_exit(fn -> :telemetry.detach(hid) end)
+
+        skipped_rec =
+          Ash.create!(
+            Badge,
+            %{code: "LOCKED-TEL", label: "Should Skip"},
+            action: :upsert_if_unlocked,
+            return_skipped_upsert?: true,
+            domain: Domain
+          )
+
+        assert Ash.Resource.get_metadata(skipped_rec, :upsert_skipped) == true
+        assert_receive {:mut_tel, :upsert, 0}
+
+        # 5. Cleanup d1
+        :ok = Ash.destroy!(d1, domain: Domain, tenant: "tenant_a")
+        assert Ash.read!(ContextTenantDoc, domain: Domain, tenant: "tenant_a") == []
+      end
+
+      test "hardens intra-batch arbitrary upsert_keys, partial where: batch identities, nil key skip, and validate_required_after_atomics" do
+        # 1. Partial where: identity allows multiple :cancelled seats with same seat_no in one batch (kills L3557)
+        %Ash.BulkResult{status: :success, records: cancelled_seats} =
+          Ash.bulk_create!(
+            [
+              %{seat_no: 77, status: :cancelled},
+              %{seat_no: 77, status: :cancelled}
+            ],
+            AttrTenantSeat,
+            :create,
+            domain: Domain,
+            tenant: 99,
+            return_records?: true
+          )
+
+        assert length(cancelled_seats) == 2
+
+        # Two :confirmed seats with same seat_no in one batch fail intra-batch identity check
+        err_batch =
+          Ash.bulk_create(
+            [
+              %{seat_no: 88, status: :confirmed},
+              %{seat_no: 88, status: :confirmed}
+            ],
+            AttrTenantSeat,
+            :create,
+            domain: Domain,
+            tenant: 99,
+            return_errors?: true
+          )
+
+        assert err_batch.status == :error
+
+        # 2. Arbitrary non-identity upsert_keys (find_staged_by_keys + nil key skip + tenant isolation, kills L2476, L2546)
+        upsert_changesets =
+          for attrs <- [
+                %{slug: "k1", body: "v1", tag: "shared"},
+                %{slug: "k2", body: "v2", tag: "shared"},
+                %{slug: "k3", body: "v3", tag: nil},
+                %{slug: "k4", body: "v4", tag: nil}
+              ] do
+            ContextTenantDoc
+            |> Ash.Changeset.for_create(:create, attrs)
+            |> Ash.Changeset.put_context(:private, %{upsert?: true, upsert_fields: [:body]})
+          end
+
+        {:ok, _} =
+          Xitdb.Ash.Mutator.bulk_create(ContextTenantDoc, upsert_changesets,
+            tenant: "t_keys",
+            upsert?: true,
+            upsert_keys: [:tag],
+            upsert_fields: [:body],
+            return_records?: true
+          )
+
+        docs_t_keys = Ash.read!(ContextTenantDoc, domain: Domain, tenant: "t_keys")
+
+        # Two nil-tag docs did NOT collide; two "shared"-tag docs coalesced into one with body "v2"
+        assert length(docs_t_keys) == 3
+        shared_doc = Enum.find(docs_t_keys, &(&1.tag == "shared"))
+        assert shared_doc.body == "v2"
+
+        # Same "shared" tag in another tenant does NOT collide with "t_keys"
+        d_other =
+          Ash.create!(ContextTenantDoc, %{slug: "k-other", body: "v-other", tag: "shared"},
+            domain: Domain,
+            tenant: "t_keys_other"
+          )
+
+        assert d_other.body == "v-other"
+
+        # 3. validate_required_after_atomics returns Required error when non-generated allow_nil?: false attr is nil (kills L3205)
+        missing_cs =
+          ContextTenantDoc
+          |> Ash.Changeset.for_create(:create, %{slug: "no-body"})
+          |> Ash.Changeset.set_tenant("t_keys")
+          |> Map.merge(%{valid?: true, errors: [], create_atomics: [tag: "x"]})
+
+        assert {:error, %Ash.Error.Changes.Required{field: :body}} =
+                 Xitdb.Ash.Mutator.create(ContextTenantDoc, missing_cs)
+
+        # 4. Telemetry stats cleanup (kills L4102 prev_stats == nil -> != nil)
+        assert Process.get(:xitdb_ash_mutation_stats) == nil
+
+        # 5. Pre-existing DB record overwritten via bulk_create upsert preserves/updates indexes (kills L1262)
+        existing =
+          Ash.create!(ContextTenantDoc, %{slug: "pre-1", body: "old-body", tag: "old-tag"},
+            domain: Domain,
+            tenant: "t_pre"
+          )
+
+        %Ash.BulkResult{status: :success} =
+          Ash.bulk_create!(
+            [%{slug: "pre-1", body: "new-body", tag: "new-tag"}],
+            ContextTenantDoc,
+            :upsert_by_slug,
+            domain: Domain,
+            tenant: "t_pre",
+            return_records?: true
+          )
+
+        reloaded = Ash.get!(ContextTenantDoc, existing.id, domain: Domain, tenant: "t_pre")
+        assert reloaded.body == "new-body"
+        assert reloaded.tag == "new-tag"
+
+        assert Ash.read!(ContextTenantDoc, domain: Domain, tenant: "t_pre")
+               |> Enum.filter(&(&1.tag == "old-tag")) == []
+      end
     end
   end
 end

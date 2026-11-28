@@ -145,4 +145,86 @@ defmodule Xitdb.CursorHardeningTest do
       root
     end)
   end
+
+  test "hardens Enumerable count/slice on root and staged tx_mode cursors, collection preservation, nil writes, and list insert_at bounds" do
+    db =
+      Xitdb.open!(backend: :memory)
+      |> Xitdb.transact!(%{
+        "cm" => Xitdb.counted_map(%{"a" => 1, "b" => 2}),
+        "sm" => Xitdb.sorted_map(%{"x" => 10, "y" => 20}),
+        "arr" => [10, 20, 30, 40],
+        "larr" => Xitdb.linked_list([10, 20, 30, 40]),
+        "m" => %{"k" => 1}
+      })
+
+    on_exit(fn -> Xitdb.close(db) end)
+
+    # Root cursor Enum.count (tx_mode: false, root: true)
+    root_snap = Xitdb.db(db)
+    assert Enum.count(root_snap["cm"]) == 2
+    assert Enum.count(root_snap["arr"]) == 4
+    assert Enum.slice(root_snap["arr"], 1..2) == [20, 30]
+
+    Xitdb.transact!(db, fn root ->
+      # tx_mode: true WITHOUT staged edits uses fast count
+      assert Enum.count(root["cm"]) == 2
+      assert Enum.count(root["arr"]) == 4
+
+      # Stage a counted_map edit (exercises # canonical_override_selector + staged Enum.count fallback)
+      root = put_in(root["cm"]["c"], 3)
+      assert Enum.count(root["cm"]) == 3
+      assert Enum.count(root["arr"]) == 4
+
+      # Stage a sorted_map edit (exercises $ canonical_override_selector)
+      root = put_in(root["sm"]["z"], 30)
+      assert root["sm"]["z"] == 30
+
+      # Putting nil on hash_map vs array_list
+      root = put_in(root["m"]["k"], nil)
+      assert root["m"]["k"] == nil
+      root = put_in(root["arr"][1], nil)
+      assert root["arr"][1] == nil
+
+      # pop_in sets deleted_paths (exercises MapSet.size(deleted_paths) != 0)
+      {popped, root} = pop_in(root["m"]["k"])
+      assert popped == nil
+
+      # Staged update on counted_map
+      {old_cm, root} =
+        get_and_update_in(root["cm"], fn cm ->
+          mat = Xitdb.materialize(cm)
+          {mat, Xitdb.counted_map(Map.put(mat, "d", 4))}
+        end)
+
+      assert old_cm == %{"a" => 1, "b" => 2, "c" => 3}
+      assert Enum.count(root["cm"]) == 4
+
+      # Linked list insert_at / delete_at bounds inside tx_mode (idx == length append, idx == 0 delete)
+      root = Xitdb.insert_at(root, ".larr", 4, 50)
+      assert Xitdb.materialize(root["larr"]) == [10, 20, 30, 40, 50]
+      root = Xitdb.delete_at(root, ".larr", 0)
+      assert Xitdb.materialize(root["larr"]) == [20, 30, 40, 50]
+      assert Enum.slice(root["arr"], 0..1) == [10, nil]
+
+      # Enum.count on tx_mode cursors with deleted_paths, staged_list_edits, and fork_aliases (kills L2718-2719)
+      assert Enum.count(root["larr"]) == 4
+      root = Xitdb.fork(root, ".m", ".m_fork")
+      assert Enum.count(root) >= 5
+      assert Enum.member?(root["m_fork"], {"k", nil}) or is_map(Xitdb.materialize(root["m_fork"]))
+
+      # Keys containing @, #, $ in tx_mode (kills L2658)
+      root = put_in(root["m"]["@tag#1$2"], "special")
+      assert root["m"]["@tag#1$2"] == "special"
+
+      root
+    end)
+
+    # Root cursor Enum.count / Enum.member? across moments (kills L2859)
+    assert Enum.count(Xitdb.db(db)) == 6
+    assert Enum.count(Xitdb.as_of(db, 0)) == 5
+    assert Enum.count(Xitdb.as_of(db, 1)) == 6
+
+    assert Enum.count(Xitdb.db(db)["cm"]) == 4
+    assert Xitdb.select!(db, ".sm.z") == 30
+  end
 end

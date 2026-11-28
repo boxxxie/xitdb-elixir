@@ -841,5 +841,170 @@ defmodule Xitdb.Ash.SearchTest do
       assert Search.ids(SearchProfile, "analyst", db: db) == []
       assert length(Search.ids(SearchProfile, "director", db: db, limit: 200)) == 130
     end
+
+    test "hardens tx_mode cursor staging/overlay reads, {db, moment} indexing at moment >= 1, rebuild_index! parallel threshold, and tx_opts",
+         %{db: db} do
+      # 1. tx_mode: true cursor staging (put + update + delete + overlay read inside Xitdb.transact)
+      p1 = %SearchProfile{
+        id: "tx_1",
+        full_name: "Alpha Stag",
+        headline: "Founder",
+        organization_id: nil
+      }
+
+      p2 = %SearchProfile{
+        id: "tx_2",
+        full_name: "Beta Stag",
+        headline: "Engineer",
+        organization_id: nil
+      }
+
+      {:ok, db} =
+        Xitdb.transact(db, fn tx ->
+          tx = Search.index_record(tx, SearchProfile, p1)
+          tx = Search.index_record(tx, SearchProfile, p2)
+          assert "tx_1" in Search.ids(SearchProfile, "alpha", db: tx)
+          assert "tx_2" in Search.ids(SearchProfile, "beta", db: tx)
+
+          tx = Search.remove_record(tx, SearchProfile, "tx_2")
+          assert Search.ids(SearchProfile, "beta", db: tx) == []
+          assert "tx_1" in Search.ids(SearchProfile, "alpha", db: tx)
+          tx
+        end)
+
+      assert Search.ids(SearchProfile, "alpha", db: db) == ["tx_1"]
+      assert Search.ids(SearchProfile, "beta", db: db) == []
+
+      # 2. {db, moment} at moment >= 1 preserves moment >= 0 branch
+      m = Xitdb.moment_count(db) - 1
+      assert m >= 1
+
+      p3 = %SearchProfile{
+        id: "snap_3",
+        full_name: "Gamma Snap",
+        headline: "Advisor",
+        organization_id: nil
+      }
+
+      {next_db, m2} = Search.index_records!({db, m}, SearchProfile, [p3], parallel: false)
+      assert m2 > m
+      assert Search.ids(SearchProfile, "gamma", db: Xitdb.as_of(next_db, m2)) == ["snap_3"]
+      assert Search.ids(SearchProfile, "gamma", db: Xitdb.as_of(next_db, m)) == []
+
+      # 3. rebuild_index! parallel threshold (< 128 runs sequentially on caller pid)
+      parent = self()
+
+      wrapper = fn _root, fun ->
+        send(parent, {:worker_pid, self()})
+        fun.()
+      end
+
+      small_db = Xitdb.open!()
+
+      {:ok, small_db} =
+        Xitdb.transact_ops(
+          small_db,
+          for i <- 1..10 do
+            {:put, ".search_profiles.s_#{i}",
+             %{"id" => "s_#{i}", "full_name" => "Small #{i}", "headline" => "Role"}}
+          end
+        )
+
+      _ = Search.rebuild_index!(small_db, SearchProfile, parallel: true, worker_wrapper: wrapper)
+      assert_received {:worker_pid, ^parent}
+
+      # 4. empty doc in tx_context falls back to default reindex doc
+      next_db2 =
+        Xitdb.with_tx_context([doc: ""], fn ->
+          Search.index_records!(next_db, SearchProfile, [p3], parallel: false)
+        end)
+
+      assert Xitdb.tx_meta!(next_db2)["doc"] == "reindex search search_profiles"
+    end
+
+    test "hardens prefix/exact Search.query inside tx_mode and on persisted db",
+         %{db: db} do
+      p1 = %SearchProfile{
+        id: "rd_1",
+        full_name: "Zephyr Alpha",
+        headline: "Principal",
+        organization_id: nil
+      }
+
+      db = Search.index_records!(db, SearchProfile, [p1], parallel: false)
+
+      assert [{"rd_1", score}] = Search.query(SearchProfile, "zeph*", db: db)
+      assert score > 0.0
+
+      {:ok, db} =
+        Xitdb.transact(db, fn tx ->
+          Search.index_record(tx, SearchProfile, %{p1 | id: "rd_2", full_name: "Zephyr Beta"})
+        end)
+
+      assert "rd_1" in Search.ids(SearchProfile, "zephyr", db: db)
+      assert "rd_2" in Search.ids(SearchProfile, "zephyr", db: db)
+      assert Search.ids(SearchProfile, "beta", db: db) == ["rd_2"]
+
+      # rebuild_index! on {db, moment} at moment >= 1 preserves moment >= 0 branch (kills L1273)
+      {:ok, db} =
+        Xitdb.transact_ops(db, [
+          {:put, ".search_profiles.rd_2",
+           %{"id" => "rd_2", "full_name" => "Zephyr Beta", "headline" => "Principal"}}
+        ])
+
+      m_cur = Xitdb.moment_count(db) - 1
+      assert m_cur >= 1
+      {rebuilt_db, m_rebuilt} = Search.rebuild_index!({db, m_cur}, SearchProfile, parallel: false)
+      assert m_rebuilt > m_cur
+      assert "rd_2" in Search.ids(SearchProfile, "beta", db: Xitdb.as_of(rebuilt_db, m_rebuilt))
+
+      # rebuild_index! on :attribute multitenancy resource WITH actual records (kills L1309)
+      %{records: [rt_rec]} =
+        Ash.bulk_create!(
+          [%{id: 99, name: "Rebuild Attr Tenant"}],
+          SearchRebuildAttrTenant,
+          :create,
+          domain: SearchRebuildDomain,
+          tenant: "tenant_rt",
+          return_records?: true,
+          context: %{xitdb: %{skip_search_index?: true}}
+        )
+
+      :ok =
+        Search.rebuild_index!(SearchRebuildStore, SearchRebuildAttrTenant,
+          tenant: "tenant_rt",
+          parallel: false
+        )
+
+      assert Search.ids(SearchRebuildAttrTenant, "rebuild", tenant: "tenant_rt") == [rt_rec.id]
+
+      # index_records! with empty records does NOT bump Store moment (kills L332)
+      m_before_empty = Xitdb.Ash.Store.root(SearchRebuildStore).moment
+
+      :ok =
+        Search.index_records!(SearchRebuildStore, SearchRebuildAttrTenant, [],
+          tenant: "tenant_rt"
+        )
+
+      assert Xitdb.Ash.Store.root(SearchRebuildStore).moment == m_before_empty
+
+      # remove_record followed by index_record on the SAME id inside tx_mode (kills L2065, L2151, L2271)
+      p_readd = %SearchProfile{
+        id: "readd_1",
+        full_name: "Readd Token",
+        headline: "Role",
+        organization_id: nil
+      }
+
+      {:ok, db} =
+        Xitdb.transact(db, fn tx ->
+          tx = Search.index_record(tx, SearchProfile, p_readd)
+          tx = Search.remove_record(tx, SearchProfile, "readd_1")
+          tx = Search.index_record(tx, SearchProfile, p_readd)
+          tx
+        end)
+
+      assert Search.ids(SearchProfile, "readd", db: db) == ["readd_1"]
+    end
   end
 end

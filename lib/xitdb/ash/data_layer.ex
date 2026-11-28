@@ -304,21 +304,16 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           end
 
         record =
-          Map.get(context, :record) ||
-            Map.get(plain_ctx, :record) ||
+          Map.get(plain_ctx, :record) ||
             Map.get(source_ctx, :record)
 
-        base_eval_opts =
-          [
-            resource: resource,
-            domain: domain,
-            actor: actor,
-            tenant: tenant,
-            context: source_ctx
-          ]
-          |> then(fn opts ->
-            if is_nil(record), do: opts, else: Keyword.put(opts, :record, record)
-          end)
+        base_eval_opts = [
+          resource: resource,
+          domain: domain,
+          actor: actor,
+          tenant: tenant,
+          context: source_ctx
+        ]
 
         expressions
         |> Enum.reduce_while({:ok, []}, fn raw_expr, {:ok, acc} ->
@@ -453,11 +448,9 @@ if Code.ensure_loaded?(Ash.DataLayer) do
 
       override =
         Enum.find_value([context, calc_ctx, direct_source_ctx, calc_source_ctx], :none, fn ctx ->
-          if is_map(ctx) do
-            case extract_db_override(ctx) do
-              {:override, _} = found -> found
-              :none -> nil
-            end
+          case extract_db_override(ctx) do
+            {:override, _} = found -> found
+            :none -> nil
           end
         end)
 
@@ -538,13 +531,6 @@ if Code.ensure_loaded?(Ash.DataLayer) do
     ]
 
     defp boolean_filter_expr?(%mod{}) when mod in @boolean_filter_structs, do: true
-
-    defp boolean_filter_expr?(%{__struct__: mod}) do
-      function_exported?(mod, :evaluate_operator, 1) and
-        Code.ensure_loaded?(Ash.Filter.Simple) and
-        Ash.Filter.Simple in (mod.__info__(:attributes)[:behaviour] || [])
-    end
-
     defp boolean_filter_expr?(_), do: false
 
     defp collect_refs_to_load(expr) do

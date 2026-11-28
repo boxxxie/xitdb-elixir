@@ -132,4 +132,100 @@ defmodule Xitdb.HardeningTest do
     assert {nil, ^list} = pop_in(list, [Xitdb.at(3)])
     assert {nil, ^list} = pop_in(list, [Xitdb.at(-4)])
   end
+
+  @tag :tmp_dir
+  test "compact/2 file backend, pinned select on moment 0, empty_root query, wildcard pull, and nested with_tx_context",
+       %{tmp_dir: tmp_dir} do
+    payload = String.duplicate("compressible payload text ", 20)
+    db = Xitdb.open!(backend: :memory)
+    on_exit(fn -> Xitdb.close(db) end)
+
+    db =
+      db
+      |> Xitdb.transact!(%{"users" => %{"a" => 1, "b" => 99}, "other" => "ok"})
+      |> Xitdb.transact!(%{"users" => %{"a" => 2, "b" => 88}, "other" => "ok2"})
+
+    # 1. compact/2 to file backend sets :buffered_file and path
+    compact_path = Path.join(tmp_dir, "compacted.xdb")
+    {:ok, file_compacted} = Xitdb.compact(db, path: compact_path)
+    on_exit(fn -> Xitdb.close(file_compacted) end)
+    assert file_compacted.backend == :buffered_file
+    assert file_compacted.path == compact_path
+    assert file_compacted["other"] == "ok2"
+
+    # 2. select/3 on as_of(db, 0) and as_of(db, 1) with @0
+    snap0 = Xitdb.as_of(db, 0)
+    assert {:ok, 1} = Xitdb.select(snap0, ".users.a")
+    assert {:ok, 1} = Xitdb.select(snap0, ["users", "a"])
+    assert {:ok, 1} = Xitdb.select(Xitdb.as_of(db, 1), "@0.users.a")
+
+    # 3. select!(db, "") returns a pinned root cursor
+    root_sel = Xitdb.select!(db, "")
+    assert %Cursor{root: true, moment: m} = root_sel
+    assert m >= 0
+
+    # 4. query/3 on Cursor.empty_root/1 queries an isolated empty memory DB
+    empty_root = Cursor.empty_root(db.db_ref)
+    assert {:ok, %{rows: []}} = Xitdb.query(empty_root, "find ?e\nwhere\n  .users[?e].a = ?v")
+
+    # 5. wildcard pull with sibling keys + nested spec + compressed value
+    {:ok, db} =
+      Xitdb.transact(db, %{
+        "users" => %{"a" => {:compressed, payload, min_bytes: 0}, "b" => 7},
+        "other" => "ok3"
+      })
+
+    assert {:ok, %{"other" => "ok3", "users" => %{"a" => ^payload}}} =
+             Xitdb.pull(db, "{*, users{a}}")
+
+    # 6. nested with_tx_context preserves outer meta and ignores empty doc ""
+    Xitdb.with_tx_context([doc: "outer-doc", meta: %{"actor" => "alice"}], fn ->
+      Xitdb.with_tx_context([doc: "", meta: %{"trace" => "t1"}], fn ->
+        ctx = Xitdb.current_tx_context()
+        assert ctx.doc == "outer-doc"
+        assert ctx.meta == %{"actor" => "alice", "trace" => "t1"}
+
+        {:ok, db2} = Xitdb.transact(db, %{"ctx_key" => "v"})
+        {:ok, tx_meta} = Xitdb.tx_meta(db2)
+        assert tx_meta["actor"] == "alice"
+        assert tx_meta["trace"] == "t1"
+      end)
+    end)
+
+    # 7. diff_moments include_internal: true vs false
+    {:ok, db} = Xitdb.transact(db, %{"big" => {:compressed, payload, min_bytes: 0}})
+    {:ok, without_internal} = Xitdb.diff_moments(db, 0, 3)
+    {:ok, with_internal} = Xitdb.diff_moments(db, 0, 3, include_internal: true)
+    assert length(with_internal) >= length(without_internal)
+    refute Enum.any?(without_internal, &String.starts_with?(&1.path, ".__blobs"))
+  end
+
+  test "open/1 rejects empty file path, select!/2 pins non-root moment, pull raw_tagged wildcard, and nested tx_meta" do
+    assert {:error, %Error{reason: :missing_path}} = Xitdb.open(backend: :file, path: "")
+    assert {:error, %Error{reason: :missing_path}} = Xitdb.open(backend: :buffered_file, path: "")
+
+    payload = String.duplicate("compressible payload text ", 20)
+
+    db =
+      Xitdb.open!(backend: :memory)
+      |> Xitdb.transact!(
+        %{"users" => %{"a" => {:compressed, payload, min_bytes: 0}}, "other" => "ok"},
+        meta: %{count: 42}
+      )
+
+    on_exit(fn -> Xitdb.close(db) end)
+
+    # Non-root select! pins moment >= 0 and keeps root: false
+    users_cur = Xitdb.select!(db, ".users")
+    assert %Cursor{root: false, moment: m} = users_cur
+    assert m >= 0
+
+    # pull with raw_tagged: true preserves {:tagged, "zs", _} inside wildcard + nested spec
+    assert {:ok, %{"other" => "ok", "users" => %{"a" => {:tagged, "zs", _}}}} =
+             Xitdb.pull(db, "{*, users{a}}", raw_tagged: true)
+
+    # number in tx_meta
+    {:ok, meta} = Xitdb.tx_meta(db)
+    assert meta["count"] == 42
+  end
 end

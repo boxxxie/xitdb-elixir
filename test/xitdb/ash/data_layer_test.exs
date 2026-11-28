@@ -80,6 +80,8 @@ if Code.ensure_loaded?(Ash.DataLayer) do
           constraints: [one_of: [:active, :suspended]],
           public?: true
         )
+
+        attribute(:internal_tag, :string, default: "secret", public?: false)
       end
 
       identities do
@@ -2582,6 +2584,172 @@ if Code.ensure_loaded?(Ash.DataLayer) do
                    Event,
                    [expr(start_date)],
                    %{record: event, domain: TestDomain}
+                 )
+
+        # 6. True Ash.Query.Operator.Equal relational fallback (hits boolean_filter_expr? == true, L490/L491)
+        assert {:ok, [true, false]} =
+                 Xitdb.Ash.DataLayer.calculate(
+                   Profile,
+                   [
+                     expr(user.email == "calc@acme.io"),
+                     expr(user.email == "nobody@acme.io")
+                   ],
+                   %{record: profile, domain: TestDomain}
+                 )
+
+        # 7. context[:record] takes precedence even when calculation_context lacks :record (kills L307 || -> &&)
+        assert {:ok, ["Alice"]} =
+                 Xitdb.Ash.DataLayer.calculate(
+                   Profile,
+                   [expr(first_name)],
+                   %{
+                     record: profile,
+                     calculation_context: %{actor: nil, tenant: nil, domain: TestDomain},
+                     domain: TestDomain
+                   }
+                 )
+
+        # 8. calculate/3 with record == nil evaluates pure expressions cleanly
+        assert {:ok, [3]} =
+                 Xitdb.Ash.DataLayer.calculate(
+                   Profile,
+                   [expr(1 + 2)],
+                   %{domain: TestDomain}
+                 )
+
+        # 9. run_aggregate_query emits :error status on telemetry when aggregate fails (kills L221)
+        test_pid = self()
+        handler_id = "agg-err-telemetry-#{System.unique_integer([:positive])}"
+
+        :telemetry.attach(
+          handler_id,
+          [:xitdb, :ash, :aggregate_query, :stop],
+          fn _event, _meas, meta, _cfg -> send(test_pid, {:agg_meta, meta}) end,
+          nil
+        )
+
+        on_exit(fn -> :telemetry.detach(handler_id) end)
+
+        bad_agg = %Ash.Query.Aggregate{
+          name: :bad_agg,
+          kind: :sum,
+          field: :nonexistent_field,
+          relationship_path: [],
+          query: %Ash.Query{resource: Profile}
+        }
+
+        base_q = Xitdb.Ash.DataLayer.resource_to_query(Profile, TestDomain)
+        assert {:error, _} = Xitdb.Ash.DataLayer.run_aggregate_query(base_q, [bad_agg], Profile)
+        assert_receive {:agg_meta, %{status: :error}}
+      end
+
+      test "calculate/3 hardens calculation_context[:record], Not/BooleanExpression fallback, unloaded refs, and db override" do
+        user = Ash.create!(User, %{email: "calc2@acme.io", role: "admin"})
+
+        profile =
+          Ash.create!(Profile, %{
+            user_id: user.id,
+            first_name: "Bob"
+          })
+
+        # 1. %Ash.Resource.Calculation.Context{source_context: %{record: profile}} falls back to plain_ctx[:record] (kills L307 || -> &&)
+        assert {:ok, ["Bob"]} =
+                 Xitdb.Ash.DataLayer.calculate(
+                   Profile,
+                   [expr(first_name)],
+                   %Ash.Resource.Calculation.Context{
+                     source_context: %{record: profile},
+                     domain: TestDomain
+                   }
+                 )
+
+        # 2. record present puts :record into eval_opts (kills L320) & Not / BooleanExpression fallback (kills L478-L491, L543-544)
+        not_expr = %Ash.Query.Not{expression: expr(user.email == "other@acme.io")}
+
+        and_expr = %Ash.Query.BooleanExpression{
+          op: :and,
+          left: expr(user.email == "calc2@acme.io"),
+          right: not_expr
+        }
+
+        or_expr = %Ash.Query.BooleanExpression{
+          op: :or,
+          left: expr(user.email == "nope@acme.io"),
+          right: expr(user.email == "calc2@acme.io")
+        }
+
+        assert {:ok, [true, true, true]} =
+                 Xitdb.Ash.DataLayer.calculate(
+                   Profile,
+                   [not_expr, and_expr, or_expr],
+                   %{record: profile, domain: TestDomain}
+                 )
+
+        # 3. Direct Not with unloaded/nil relation still evaluates cleanly via eval_relational_fallback
+        orphan = %Profile{
+          id: 999_999,
+          user_id: 999_999,
+          first_name: "Orphan"
+        }
+
+        assert {:ok, [nil, nil]} =
+                 Xitdb.Ash.DataLayer.calculate(
+                   Profile,
+                   [
+                     expr(user.email == "calc2@acme.io"),
+                     %Ash.Query.Not{expression: expr(user.email == "calc2@acme.io")}
+                   ],
+                   %{record: orphan, domain: TestDomain}
+                 )
+
+        # 4. Exists expression forces Ash.Expr.eval_hydrated -> :unknown -> eval_relational_fallback -> boolean_filter_expr?
+        assert {:ok, [true, false]} =
+                 Xitdb.Ash.DataLayer.calculate(
+                   Profile,
+                   [
+                     expr(exists(user, email == "calc2@acme.io")),
+                     expr(exists(user, email == "nobody@acme.io"))
+                   ],
+                   %{record: profile, domain: TestDomain}
+                 )
+
+        # 5. source_context[:data_layer][:as_of] override in calculate/3 (kills L456)
+        assert {:ok, [false]} =
+                 Xitdb.Ash.DataLayer.calculate(
+                   Profile,
+                   [expr(exists(user, email == "calc2@acme.io"))],
+                   %{
+                     record: profile,
+                     domain: TestDomain,
+                     calculation_context: %Ash.Resource.Calculation.Context{
+                       domain: TestDomain,
+                       source_context: %{data_layer: %{as_of: 0}}
+                     }
+                   }
+                 )
+
+        # 6. prefer_lateral_join_for_many_to_many?/0 (kills L104) & private attr calculate (kills L362, L428)
+        assert Xitdb.Ash.DataLayer.prefer_lateral_join_for_many_to_many?() == false
+
+        assert {:ok, ["secret"]} =
+                 Xitdb.Ash.DataLayer.calculate(
+                   User,
+                   [expr(internal_tag)],
+                   %{record: user, domain: TestDomain}
+                 )
+
+        assert {:ok, [true]} =
+                 Xitdb.Ash.DataLayer.calculate(
+                   Profile,
+                   [expr(user.internal_tag == "secret")],
+                   %{record: profile, domain: TestDomain}
+                 )
+
+        assert {:ok, [nil]} =
+                 Xitdb.Ash.DataLayer.calculate(
+                   User,
+                   [expr(internal_tag)],
+                   %{domain: TestDomain}
                  )
       end
     end
